@@ -272,8 +272,8 @@ Two independent re-review agents verified ALL Round 14+15 fixes correct. Found 4
 | Item | Reason | When to Fix |
 |------|--------|-------------|
 | ~~WS transport uses Go TLS not tls-client~~ | **FIXED** — uTLS via `NetDialTLSContext` | Done |
-| JA4 normalized fingerprint | ТСПУ not using JA4 yet | Monitor |
-| Post-quantum key exchange (X25519MLKEM768) | uTLS doesn't support it; ТСПУ blocks PQ, not its absence | When uTLS adds support |
+| JA4 normalized fingerprint | DPI not using JA4 yet | Monitor |
+| Post-quantum key exchange (X25519MLKEM768) | uTLS doesn't support it; DPI blocks PQ, not its absence | When uTLS adds support |
 | WB TURN TUN mode: UDP-only apps fail | wbturn SOCKS5 = TCP only, DNS bypasses TUN | Phase 2: add UDP ASSOCIATE to wbturn |
 | 100% POST traffic (no GET) | Architectural; needs fake page loads | Phase 2+ |
 | Static Bearer token | Never refreshes; needs rotation protocol | Phase 2+ |
