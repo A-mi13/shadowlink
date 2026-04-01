@@ -1,0 +1,83 @@
+package leakguard
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"time"
+)
+
+// State holds everything LeakGuard needs to undo its changes after a crash.
+type State struct {
+	EnabledAt  time.Time       `json:"enabled_at"`
+	Platform   string          `json:"platform"`
+	DNSBackup  DNSBackup       `json:"dns_backup"`
+	IPv6Backup IPv6Backup      `json:"ipv6_backup"`
+	KillSwitch KillSwitchState `json:"kill_switch"`
+}
+
+// DNSBackup stores original DNS settings so they can be restored.
+type DNSBackup struct {
+	Entries []DNSEntry `json:"entries"`
+}
+
+// DNSEntry represents DNS servers configured on a single network interface.
+type DNSEntry struct {
+	InterfaceName string   `json:"interface_name"`
+	Servers       []string `json:"servers"`
+}
+
+// IPv6Backup stores the list of interfaces where IPv6 was disabled
+// and (on Linux) the original sysctl value.
+type IPv6Backup struct {
+	DisabledInterfaces []string `json:"disabled_interfaces"`
+	OriginalSysctl     string   `json:"original_sysctl,omitempty"`
+}
+
+// KillSwitchState stores firewall rules so they can be removed on cleanup.
+type KillSwitchState struct {
+	Rules      []string `json:"rules"`
+	ServerIP   string   `json:"server_ip"`
+	ServerPort int      `json:"server_port"`
+	TunName    string   `json:"tun_name"`
+	Backend    string   `json:"backend"`
+}
+
+// SaveState serialises state to a JSON file with restricted permissions.
+func SaveState(path string, s *State) error {
+	data, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return fmt.Errorf("leakguard: marshal state: %w", err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return fmt.Errorf("leakguard: write state %s: %w", path, err)
+	}
+	return nil
+}
+
+// LoadState reads a previously saved state file.
+func LoadState(path string) (*State, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("leakguard: read state %s: %w", path, err)
+	}
+	var s State
+	if err := json.Unmarshal(data, &s); err != nil {
+		return nil, fmt.Errorf("leakguard: unmarshal state %s: %w", path, err)
+	}
+	return &s, nil
+}
+
+// StateExists returns true when a state file is present on disk.
+func StateExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// DeleteState removes the state file.
+func DeleteState(path string) error {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("leakguard: delete state %s: %w", path, err)
+	}
+	return nil
+}

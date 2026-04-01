@@ -1,0 +1,44 @@
+# Compiled binaries
+*.exe
+*.exe~
+shadowlink-client-mac
+shadowlink-server-linux
+shadowlink-server
+
+# Third-party binaries
+tun2socks*
+wbturn.exe
+
+# Config with secrets (pubkey, passwords)
+config.yaml
+
+# Connection scripts (contain server IPs and passwords)
+connect*.bat
+connect*.sh
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test coverage
+coverage.out
+*.test
+
+# User state
+fingerprint.json
+leakguard-state.json
+
+# Key files (secrets)
+*.key
+
+# Archives
+*.zip
+
+# Windows DLL
+wintun.dll
