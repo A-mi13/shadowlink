@@ -3,6 +3,7 @@ package server
 import (
 	"testing"
 
+	"github.com/nixavpn/shadowlink/core"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -133,4 +134,48 @@ func TestClientAuthCheckDeviceLimitExistingSession(t *testing.T) {
 	assert.True(t, ca.CheckDeviceLimit("u1:d1"), "reconnecting client should be allowed")
 	// d2 is genuinely new — should be blocked.
 	assert.False(t, ca.CheckDeviceLimit("u1:d2"), "new device should be blocked at limit")
+}
+
+// TestNewHandlerHandshakeRateLimitFromConfig verifies that the handler's
+// rate limiter respects Config.HandshakeRateLimitPerMin so we can raise the
+// cap above the legacy 50/min hardcode that was breaking pool reconnect.
+func TestNewHandlerHandshakeRateLimitFromConfig(t *testing.T) {
+	serverKey, err := core.GenerateKeyPair()
+	require.NoError(t, err)
+
+	cfg := TestConfig()
+	cfg.HandshakeRateLimitPerMin = 100
+
+	h := NewHandler(serverKey, cfg, "")
+
+	// First 100 attempts from one IP must be allowed.
+	for i := 0; i < 100; i++ {
+		require.True(t, h.rateLimiter.Allow("203.0.113.10"),
+			"attempt %d/100 must pass under configured limit", i+1)
+	}
+	// 101st must be blocked.
+	require.False(t, h.rateLimiter.Allow("203.0.113.10"),
+		"attempt 101 must be rate-limited")
+}
+
+// TestNewHandlerHandshakeRateLimitDefaultRaised verifies the new default
+// (300/min) replaces the legacy hardcoded 50/min that throttled legitimate
+// pool reconnect bursts. Pool of 4 slots × cascade reconnects can easily
+// generate 30+ handshakes/min from one IP — we must allow this.
+func TestNewHandlerHandshakeRateLimitDefaultRaised(t *testing.T) {
+	serverKey, err := core.GenerateKeyPair()
+	require.NoError(t, err)
+
+	cfg := TestConfig() // does not set HandshakeRateLimitPerMin
+	h := NewHandler(serverKey, cfg, "")
+
+	// At least 100 attempts must pass under default — well above old 50.
+	allowed := 0
+	for i := 0; i < 100; i++ {
+		if h.rateLimiter.Allow("203.0.113.20") {
+			allowed++
+		}
+	}
+	require.GreaterOrEqual(t, allowed, 100,
+		"default rate limit must allow >=100 handshakes/min for pool reconnect; got %d", allowed)
 }

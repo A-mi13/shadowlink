@@ -326,7 +326,15 @@ var killSwitchRuleNames = []string{
 // enableKillSwitch adds Windows Firewall rules that block all traffic except
 // through the VPN tunnel.
 func (g *windowsGuard) enableKillSwitch(cfg LeakGuardConfig) (KillSwitchState, error) {
-	serverIP := cfg.ServerIP.String()
+	// Build comma-separated list of ALL server IPs for firewall rules.
+	// CDN (Cloudflare) returns multiple IPs — ALL must be allowed or
+	// the kill switch blocks download stream ACKs to the "other" IP.
+	allIPs := cfg.AllServerIPs()
+	var ipStrs []string
+	for _, ip := range allIPs {
+		ipStrs = append(ipStrs, ip.String())
+	}
+	serverIPList := strings.Join(ipStrs, ",")
 	port := strconv.Itoa(cfg.ServerPort)
 
 	rules := []struct {
@@ -342,13 +350,13 @@ func (g *windowsGuard) enableKillSwitch(cfg LeakGuardConfig) (KillSwitchState, e
 			name: "SL-Allow-TUN",
 			args: []string{"advfirewall", "firewall", "add", "rule",
 				"name=SL-Allow-TUN", "dir=out", "action=allow",
-				fmt.Sprintf("interface=%s", cfg.TunName)},
+				"localip=198.18.0.0/15"},
 		},
 		{
 			name: "SL-Allow-Server-TCP",
 			args: []string{"advfirewall", "firewall", "add", "rule",
 				"name=SL-Allow-Server-TCP", "dir=out", "action=allow",
-				fmt.Sprintf("remoteip=%s", serverIP),
+				fmt.Sprintf("remoteip=%s", serverIPList),
 				fmt.Sprintf("remoteport=%s", port),
 				"protocol=tcp"},
 		},
@@ -356,7 +364,7 @@ func (g *windowsGuard) enableKillSwitch(cfg LeakGuardConfig) (KillSwitchState, e
 			name: "SL-Allow-Server-UDP",
 			args: []string{"advfirewall", "firewall", "add", "rule",
 				"name=SL-Allow-Server-UDP", "dir=out", "action=allow",
-				fmt.Sprintf("remoteip=%s", serverIP),
+				fmt.Sprintf("remoteip=%s", serverIPList),
 				fmt.Sprintf("remoteport=%s", port),
 				"protocol=udp"},
 		},
@@ -406,7 +414,7 @@ func (g *windowsGuard) enableKillSwitch(cfg LeakGuardConfig) (KillSwitchState, e
 
 	return KillSwitchState{
 		Rules:      added,
-		ServerIP:   serverIP,
+		ServerIP:   serverIPList,
 		ServerPort: cfg.ServerPort,
 		TunName:    cfg.TunName,
 		Backend:    "netsh-advfirewall",

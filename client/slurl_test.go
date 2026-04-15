@@ -145,3 +145,102 @@ func TestBuildSLURL_OmitsDefaults(t *testing.T) {
 	// Should contain tls
 	assert.Contains(t, url, "tls=1")
 }
+
+// TestParseSLURL_FullDirectSNI verifies the full-direct URL form:
+// IP as host + sni=domain parameter. Used to bypass CF entirely while
+// keeping the CF-protected domain in TLS SNI so nginx server_name matches.
+func TestParseSLURL_FullDirectSNI(t *testing.T) {
+	raw := "sl://aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233@104.222.177.67:443?tls=1&sni=datacanvases.com"
+
+	cfg, err := ParseSLURL(raw)
+	require.NoError(t, err)
+
+	assert.Equal(t, "104.222.177.67:443", cfg.Server)
+	assert.Equal(t, "datacanvases.com", cfg.SNI)
+	assert.Equal(t, "", cfg.CDN, "full-direct must not set CDN")
+	assert.Equal(t, "", cfg.Origin, "full-direct uses Server as origin, no separate Origin")
+	assert.Equal(t, true, cfg.TLS)
+}
+
+// TestBuildSLURL_FullDirectRoundtrip verifies BuildSLURL preserves sni= and origin=
+// so full-direct and hybrid configs can be serialized and re-parsed without loss.
+func TestBuildSLURL_FullDirectRoundtrip(t *testing.T) {
+	orig := &ClientFileConfig{
+		Server: "104.222.177.67:443",
+		PubKey: "aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233",
+		TLS:    true,
+		SNI:    "datacanvases.com",
+	}
+	built := BuildSLURL(orig)
+	assert.Contains(t, built, "sni=datacanvases.com")
+
+	roundtripped, err := ParseSLURL(built)
+	require.NoError(t, err)
+	assert.Equal(t, orig.Server, roundtripped.Server)
+	assert.Equal(t, orig.SNI, roundtripped.SNI)
+	assert.Equal(t, orig.TLS, roundtripped.TLS)
+}
+
+// TestParseSLURL_BackupServers verifies the backup= parameter produces a list
+// of fallback servers. Used when the primary CF domain gets blocked by ТСПУ.
+func TestParseSLURL_BackupServers(t *testing.T) {
+	raw := "sl://aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233@primary.com:443?tls=1&cdn=primary.com&backup=fallback1.com,fallback2.com:8443"
+
+	cfg, err := ParseSLURL(raw)
+	require.NoError(t, err)
+
+	assert.Equal(t, "primary.com:443", cfg.Server)
+	require.Len(t, cfg.BackupServers, 2, "expected 2 backup servers")
+	assert.Equal(t, "fallback1.com:443", cfg.BackupServers[0], "backup without :port should default to :443")
+	assert.Equal(t, "fallback2.com:8443", cfg.BackupServers[1], "backup with explicit :port should be preserved")
+}
+
+// TestParseSLURL_NoBackupBackwardCompat verifies that existing URLs without
+// backup= continue to parse to an empty BackupServers slice (no breaking change).
+func TestParseSLURL_NoBackupBackwardCompat(t *testing.T) {
+	raw := "sl://aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233@primary.com:443?tls=1&cdn=primary.com"
+
+	cfg, err := ParseSLURL(raw)
+	require.NoError(t, err)
+
+	assert.Empty(t, cfg.BackupServers, "no backup param must produce empty slice")
+}
+
+// TestBuildSLURL_BackupRoundtrip verifies BuildSLURL preserves backup servers
+// so configs can be exported and re-imported.
+func TestBuildSLURL_BackupRoundtrip(t *testing.T) {
+	orig := &ClientFileConfig{
+		Server:        "primary.com:443",
+		PubKey:        "aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233",
+		TLS:           true,
+		CDN:           "primary.com",
+		BackupServers: []string{"fallback1.com:443", "fallback2.com:8443"},
+	}
+
+	built := BuildSLURL(orig)
+	assert.Contains(t, built, "backup=")
+
+	roundtripped, err := ParseSLURL(built)
+	require.NoError(t, err)
+	assert.Equal(t, orig.BackupServers, roundtripped.BackupServers)
+}
+
+func TestBuildSLURL_HybridRoundtrip(t *testing.T) {
+	orig := &ClientFileConfig{
+		Server: "datacanvases.com:443",
+		PubKey: "aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233",
+		TLS:    true,
+		CDN:    "datacanvases.com",
+		Origin: "104.222.177.67",
+	}
+	built := BuildSLURL(orig)
+	assert.Contains(t, built, "cdn=datacanvases.com")
+	assert.Contains(t, built, "origin=104.222.177.67")
+
+	roundtripped, err := ParseSLURL(built)
+	require.NoError(t, err)
+	assert.Equal(t, orig.Server, roundtripped.Server)
+	assert.Equal(t, orig.CDN, roundtripped.CDN)
+	assert.Equal(t, orig.Origin, roundtripped.Origin)
+	assert.Equal(t, "", roundtripped.SNI, "hybrid must not set SNI")
+}

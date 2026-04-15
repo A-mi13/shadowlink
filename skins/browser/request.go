@@ -191,6 +191,23 @@ func BuildDownloadResponse(encryptedChunk []byte, seqNum uint32) ([]byte, error)
 	return json.Marshal(env)
 }
 
+// BuildDownloadResponseMulti creates an HTTP response with multiple encrypted chunks.
+// Batches multiple chunks per response to reduce round-trips through CDN.
+func BuildDownloadResponseMulti(encryptedChunks [][]byte) ([]byte, error) {
+	results := make([]downloadResult, 0, len(encryptedChunks))
+	for _, chunk := range encryptedChunks {
+		results = append(results, downloadResult{
+			ID:      fmt.Sprintf("%08x", rand.Uint32()),
+			Payload: base64.RawURLEncoding.EncodeToString(chunk),
+		})
+	}
+	env := downloadEnvelope{
+		Status:  "ok",
+		Results: results,
+	}
+	return json.Marshal(env)
+}
+
 // BuildInflatedDownloadResponse creates an HTTP response body with realistic extra fields
 // that make the JSON look like a real SaaS analytics API response.
 // This is the MimicryEngine integration for download responses — adds config_version,
@@ -230,7 +247,8 @@ func BuildInflatedDownloadResponse(encryptedChunk []byte, seqNum uint32) ([]byte
 	return json.Marshal(env)
 }
 
-// ParseDownloadResponse extracts the encrypted chunk from a download response body.
+// ParseDownloadResponse extracts the first encrypted chunk from a download response body.
+// For multi-chunk responses, use ParseDownloadResponseMulti.
 func ParseDownloadResponse(body []byte) ([]byte, uint32, error) {
 	var env downloadEnvelope
 	if err := json.Unmarshal(body, &env); err != nil {
@@ -251,6 +269,38 @@ func ParseDownloadResponse(body []byte) ([]byte, uint32, error) {
 
 	seqNum, _ := strconv.ParseUint(r.ID, 16, 32)
 	return data, uint32(seqNum), nil
+}
+
+// ParseDownloadResponseMulti extracts ALL encrypted chunks from a download response.
+// Returns a slice of encrypted chunks. Servers may batch multiple chunks per response
+// to reduce round-trips through CDN.
+func ParseDownloadResponseMulti(body []byte) ([][]byte, error) {
+	var env downloadEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		return nil, err
+	}
+	if env.Status != "ok" {
+		return nil, fmt.Errorf("server returned status: %s", env.Status)
+	}
+	if len(env.Results) == 0 {
+		return nil, errors.New("no results in response")
+	}
+
+	chunks := make([][]byte, 0, len(env.Results))
+	for _, r := range env.Results {
+		if r.Payload == "" {
+			continue
+		}
+		data, err := base64.RawURLEncoding.DecodeString(r.Payload)
+		if err != nil {
+			continue
+		}
+		chunks = append(chunks, data)
+	}
+	if len(chunks) == 0 {
+		return nil, errors.New("no results in response")
+	}
+	return chunks, nil
 }
 
 // ExtractSessionToken extracts session token from Authorization header.

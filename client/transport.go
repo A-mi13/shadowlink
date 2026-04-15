@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"sync"
 	"time"
 
@@ -28,10 +29,24 @@ type Transport interface {
 	Close() error
 }
 
+// SessionAware is implemented by transports that need session data for cover traffic.
+type SessionAware interface {
+	SetSession(s *core.Session)
+	SetSessionToken(token []byte)
+}
+
+// Compile-time assertions: both transports must implement SessionAware.
+var (
+	_ SessionAware = (*DirectTransport)(nil)
+	_ SessionAware = (*CDNTransport)(nil)
+)
+
 // DirectTransport connects directly to the ShadowLink server.
 // Uses bogdanfinn/tls-client for browser-identical TLS + HTTP/2 fingerprinting.
 type DirectTransport struct {
-	baseURL     string
+	baseURL     string // scheme://DIAL_HOST:PORT — drives DNS/dial + default SNI
+	publicURL   string // scheme://VISIBLE_HOST:PORT — used in Origin/Referer headers
+	publicHost  string // VISIBLE_HOST used as HTTP Host header (== sniOverride when set, else dial host)
 	urlPool     *browser.URLPool
 	connManager *ConnManager
 
@@ -46,30 +61,81 @@ type DirectTransport struct {
 // serverAddr is "host:port" (e.g., "example.com:443").
 // useTLS enables TLS with browser-identical fingerprinting. skipVerify for testing.
 func NewDirectTransport(serverAddr string, useTLS bool, skipVerify bool) *DirectTransport {
-	return newDirectTransportECH(serverAddr, useTLS, skipVerify, false, "")
+	return newDirectTransportFull(serverAddr, useTLS, skipVerify, false, "", "")
 }
 
-// newDirectTransportECH is the internal constructor that accepts ECH parameters.
+// NewDirectTransportWithSNI creates a direct transport that dials serverAddr (IP:port)
+// but presents sniDomain as the TLS ServerName. This is the full-direct mode: the
+// client contacts the origin IP without going through CF, but the TLS handshake
+// still uses the CF-protected domain so nginx server_name matching and certificate
+// presentation work normally.
+//
+// Implementation uses tls-client's WithServerNameOverwrite, which requires
+// InsecureSkipVerify. This is acceptable because ShadowLink pins the server's
+// X25519 public key at the protocol layer — TLS here is only for steganographic
+// packet shape, not for authentication.
+func NewDirectTransportWithSNI(serverAddr, sniDomain string, useTLS bool) *DirectTransport {
+	return newDirectTransportFull(serverAddr, useTLS, false, false, "", sniDomain)
+}
+
+// newDirectTransportECH is kept for backward compatibility with existing callers.
 func newDirectTransportECH(serverAddr string, useTLS bool, skipVerify bool, echEnabled bool, echDomain string) *DirectTransport {
+	return newDirectTransportFull(serverAddr, useTLS, skipVerify, echEnabled, echDomain, "")
+}
+
+// newDirectTransportFull is the unified internal constructor.
+func newDirectTransportFull(serverAddr string, useTLS bool, skipVerify bool, echEnabled bool, echDomain, sniOverride string) *DirectTransport {
 	scheme := "http"
 	if useTLS {
 		scheme = "https"
+	}
+
+	// Full-direct mode: tls-client's WithServerNameOverwrite requires
+	// InsecureSkipVerify. This is acceptable because ShadowLink authenticates
+	// the server via X25519 pubkey pin inside the encrypted payload — TLS
+	// certificate validation here is cosmetic (for steganographic shape only).
+	effSkipVerify := skipVerify
+	if sniOverride != "" {
+		effSkipVerify = true
 	}
 
 	fpPool := browser.NewFingerprintPool()
 	cm := NewConnManager(ConnManagerConfig{
 		ServerAddr:  serverAddr,
 		UseTLS:      useTLS,
-		SkipVerify:  skipVerify,
+		SkipVerify:  effSkipVerify,
 		FPPool:      fpPool,
 		MinRotation: 5 * time.Minute,
 		MaxRotation: 10 * time.Minute,
 		ECHEnabled:  echEnabled,
 		ECHDomain:   echDomain,
+		SNIOverride: sniOverride,
 	})
 
+	baseURL := fmt.Sprintf("%s://%s", scheme, serverAddr)
+	publicURL := baseURL
+	publicHost := ""
+	if sniOverride != "" {
+		// Host header and Origin/Referer must use the public (CF-protected)
+		// domain, not the origin IP. Otherwise nginx server_name won't match
+		// and the request looks anomalous (IP in Host header).
+		_, port, splitErr := net.SplitHostPort(serverAddr)
+		if splitErr != nil {
+			port = "443"
+		}
+		if port == "443" || port == "" {
+			publicURL = fmt.Sprintf("%s://%s", scheme, sniOverride)
+			publicHost = sniOverride
+		} else {
+			publicURL = fmt.Sprintf("%s://%s:%s", scheme, sniOverride, port)
+			publicHost = fmt.Sprintf("%s:%s", sniOverride, port)
+		}
+	}
+
 	t := &DirectTransport{
-		baseURL:     fmt.Sprintf("%s://%s", scheme, serverAddr),
+		baseURL:     baseURL,
+		publicURL:   publicURL,
+		publicHost:  publicHost,
 		urlPool:     browser.NewURLPool(),
 		connManager: cm,
 		rc:          browser.NewRatioController(2.5, 3.5),
@@ -168,6 +234,9 @@ func (t *DirectTransport) startCoverTraffic() {
 				if err != nil {
 					continue
 				}
+				if t.publicHost != "" {
+					req.Host = t.publicHost
+				}
 				req.Header = http.Header{
 					"content-type":    {"application/json"},
 					"authorization":   {"Bearer " + base64.RawURLEncoding.EncodeToString(token)},
@@ -176,8 +245,8 @@ func (t *DirectTransport) startCoverTraffic() {
 					"accept":          {"application/json"},
 					"accept-encoding": {"gzip, deflate, br"},
 					"accept-language": {"en-US,en;q=0.9"},
-					"origin":          {t.baseURL},
-					"referer":         {t.baseURL + "/"},
+					"origin":          {t.publicURL},
+					"referer":         {t.publicURL + "/"},
 					"cache-control":   {"no-cache"},
 					http.HeaderOrderKey: {
 						"content-type",
@@ -200,6 +269,7 @@ func (t *DirectTransport) startCoverTraffic() {
 				resp.Body.Close()
 
 				t.rc.RecordUpload(len(encrypted))
+				Stats.CoverPosts.Add(1)
 			}
 		}
 	}()
@@ -230,6 +300,9 @@ func (t *DirectTransport) SendHandshake(ctx context.Context, hello *core.ClientH
 	if err != nil {
 		return nil, err
 	}
+	if t.publicHost != "" {
+		req.Host = t.publicHost
+	}
 
 	ua := t.connManager.ActiveFingerprint().UserAgent()
 	req.Header = http.Header{
@@ -238,8 +311,8 @@ func (t *DirectTransport) SendHandshake(ctx context.Context, hello *core.ClientH
 		"accept":          {"application/json"},
 		"accept-encoding": {"gzip, deflate, br"},
 		"accept-language": {"en-US,en;q=0.9"},
-		"origin":          {t.baseURL},
-		"referer":         {t.baseURL + "/"},
+		"origin":          {t.publicURL},
+		"referer":         {t.publicURL + "/"},
 		"cache-control":   {"no-cache"},
 		http.HeaderOrderKey: {
 			"content-type",
@@ -304,6 +377,9 @@ func (t *DirectTransport) SendChunk(ctx context.Context, encryptedChunk []byte, 
 	if err != nil {
 		return nil, err
 	}
+	if t.publicHost != "" {
+		req.Host = t.publicHost
+	}
 
 	req.Header = http.Header{
 		"content-type":    {"application/json"},
@@ -313,8 +389,8 @@ func (t *DirectTransport) SendChunk(ctx context.Context, encryptedChunk []byte, 
 		"accept":          {"application/json"},
 		"accept-encoding": {"gzip, deflate, br"},
 		"accept-language": {"en-US,en;q=0.9"},
-		"origin":          {t.baseURL},
-		"referer":         {t.baseURL + "/"},
+		"origin":          {t.publicURL},
+		"referer":         {t.publicURL + "/"},
 		"cache-control":   {"no-cache"},
 		http.HeaderOrderKey: {
 			"content-type",
@@ -362,6 +438,74 @@ func (t *DirectTransport) SendChunk(ctx context.Context, encryptedChunk []byte, 
 	return encResp, nil
 }
 
+// SendChunkRawBody sends a chunk and returns the raw JSON response body (not parsed).
+// Used by PollVia to handle multi-chunk server responses.
+func (t *DirectTransport) SendChunkRawBody(ctx context.Context, encryptedChunk []byte, sessionToken []byte, seqNum uint32) ([]byte, error) {
+	ua := t.connManager.ActiveFingerprint().UserAgent()
+
+	payload := base64.RawURLEncoding.EncodeToString(encryptedChunk)
+	type evt struct {
+		Type string `json:"type"`
+		TS   int64  `json:"ts"`
+		Data string `json:"data"`
+	}
+	type envelope struct {
+		Events []evt `json:"events"`
+	}
+	evtBody, _ := json.Marshal(envelope{Events: []evt{{
+		Type: browser.RandomEventType(),
+		TS:   time.Now().UnixMilli(),
+		Data: payload,
+	}}})
+
+	url := t.baseURL + t.urlPool.NextUploadPath()
+	req, err := http.NewRequest("POST", url, bytes.NewReader(evtBody))
+	if err != nil {
+		return nil, err
+	}
+	if t.publicHost != "" {
+		req.Host = t.publicHost
+	}
+
+	req.Header = http.Header{
+		"content-type":    {"application/json"},
+		"authorization":   {"Bearer " + base64.RawURLEncoding.EncodeToString(sessionToken)},
+		"x-request-id":    {fmt.Sprintf("%08x", browser.RandomUint32())},
+		"user-agent":      {ua},
+		"accept":          {"application/json"},
+		"accept-encoding": {"gzip, deflate, br"},
+		"accept-language": {"en-US,en;q=0.9"},
+		"origin":          {t.publicURL},
+		"referer":         {t.publicURL + "/"},
+		"cache-control":   {"no-cache"},
+		http.HeaderOrderKey: {
+			"content-type",
+			"authorization",
+			"x-request-id",
+			"user-agent",
+			"accept",
+			"accept-encoding",
+			"accept-language",
+			"origin",
+			"referer",
+			"cache-control",
+		},
+	}
+
+	resp, err := t.connManager.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, respBody)
+	}
+
+	return io.ReadAll(io.LimitReader(resp.Body, 128*1024))
+}
+
 // CDNTransport connects to the server via Cloudflare CDN (orange cloud).
 type CDNTransport struct {
 	direct *DirectTransport
@@ -390,4 +534,17 @@ func (t *CDNTransport) SendHandshake(ctx context.Context, hello *core.ClientHell
 
 func (t *CDNTransport) SendChunk(ctx context.Context, data []byte, token []byte, seq uint32) ([]byte, error) {
 	return t.direct.SendChunk(ctx, data, token, seq)
+}
+
+// SendChunkRawBody returns the raw response body for multi-chunk parsing.
+func (t *CDNTransport) SendChunkRawBody(ctx context.Context, data []byte, token []byte, seq uint32) ([]byte, error) {
+	return t.direct.SendChunkRawBody(ctx, data, token, seq)
+}
+
+func (t *CDNTransport) SetSession(s *core.Session) {
+	t.direct.SetSession(s)
+}
+
+func (t *CDNTransport) SetSessionToken(token []byte) {
+	t.direct.SetSessionToken(token)
 }

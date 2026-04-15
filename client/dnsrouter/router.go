@@ -40,6 +40,7 @@ type pattern struct {
 // New creates a DNS router.
 func New(cfg Config) *Router {
 	if cfg.ListenAddr == "" {
+		// Try port 53 first, fall back to 5353 if permission denied (macOS non-root)
 		cfg.ListenAddr = "127.0.0.1:53"
 	}
 	if cfg.Upstream == "" {
@@ -68,6 +69,7 @@ func New(cfg Config) *Router {
 }
 
 // Start begins listening for DNS queries.
+// Falls back to port 5353 if port 53 requires root.
 func (r *Router) Start() error {
 	addr, err := net.ResolveUDPAddr("udp", r.config.ListenAddr)
 	if err != nil {
@@ -75,6 +77,13 @@ func (r *Router) Start() error {
 	}
 
 	r.conn, err = net.ListenUDP("udp", addr)
+	if err != nil && r.config.ListenAddr == "127.0.0.1:53" {
+		// Port 53 needs root on macOS/Linux — fall back to 5353
+		slog.Info("dnsrouter: port 53 unavailable, trying 5353")
+		r.config.ListenAddr = "127.0.0.1:5353"
+		addr, _ = net.ResolveUDPAddr("udp", r.config.ListenAddr)
+		r.conn, err = net.ListenUDP("udp", addr)
+	}
 	if err != nil {
 		return fmt.Errorf("dnsrouter: listen %s: %w", r.config.ListenAddr, err)
 	}
@@ -84,6 +93,9 @@ func (r *Router) Start() error {
 	go r.serve()
 	return nil
 }
+
+// Addr returns the actual listen address (may differ from config if fallback was used).
+func (r *Router) Addr() string { return r.config.ListenAddr }
 
 // Stop shuts down the DNS router and cleans up added routes.
 func (r *Router) Stop() {

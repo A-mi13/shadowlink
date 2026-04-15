@@ -11,7 +11,12 @@ import (
 	"time"
 )
 
-const WindowSize = 256
+// WindowSize is the anti-replay sliding window size.
+// Per-stream WS mode: 80+ concurrent goroutines share one session, each
+// incrementing seq_num atomically. Server receives seq_nums out-of-order
+// across different WS connections (seq 5 on WS_A, seq 3 on WS_B, seq 8 on WS_C).
+// 16384 gives ample room for 200+ concurrent streams with CDN latency jitter.
+const WindowSize = 16384
 
 // Session tracks state for one client connection.
 type Session struct {
@@ -195,6 +200,21 @@ func (s *Session) Keys() (sendKey, recvKey []byte) {
 	return sk, rk
 }
 
+// sessionEncryptCounter is a debug counter for client-side throughput stats.
+// Set via SetEncryptCounter so core/ stays independent of client/.
+var sessionEncryptCounter func()
+var sessionDecryptCounter func()
+var sessionDecryptFailCounter func()
+
+// SetStatsCallbacks lets the client package hook atomic counters into the
+// session's encrypt/decrypt hot paths without pulling client into core.
+// All callbacks are optional — nil is a no-op.
+func SetStatsCallbacks(onEncrypt, onDecrypt, onDecryptFail func()) {
+	sessionEncryptCounter = onEncrypt
+	sessionDecryptCounter = onDecrypt
+	sessionDecryptFailCounter = onDecryptFail
+}
+
 // EncryptChunk encrypts a chunk safely using cached GCM if available.
 func (s *Session) EncryptChunk(chunk *Chunk) ([]byte, error) {
 	s.mu.Lock()
@@ -204,6 +224,10 @@ func (s *Session) EncryptChunk(chunk *Chunk) ([]byte, error) {
 		s.sendNonce++
 	}
 	s.mu.Unlock()
+
+	if sessionEncryptCounter != nil {
+		sessionEncryptCounter()
+	}
 
 	if gcm != nil {
 		return chunk.EncryptWith(gcm, nonce)
@@ -219,6 +243,10 @@ func (s *Session) EncryptChunk(chunk *Chunk) ([]byte, error) {
 
 // DecryptChunkSafe decrypts a chunk safely using cached GCM if available.
 func (s *Session) DecryptChunkSafe(data []byte) (*Chunk, error) {
+	if sessionDecryptCounter != nil {
+		sessionDecryptCounter()
+	}
+
 	s.mu.Lock()
 	gcm := s.recvGCM
 	oldGCM := s.oldRecvGCM
@@ -262,6 +290,9 @@ func (s *Session) DecryptChunkSafe(data []byte) (*Chunk, error) {
 				s.mu.Unlock()
 				return chunk, nil
 			}
+		}
+		if sessionDecryptFailCounter != nil {
+			sessionDecryptFailCounter()
 		}
 		return nil, fmt.Errorf("decrypt failed with cached GCM")
 	}

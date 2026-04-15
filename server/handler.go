@@ -6,16 +6,24 @@ import (
 	"crypto/cipher"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nixavpn/shadowlink/core"
 	"github.com/nixavpn/shadowlink/skins/browser"
+)
+
+// SSE framing constants — pre-allocated to avoid per-write allocations.
+var (
+	sseDataPrefix = []byte("data: ")
+	sseEventEnd   = []byte("\n\n")
 )
 
 // Handler processes authenticated ShadowLink requests.
@@ -36,19 +44,28 @@ type Handler struct {
 }
 
 // StreamConn represents one multiplexed stream within a tunnel.
+// Supports optimistic CONNECT: TargetConn may be nil while dial is in progress.
+// Data arriving before dial completes is buffered in PendingBuf.
 type StreamConn struct {
 	StreamID   uint16
 	TargetConn net.Conn
+	mu         sync.Mutex
+	PendingBuf [][]byte // data buffered while TargetConn==nil (optimistic CONNECT)
 }
 
 // Tunnel represents one client's bidirectional data channel with multiplexed streams.
 type Tunnel struct {
 	SessionID uint32
 	ClientID  string // "userID:deviceID" — used for OnSessionDestroyed cleanup
-	Incoming  chan []byte
-	Outgoing  chan []byte
-	done      chan struct{} // closed to signal all relays to stop
+	Incoming    chan []byte
+	Outgoing    chan []byte
+	OutgoingUDP chan []byte // UDP responses (separate to preserve FlagUDP in SplitHTTP download stream)
+	done        chan struct{} // closed to signal all relays to stop
 	closeOnce sync.Once
+
+	// HasDownloadStream is true when a SplitHTTP GET stream is active.
+	// When true, handleDataChunk skips polling Outgoing (the download stream drains it).
+	HasDownloadStream atomic.Bool
 
 	mu      sync.Mutex
 	streams map[uint16]*StreamConn
@@ -63,18 +80,27 @@ func (t *Tunnel) closeTunnel() {
 		close(t.done)
 		close(t.Incoming)
 		close(t.Outgoing)
+		close(t.OutgoingUDP)
 	})
 }
 
 // NewHandler creates a ShadowLink request handler.
 func NewHandler(serverKey *core.KeyPair, config Config, decoyDir string) *Handler {
+	// Sized for WS pool reconnect bursts: pool=4-8 slots × cascade reconnects
+	// generate 20-50 handshakes/min from one client IP. The old 50/min cap
+	// blocked legitimate reconnect and forced the client into decoy fallback
+	// (HTTP 404 / HTML), creating a circular failure mode.
+	rateLimit := config.HandshakeRateLimitPerMin
+	if rateLimit <= 0 {
+		rateLimit = 300
+	}
 	return &Handler{
 		serverKey:   serverKey,
 		sessions:    core.NewSessionManager(config.SessionTimeout),
 		decoy:       NewDecoyHandler(decoyDir),
 		config:      config,
 		metrics:     NewMetrics(),
-		rateLimiter: NewRateLimiter(50, time.Minute), // 50/min/IP — each SOCKS5 CONNECT = new session
+		rateLimiter: NewRateLimiter(rateLimit, time.Minute),
 		clientAuth:  NewClientAuth(config.AuthorizedClients),
 		udpRelay:    NewUDPRelay(60 * time.Second),
 		tunnels:     make(map[uint32]*Tunnel),
@@ -111,6 +137,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// WebSocket upgrade for full-duplex relay (Phase 1b)
 	if r.Header.Get("Upgrade") == "websocket" {
 		h.handleWebSocket(w, r)
+		return
+	}
+
+	// Debug: streaming test endpoint (remove after debugging).
+	if r.Method == "GET" && r.URL.Path == "/_debug/stream" {
+		h.handleStreamTest(w, r)
+		return
+	}
+
+	// SplitHTTP: GET + Authorization → streaming download.
+	// NOTE: WarmupRequests() sends GET without Authorization — falls through to decoy.
+	if r.Method == "GET" && r.Header.Get("Authorization") != "" {
+		h.handleDownloadStream(w, r)
 		return
 	}
 
@@ -236,7 +275,8 @@ func (h *Handler) handleHandshake(w http.ResponseWriter, r *http.Request, encryp
 		SessionID: session.ID,
 		ClientID:  string(clientID),
 		Incoming:  make(chan []byte, 64),
-		Outgoing:  make(chan []byte, 64),
+		Outgoing:    make(chan []byte, 256), // 256: handles burst of 50+ concurrent CONNECT results via SplitHTTP
+		OutgoingUDP: make(chan []byte, 64),
 		done:      make(chan struct{}),
 	}
 	h.tunnelsMu.Lock()
@@ -286,9 +326,18 @@ func (h *Handler) handleData(w http.ResponseWriter, r *http.Request, encryptedCh
 
 	// Validate seq_num (replay protection)
 	if !session.AcceptSeqNum(chunk.SeqNum) {
-		slog.Debug("rejected seq_num")
+		slog.Warn("rejected seq_num", "seq", chunk.SeqNum, "flags", chunk.Flags)
+		// Must return proper response with encrypted chunk — bare JSON causes client parse errors.
+		ackChunk := &core.Chunk{
+			SessionID: session.ID,
+			SeqNum:    session.NextSeqNum(),
+			Flags:     core.FlagAck,
+		}
+		encrypted, _ := session.EncryptChunk(ackChunk)
+		respBody, _ := h.buildResponse(encrypted, ackChunk.SeqNum)
+		setStandardHeaders(w)
 		w.WriteHeader(200)
-		w.Write([]byte(`{"status":"ok"}`))
+		w.Write(respBody)
 		return
 	}
 
@@ -308,14 +357,27 @@ func (h *Handler) handleData(w http.ResponseWriter, r *http.Request, encryptedCh
 	case core.FlagControl:
 		h.handleControl(w, session, chunk)
 	case core.FlagFin:
-		h.handleFin(session)
+		// Per-stream FIN (payload has StreamID) vs session FIN (no payload).
+		if len(chunk.Payload) >= 2 {
+			streamID := binary.BigEndian.Uint16(chunk.Payload[0:2])
+			h.handleStreamFin(session, streamID)
+		} else {
+			h.handleFin(session)
+		}
+		// Must return proper response with encrypted chunk — bare JSON causes client parse errors.
+		ackChunk := &core.Chunk{
+			SessionID: session.ID,
+			SeqNum:    session.NextSeqNum(),
+			Flags:     core.FlagAck,
+		}
+		encrypted, _ := session.EncryptChunk(ackChunk)
+		respBody, _ := h.buildResponse(encrypted, ackChunk.SeqNum)
 		setStandardHeaders(w)
 		w.WriteHeader(200)
-		w.Write([]byte(`{"status":"ok"}`))
+		w.Write(respBody)
 	default:
-		setStandardHeaders(w)
-		w.WriteHeader(200)
-		w.Write([]byte(`{"status":"ok"}`))
+		// Must return proper response with encrypted chunk — bare JSON causes client parse errors.
+		h.handleKeepalive(w, session)
 	}
 }
 
@@ -338,9 +400,25 @@ func (h *Handler) handleDataChunk(w http.ResponseWriter, session *core.Session, 
 			streamID, data := core.ParseStreamID(chunk.Payload)
 			tunnel.mu.Lock()
 			stream := tunnel.streams[streamID]
+			streamCount := len(tunnel.streams)
 			tunnel.mu.Unlock()
-			if stream != nil && stream.TargetConn != nil && len(data) > 0 {
-				stream.TargetConn.Write(data)
+			if stream != nil && len(data) > 0 {
+				stream.mu.Lock()
+				if stream.TargetConn != nil {
+					stream.TargetConn.Write(data)
+					stream.mu.Unlock()
+					slog.Debug("data→target", "stream", streamID, "bytes", len(data), "activeStreams", streamCount)
+				} else {
+					// Optimistic CONNECT: buffer data while dial is in progress
+					if len(stream.PendingBuf) < 64 {
+						cp := make([]byte, len(data))
+						copy(cp, data)
+						stream.PendingBuf = append(stream.PendingBuf, cp)
+					}
+					stream.mu.Unlock()
+				}
+			} else if stream == nil {
+				slog.Warn("data for unknown stream", "stream", streamID, "bytes", len(data), "activeStreams", streamCount)
 			}
 		} else if legacyConn != nil {
 			// Legacy mode: payload is raw data, no StreamID
@@ -353,62 +431,101 @@ func (h *Handler) handleDataChunk(w http.ResponseWriter, session *core.Session, 
 		}
 	}
 
-	// Collect outgoing data — accumulate pooled slices, free them after encrypt.
-	var responsePayload []byte
-	var pooledChunks [][]byte
-	if ok {
+	// Collect outgoing data — batch multiple chunks per response to maximize throughput
+	// through CDN (fewer HTTP round-trips = fewer chances for CF to throttle).
+	// Each chunk is encrypted separately and placed in the JSON results array.
+	//
+	// CRITICAL: when download stream is active, do NOT poll Outgoing.
+	// The download stream (chunked GET) delivers data at full speed.
+	// Stealing data here would starve the download stream.
+	const maxBatchChunks = 16
+	const maxBatchBytes = 48 * 1024 // cap total response size
+	var collectedChunks [][]byte    // raw data from tunnel.Outgoing
+	var totalBytes int
+
+	if ok && !tunnel.HasDownloadStream.Load() {
 		tunnel.mu.Lock()
 		hasAnyConn := len(tunnel.streams) > 0 || tunnel.connected
 		tunnel.mu.Unlock()
 
-		waitTime := time.Duration(20+rand.IntN(50)) * time.Millisecond
+		// 300ms for active connections (CDN poll fallback needs large batches).
+		// 10-30ms for idle (legacy/non-CDN direct mode).
+		waitTime := time.Duration(10+rand.IntN(20)) * time.Millisecond
 		if hasAnyConn {
-			waitTime = 2 * time.Second
+			waitTime = 300 * time.Millisecond
 		}
 
-		// HIGH-1 fix: replace time.After with NewTimer to prevent timer leak
 		timer := time.NewTimer(waitTime)
 		select {
 		case data := <-tunnel.Outgoing:
 			timer.Stop()
-			pooledChunks = append(pooledChunks, data)
-			responsePayload = append(responsePayload, data...)
-			draining := true
-			for draining {
+			collectedChunks = append(collectedChunks, data)
+			totalBytes += len(data)
+			// Drain more data without blocking (up to maxBatchChunks).
+			for len(collectedChunks) < maxBatchChunks && totalBytes < maxBatchBytes {
 				select {
 				case more := <-tunnel.Outgoing:
-					pooledChunks = append(pooledChunks, more)
-					responsePayload = append(responsePayload, more...)
+					collectedChunks = append(collectedChunks, more)
+					totalBytes += len(more)
 				default:
-					draining = false
+					goto done
 				}
 			}
 		case <-timer.C:
 		}
 	}
+done:
 
-	// Build encrypted response
-	respChunk := &core.Chunk{
-		SessionID: session.ID,
-		SeqNum:    session.NextSeqNum(),
-		Flags:     core.FlagData,
-		Payload:   responsePayload,
-	}
-
-	encrypted, err := session.EncryptChunk(respChunk)
-	// Return pooled chunks now that payload has been encrypted.
-	for _, pc := range pooledChunks {
-		core.PutBuffer(pc)
-	}
-	if err != nil {
-		w.WriteHeader(500)
+	if len(collectedChunks) == 0 {
+		// No data — send empty response (single empty chunk).
+		respChunk := &core.Chunk{
+			SessionID: session.ID,
+			SeqNum:    session.NextSeqNum(),
+			Flags:     core.FlagData,
+		}
+		encrypted, err := session.EncryptChunk(respChunk)
+		if err != nil {
+			w.WriteHeader(500)
+			return
+		}
+		h.metrics.ChunksSent.Add(1)
+		respBody, _ := h.buildResponse(encrypted, respChunk.SeqNum)
+		setStandardHeaders(w)
+		w.WriteHeader(200)
+		w.Write(respBody)
 		return
 	}
 
-	h.metrics.ChunksSent.Add(1)
-	h.metrics.BytesSent.Add(uint64(len(responsePayload)))
+	// Encrypt each collected chunk separately.
+	encryptedChunks := make([][]byte, 0, len(collectedChunks))
+	for _, data := range collectedChunks {
+		respChunk := &core.Chunk{
+			SessionID: session.ID,
+			SeqNum:    session.NextSeqNum(),
+			Flags:     core.FlagData,
+			Payload:   data,
+		}
+		encrypted, err := session.EncryptChunk(respChunk)
+		core.PutBuffer(data) // return pooled buffer after encryption
+		if err != nil {
+			continue
+		}
+		encryptedChunks = append(encryptedChunks, encrypted)
+	}
 
-	respBody, _ := h.buildResponse(encrypted, respChunk.SeqNum)
+	h.metrics.ChunksSent.Add(uint64(len(encryptedChunks)))
+	h.metrics.BytesSent.Add(uint64(totalBytes))
+
+	var respBody []byte
+	if len(encryptedChunks) == 1 {
+		// Single chunk — use standard response (backward compatible with old clients).
+		// Note: seqNum param is unused by buildResponse (uses random ID), but passing 0
+		// to avoid wasting a seq_num from NextSeqNum() — the chunk already has its own.
+		respBody, _ = h.buildResponse(encryptedChunks[0], 0)
+	} else {
+		// Multiple chunks — batch in results array.
+		respBody, _ = browser.BuildDownloadResponseMulti(encryptedChunks)
+	}
 	setStandardHeaders(w)
 	w.WriteHeader(200)
 	w.Write(respBody)
@@ -428,6 +545,183 @@ func (h *Handler) handleKeepalive(w http.ResponseWriter, session *core.Session) 
 	w.WriteHeader(200)
 	w.Write(respBody)
 }
+
+// handleDownloadStream provides a persistent chunked HTTP response for SplitHTTP mode.
+// The client opens a GET request with Authorization header. Server holds the connection
+// and pushes encrypted data chunks as they arrive from target connections.
+// Frame format: [4-byte big-endian length][encrypted chunk bytes].
+// This replaces WebSocket for system VPN — Cloudflare handles chunked HTTP better than WS.
+func (h *Handler) handleDownloadStream(w http.ResponseWriter, r *http.Request) {
+	tokenBytes, err := browser.ExtractSessionToken(r)
+	if err != nil {
+		h.decoy.ServeHTTP(w, r)
+		return
+	}
+
+	session := h.findSession(tokenBytes)
+	if session == nil {
+		h.decoy.ServeHTTP(w, r)
+		return
+	}
+
+	h.tunnelsMu.RLock()
+	tunnel, ok := h.tunnels[session.ID]
+	h.tunnelsMu.RUnlock()
+	if !ok {
+		h.decoy.ServeHTTP(w, r)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		h.decoy.ServeHTTP(w, r)
+		return
+	}
+
+	// Signal that download stream is active — handleDataChunk skips polling Outgoing.
+	// CAS prevents two concurrent download streams from racing on tunnel.Outgoing.
+	if !tunnel.HasDownloadStream.CompareAndSwap(false, true) {
+		slog.Warn("SplitHTTP: duplicate download stream rejected")
+		h.decoy.ServeHTTP(w, r)
+		return
+	}
+	defer tunnel.HasDownloadStream.Store(false)
+
+	// CRITICAL: Disable the server's WriteTimeout for this handler.
+	// Go's http.Server.WriteTimeout is an absolute deadline from header read.
+	// The default 30s kills the download stream. We use ResponseController
+	// to extend the deadline before each write (Go 1.20+).
+	rc := http.NewResponseController(w)
+
+	// Headers for streaming through Cloudflare CDN — exact XHTTP/Xray-core pattern.
+	// XHTTP uses these 3 headers and CF streams without buffering (confirmed working).
+	// Key: NO Content-Encoding, NO X-Content-Type-Options — only these 3.
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	slog.Info("SplitHTTP download stream started")
+	ctx := r.Context()
+
+	// extendDeadline pushes the write deadline forward before each write.
+	// Without this, Go's http.Server.WriteTimeout (30s) kills the stream.
+	const streamWriteTimeout = 60 * time.Second
+	extendDeadline := func() {
+		rc.SetWriteDeadline(time.Now().Add(streamWriteTimeout))
+	}
+
+	// Pre-allocate frame buffer for binary writes (4-byte length + max encrypted frame).
+	frameBuf := make([]byte, 4+32*1024)
+	msgCount := 0
+
+	// Prime the CDN pipeline: send an immediate ACK frame so CF starts forwarding.
+	{
+		extendDeadline()
+		ack := &core.Chunk{SessionID: session.ID, SeqNum: session.NextSeqNum(), Flags: core.FlagAck}
+		if encrypted, err := session.EncryptChunk(ack); err == nil {
+			frameLen := 4 + len(encrypted)
+			binary.BigEndian.PutUint32(frameBuf[0:4], uint32(len(encrypted)))
+			copy(frameBuf[4:], encrypted)
+			w.Write(frameBuf[:frameLen])
+			flusher.Flush()
+			slog.Info("SplitHTTP priming frame sent", "bytes", frameLen)
+		}
+	}
+
+	// Keepalive: prevent CDN/nginx from killing idle connection (CF ~100s, nginx proxy_read_timeout 86400s).
+	keepalive := time.NewTicker(25 * time.Second)
+	defer keepalive.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("SplitHTTP download stream ended (client disconnect)", "messages", msgCount)
+			return
+		case <-tunnel.done:
+			slog.Info("SplitHTTP download stream ended (tunnel closed)", "messages", msgCount)
+			return
+		case data, ok := <-tunnel.Outgoing:
+			if !ok || data == nil {
+				slog.Info("SplitHTTP download stream ended (channel closed)", "messages", msgCount)
+				return
+			}
+			extendDeadline()
+			if err := writeFrame(w, flusher, session, core.FlagData, data, frameBuf); err != nil {
+				slog.Warn("SplitHTTP download write error", "err", err, "messages", msgCount)
+				core.PutBuffer(data)
+				return
+			}
+			core.PutBuffer(data)
+			msgCount++
+			if msgCount <= 20 || msgCount%50 == 0 {
+				slog.Info("SplitHTTP download frame sent", "msg", msgCount, "bytes", len(data),
+					"outgoingLen", len(tunnel.Outgoing))
+			}
+
+		case udpData := <-tunnel.OutgoingUDP:
+			if udpData == nil {
+				continue
+			}
+			extendDeadline()
+			if err := writeFrame(w, flusher, session, core.FlagUDP, udpData, frameBuf); err != nil {
+				slog.Warn("SplitHTTP download UDP write error", "err", err)
+				core.PutBuffer(udpData)
+				return
+			}
+			msgCount++
+
+		case <-keepalive.C:
+			ack := &core.Chunk{SessionID: session.ID, SeqNum: session.NextSeqNum(), Flags: core.FlagAck}
+			encrypted, err := session.EncryptChunk(ack)
+			if err != nil {
+				continue
+			}
+			extendDeadline()
+			frameLen := 4 + len(encrypted)
+			binary.BigEndian.PutUint32(frameBuf[0:4], uint32(len(encrypted)))
+			copy(frameBuf[4:], encrypted)
+			if _, err := w.Write(frameBuf[:frameLen]); err != nil {
+				slog.Warn("SplitHTTP keepalive write error", "err", err)
+				return
+			}
+			flusher.Flush()
+			slog.Debug("SplitHTTP keepalive sent", "messages", msgCount)
+		}
+	}
+}
+
+// writeFrame encrypts data and writes a length-prefixed binary frame to the download stream.
+// Single Write call + Flush — matches XHTTP/Xray-core pattern that works through CF CDN.
+// frameBuf is a pre-allocated buffer to avoid per-frame allocations.
+func writeFrame(w http.ResponseWriter, flusher http.Flusher, session *core.Session, flag byte, data []byte, frameBuf []byte) error {
+	chunk := &core.Chunk{
+		SessionID: session.ID,
+		SeqNum:    session.NextSeqNum(),
+		Flags:     flag,
+		Payload:   data,
+	}
+	encrypted, err := session.EncryptChunk(chunk)
+	if err != nil {
+		return nil // skip, don't kill stream
+	}
+	// Build frame: 4-byte length prefix + encrypted data — in one buffer, one Write.
+	frameLen := 4 + len(encrypted)
+	if frameLen > len(frameBuf) {
+		frameBuf = make([]byte, frameLen)
+	}
+	binary.BigEndian.PutUint32(frameBuf[0:4], uint32(len(encrypted)))
+	copy(frameBuf[4:], encrypted)
+	if _, err := w.Write(frameBuf[:frameLen]); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
+// writeFrameSSE is an alias used in tests — same as writeFrame.
+var writeFrameSSE = writeFrame
 
 // isBlockedDomain reports whether host matches any entry in blockDomains.
 // Each entry may be an exact domain ("illegal.com") or wildcard ("*.illegal.org").
@@ -482,8 +776,8 @@ func (h *Handler) handleConnect(w http.ResponseWriter, session *core.Session, ch
 	streamID, targetBytes := core.ParseStreamID(chunk.Payload)
 	target := string(targetBytes)
 	if target == "" {
-		w.WriteHeader(200)
-		w.Write([]byte(`{"status":"ok"}`))
+		slog.Warn("CONNECT: empty target", "payloadLen", len(chunk.Payload))
+		h.sendConnectResult(w, session, nil, streamID, "CONNECT_FAIL")
 		return
 	}
 
@@ -491,8 +785,8 @@ func (h *Handler) handleConnect(w http.ResponseWriter, session *core.Session, ch
 	tunnel, ok := h.tunnels[session.ID]
 	h.tunnelsMu.RUnlock()
 	if !ok {
-		w.WriteHeader(200)
-		w.Write([]byte(`{"status":"ok"}`))
+		slog.Warn("CONNECT: tunnel not found", "target", target)
+		h.sendConnectResult(w, session, nil, streamID, "CONNECT_FAIL")
 		return
 	}
 
@@ -504,57 +798,69 @@ func (h *Handler) handleConnect(w http.ResponseWriter, session *core.Session, ch
 		}
 		if isBlockedDomain(blockHost, h.config.BlockDomains) {
 			slog.Debug("CONNECT blocked by server block-list", "target", target)
-			errChunk := core.NewDataChunk(session.ID, session.NextSeqNum(), []byte("CONNECT_FAIL"))
-			encrypted, _ := session.EncryptChunk(errChunk)
-			respBody, _ := h.buildResponse(encrypted, errChunk.SeqNum)
-			setStandardHeaders(w)
-			w.WriteHeader(200)
-			w.Write(respBody)
+			h.sendConnectResult(w, session, tunnel, streamID, "CONNECT_FAIL")
 			return
 		}
 	}
 
-	conn, err := SafeDial(context.Background(), target, 10*time.Second)
-	if err != nil {
-		errChunk := core.NewDataChunk(session.ID, session.NextSeqNum(), []byte("CONNECT_FAIL"))
-		encrypted, _ := session.EncryptChunk(errChunk)
-		respBody, _ := h.buildResponse(encrypted, errChunk.SeqNum)
-		setStandardHeaders(w)
-		w.WriteHeader(200)
-		w.Write(respBody)
-		return
-	}
-
-	// HIGH-8 fix: check stream count limit before adding
+	// Optimistic CONNECT: register stream entry BEFORE dial so incoming data
+	// is buffered (not dropped). Mirrors WS path behavior.
 	tunnel.mu.Lock()
 	if tunnel.streams == nil {
 		tunnel.streams = make(map[uint16]*StreamConn)
 	}
 	if len(tunnel.streams) >= maxStreamsPerSession {
 		tunnel.mu.Unlock()
-		conn.Close()
-		errChunk := core.NewDataChunk(session.ID, session.NextSeqNum(), []byte("CONNECT_FAIL"))
-		encrypted, _ := session.EncryptChunk(errChunk)
-		respBody, _ := h.buildResponse(encrypted, errChunk.SeqNum)
-		setStandardHeaders(w)
-		w.WriteHeader(200)
-		w.Write(respBody)
+		h.sendConnectResult(w, session, tunnel, streamID, "CONNECT_FAIL")
 		return
 	}
-	tunnel.streams[streamID] = &StreamConn{StreamID: streamID, TargetConn: conn}
+	stream := &StreamConn{StreamID: streamID} // TargetConn=nil — pending state
+	tunnel.streams[streamID] = stream
+	tunnel.mu.Unlock()
+
+	conn, err := SafeDial(context.Background(), target, 10*time.Second)
+	if err != nil {
+		tunnel.mu.Lock()
+		delete(tunnel.streams, streamID)
+		tunnel.mu.Unlock()
+		h.sendConnectResult(w, session, tunnel, streamID, "CONNECT_FAIL")
+		return
+	}
+
+	// Activate: set target conn, flush buffered data
+	stream.mu.Lock()
+	stream.TargetConn = conn
+	pending := stream.PendingBuf
+	stream.PendingBuf = nil
+	stream.mu.Unlock()
+	for _, data := range pending {
+		conn.Write(data)
+	}
+
 	// Legacy compat
 	if streamID == 0 {
+		tunnel.mu.Lock()
 		tunnel.targetConn = conn
+		tunnel.mu.Unlock()
 	}
+	tunnel.mu.Lock()
 	tunnel.connected = true
 	tunnel.mu.Unlock()
 
 	// Per-stream relay: target → tunnel.Outgoing (tagged with StreamID)
 	go h.relayStreamFromTarget(session, tunnel, streamID, conn)
 
-	okChunk := core.NewDataChunk(session.ID, session.NextSeqNum(), []byte("CONNECT_OK"))
-	encrypted, _ := session.EncryptChunk(okChunk)
-	respBody, _ := h.buildResponse(encrypted, okChunk.SeqNum)
+	h.sendConnectResult(w, session, tunnel, streamID, "CONNECT_OK")
+}
+
+// sendConnectResult sends CONNECT_OK or CONNECT_FAIL to the client.
+// Always returns in the POST response body (reliable delivery).
+// CF may buffer or kill the download stream — CONNECT results must not depend on it.
+func (h *Handler) sendConnectResult(w http.ResponseWriter, session *core.Session, tunnel *Tunnel, streamID uint16, result string) {
+	// Always send in POST response body — guaranteed delivery even if download stream is dead.
+	chunk := core.NewDataChunk(session.ID, session.NextSeqNum(), []byte(result))
+	encrypted, _ := session.EncryptChunk(chunk)
+	respBody, _ := h.buildResponse(encrypted, chunk.SeqNum)
 	setStandardHeaders(w)
 	w.WriteHeader(200)
 	w.Write(respBody)
@@ -579,6 +885,11 @@ func (h *Handler) relayFromTarget(session *core.Session, tunnel *Tunnel) {
 	}
 
 	for {
+		select {
+		case <-tunnel.done:
+			return
+		default:
+		}
 		n, err := conn.Read(buf)
 		if n > 0 {
 			data := core.GetBuffer(n)
@@ -586,31 +897,8 @@ func (h *Handler) relayFromTarget(session *core.Session, tunnel *Tunnel) {
 			copy(data, buf[:n])
 			select {
 			case tunnel.Outgoing <- data:
-			default:
-				core.PutBuffer(data)
-			}
-		}
-		if err != nil {
-			return
-		}
-	}
-}
-
-// relayStreamFromTarget reads from a specific stream's target and tags data with StreamID.
-func (h *Handler) relayStreamFromTarget(session *core.Session, tunnel *Tunnel, streamID uint16, conn net.Conn) {
-	buf := core.GetBuffer(16384)
-	defer core.PutBuffer(buf)
-	for {
-		n, err := conn.Read(buf)
-		if n > 0 {
-			tagged := core.GetBuffer(2 + n)
-			tagged = tagged[:2+n]
-			binary.BigEndian.PutUint16(tagged[0:2], streamID)
-			copy(tagged[2:], buf[:n])
-			select {
-			case tunnel.Outgoing <- tagged:
 			case <-tunnel.done:
-				core.PutBuffer(tagged)
+				core.PutBuffer(data)
 				return
 			}
 		}
@@ -620,27 +908,79 @@ func (h *Handler) relayStreamFromTarget(session *core.Session, tunnel *Tunnel, s
 	}
 }
 
+// relayStreamFromTarget reads from a specific stream's target and tags data with StreamID.
+// CRIT-4 fix: must check tunnel.done BEFORE sending to tunnel.Outgoing to avoid
+// panic from send on closed channel (closeTunnel closes both done and Outgoing).
+func (h *Handler) relayStreamFromTarget(session *core.Session, tunnel *Tunnel, streamID uint16, conn net.Conn) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("panic recovered in relayStreamFromTarget", "stream", streamID, "error", r)
+		}
+	}()
+	// Clean up stream when relay exits (target closed, tunnel done, or error).
+	// Without this, streams accumulate in tunnel.streams until maxStreamsPerSession
+	// is hit and ALL new CONNECTs are rejected.
+	defer func() {
+		conn.Close()
+		tunnel.mu.Lock()
+		delete(tunnel.streams, streamID)
+		remaining := len(tunnel.streams)
+		tunnel.mu.Unlock()
+		slog.Debug("stream removed", "stream", streamID, "remaining", remaining)
+	}()
+	buf := core.GetBuffer(16384)
+	defer core.PutBuffer(buf)
+	totalBytes := 0
+	chunks := 0
+	for {
+		select {
+		case <-tunnel.done:
+			slog.Info("relay exit: tunnel done", "stream", streamID, "totalBytes", totalBytes)
+			return
+		default:
+		}
+		n, err := conn.Read(buf)
+		if n > 0 {
+			tagged := core.GetBuffer(2 + n)
+			tagged = tagged[:2+n]
+			binary.BigEndian.PutUint16(tagged[0:2], streamID)
+			copy(tagged[2:], buf[:n])
+			select {
+			case tunnel.Outgoing <- tagged:
+				totalBytes += n
+				chunks++
+				if chunks <= 5 || chunks%50 == 0 {
+					slog.Info("relay→Outgoing", "stream", streamID, "bytes", n,
+						"totalBytes", totalBytes, "chunks", chunks, "chanLen", len(tunnel.Outgoing))
+				}
+			case <-tunnel.done:
+				core.PutBuffer(tagged)
+				slog.Info("relay exit: tunnel done", "stream", streamID, "totalBytes", totalBytes)
+				return
+			}
+		}
+		if err != nil {
+			slog.Info("relay exit: target closed", "stream", streamID, "totalBytes", totalBytes, "chunks", chunks, "err", err)
+			return
+		}
+	}
+}
+
 func (h *Handler) handleControl(w http.ResponseWriter, session *core.Session, chunk *core.Chunk) {
 	// Control chunks handle rekeying, chunk_size negotiation, etc.
-	// For now: just ACK
-	setStandardHeaders(w)
-	w.WriteHeader(200)
-	w.Write([]byte(`{"status":"ok","type":"control_ack"}`))
+	// Respond with proper encrypted FlagAck chunk — bare JSON causes client parse errors.
+	h.handleKeepalive(w, session)
 }
 
 // handleUDPData processes a FlagUDP chunk: relays UDP data to the target via UDPRelay.
 func (h *Handler) handleUDPData(w http.ResponseWriter, session *core.Session, chunk *core.Chunk) {
 	streamID, targetAddr, data, err := core.ParseUDPChunk(chunk.Payload)
 	if err != nil {
-		setStandardHeaders(w)
-		w.WriteHeader(200)
-		w.Write([]byte(`{"status":"ok"}`))
+		h.handleKeepalive(w, session)
 		return
 	}
 	if h.udpRelay == nil {
-		setStandardHeaders(w)
-		w.WriteHeader(200)
-		w.Write([]byte(`{"status":"ok"}`))
+		h.handleKeepalive(w, session)
 		return
 	}
 
@@ -648,9 +988,7 @@ func (h *Handler) handleUDPData(w http.ResponseWriter, session *core.Session, ch
 	tunnel, ok := h.tunnels[session.ID]
 	h.tunnelsMu.RUnlock()
 	if !ok {
-		setStandardHeaders(w)
-		w.WriteHeader(200)
-		w.Write([]byte(`{"status":"ok"}`))
+		h.handleKeepalive(w, session)
 		return
 	}
 
@@ -661,31 +999,36 @@ func (h *Handler) handleUDPData(w http.ResponseWriter, session *core.Session, ch
 	}
 	if isBlockedDomain(udpHost, h.config.BlockDomains) {
 		slog.Debug("blocked domain UDP target", "addr", targetAddr)
-		setStandardHeaders(w)
-		w.WriteHeader(200)
-		w.Write([]byte(`{"status":"ok"}`))
+		h.handleKeepalive(w, session)
 		return
 	}
 	// Resolve hostname to IP to prevent DNS rebinding bypassing isPrivateIP
 	resolvedAddr, err := net.ResolveUDPAddr("udp", targetAddr)
 	if err != nil {
 		slog.Debug("failed to resolve UDP target", "addr", targetAddr, "error", err)
-		setStandardHeaders(w)
-		w.WriteHeader(200)
-		w.Write([]byte(`{"status":"ok"}`))
+		h.handleKeepalive(w, session)
 		return
 	}
 	if isPrivateIP(resolvedAddr.IP) {
 		slog.Debug("blocked private UDP target", "addr", targetAddr, "resolved", resolvedAddr.IP)
-		setStandardHeaders(w)
-		w.WriteHeader(200)
-		w.Write([]byte(`{"status":"ok"}`))
+		h.handleKeepalive(w, session)
 		return
 	}
 	// Use the resolved IP:port to prevent TOCTOU DNS rebinding
 	resolvedTarget := resolvedAddr.String()
 
 	h.udpRelay.Send(streamID, resolvedTarget, data, func(response []byte) {
+		if tunnel.HasDownloadStream.Load() {
+			// SplitHTTP: push raw UDP payload to OutgoingUDP channel.
+			// Download stream reads from it separately and sends with FlagUDP.
+			udpPayload := core.BuildUDPChunkPayload(streamID, targetAddr, response)
+			select {
+			case tunnel.OutgoingUDP <- udpPayload:
+			case <-tunnel.done:
+			}
+			return
+		}
+		// Classic poll mode: encrypt and queue.
 		respChunk := core.NewUDPDataChunk(session.ID, session.NextSeqNum(), streamID, targetAddr, response)
 		encrypted, err := session.EncryptChunk(respChunk)
 		if err != nil {
@@ -693,13 +1036,15 @@ func (h *Handler) handleUDPData(w http.ResponseWriter, session *core.Session, ch
 		}
 		select {
 		case tunnel.Outgoing <- encrypted:
+		case <-tunnel.done:
 		default:
 		}
 	})
 
-	// Collect any pending outgoing data (same pattern as handleDataChunk)
+	// Collect any pending outgoing data (same pattern as handleDataChunk).
+	// Skip when SplitHTTP download stream is active — it drains Outgoing.
 	var responsePayload []byte
-	if ok {
+	if ok && !tunnel.HasDownloadStream.Load() {
 		// HIGH-1 fix: replace time.After with NewTimer to prevent timer leak
 		udpTimer := time.NewTimer(100 * time.Millisecond)
 		select {
@@ -717,6 +1062,10 @@ func (h *Handler) handleUDPData(w http.ResponseWriter, session *core.Session, ch
 		Payload:   responsePayload,
 	}
 	encrypted, err := session.EncryptChunk(respChunk)
+	// Fix: release pooled buffer after encryption (prevents pool memory leak).
+	if responsePayload != nil {
+		core.PutBuffer(responsePayload)
+	}
 	if err != nil {
 		w.WriteHeader(500)
 		return
@@ -725,6 +1074,26 @@ func (h *Handler) handleUDPData(w http.ResponseWriter, session *core.Session, ch
 	setStandardHeaders(w)
 	w.WriteHeader(200)
 	w.Write(respBody)
+}
+
+// handleStreamFin closes a single multiplexed stream (target conn + remove from map).
+// Sent by client when SOCKS5 connection closes — prevents stream leak.
+func (h *Handler) handleStreamFin(session *core.Session, streamID uint16) {
+	h.tunnelsMu.RLock()
+	tunnel, ok := h.tunnels[session.ID]
+	h.tunnelsMu.RUnlock()
+	if !ok {
+		return
+	}
+	tunnel.mu.Lock()
+	sc := tunnel.streams[streamID]
+	delete(tunnel.streams, streamID)
+	remaining := len(tunnel.streams)
+	tunnel.mu.Unlock()
+	if sc != nil && sc.TargetConn != nil {
+		sc.TargetConn.Close() // triggers relayStreamFromTarget exit
+	}
+	slog.Debug("stream FIN", "stream", streamID, "remaining", remaining)
 }
 
 func (h *Handler) handleFin(session *core.Session) {
@@ -911,6 +1280,30 @@ func encodeServerHello(sh *core.ServerHello) []byte {
 		},
 	})
 	return data
+}
+
+// handleStreamTest is a debug endpoint that sends chunked test data.
+// Used to test whether CF/nginx properly stream chunked responses.
+// Remove after debugging.
+func (h *Handler) handleStreamTest(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "no flusher", 500)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache, no-store")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(200)
+	flusher.Flush()
+
+	for i := 0; i < 10; i++ {
+		fmt.Fprintf(w, "data: chunk %d at %s\n\n", i, time.Now().Format(time.RFC3339))
+		flusher.Flush()
+		time.Sleep(1 * time.Second)
+	}
+	fmt.Fprintf(w, "data: done\n\n")
+	flusher.Flush()
 }
 
 func httpPlaceholderRequest() *http.Request {

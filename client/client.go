@@ -62,6 +62,7 @@ type ClientConfig struct {
 	SkipVerify   bool   // skip TLS cert verification (testing only)
 	CDNDomain    string // if set, use CDN transport via this domain
 	ECHEnabled   bool   // enable ECH (Encrypted Client Hello) for CDN mode
+	SNIOverride  string // if set, TLS ServerName = SNIOverride (full-direct mode: IP host + domain SNI). Requires UseTLS=true.
 
 	// Phase 2: TURN relay for whitelist bypass
 	TURNServer    string // TURN server "host:port"
@@ -74,9 +75,15 @@ type ClientConfig struct {
 // NewClient creates a client with the given config.
 func NewClient(config ClientConfig) *Client {
 	var transport Transport
-	if config.CDNDomain != "" {
+	switch {
+	case config.SNIOverride != "":
+		// Full-direct: dial to ServerAddr (IP), TLS SNI = SNIOverride (domain).
+		// Used when client knows the origin IP and wants to bypass CF entirely
+		// while keeping the legitimate SNI so nginx server_name still matches.
+		transport = NewDirectTransportWithSNI(config.ServerAddr, config.SNIOverride, config.UseTLS)
+	case config.CDNDomain != "":
 		transport = NewCDNTransportWithECH(config.CDNDomain, config.ECHEnabled)
-	} else {
+	default:
 		transport = NewDirectTransport(config.ServerAddr, config.UseTLS, config.SkipVerify)
 	}
 
@@ -152,11 +159,11 @@ func (c *Client) Connect(ctx context.Context) error {
 		c.chunkSize = 12288
 	}
 
-	// M-1 fix: pass session and token to DirectTransport so cover traffic can use them.
-	// Without this, cover traffic goroutine never gets the session and sends nothing.
-	if dt, ok := c.transport.(*DirectTransport); ok {
-		dt.SetSession(c.session)
-		dt.SetSessionToken(c.token)
+	// M-1 fix: pass session and token to transport so cover traffic can use them.
+	// Works for both DirectTransport and CDNTransport (both implement SessionAware).
+	if sa, ok := c.transport.(SessionAware); ok {
+		sa.SetSession(c.session)
+		sa.SetSessionToken(c.token)
 	}
 
 	// Apply server-provided UA updates (keeps client UAs fresh without code changes).
@@ -301,6 +308,12 @@ func (c *Client) UpgradeToWebSocket(serverAddr string, useTLS, skipVerify bool, 
 		fp = lockedFP[0]
 	}
 	wst := NewWebSocketTransport(serverAddr, useTLS, skipVerify, fp)
+
+	// Signature packets: warmup GET requests to decoy pages before WS upgrade.
+	// Real browser loads HTML/CSS/JS before opening WebSocket.
+	// Without this, DPI sees instant TLS→WS upgrade (suspicious pattern).
+	wst.WarmupRequests()
+
 	if err := wst.UpgradeToWS(token); err != nil {
 		return nil, err
 	}
@@ -344,6 +357,41 @@ func (c *Client) UnregisterStream(streamID uint16) {
 	c.streamMu.Lock()
 	defer c.streamMu.Unlock()
 	delete(c.streamChans, streamID)
+}
+
+// CloseStream sends a per-stream FIN to the server and unregisters the stream locally.
+// This tells the server to close the target connection and free the stream slot.
+// Without this, streams leak on the server until maxStreamsPerSession is hit.
+// FIN is best-effort with a 3s timeout — if it fails, server cleans up via idle timeout.
+// Pool-aware: uses the slot's session and releases stream assignment.
+func (c *Client) CloseStream(streamID uint16, wst StreamTransport) {
+	c.UnregisterStream(streamID)
+
+	// Pool-aware: use slot's session, then release stream assignment.
+	session := StreamSession(wst, c, streamID)
+	if pa, ok := wst.(PoolAware); ok {
+		defer pa.ReleaseStream(streamID)
+	}
+
+	if session == nil {
+		return
+	}
+	fin := core.NewStreamFinChunk(session.ID, session.NextSeqNum(), streamID)
+	encrypted, err := session.EncryptChunk(fin)
+	if err != nil {
+		return
+	}
+	// Sync send with timeout — prevents fire-and-forget goroutine crash.
+	done := make(chan error, 1)
+	go func() { done <- StreamWriteControl(wst, streamID, encrypted) }()
+	select {
+	case <-time.After(3 * time.Second):
+		slog.Debug("FIN send timeout", "stream", streamID)
+	case err := <-done:
+		if err != nil {
+			slog.Debug("FIN send failed", "stream", streamID, "err", err)
+		}
+	}
 }
 
 // ConnectToStream sends CONNECT for a specific stream.
@@ -436,6 +484,87 @@ func (c *Client) PollStreams(ctx context.Context) error {
 	return c.SendStream(ctx, 0, nil)
 }
 
+// RawBodySender is an optional interface for transports that can return raw response bodies.
+// Used by PollVia for multi-chunk server responses.
+type RawBodySender interface {
+	SendChunkRawBody(ctx context.Context, data []byte, token []byte, seq uint32) ([]byte, error)
+}
+
+// PollVia sends a poll through a dedicated transport (not the client's main transport).
+// This avoids contention with CONNECTs that saturate the main CDNTransport.
+// Handles multi-chunk responses: server waits 300ms and batches up to 16 chunks.
+// Only 1 goroutine should call this to ensure in-order delivery.
+func (c *Client) PollVia(ctx context.Context, t Transport) error {
+	c.mu.Lock()
+	session := c.session
+	token := c.token
+	c.mu.Unlock()
+
+	if session == nil {
+		return errors.New("not connected")
+	}
+
+	seq := session.NextSeqNum()
+	chunk := core.NewStreamDataChunk(session.ID, seq, 0, nil)
+	encrypted, err := session.EncryptChunk(chunk)
+	core.PutBuffer(chunk.Payload)
+	if err != nil {
+		return err
+	}
+
+	// Use raw body sender for multi-chunk support if available.
+	if rs, ok := t.(RawBodySender); ok {
+		rawBody, err := rs.SendChunkRawBody(ctx, encrypted, token, seq)
+		if err != nil {
+			return err
+		}
+		encChunks, err := browser.ParseDownloadResponseMulti(rawBody)
+		if err != nil {
+			return nil // no data this poll
+		}
+		for _, enc := range encChunks {
+			respChunk, err := session.DecryptChunkSafe(enc)
+			if err != nil || len(respChunk.Payload) < 2 {
+				continue
+			}
+			streamID := uint16(respChunk.Payload[0])<<8 | uint16(respChunk.Payload[1])
+			if respChunk.Flags == core.FlagUDP {
+				c.RouteToStream(streamID, respChunk.Payload)
+			} else {
+				c.RouteToStream(streamID, respChunk.Payload[2:])
+			}
+		}
+		return nil
+	}
+
+	// Fallback: single-chunk via standard SendChunk.
+	encResp, err := t.SendChunk(ctx, encrypted, token, seq)
+	if err != nil {
+		return err
+	}
+	respChunk, err := session.DecryptChunkSafe(encResp)
+	if err != nil {
+		return nil
+	}
+	if len(respChunk.Payload) >= 2 {
+		streamID := uint16(respChunk.Payload[0])<<8 | uint16(respChunk.Payload[1])
+		if respChunk.Flags == core.FlagUDP {
+			c.RouteToStream(streamID, respChunk.Payload)
+		} else {
+			c.RouteToStream(streamID, respChunk.Payload[2:])
+		}
+	}
+	return nil
+}
+
+// HasStream returns true if a stream channel is registered for the given ID.
+func (c *Client) HasStream(streamID uint16) bool {
+	c.streamMu.Lock()
+	_, ok := c.streamChans[streamID]
+	c.streamMu.Unlock()
+	return ok
+}
+
 // RouteToStream delivers data to a registered stream's channel.
 // MED-5 fix: logs warning on buffer full instead of silent drop.
 func (c *Client) RouteToStream(streamID uint16, data []byte) {
@@ -458,6 +587,18 @@ func (c *Client) Session() *core.Session {
 	return c.session
 }
 
+// Token returns the session token (for SplitHTTP transport).
+func (c *Client) Token() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.token
+}
+
+// Transport returns the underlying transport (for SplitHTTP to reuse for uploads).
+func (c *Client) Transport() Transport {
+	return c.transport
+}
+
 // Connected returns true if the client has an active session.
 func (c *Client) Connected() bool {
 	c.mu.Lock()
@@ -473,6 +614,52 @@ func (c *Client) SessionID() uint32 {
 		return 0
 	}
 	return c.session.ID
+}
+
+// NewStreamSession performs a lightweight handshake and returns an independent
+// session+token for a per-stream WS. Each per-stream WS gets its own session
+// to avoid seq_num conflicts when multiple streams share the crypto state.
+// The caller owns the returned session and must call session.Destroy() when done.
+func (c *Client) NewStreamSession(ctx context.Context) (*core.Session, []byte, error) {
+	hello, clientState, err := core.NewClientHello(c.clientID, c.serverPub)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	respBody, err := c.transport.SendHandshake(ctx, hello)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	respData, _, err := browser.ParseDownloadResponse(respBody)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var shData struct {
+		EphPub    []byte `json:"eph"`
+		Token     []byte `json:"tok"`
+		MaxConns  uint8  `json:"mc"`
+		ChunkSize uint16 `json:"cs"`
+	}
+	if err := json.Unmarshal(respData, &shData); err != nil {
+		return nil, nil, err
+	}
+
+	serverHello := &core.ServerHello{
+		EphemeralPub:          shData.EphPub,
+		EncryptedSessionToken: shData.Token,
+		MaxConnsPerClient:     shData.MaxConns,
+		ChunkSize:             shData.ChunkSize,
+	}
+
+	session, err := core.CompleteHandshake(clientState, serverHello)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	token := browser.EncodeTokenWithHint(session.ID, shData.Token)
+	return session, token, nil
 }
 
 // Close disconnects and cleans up resources.

@@ -232,6 +232,19 @@ func NewUDPDataChunk(sessID, seq uint32, streamID uint16, addr string, data []by
 	return &Chunk{SessionID: sessID, SeqNum: seq, Flags: FlagUDP, Payload: p}
 }
 
+// BuildUDPChunkPayload builds the raw payload for a UDP data chunk (no Chunk wrapper).
+// Format: [StreamID(2)] + [AddrLen(2)] + [Addr(var)] + [Data]
+// Used by SplitHTTP download stream where the Chunk wrapper + encryption is done later.
+func BuildUDPChunkPayload(streamID uint16, addr string, data []byte) []byte {
+	addrBytes := []byte(addr)
+	p := make([]byte, 2+2+len(addrBytes)+len(data))
+	binary.BigEndian.PutUint16(p[0:2], streamID)
+	binary.BigEndian.PutUint16(p[2:4], uint16(len(addrBytes)))
+	copy(p[4:4+len(addrBytes)], addrBytes)
+	copy(p[4+len(addrBytes):], data)
+	return p
+}
+
 // ParseUDPChunk extracts stream ID, target address, and data from a UDP chunk payload.
 func ParseUDPChunk(payload []byte) (streamID uint16, addr string, data []byte, err error) {
 	if len(payload) < 4 {
@@ -262,6 +275,8 @@ func NewKeepaliveChunk(sessID, seq uint32) *Chunk {
 }
 
 // NewConnectChunk creates a connect chunk (legacy, StreamID=0).
+// Delegates to NewStreamConnectChunk so the payload format matches
+// ParseStreamID expectations on the server side.
 func NewConnectChunk(sessID, seq uint32, target string) *Chunk {
-	return &Chunk{SessionID: sessID, SeqNum: seq, Flags: FlagConnect, Payload: []byte(target)}
+	return NewStreamConnectChunk(sessID, seq, 0, target)
 }

@@ -26,6 +26,9 @@ import (
 type ConnManager struct {
 	serverAddr    string
 	skipVerify    bool
+	noTimeout     bool // no HTTP client timeout (for persistent streams)
+	timeoutSec    int  // HTTP client timeout (default 10s, configurable per ConnManager)
+	allowHTTP2    bool // allow HTTP/2 multiplexing (default false = force HTTP/1.1 for compat)
 	fpPool        *browser.FingerprintPool
 	lockedProfile *browser.Fingerprint // persistent fingerprint (nil = use pool rotation)
 	useTLS        bool
@@ -47,6 +50,8 @@ type ConnManager struct {
 	echEnabled bool
 	echDomain  string
 	echCache   *ECHConfig
+
+	sniOverride string // TLS ServerName override (full-direct mode)
 }
 
 // stdHTTPClient wraps standard net/http for non-TLS testing.
@@ -59,15 +64,22 @@ type ConnManagerConfig struct {
 	ServerAddr      string
 	UseTLS          bool
 	SkipVerify      bool
+	NoTimeout       bool                 // If true, HTTP client has no timeout (for persistent streams)
+	TimeoutSec      int                  // HTTP client timeout in seconds. 0 = use default (10s). NoTimeout overrides this.
+	AllowHTTP2      bool                 // If true, allow HTTP/2 multiplexing (for CDN upload). Default false = force HTTP/1.1.
 	FPPool          *browser.FingerprintPool
 	LockedProfile   *browser.Fingerprint // If set, use this fingerprint instead of rotating
 	MinRotation     time.Duration        // default 2m (mimicry: shorter rotation defeats connection-duration fingerprinting)
 	MaxRotation     time.Duration        // default 8m
 	ECHEnabled      bool
 	ECHDomain       string
+	SNIOverride     string // TLS ServerName override. Set when dialing origin IP with CF-domain SNI (full-direct mode).
 }
 
 // NewConnManager creates a connection manager and establishes the first connection.
+// ForceHTTP1 defaults to true if not explicitly set — existing callers that don't
+// set it get HTTP/1.1 (backward-compatible). SplitTransport sets ForceHTTP1=false
+// for upload to enable HTTP/2 multiplexing through Cloudflare CDN.
 func NewConnManager(config ConnManagerConfig) *ConnManager {
 	if config.MinRotation == 0 {
 		config.MinRotation = 2 * time.Minute
@@ -76,9 +88,17 @@ func NewConnManager(config ConnManagerConfig) *ConnManager {
 		config.MaxRotation = 8 * time.Minute
 	}
 
+	timeoutSec := config.TimeoutSec
+	if timeoutSec == 0 {
+		timeoutSec = 10 // default
+	}
+
 	cm := &ConnManager{
 		serverAddr:    config.ServerAddr,
 		skipVerify:    config.SkipVerify,
+		noTimeout:     config.NoTimeout,
+		timeoutSec:    timeoutSec,
+		allowHTTP2:    config.AllowHTTP2,
 		fpPool:        config.FPPool,
 		lockedProfile: config.LockedProfile,
 		useTLS:        config.UseTLS,
@@ -89,6 +109,7 @@ func NewConnManager(config ConnManagerConfig) *ConnManager {
 		stopCh:        make(chan struct{}),
 		echEnabled:    config.ECHEnabled,
 		echDomain:     config.ECHDomain,
+		sniOverride:   config.SNIOverride,
 	}
 
 	cm.connect()
@@ -128,19 +149,41 @@ func (cm *ConnManager) connect() {
 
 	if cm.useTLS {
 		// Use tls-client with Chrome profile — browser-identical TLS + HTTP/2
+		// Timeout per ConnManager: upload pool uses 20s (CF CDN can be slow),
+		// default 10s for general use, 0 for persistent streams.
+		ts := cm.timeoutSec
+		if cm.noTimeout {
+			ts = 0 // no timeout for persistent streams (SplitHTTP download)
+		}
 		opts := []tls_client.HttpClientOption{
-			tls_client.WithTimeoutSeconds(30),
+			tls_client.WithTimeoutSeconds(ts),
 			tls_client.WithClientProfile(profileForFingerprint(fp)),
-			tls_client.WithForceHttp1(), // Force HTTP/1.1 — nginx proxies as h1
+		}
+		// HTTP/1.1 vs HTTP/2: ForceHTTP1=true (default) keeps h1 for compat with direct nginx.
+		// ForceHTTP1=false enables HTTP/2 multiplexing — critical for CDN upload throughput.
+		// tls-client Chrome 133 profile sends Chrome-identical h2 SETTINGS (DPI-safe).
+		if !cm.allowHTTP2 {
+			opts = append(opts, tls_client.WithForceHttp1())
 		}
 		if cm.skipVerify {
 			opts = append(opts, tls_client.WithInsecureSkipVerify())
+		}
+		// Full-direct mode: override SNI so the TLS ClientHello carries the CF
+		// domain name even when the TCP connection goes to the origin IP. This
+		// requires skipVerify (enforced by caller) because the certificate is
+		// for the domain, not the IP.
+		if cm.sniOverride != "" {
+			opts = append(opts, tls_client.WithServerNameOverwrite(cm.sniOverride))
 		}
 
 		client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), opts...)
 		if err != nil {
 			cm.tlsClient = nil
-			cm.stdClient = &stdHTTPClient{inner: &http.Client{Timeout: 30 * time.Second}}
+			stdTimeout := 30 * time.Second
+			if cm.noTimeout {
+				stdTimeout = 0
+			}
+			cm.stdClient = &stdHTTPClient{inner: &http.Client{Timeout: stdTimeout}}
 			return
 		}
 		cm.tlsClient = client
@@ -167,8 +210,12 @@ func (cm *ConnManager) connect() {
 		}
 	} else {
 		// Non-TLS: use bogdanfinn/fhttp client directly (for testing)
+		stdTimeout := 30 * time.Second
+		if cm.noTimeout {
+			stdTimeout = 0
+		}
 		cm.stdClient = &stdHTTPClient{
-			inner: &http.Client{Timeout: 30 * time.Second},
+			inner: &http.Client{Timeout: stdTimeout},
 		}
 		cm.tlsClient = nil
 	}
@@ -189,20 +236,33 @@ func profileForFingerprint(fp *browser.Fingerprint) profiles.ClientProfile {
 }
 
 // Do executes an HTTP request using the active tls-client.
+// Auto-rotates on connection errors — CF CDN kills persistent HTTP connections after ~20s,
+// so a fresh TLS connection is needed to recover.
 func (cm *ConnManager) Do(req *http.Request) (*http.Response, error) {
 	cm.mu.RLock()
 	tc := cm.tlsClient
 	sc := cm.stdClient
 	cm.mu.RUnlock()
 
+	var resp *http.Response
+	var err error
+
 	if tc != nil {
-		return tc.Do(req)
-	}
-	if sc != nil {
-		return sc.inner.Do(req)
+		resp, err = tc.Do(req)
+	} else if sc != nil {
+		resp, err = sc.inner.Do(req)
+	} else {
+		return nil, io.EOF
 	}
 
-	return nil, io.EOF
+	// Connection-level errors (timeout, reset, EOF) mean the underlying TCP connection is dead.
+	// HTTP errors (4xx, 5xx) return a valid response with no error — won't trigger rotation.
+	// Force rotate so the next request through this CM gets a fresh TLS connection.
+	if err != nil {
+		cm.rotate()
+	}
+
+	return resp, err
 }
 
 // ActiveFingerprint returns the fingerprint locked to the current connection.
@@ -263,12 +323,13 @@ func (cm *ConnManager) rotate() {
 	cm.connect()
 	cm.mu.Unlock()
 
-	// Grace period for in-flight requests on old client
-	time.AfterFunc(5*time.Second, func() {
-		if oldTC != nil {
+	// Close idle connections on old client after grace period for in-flight requests.
+	// Short grace: 10s timeout means in-flight requests resolve quickly.
+	if oldTC != nil {
+		time.AfterFunc(2*time.Second, func() {
 			oldTC.CloseIdleConnections()
-		}
-	})
+		})
+	}
 }
 
 // Close stops rotation and closes all connections.

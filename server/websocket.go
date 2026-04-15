@@ -25,11 +25,30 @@ var wsUpgrader = websocket.Upgrader{
 }
 
 // wsStream represents one multiplexed stream with async write buffer.
+// Supports optimistic CONNECT: data can arrive before target TCP is established.
+// In "pending" state (targetConn==nil), data is buffered in pendingBuf.
+// When Activate() is called with the target conn, pending data is flushed.
 type wsStream struct {
 	targetConn net.Conn
 	writeCh    chan []byte
 	done       chan struct{}
 	closeOnce  sync.Once
+
+	// Optimistic CONNECT support: buffer data arriving before TCP dial completes.
+	mu         sync.Mutex
+	connected  bool     // true after Activate() — target TCP is ready
+	pendingBuf [][]byte // data buffered while !connected (capped at pendingBufMax)
+}
+
+const pendingBufMax = 64 // max queued chunks before TCP dial completes
+
+// newPendingWSStream creates a stream in "pending" state (no target conn yet).
+// Data written via Write() is buffered until Activate() is called.
+func newPendingWSStream() *wsStream {
+	return &wsStream{
+		writeCh: make(chan []byte, 256),
+		done:    make(chan struct{}),
+	}
 }
 
 func newWSStream(tc net.Conn) *wsStream {
@@ -37,11 +56,35 @@ func newWSStream(tc net.Conn) *wsStream {
 		targetConn: tc,
 		writeCh:    make(chan []byte, 256),
 		done:       make(chan struct{}),
+		connected:  true,
 	}
+	s.startWriter()
+	return s
+}
+
+// Activate transitions stream from pending to connected: sets target conn,
+// flushes buffered data, starts the writer goroutine.
+func (s *wsStream) Activate(tc net.Conn) {
+	s.mu.Lock()
+	s.targetConn = tc
+	s.connected = true
+	pending := s.pendingBuf
+	s.pendingBuf = nil
+	s.mu.Unlock()
+
+	// Flush buffered data to target
+	for _, data := range pending {
+		tc.Write(data)
+		core.PutBuffer(data)
+	}
+
+	s.startWriter()
+}
+
+// startWriter launches the writer goroutine that drains writeCh to targetConn.
+func (s *wsStream) startWriter() {
 	// CRIT-5 fix: writer goroutine watches done channel to exit cleanly
 	// without relying on close(writeCh) which races with Write().
-	// NEW-1 fix: after done fires, keep draining writeCh until empty for 1ms
-	// to catch items queued by concurrent Write() calls racing with Close().
 	go func() {
 		for {
 			select {
@@ -71,13 +114,26 @@ func newWSStream(tc net.Conn) *wsStream {
 			}
 		}
 	}()
-	return s
 }
 
 func (s *wsStream) Write(data []byte) {
 	cp := core.GetBuffer(len(data))
 	cp = cp[:len(data)]
 	copy(cp, data)
+
+	s.mu.Lock()
+	if !s.connected {
+		// Pending state: buffer data until Activate()
+		if len(s.pendingBuf) < pendingBufMax {
+			s.pendingBuf = append(s.pendingBuf, cp)
+		} else {
+			core.PutBuffer(cp) // drop if buffer full
+		}
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
+
 	select {
 	case s.writeCh <- cp:
 	case <-s.done:
@@ -90,7 +146,16 @@ func (s *wsStream) Write(data []byte) {
 func (s *wsStream) Close() {
 	s.closeOnce.Do(func() {
 		close(s.done)
-		s.targetConn.Close()
+		// Free any pending buffers
+		s.mu.Lock()
+		for _, b := range s.pendingBuf {
+			core.PutBuffer(b)
+		}
+		s.pendingBuf = nil
+		s.mu.Unlock()
+		if s.targetConn != nil {
+			s.targetConn.Close()
+		}
 	})
 }
 
@@ -123,28 +188,72 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	conn.SetReadLimit(256 * 1024) // 256KB — large enough for any encrypted chunk
 
-	// Serialized writer
-	writeMu := &sync.Mutex{}
+	// Async write queue: decouples per-stream relay goroutines and CONNECT_OK
+	// responses from a slow underlying TCP send buffer (CF egress under load).
+	// Previously a single writeMu serialized every WriteMessage call, so a
+	// CONNECT_OK could be queued behind a 32KB target relay write blocked on
+	// the kernel send buffer — the client then timed out at 10s while the
+	// server log already showed "CONNECT_OK sent". The queue absorbs bursts
+	// (50+ simultaneous CONNECT_OK during system VPN start). Shared with the
+	// client via core.WSAsyncWriter (same bottleneck existed symmetrically
+	// on client ws_transport.go).
+	writer := core.NewWSAsyncWriter(conn, 512)
 	writeMsg := func(data []byte) error {
-		writeMu.Lock()
-		defer writeMu.Unlock()
-		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		return conn.WriteMessage(websocket.BinaryMessage, data)
+		return writer.Enqueue(websocket.BinaryMessage, data)
 	}
 
 	streams := make(map[uint16]*wsStream)
 	streamsMu := &sync.Mutex{}
 
 	done := make(chan struct{})
+	var doneOnce sync.Once
+	closeDone := func() { doneOnce.Do(func() { close(done) }) }
+
+	// Writer goroutine: drains the outbound queue into the WS connection.
+	// On underlying write error, signals shutdown so the reader and ping
+	// goroutines exit cleanly.
+	go func() {
+		if err := writer.Run(); err != nil {
+			slog.Warn("WS writer exit", "err", err)
+		}
+		closeDone()
+	}()
+
+	// WS-level pong handler — reset read deadline on pong
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
+	// Server-side WS ping every 20s — keeps CF proxy connection alive.
+	// Routed through the same async writer so it cannot stall behind a slow
+	// data write, and cannot itself stall data writes.
+	go func() {
+		ticker := time.NewTicker(20 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if err := writer.EnqueueControl(websocket.PingMessage, nil); err != nil {
+					return
+				}
+			}
+		}
+	}()
 
 	// Reader: client WS → route to target streams
 	go func() {
-		defer close(done)
+		defer closeDone()
+		wsMessages := 0
 		for {
 			msgType, data, err := conn.ReadMessage()
 			if err != nil {
+				slog.Warn("WS reader exit", "messages", wsMessages, "err", err)
 				return
 			}
+			wsMessages++
 			if msgType != websocket.BinaryMessage || len(data) == 0 {
 				continue
 			}
@@ -178,6 +287,8 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				streamsMu.Lock()
 				streamCount := len(streams)
 				streamsMu.Unlock()
+				slog.Info("WS CONNECT received", "stream", streamID, "target", target,
+					"activeStreams", streamCount)
 				if streamCount >= maxStreamsPerSession {
 					slog.Warn("max streams per session exceeded", "limit", maxStreamsPerSession)
 					errChunk := core.NewStreamDataChunk(session.ID, session.NextSeqNum(), streamID, []byte("CONNECT_FAIL"))
@@ -188,56 +299,86 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 
-				// X-1 fix: check server-side block list before dialing (same as handler.go handleConnect)
-				if len(h.config.BlockDomains) > 0 {
-					blockHost := target
-					if bh, _, err := net.SplitHostPort(target); err == nil {
-						blockHost = bh
+				// Optimistic CONNECT: create pending stream BEFORE dial so data
+				// arriving from client is buffered (not dropped). This eliminates
+				// the round-trip wait that blocks system VPN through CF CDN.
+				pendingStream := newPendingWSStream()
+				streamsMu.Lock()
+				streams[streamID] = pendingStream
+				streamsMu.Unlock()
+
+				// ASYNC dial: SafeDial blocks up to 10s per target.
+				go func(sid uint16, tgt string, s *wsStream) {
+					// X-1 fix: check server-side block list before dialing
+					if len(h.config.BlockDomains) > 0 {
+						blockHost := tgt
+						if bh, _, err := net.SplitHostPort(tgt); err == nil {
+							blockHost = bh
+						}
+						if isBlockedDomain(blockHost, h.config.BlockDomains) {
+							slog.Debug("blocked domain (ws)", "host", blockHost)
+							s.Close()
+							streamsMu.Lock()
+							delete(streams, sid)
+							streamsMu.Unlock()
+							errChunk := core.NewStreamDataChunk(session.ID, session.NextSeqNum(), sid, []byte("CONNECT_FAIL"))
+							if enc, err := session.EncryptChunk(errChunk); err == nil {
+								writeMsg(enc)
+							}
+							core.PutBuffer(errChunk.Payload)
+							return
+						}
 					}
-					if isBlockedDomain(blockHost, h.config.BlockDomains) {
-						slog.Debug("blocked domain (ws)", "host", blockHost)
-						errChunk := core.NewStreamDataChunk(session.ID, session.NextSeqNum(), streamID, []byte("CONNECT_FAIL"))
-						if enc, err := session.EncryptChunk(errChunk); err == nil {
+
+					dialStart := time.Now()
+					slog.Info("WS CONNECT dial start", "stream", sid, "target", tgt)
+					tc, err := SafeDial(context.Background(), tgt, 10*time.Second)
+					dialElapsed := time.Since(dialStart).Round(time.Millisecond)
+					if err != nil {
+						slog.Warn("WS CONNECT dial FAIL", "stream", sid, "target", tgt,
+							"elapsed", dialElapsed, "err", err)
+						s.Close()
+						streamsMu.Lock()
+						delete(streams, sid)
+						streamsMu.Unlock()
+						resp := core.NewStreamDataChunk(session.ID, session.NextSeqNum(), sid, []byte("CONNECT_FAIL"))
+						if enc, err := session.EncryptChunk(resp); err == nil {
 							writeMsg(enc)
 						}
-						core.PutBuffer(errChunk.Payload)
-						continue
+						core.PutBuffer(resp.Payload)
+						return
 					}
-				}
+					slog.Info("WS CONNECT dial OK", "stream", sid, "target", tgt,
+						"elapsed", dialElapsed)
 
-				tc, err := SafeDial(context.Background(), target, 10*time.Second)
-				if err != nil {
-					resp := core.NewStreamDataChunk(session.ID, session.NextSeqNum(), streamID, []byte("CONNECT_FAIL"))
+					// Activate: set target conn, flush buffered data, start writer.
+					s.Activate(tc)
+
+					// Send CONNECT_OK (client may already be relaying — that's OK)
+					resp := core.NewStreamDataChunk(session.ID, session.NextSeqNum(), sid, []byte("CONNECT_OK"))
 					if enc, err := session.EncryptChunk(resp); err == nil {
 						writeMsg(enc)
 					}
 					core.PutBuffer(resp.Payload)
-					continue
-				}
+					slog.Info("WS CONNECT_OK sent", "stream", sid, "target", tgt)
 
-				s := newWSStream(tc)
-				streamsMu.Lock()
-				streams[streamID] = s
-				streamsMu.Unlock()
-
-				// Per-stream relay: target → WS (instant push)
-				go func(sid uint16, stream *wsStream) {
+					// Per-stream relay: target → WS (instant push)
 					defer func() {
 						if r := recover(); r != nil {
 							slog.Error("panic recovered in ws stream relay", "error", r, "stream_id", sid)
 						}
-						stream.Close()
+						s.Close()
 						streamsMu.Lock()
 						delete(streams, sid)
 						streamsMu.Unlock()
 					}()
-					buf := make([]byte, 32768) // larger read buffer
+					buf := make([]byte, 32768)
 					for {
-						n, err := stream.targetConn.Read(buf)
+						n, err := tc.Read(buf)
 						if n > 0 {
 							resp := core.NewStreamDataChunk(session.ID, session.NextSeqNum(), sid, buf[:n])
 							enc, encErr := session.EncryptChunk(resp)
-							core.PutBuffer(resp.Payload) // release pooled payload immediately
+							core.PutBuffer(resp.Payload)
 							if encErr != nil {
 								return
 							}
@@ -249,13 +390,7 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 							return
 						}
 					}
-				}(streamID, s)
-
-				resp := core.NewStreamDataChunk(session.ID, session.NextSeqNum(), streamID, []byte("CONNECT_OK"))
-				if enc, err := session.EncryptChunk(resp); err == nil {
-					writeMsg(enc)
-				}
-				core.PutBuffer(resp.Payload)
+				}(streamID, target, pendingStream)
 
 			case core.FlagFin:
 				streamID, _ := core.ParseStreamID(chunk.Payload)
@@ -320,5 +455,10 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		s.Close()
 	}
 	streamsMu.Unlock()
+
+	// Stop the writer (idempotent; Run drains any in-flight queue then exits)
+	// before closing the conn so an in-progress WriteMessage isn't aborted
+	// mid-frame.
+	writer.Close()
 	conn.Close()
 }

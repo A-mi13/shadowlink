@@ -31,25 +31,26 @@ func TestSessionAcceptsOutOfOrder(t *testing.T) {
 
 func TestSessionSlidingWindowLimit(t *testing.T) {
 	s := NewSession(1, make([]byte, 32), make([]byte, 32))
-	assert.True(t, s.AcceptSeqNum(300))
-	assert.False(t, s.AcceptSeqNum(0), "too old — outside window of 256")
+	assert.True(t, s.AcceptSeqNum(WindowSize+100))
+	assert.False(t, s.AcceptSeqNum(0), "too old — outside window")
 }
 
 func TestSessionSlidingWindowEdge(t *testing.T) {
 	s := NewSession(1, make([]byte, 32), make([]byte, 32))
 	assert.True(t, s.AcceptSeqNum(0))
-	assert.True(t, s.AcceptSeqNum(255)) // exactly at window edge
-	assert.True(t, s.AcceptSeqNum(0))   // still within window (255-0=255 < 256)
+	assert.True(t, s.AcceptSeqNum(WindowSize-1)) // exactly at window edge
+	assert.True(t, s.AcceptSeqNum(0))             // still within window
 }
 
 func TestSessionLargeJump(t *testing.T) {
 	s := NewSession(1, make([]byte, 32), make([]byte, 32))
 	assert.True(t, s.AcceptSeqNum(0))
-	assert.True(t, s.AcceptSeqNum(1000)) // large jump, resets bitmap
+	high := uint32(WindowSize + 5000) // always larger than WindowSize
+	assert.True(t, s.AcceptSeqNum(high))
 	assert.False(t, s.AcceptSeqNum(0), "old seq after large jump")
-	assert.True(t, s.AcceptSeqNum(999))  // within new window
-	assert.True(t, s.AcceptSeqNum(745))  // within window (1000-745=255)
-	assert.False(t, s.AcceptSeqNum(744), "just outside window (1000-744=256)")
+	assert.True(t, s.AcceptSeqNum(high-1))              // within new window
+	assert.True(t, s.AcceptSeqNum(high-WindowSize+1))   // exactly at edge
+	assert.False(t, s.AcceptSeqNum(high-WindowSize), "just outside window")
 }
 
 func TestSessionExpiry(t *testing.T) {

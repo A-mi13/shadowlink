@@ -15,7 +15,12 @@ const defaultSocksAddr = "127.0.0.1:1080"
 
 // ParseSLURL parses an sl:// URL into a ClientFileConfig.
 //
-// Format: sl://PUBKEY@HOST:PORT?tls=1&ws=1&auto=1&cdn=DOMAIN&socks=ADDR&ech=1&id=CLIENT_ID
+// Format: sl://PUBKEY@HOST:PORT?tls=1&ws=1&auto=1&cdn=DOMAIN&sni=DOMAIN&origin=IP&socks=ADDR&ech=1&id=CLIENT_ID
+//
+// Modes:
+//   - Full-CF:     @DOMAIN:443?tls=1&cdn=DOMAIN                       — all traffic via CF
+//   - Hybrid:      @DOMAIN:443?tls=1&cdn=DOMAIN&origin=IP              — handshake via CF, WS direct to origin
+//   - Full-direct: @IP:443?tls=1&sni=DOMAIN                            — all traffic direct, TLS SNI = DOMAIN
 //
 // Security:
 //   - Pubkey must be exactly 64 lowercase hex characters.
@@ -77,6 +82,23 @@ func ParseSLURL(rawURL string) (*ClientFileConfig, error) {
 		Auto:      q.Get("auto") == "1",
 		ECH:       q.Get("ech") == "1",
 		CDN:       q.Get("cdn"),
+		Origin:    q.Get("origin"),
+		SNI:       q.Get("sni"),
+		CFIP:      q.Get("cfip"),
+	}
+
+	// Parse comma-separated backup= list; each entry may omit :port (defaults to 443).
+	if raw := q.Get("backup"); raw != "" {
+		for _, entry := range strings.Split(raw, ",") {
+			entry = strings.TrimSpace(entry)
+			if entry == "" {
+				continue
+			}
+			if _, _, err := net.SplitHostPort(entry); err != nil {
+				entry = entry + ":443"
+			}
+			cfg.BackupServers = append(cfg.BackupServers, entry)
+		}
 	}
 
 	if cfg.Socks == "" {
@@ -124,6 +146,18 @@ func BuildSLURL(cfg *ClientFileConfig) string {
 	}
 	if cfg.CDN != "" {
 		params.Set("cdn", cfg.CDN)
+	}
+	if cfg.Origin != "" {
+		params.Set("origin", cfg.Origin)
+	}
+	if cfg.SNI != "" {
+		params.Set("sni", cfg.SNI)
+	}
+	if cfg.CFIP != "" {
+		params.Set("cfip", cfg.CFIP)
+	}
+	if len(cfg.BackupServers) > 0 {
+		params.Set("backup", strings.Join(cfg.BackupServers, ","))
 	}
 	if cfg.Socks != "" && cfg.Socks != defaultSocksAddr {
 		params.Set("socks", cfg.Socks)

@@ -67,6 +67,13 @@ type Config struct {
 	// Disabled by default — adds overhead that reduces throughput ~2-3x.
 	// Enable via mimicry.inflation: true in YAML config.
 	UseInflatedResponses bool
+
+	// HandshakeRateLimitPerMin caps new handshakes per minute per client IP.
+	// 0 = use safe default (300). The legacy hardcoded value (50) was sized
+	// for one-handshake-per-CONNECT clients and broke pool reconnect: 4 slots
+	// × cascade death easily produces 30+ handshakes/min from one IP, hitting
+	// the limit and falling through to the decoy (HTTP 404 / HTML responses).
+	HandshakeRateLimitPerMin int
 }
 
 // DefaultConfig returns production-ready defaults for a 2 vCPU / 2 GB RAM VPS.

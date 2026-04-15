@@ -25,6 +25,15 @@ type ClientFileConfig struct {
 	Warmup     *bool         `yaml:"warmup"`
 	ECH        bool          `yaml:"ech"`
 	WBTurn     bool          `yaml:"wbturn"`     // Enable WB TURN transport in auto-detect
+	Origin     string        `yaml:"origin"`     // Origin IP for direct WS (bypass CF CDN)
+	SNI        string        `yaml:"sni"`        // TLS ServerName override when connecting to IP directly (full-direct mode)
+	CFIP       string        `yaml:"cfip"`       // Specific Cloudflare edge IP (bypass DNS, keep domain as TLS SNI)
+	// BackupServers is a list of fallback "host:port" endpoints. When the
+	// primary Server fails to handshake (e.g. ТСПУ blocks the CF domain by
+	// SNI), the client tries each backup in order. Each backup must point
+	// to the same underlying ShadowLink server (same X25519 pubkey) but via
+	// a different CF domain (or IP).
+	BackupServers []string `yaml:"backup_servers,omitempty"`
 }
 
 // RoutingConfig holds per-domain routing rules from the YAML file.

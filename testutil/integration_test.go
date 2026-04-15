@@ -155,7 +155,7 @@ func TestE2E_DPI16KBThreshold(t *testing.T) {
 	t.Logf("DPI: conns=%d frozen=%d", dpi.TotalConns.Load(), dpi.FrozenConns.Load())
 }
 
-// Destination routing: ConnectTo public server
+// Destination routing: ConnectToStream to public server
 func TestE2E_DestinationRouting(t *testing.T) {
 	serverKey, _ := core.GenerateKeyPair()
 	srvConfig := server.TestConfig()
@@ -173,17 +173,39 @@ func TestE2E_DestinationRouting(t *testing.T) {
 	err := cl.Connect(context.Background())
 	require.NoError(t, err)
 
-	// Connect to a public HTTP server (example.com:80)
-	err = cl.ConnectTo(context.Background(), "93.184.216.34:80")
+	// Register stream and connect to a public HTTP server (example.com:80)
+	var streamID uint16 = 1
+	ch, err := cl.RegisterStream(streamID)
+	require.NoError(t, err)
+	defer cl.UnregisterStream(streamID)
+
+	err = cl.ConnectToStream(context.Background(), streamID, "93.184.216.34:80")
 	if err != nil {
 		t.Skipf("cannot reach external server: %v", err)
 	}
 
-	// Send HTTP request through tunnel
+	// Send HTTP request through tunnel via stream API
 	httpReq := []byte("GET / HTTP/1.0\r\nHost: example.com\r\n\r\n")
-	resp, err := cl.Send(context.Background(), httpReq)
+	err = cl.SendStream(context.Background(), streamID, httpReq)
 	require.NoError(t, err)
-	assert.Contains(t, string(resp), "HTTP/1.0", "should get HTTP response from example.com")
+
+	// Poll for response — server returns data only when it has arrived from target.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() {
+		for ctx.Err() == nil {
+			cl.PollStreams(ctx)
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
+
+	// Read response from stream channel
+	select {
+	case resp := <-ch:
+		assert.Contains(t, string(resp), "HTTP/1.", "should get HTTP response from example.com")
+	case <-ctx.Done():
+		t.Skip("timeout reaching example.com — network may be unavailable")
+	}
 }
 
 // Destination routing: SSRF protection blocks localhost
@@ -205,16 +227,16 @@ func TestE2E_DestinationRoutingSSRFBlocked(t *testing.T) {
 
 	// SSRF: try to connect to localhost — should be BLOCKED
 	err := cl.ConnectTo(context.Background(), "127.0.0.1:5432")
-	assert.Error(t, err)
+	require.Error(t, err)
 	assert.Contains(t, err.Error(), "CONNECT_FAIL")
 
 	// SSRF: try AWS metadata
 	err = cl.ConnectTo(context.Background(), "169.254.169.254:80")
-	assert.Error(t, err)
+	require.Error(t, err)
 
 	// SSRF: try private network
 	err = cl.ConnectTo(context.Background(), "10.0.0.1:22")
-	assert.Error(t, err)
+	require.Error(t, err)
 }
 
 // Destination routing: connect to invalid target
