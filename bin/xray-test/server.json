@@ -1,0 +1,18 @@
+{
+  "log": {"loglevel": "info"},
+  "inbounds": [{
+    "port": 10444,
+    "protocol": "vless",
+    "settings": {
+      "clients": [{"id": "f47ac10b-58cc-4372-a567-0e02b2c3d479"}],
+      "decryption": "none"
+    },
+    "streamSettings": {
+      "network": "xhttp",
+      "xhttpSettings": {
+        "path": "/xhttp-test"
+      }
+    }
+  }],
+  "outbounds": [{"protocol": "freedom"}]
+}
