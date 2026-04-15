@@ -71,13 +71,15 @@ type WSPoolTransport struct {
 	streamMap sync.Map // map[uint16]int — streamID -> slot index
 
 	// For creating new slots
-	serverAddr string
-	sniHost    string // override TLS ServerName
-	cfIP       string // specific CF edge IP
-	useTLS     bool
-	skipVerify bool
-	lockedFP   *browser.Fingerprint
-	client     *Client // back-reference for handshake
+	serverAddr   string
+	sniHost      string // override TLS ServerName
+	cfIP         string // specific CF edge IP
+	useTLS       bool
+	skipVerify   bool
+	lockedFP     *browser.Fingerprint
+	client       *Client       // back-reference for handshake
+	writeTimeout time.Duration // per-frame write deadline (0 → 30s WSAsyncWriter default)
+	staggerDelay time.Duration // initial/reconnect slot startup spacing (0 → no stagger)
 
 	// Meltdown protection: when multiple slots die within a short window
 	// (usually CF punishing an aggressive burst), pause reconnect loops so CF
@@ -119,6 +121,17 @@ type WSPoolConfig struct {
 	// For CF CDN mode, set low (4-8) so each WS carries light traffic.
 	MaxStreamsPerSlot int
 
+	// WriteTimeout caps each WS frame's write deadline. 0 → WSAsyncWriter
+	// default (30s). For viaCF mode pass 5-8s: CF-side stalls propagate as
+	// TCP backpressure, and 30s means a stuck slot blocks traffic for 30s
+	// before the pool can route around it. Cross-check 2026-04-15 H6.
+	WriteTimeout time.Duration
+
+	// StaggerDelay spaces initial slot handshakes. 0 disables. Recommended
+	// ~300ms × slot index so 8 TCP SYNs don't arrive at CF edge in the same
+	// millisecond and trip burst/rate-limit heuristics.
+	StaggerDelay time.Duration
+
 	// Meltdown protection parameters. All default to sensible values if zero.
 	MeltdownWindow    time.Duration // how long "recent death" lasts (default 5s)
 	MeltdownThreshold int           // N deaths in window triggers cooldown (default = ceil(size/2), min 2)
@@ -133,13 +146,19 @@ func NewWSPoolTransport(cl *Client, cfg WSPoolConfig) *WSPoolTransport {
 	if cfg.MaxPendingPerSlot < 1 {
 		cfg.MaxPendingPerSlot = defaultMaxPendingPerSlot
 	}
+	// Meltdown defaults tuned 2026-04-15 after field regression analysis:
+	// the old 5s / ceil(size/2) combo turned a transient CF edge hiccup
+	// into a self-sustaining outage. Widening the window to 15s and
+	// raising the threshold to ⌈3·size/4⌉ means we still pause reconnect
+	// when CF is genuinely angry, but don't trip on 4 correlated deaths
+	// from one bad edge IP (see DNS-spray finding F4).
 	if cfg.MeltdownWindow <= 0 {
-		cfg.MeltdownWindow = 5 * time.Second
+		cfg.MeltdownWindow = 15 * time.Second
 	}
 	if cfg.MeltdownThreshold < 1 {
-		cfg.MeltdownThreshold = (cfg.Size + 1) / 2 // ceil(size/2)
-		if cfg.MeltdownThreshold < 2 {
-			cfg.MeltdownThreshold = 2
+		cfg.MeltdownThreshold = (cfg.Size*3 + 3) / 4 // ceil(3·size/4)
+		if cfg.MeltdownThreshold < 3 {
+			cfg.MeltdownThreshold = 3
 		}
 	}
 	if cfg.MeltdownCooldown <= 0 {
@@ -158,6 +177,8 @@ func NewWSPoolTransport(cl *Client, cfg WSPoolConfig) *WSPoolTransport {
 		skipVerify:        cfg.SkipVerify,
 		lockedFP:          cfg.LockedFP,
 		client:            cl,
+		writeTimeout:      cfg.WriteTimeout,
+		staggerDelay:      cfg.StaggerDelay,
 		meltdownWindow:    cfg.MeltdownWindow,
 		meltdownThreshold: cfg.MeltdownThreshold,
 		meltdownCooldown:  cfg.MeltdownCooldown,
@@ -173,10 +194,21 @@ func (p *WSPoolTransport) Connect(ctx context.Context) error {
 	var wg sync.WaitGroup
 	results := make([]error, p.poolSize)
 
+	// Stagger the initial fan-out so N TCP SYNs don't arrive at CF edge in
+	// the same millisecond (trips burst/rate-limit heuristics). Same pattern
+	// WSReadyPool already uses. Zero staggerDelay → no stagger (direct mode).
 	for i := 0; i < p.poolSize; i++ {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
+			if idx > 0 && p.staggerDelay > 0 {
+				select {
+				case <-time.After(time.Duration(idx) * p.staggerDelay):
+				case <-ctx.Done():
+					results[idx] = ctx.Err()
+					return
+				}
+			}
 			results[idx] = p.connectSlot(ctx, idx)
 		}(i)
 	}
@@ -301,6 +333,9 @@ func (p *WSPoolTransport) connectSlot(ctx context.Context, idx int) error {
 	wst := NewWebSocketTransport(p.serverAddr, p.useTLS, p.skipVerify, p.lockedFP)
 	wst.sniHost = p.sniHost // SNI trick: domain as ServerName when connecting to origin IP
 	wst.cfIP = p.cfIP       // CF edge IP override: bypass DNS, keep domain as TLS SNI
+	if p.writeTimeout > 0 {
+		wst.SetWriteTimeout(p.writeTimeout) // viaCF: 5-8s, direct: 0 (→ 30s default)
+	}
 	if idx == 0 {
 		wst.WarmupRequests() // Only warmup for first slot (looks natural)
 	}
@@ -772,6 +807,12 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 			if netErr, ok := err.(interface{ Timeout() bool }); ok && netErr.Timeout() {
 				continue
 			}
+			// Terminal (non-timeout) reader error — attribute slot death.
+			// If this correlates with writer_exits in stats, CF-side stalls
+			// are the trigger (H6); if writer_exits stays low and
+			// reader_exits climbs, the server or CF edge is actively
+			// closing our TCP.
+			Stats.ReaderExits.Add(1)
 			p.log.Warn("WS pool slot reader error", "slot", idx, "err", err, "messages", msgCount)
 			p.handleSlotDeath(cl, idx)
 			return

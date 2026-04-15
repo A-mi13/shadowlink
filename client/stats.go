@@ -40,6 +40,16 @@ type statsRegistry struct {
 	UplinkBytes atomic.Int64
 	// Downlink bytes written to SOCKS5 client (after decryption).
 	DownlinkBytes atomic.Int64
+	// Async writer Run() exits — one of the two death causes for a pool slot.
+	// A writer exit means the local 30s (or configured) WriteDeadline fired
+	// because CF stalled our send buffer; we then close the conn ourselves.
+	// Distinguishing this from a reader-side close is critical for telling
+	// "CF closed us" apart from "we closed ourselves" — cross-check 2026-04-15.
+	WriterExits atomic.Int64
+	// Slot reader goroutine exits (terminal, not timeout continues). Paired
+	// with WriterExits to attribute slot deaths. If WriterExits ≫ ReaderExits
+	// then CF-side stall is the trigger, not a server-originated close.
+	ReaderExits atomic.Int64
 }
 
 // Stats is the singleton stats registry. All increments across the codebase
@@ -71,6 +81,7 @@ func StartStatsLogger(ctx context.Context, interval time.Duration) {
 			lastCover, lastUDP, lastWSNew, lastWSDie, lastPool int64
 			lastEnc, lastDec, lastDecFail                      int64
 			lastSocks, lastUp, lastDown                        int64
+			lastWriterExits, lastReaderExits                   int64
 		)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -92,6 +103,8 @@ func StartStatsLogger(ctx context.Context, interval time.Duration) {
 			socks := Stats.SocksConnects.Load()
 			up := Stats.UplinkBytes.Load()
 			down := Stats.DownlinkBytes.Load()
+			writerExits := Stats.WriterExits.Load()
+			readerExits := Stats.ReaderExits.Load()
 
 			slog.Info("shadowlink client stats (delta)",
 				"interval", interval,
@@ -106,11 +119,14 @@ func StartStatsLogger(ctx context.Context, interval time.Duration) {
 				"socks_connects", socks-lastSocks,
 				"uplink_kb", (up-lastUp)/1024,
 				"downlink_kb", (down-lastDown)/1024,
+				"writer_exits", writerExits-lastWriterExits,
+				"reader_exits", readerExits-lastReaderExits,
 			)
 
 			lastCover, lastUDP, lastWSNew, lastWSDie, lastPool = cover, udp, wsNew, wsDie, pool
 			lastEnc, lastDec, lastDecFail = enc, dec, decFail
 			lastSocks, lastUp, lastDown = socks, up, down
+			lastWriterExits, lastReaderExits = writerExits, readerExits
 		}
 	}()
 }

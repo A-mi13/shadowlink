@@ -261,12 +261,44 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 				// field-test 2026-04-15) → data stalls, decrypts stop
 				// arriving. 4 streams/slot × 8 slots = 32 concurrent streams
 				// which covers a typical page load while keeping each WS light.
-				maxStreamsPerSlot := 0 // unlimited for direct
-				maxPendingPerSlot := 0 // default 4 for direct
+				maxStreamsPerSlot := 0          // unlimited for direct
+				maxPendingPerSlot := 0          // default 4 for direct
+				var writeTimeout time.Duration  // 0 → 30s default for direct
+				var staggerDelay time.Duration  // 0 → no stagger for direct
+				poolCFIP := slCfg.CFIP
 				viaCF := slCfg.CDN != "" && slCfg.Origin == "" && slCfg.SNI == ""
 				if viaCF {
 					maxStreamsPerSlot = 4
 					maxPendingPerSlot = 2
+					// 5s write deadline (vs 30s default): under CF
+					// backpressure we want to declare the slot dead fast
+					// and let the pool route around the bad edge.
+					writeTimeout = 5 * time.Second
+					// 300ms × idx so 8 TCP SYNs don't arrive at CF in
+					// the same millisecond and trip burst heuristics.
+					staggerDelay = 300 * time.Millisecond
+
+					// R4: pre-resolve CF domain once and pin the same
+					// edge IP across all slots when no explicit CFIP is
+					// supplied. Without this, gorilla's dial does an
+					// independent DNS lookup per slot → CF round-robins
+					// 3-5 different edges → if one degrades, several
+					// slots die in a correlated burst (DNS-spray).
+					if poolCFIP == "" {
+						host, _, splitErr := net.SplitHostPort(slCfg.Server)
+						if splitErr != nil {
+							host = slCfg.Server
+						}
+						resolveCtx, cancelResolve := context.WithTimeout(ctx2, 3*time.Second)
+						addrs, lookupErr := net.DefaultResolver.LookupHost(resolveCtx, host)
+						cancelResolve()
+						if lookupErr == nil && len(addrs) > 0 {
+							poolCFIP = addrs[0] // pin to first returned edge
+							slog.Info("CF edge pinned for pool", "domain", host, "edge", poolCFIP)
+						} else if lookupErr != nil {
+							slog.Warn("CF edge pre-resolve failed (using DNS per slot)", "err", lookupErr)
+						}
+					}
 				}
 
 				pool := client.NewWSPoolTransport(e.cl, client.WSPoolConfig{
@@ -275,9 +307,11 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 					UseTLS:            slCfg.TLS,
 					SkipVerify:        false,
 					SNIHost:           sniHost,
-					CFIP:              slCfg.CFIP,
+					CFIP:              poolCFIP,
 					MaxStreamsPerSlot: maxStreamsPerSlot,
 					MaxPendingPerSlot: maxPendingPerSlot,
+					WriteTimeout:      writeTimeout,
+					StaggerDelay:      staggerDelay,
 				})
 				if err := pool.Connect(ctx2); err != nil {
 					slog.Warn("WS Pool не удался, fallback на SplitHTTP", "err", err)
@@ -288,7 +322,10 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 						"slots", pool.HealthySlots(),
 						"total", poolSize,
 						"maxStreamsPerSlot", maxStreamsPerSlot,
-						"viaCF", viaCF)
+						"viaCF", viaCF,
+						"writeTimeout", writeTimeout,
+						"staggerDelay", staggerDelay,
+						"cfIP", poolCFIP)
 					poolOK = true
 				}
 			}

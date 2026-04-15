@@ -39,6 +39,12 @@ type WebSocketTransport struct {
 	writeMu     sync.Mutex // only used by SendChunk (legacy single-WS fallback, not ws_pool hot path)
 	conn        *websocket.Conn
 	asyncWriter *core.WSAsyncWriter // async egress queue, used by WriteMessage (ws_pool hot path)
+
+	// Per-frame write deadline. Zero → WSAsyncWriter default (30s). For viaCF
+	// mode this should be 5-8s: CF-side stalls propagate to us as TCP
+	// backpressure and the default 30s means the slot freezes for 30s before
+	// the pool can route around the bad edge. Cross-check 2026-04-15 H6.
+	writeTimeout time.Duration
 }
 
 // NewWebSocketTransport creates a transport that uses WebSocket for data relay.
@@ -85,6 +91,12 @@ func (t *WebSocketTransport) SetSNIHost(host string) { t.sniHost = host }
 
 // SetCFIP sets a specific CF edge IP (bypass DNS, keep domain as TLS SNI).
 func (t *WebSocketTransport) SetCFIP(ip string) { t.cfIP = ip }
+
+// SetWriteTimeout overrides the per-frame write deadline used by the async
+// writer. Must be called before UpgradeToWS. Zero keeps the WSAsyncWriter
+// default (30s). For viaCF mode pass 5-8s to surface CF-side backpressure
+// quickly instead of letting a stalled slot block traffic for 30s.
+func (t *WebSocketTransport) SetWriteTimeout(d time.Duration) { t.writeTimeout = d }
 
 // SendHandshake performs initial HTTP handshake (same as DirectTransport).
 // After this, call UpgradeToWS() to switch to WebSocket.
@@ -300,10 +312,15 @@ func (t *WebSocketTransport) UpgradeToWS(token []byte) error {
 	// control channel (drained first), data relay uses the data channel.
 	// This eliminates the writeMu bottleneck where 100 data goroutines
 	// starved CONNECT requests for 5+ seconds.
-	//
-	// Previous concern about async writer killing slot on CF timeout is
-	// now handled by the pool's slot death + reconnect mechanism.
 	w := core.NewWSAsyncWriter(conn, 256) // 256 data frames, 64 control frames
+
+	// Apply per-frame write deadline. Default (0) keeps WSAsyncWriter's own
+	// default of 30s; viaCF mode sets this to 5-8s via SetWriteTimeout so a
+	// CF-side stall kills this slot quickly and the pool can route around
+	// the bad edge instead of freezing for 30s.
+	if t.writeTimeout > 0 {
+		w.SetWriteTimeout(t.writeTimeout)
+	}
 
 	// Custom ping handler: route pong through our async writer to avoid
 	// gorilla's WriteControl concurrent write conflict. Without this, the
@@ -317,7 +334,12 @@ func (t *WebSocketTransport) UpgradeToWS(token []byte) error {
 
 	go func() {
 		if err := w.Run(); err != nil {
-			slog.Debug("ws async writer exit", "err", err)
+			// Warn-level (was Debug) so writer-triggered slot deaths are
+			// distinguishable from reader-triggered ones in the field logs.
+			// Cross-check 2026-04-15 H6: the local write deadline is the
+			// real first domino under CF backpressure — we need to see it.
+			Stats.WriterExits.Add(1)
+			slog.Warn("ws async writer exit", "err", err, "writeTimeout", t.writeTimeout)
 			// Close the conn so the reader goroutine gets an error and exits
 			// immediately instead of waiting up to 60s for the server's read
 			// deadline to expire (zombie connection prevention).
