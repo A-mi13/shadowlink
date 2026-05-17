@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	mrand "math/rand"
 	"net"
 	"net/http"
 	"sync"
@@ -25,7 +26,7 @@ import (
 // Eliminates polling pattern — data flows instantly in both directions.
 type WebSocketTransport struct {
 	baseURL     string
-	wsURL       string
+	wsScheme    string // "ws" or "wss" — used to rebuild dialURL per UpgradeToWS
 	serverAddr  string
 	sniHost     string // override TLS ServerName (for origin IP with domain SNI)
 	cfIP        string // specific CF edge IP (TCP dial override, domain stays as TLS SNI)
@@ -34,6 +35,19 @@ type WebSocketTransport struct {
 	urlPool     *browser.URLPool
 	connManager *ConnManager // for initial HTTP handshake
 	pd          *browser.PayloadDistribution
+
+	// rlDetector — Phase 2.3 (2026-05-14): dual-carrier rate-limit detection
+	// for WS upgrade response. Mirrors transport.go pattern — if CF strips
+	// X-SL-RL header, body marker in the 200-decoy response still surfaces
+	// the signal.
+	//
+	// NOTE: WS path uses `DetectCarriersOnly` (no lifeline) — any non-101
+	// WS response returns HTML (CF middlebox, plain decoy, connection error),
+	// so the HTML-body lifeline would fire on every generic failure causing
+	// false-positive 90s cooldowns. Generic upgrade failures must surface
+	// as ordinary errors with session-FIN, not as rate-limit. See
+	// TestUpgradeToWS_NoXSLRLHeader_ReturnsGenericError for the invariant.
+	rlDetector *RateLimitDetector
 
 	mu          sync.Mutex
 	writeMu     sync.Mutex // only used by SendChunk (legacy single-WS fallback, not ws_pool hot path)
@@ -74,14 +88,50 @@ func NewWebSocketTransport(serverAddr string, useTLS bool, skipVerify bool, lock
 
 	return &WebSocketTransport{
 		baseURL:     fmt.Sprintf("%s://%s", scheme, serverAddr),
-		wsURL:       fmt.Sprintf("%s://%s/ws", wsScheme, serverAddr),
+		wsScheme:    wsScheme,
 		serverAddr:  serverAddr,
 		useTLS:      useTLS,
 		skipVerify:  skipVerify,
 		urlPool:     browser.NewURLPool(),
 		connManager: cm,
 		pd:          browser.NewPayloadDistribution(),
+		rlDetector:  DefaultDetector(&Stats),
 	}
+}
+
+// pickDialURL builds the WS dial URL for one upgrade attempt. Call sites use
+// this on every UpgradeToWS so reconnects do not reuse the previous path —
+// that is the anti-correlation invariant from CRIT-4 in the 2026-04-25 audit.
+//
+// host argument: serverAddr by default; when sniHost is set we dial against
+// the domain so gorilla emits the correct Host header (NetDialTLSContext
+// then redirects the underlying TCP to the origin IP). The path comes from
+// the shared compile-time pool (ws_paths.go).
+func (t *WebSocketTransport) pickDialURL(host string) string {
+	return fmt.Sprintf("%s://%s%s", t.wsScheme, host, pickWSPath())
+}
+
+// buildColdPathClient returns an *http.Client used for cold-path HTTPS
+// (SendHandshake POST and WarmupRequests GETs). It shares the uTLS profile
+// with UpgradeToWS so a passive observer sees a single JA3 across the
+// pre-upgrade burst (CRIT-1/CRIT-2 in the 2026-04-25 audit).
+//
+// In useTLS=false mode (unit tests against an httptest server) we fall back
+// to a stdlib client because there is no TLS to fingerprint.
+func (t *WebSocketTransport) buildColdPathClient(fp *browser.Fingerprint, timeout time.Duration) *http.Client {
+	if !t.useTLS {
+		return &http.Client{Timeout: timeout}
+	}
+	sni := t.sniHost
+	if sni == "" {
+		host, _, err := net.SplitHostPort(t.serverAddr)
+		if err != nil || host == "" {
+			sni = t.serverAddr
+		} else {
+			sni = host
+		}
+	}
+	return buildUTLSHTTPClient(t.serverAddr, sni, fp, t.skipVerify, timeout, "http/1.1")
 }
 
 func (t *WebSocketTransport) Name() string { return "websocket" }
@@ -119,8 +169,14 @@ func (t *WebSocketTransport) SendHandshake(ctx context.Context, hello *core.Clie
 		Type: "init", TS: time.Now().UnixMilli(), Data: encoded,
 	}}})
 
-	// Use standard HTTP for handshake (before WS upgrade)
-	httpClient := &http.Client{Timeout: 15 * time.Second}
+	// CRIT-1 (2026-04 audit): cold-path handshake POST must share the uTLS JA3
+	// of the upcoming WS upgrade. Previously this used `&http.Client{}` (Go
+	// stdlib JA3) seconds before UpgradeToWS sent Chrome 133 — a single passive
+	// fingerprint logger could flag the inconsistency. Route through the same
+	// uTLS dialer family used by UpgradeToWS / SplitTransport.
+	fp := t.connManager.ActiveFingerprint()
+	httpClient := t.buildColdPathClient(fp, 15*time.Second)
+	defer httpClient.CloseIdleConnections()
 	url := t.baseURL + t.urlPool.NextUploadPath()
 	req, err := http.NewRequestWithContext(ctx, "POST", url, nil)
 	if err != nil {
@@ -129,8 +185,9 @@ func (t *WebSocketTransport) SendHandshake(ctx context.Context, hello *core.Clie
 	req.Body = io.NopCloser(io.Reader(newBytesReader(body)))
 	req.ContentLength = int64(len(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", t.connManager.ActiveFingerprint().UserAgent())
+	req.Header.Set("User-Agent", fp.UserAgent())
 	req.Header.Set("Accept", "application/json")
+	browser.ApplyChromeCHUAForFingerprint(req.Header, fp)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -147,39 +204,52 @@ func (t *WebSocketTransport) SendHandshake(ctx context.Context, hello *core.Clie
 
 // utlsProfileForFingerprint maps our browser fingerprint to a uTLS ClientHelloID.
 // This ensures the WebSocket TLS handshake has the same JA3 fingerprint as the
-// HTTP handshake (via tls-client). Without this, DPI sees "Chrome HTTP → Go WebSocket".
+// HTTP handshake (via tls-client).
+//
+// 2026-05-05: non-Chrome fingerprints retired (TSPU блокирует Safari/Firefox/
+// Edge). Switch свёрнут — функция всегда отдаёт LockedUTLSChromeID() (Chrome 133)
+// независимо от fp.Name(). Сигнатура сохранена для совместимости со всеми каллерами.
 func utlsProfileForFingerprint(fp *browser.Fingerprint) utls.ClientHelloID {
-	switch fp.Name() {
-	case browser.ProfileChrome:
-		return utls.HelloChrome_133
-	case browser.ProfileSafari:
-		return utls.HelloSafari_16_0
-	case browser.ProfileFirefox:
-		return utls.HelloFirefox_Auto // latest available (120)
-	default:
-		return utls.HelloChrome_133
-	}
+	_ = fp // legacy parameter: всегда Chrome
+	return browser.LockedUTLSChromeID()
 }
 
-// WarmupRequests sends 2-3 GET requests to decoy pages before WebSocket upgrade.
-// Mimics real browser behavior: user loads page, browses, THEN opens WebSocket.
-// Without this, DPI sees: TLS connect → instant WS upgrade (suspicious).
-// With this: TLS → GET / → GET /about → GET /api/config → WS upgrade (normal).
+// chooseWarmupCount picks the warmup-burst length for a given RNG. Returns
+// a value in [1, min(4, max)]. Exposed for ws_transport_warmup_test.go.
+func chooseWarmupCount(rng *mrand.Rand, max int) int {
+	if max <= 0 {
+		return 0
+	}
+	cap := 4
+	if max < cap {
+		cap = max
+	}
+	return 1 + rng.Intn(cap)
+}
+
+// WarmupRequests sends 1-4 GET requests to cover paths before WebSocket
+// upgrade. Mimics real browser behavior: user loads SDK assets / feature
+// flags before opening WS. T1.6 randomizes both order (Fisher-Yates
+// shuffle) and count so the burst signature varies across reconnects —
+// without this, a passive observer sees the exact same 3-path GET burst
+// every dial and fingerprints us by request order alone.
 func (t *WebSocketTransport) WarmupRequests() {
-	ua := t.connManager.ActiveFingerprint().UserAgent()
+	// CRIT-2 (2026-04 audit): warmup GETs are intended to look like a real
+	// browser visiting the SPA before opening WS. Sending them with stdlib JA3
+	// is *worse* than skipping warmup — the upcoming WS upgrade will use the
+	// uTLS Chrome JA3, and the JA3 mismatch on the same flow is the cleanest
+	// "this is not a real browser" signal a JA3 logger can capture. Pin the
+	// uTLS dialer used by UpgradeToWS for these probes too.
+	fp := t.connManager.ActiveFingerprint()
+	ua := fp.UserAgent()
+	client := t.buildColdPathClient(fp, 5*time.Second)
+	defer client.CloseIdleConnections()
 
-	// Decoy page paths that a real SPA would load
-	paths := []string{
-		"/",
-		"/about",
-		"/api/v1/config",
-	}
-
-	// Pick 2-3 random paths
-	count := 2 + int(time.Now().UnixNano()%2) // 2 or 3
-	if count > len(paths) {
-		count = len(paths)
-	}
+	// Shared cover/warmup pool — one definition lives in skins/browser.
+	paths := browser.DefaultCoverPaths()
+	rng := mrand.New(mrand.NewSource(time.Now().UnixNano()))
+	rng.Shuffle(len(paths), func(i, j int) { paths[i], paths[j] = paths[j], paths[i] })
+	count := chooseWarmupCount(rng, len(paths))
 
 	for i := 0; i < count; i++ {
 		url := t.baseURL + paths[i]
@@ -188,10 +258,10 @@ func (t *WebSocketTransport) WarmupRequests() {
 			continue
 		}
 		req.Header.Set("User-Agent", ua)
-		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+		req.Header.Set("Accept", "application/json,text/javascript,image/*;q=0.9,*/*;q=0.8")
 		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+		browser.ApplyChromeCHUAForFingerprint(req.Header, fp)
 
-		client := &http.Client{Timeout: 5 * time.Second}
 		resp, err := client.Do(req)
 		if err != nil {
 			continue
@@ -200,20 +270,51 @@ func (t *WebSocketTransport) WarmupRequests() {
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 256*1024))
 		resp.Body.Close()
 
-		// Random delay between requests (200-600ms, like real browsing)
-		delay := 200 + time.Duration(time.Now().UnixNano()%400)*time.Millisecond
+		// Inter-request jitter: 50ms + rand[0..100]ms == [50ms, 150ms].
+		// That's the spec's "100ms ± 50%" window expressed in linear form.
+		delay := 50*time.Millisecond + time.Duration(rng.Intn(101))*time.Millisecond
 		time.Sleep(delay)
 	}
 }
 
-// UpgradeToWS establishes WebSocket connection with session token.
-// Uses uTLS for TLS handshake to match browser fingerprint (fixes detection via JA3 mismatch).
-func (t *WebSocketTransport) UpgradeToWS(token []byte) error {
-	header := http.Header{}
-	header.Set("Authorization", "Bearer "+base64.RawURLEncoding.EncodeToString(token))
-	header.Set("User-Agent", t.connManager.ActiveFingerprint().UserAgent())
+// UpgradeToWS establishes WebSocket connection and authenticates via a
+// post-upgrade first-frame.
+//
+// D3 migration (2026-04): the session token used to ride in `Authorization:
+// Bearer` on the upgrade request. Now the upgrade carries no auth-bearing
+// header; instead, immediately after the 101 Switching Protocols response the
+// client sends one binary frame containing [token][encrypted FlagKeepalive
+// chunk] — the server's authenticateFirstFrame path (Phase C) validates it and
+// completes the session.
+//
+// The session is required to produce the encrypted FlagKeepalive chunk that
+// serves as the first frame.
+//
+// Uses uTLS for TLS handshake to match browser fingerprint (fixes detection
+// via JA3 mismatch).
+func (t *WebSocketTransport) UpgradeToWS(token []byte, session *core.Session) error {
+	if session == nil {
+		return fmt.Errorf("ws upgrade: nil session")
+	}
+
+	// Pre-compute the first frame BEFORE Dial so the WriteMessage fires within
+	// a few ms of 101 — slow first frames are themselves a DPI signal and also
+	// give the server's 1500ms auth timeout room to spare.
+	firstFramePayload, err := t.buildFirstFramePayload(token, session)
+	if err != nil {
+		return fmt.Errorf("ws upgrade: first frame prep: %w", err)
+	}
 
 	fp := t.connManager.ActiveFingerprint()
+	header := http.Header{}
+	// D3: Authorization header removed — auth happens via the first WS frame.
+	header.Set("User-Agent", fp.UserAgent())
+	// 2026-05-02 wire-trigger followup NEW-2: Chrome WS Upgrade requests
+	// emit sec-ch-ua headers same as regular HTTP. Their absence on a
+	// connection that simultaneously presents a Chrome JA4 fingerprint is
+	// a browser-class contradiction.
+	browser.ApplyChromeCHUAForFingerprint(header, fp)
+
 	skipVerify := t.skipVerify
 	serverAddr := t.serverAddr
 
@@ -228,6 +329,7 @@ func (t *WebSocketTransport) UpgradeToWS(token []byte) error {
 		// gorilla/websocket's NetDialTLSContext bypasses crypto/tls entirely.
 		helloID := utlsProfileForFingerprint(fp)
 		originAddr := serverAddr // actual IP:port to connect to
+		usePQ := pqEnabled()
 		dialer.NetDialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			host, port, _ := net.SplitHostPort(addr)
 			if host == "" {
@@ -259,13 +361,40 @@ func (t *WebSocketTransport) UpgradeToWS(token []byte) error {
 				InsecureSkipVerify: skipVerify,
 			}
 
-			// Get browser spec, then patch ALPN to http/1.1 only.
-			// WebSocket requires HTTP/1.1 — Chrome h2 ALPN makes nginx respond with HTTP/2 SETTINGS.
-			spec, specErr := utls.UTLSIdToSpec(helloID)
-			if specErr != nil {
-				tcpConn.Close()
-				return nil, fmt.Errorf("uTLS spec: %w", specErr)
+			// PQ branch (T1.1, Phase 2): when SHADOWLINK_TLS_PQ=1, derive a
+			// custom spec with X25519MLKEM768 prepended into key_share +
+			// supported_groups. Falls back to the helloID-based spec if the
+			// PQ helper errors. Both branches end in the same ALPN patch +
+			// ApplyPreset + Handshake. The fallback is also accounted for in
+			// the prom counter so ops can spot a botched derive at scale.
+			var spec utls.ClientHelloSpec
+			pqApplied := false
+			pqFellBack := false
+			if usePQ {
+				if pqSpec, pqErr := pqClientHelloSpec(); pqErr == nil {
+					spec = pqSpec
+					pqApplied = true
+				} else {
+					pqFellBack = true
+					hsSpec, specErr := utls.UTLSIdToSpec(helloID)
+					if specErr != nil {
+						tcpConn.Close()
+						Stats.PQHandshakeError.Add(1)
+						return nil, fmt.Errorf("uTLS spec: %w", specErr)
+					}
+					spec = hsSpec
+				}
+			} else {
+				hsSpec, specErr := utls.UTLSIdToSpec(helloID)
+				if specErr != nil {
+					tcpConn.Close()
+					return nil, fmt.Errorf("uTLS spec: %w", specErr)
+				}
+				spec = hsSpec
 			}
+
+			// Patch ALPN to http/1.1 only on whichever spec we picked.
+			// WebSocket requires HTTP/1.1 — Chrome h2 ALPN makes nginx respond with HTTP/2 SETTINGS.
 			for i, ext := range spec.Extensions {
 				switch v := ext.(type) {
 				case *utls.ALPNExtension:
@@ -277,11 +406,27 @@ func (t *WebSocketTransport) UpgradeToWS(token []byte) error {
 			tlsConn := utls.UClient(tcpConn, uConfig, utls.HelloCustom)
 			if err := tlsConn.ApplyPreset(&spec); err != nil {
 				tcpConn.Close()
+				if usePQ {
+					Stats.PQHandshakeError.Add(1)
+				}
 				return nil, fmt.Errorf("uTLS apply: %w", err)
 			}
 			if err := tlsConn.HandshakeContext(ctx); err != nil {
 				tcpConn.Close()
+				if usePQ {
+					Stats.PQHandshakeError.Add(1)
+				}
 				return nil, fmt.Errorf("uTLS handshake: %w", err)
+			}
+			// PQ counter accounting: only ticks when usePQ is true so the
+			// counter stays at zero in default builds.
+			if usePQ {
+				switch {
+				case pqApplied:
+					Stats.PQHandshakeSuccess.Add(1)
+				case pqFellBack:
+					Stats.PQHandshakeFallback.Add(1)
+				}
 			}
 			return tlsConn, nil
 		}
@@ -293,19 +438,71 @@ func (t *WebSocketTransport) UpgradeToWS(token []byte) error {
 
 	// SNI trick: use domain URL so gorilla sets correct Host header.
 	// gorilla/websocket ignores header.Set("Host") — it takes Host from the URL.
-	// We use domain URL (wss://domain/ws) but NetDialTLSContext connects to origin IP.
-	dialURL := t.wsURL
+	// NetDialTLSContext (above) redirects TCP to the origin IP regardless.
+	//
+	// CRIT-4 anti-correlation: the path component is drawn fresh from the
+	// shared WS pool on every UpgradeToWS, including reconnects to the same
+	// server. The pool entry is byte-identical to one of the server's
+	// IsAllowedWSPath whitelist members; the server matches on r.URL.Path so
+	// any query string in the chosen entry collapses to the bare path on
+	// the receiving side.
+	host := t.serverAddr
 	if t.sniHost != "" {
-		wsScheme := "ws"
-		if t.useTLS {
-			wsScheme = "wss"
+		host = t.sniHost
+	}
+	dialURL := t.pickDialURL(host)
+
+	conn, resp, err := dialer.Dial(dialURL, header)
+	if err != nil {
+		// Phase 2.3 (2026-05-14): dual-carrier rate-limit detection.
+		// gorilla returns non-nil resp on non-101 status (rate-limit hit
+		// produces 200+decoy). Try body marker → header carriers (no lifeline).
+		// If CF stripped X-SL-RL but body has Schema.org marker, body carrier
+		// catches it. Lifeline is intentionally skipped here: any rejected WS
+		// upgrade returns a decoy HTML body; the lifeline would fire on every
+		// CF middlebox / generic error, causing false-positive cooldowns. Only
+		// genuine positive signals (Schema.org marker or X-SL-RL) trigger RL.
+		// gorilla returns *net/http.Response directly — no type cast needed
+		// (unlike transport.go which works with fhttp fork).
+		if resp != nil {
+			var bodyHead []byte
+			if resp.Body != nil {
+				bodyHead, _ = io.ReadAll(io.LimitReader(resp.Body, 4096))
+				resp.Body.Close()
+			}
+			detCtx := &DetectionContext{Response: resp, BodyHead: bodyHead, Path: "ws_upgrade"}
+			if sig := t.rlDetector.DetectCarriersOnly(detCtx); sig != nil {
+				// Counter increment lives in reconnectLoop (single decision
+				// point) so upgrade-path + handshake-POST-path don't double-
+				// count one event. No best-effort FIN here: server explicitly
+				// told us to back off — cleanup happens via idle timeout.
+				// Task D5 (cold-start metrics): tick decoy-received counter
+				// at detection site — symmetric with transport.go SendHandshake.
+				IncHandshakeDecoyReceived()
+				return fmt.Errorf("ws upgrade: %w", &RateLimitError{Signal: sig})
+			}
 		}
-		dialURL = fmt.Sprintf("%s://%s/ws", wsScheme, t.sniHost)
+		// C10 M5 (May audit, 2026-05-01): handshake POST already succeeded
+		// (server has a session + tunnel attached), but the WS upgrade
+		// failed mid-flight — without this signal the orphan session sits
+		// for the full 5 min cleanup-loop window, and under cascade we
+		// accumulate dozens of orphans per client. Fire-and-forget a
+		// session-level FIN so the server can short-circuit cleanup.
+		t.sendBestEffortSessionFIN(token, session)
+		return fmt.Errorf("ws upgrade: %w", err)
 	}
 
-	conn, _, err := dialer.Dial(dialURL, header)
-	if err != nil {
-		return fmt.Errorf("ws upgrade: %w", err)
+	// D3: send the authentication first frame immediately after 101 — target
+	// <100ms. Server Phase C authenticateFirstFrame rejects anything that
+	// doesn't arrive within its 1500ms timeout, so this write must not wait
+	// on the async writer's queue.
+	if err := conn.WriteMessage(websocket.BinaryMessage, firstFramePayload); err != nil {
+		conn.Close()
+		// C10 M5: same orphan-session theme as the Dial-fail branch above —
+		// server-side authenticateFirstFrame won't complete the session, and
+		// we'd otherwise leak it until the 5 min sweeper. Best-effort FIN.
+		t.sendBestEffortSessionFIN(token, session)
+		return fmt.Errorf("ws upgrade: first frame send: %w", err)
 	}
 
 	// Async writer with priority channels: CONNECT/FIN/keepalive use the
@@ -355,6 +552,131 @@ func (t *WebSocketTransport) UpgradeToWS(token []byte) error {
 	return nil
 }
 
+// bestEffortSessionFINHook is a test seam: when non-nil it intercepts the
+// fire-and-forget FIN POST in sendBestEffortSessionFIN. Production paths
+// never assign this (it is checked but not set). Tests use it to observe
+// the upgrade-fail FIN attempt without spinning up an HTTPS server.
+var bestEffortSessionFINHook func(token []byte, session *core.Session, body []byte)
+
+// bestEffortSessionFINTimeout caps the fire-and-forget POST. Two seconds is
+// generous enough to cover one round-trip via CF CDN under healthy
+// conditions, but short enough that a stuck POST does not pin a goroutine
+// past the next reconnect attempt (reconnectLoop's slowest baseline is 5s).
+const bestEffortSessionFINTimeout = 2 * time.Second
+
+// sendBestEffortSessionFIN fires a best-effort POST containing a FIN chunk
+// for streamID=0 (session-level FIN semantic). C10 M5 (May audit,
+// 2026-05-01): when the WS upgrade fails after a successful handshake POST,
+// the server is left with an orphan session + tunnel until the 5 min
+// cleanup loop sweeps it. Under reconnect cascade this accumulates dozens of
+// orphans per client. Telling the server "this session will not attach"
+// lets it cleanup immediately (or, on Group C M2 paths, fall back to a 30s
+// timeout — either way better than 5 min).
+//
+// Contract:
+//   - Fire-and-forget: returns immediately, dispatches in a fresh goroutine.
+//   - Errors swallowed: server may reject (rate-limit, 404, decoy fall-through);
+//     we log debug and move on. Reconnect flow MUST NOT block on this.
+//   - Idempotent: if the encrypt/build path errors out, we silently drop.
+//   - 2s timeout via context.WithTimeout — one round-trip cap.
+//   - Test seam: bestEffortSessionFINHook intercepts the dispatch so unit
+//     tests can observe the attempt without an HTTPS test server.
+func (t *WebSocketTransport) sendBestEffortSessionFIN(token []byte, session *core.Session) {
+	if session == nil || len(token) == 0 {
+		return
+	}
+
+	// Build the FIN chunk synchronously so we capture the seq number BEFORE
+	// returning to the caller — concurrent goroutines on the same session
+	// must not collide on NextSeqNum() ordering.
+	fin := core.NewStreamFinChunk(session.ID, session.NextSeqNum(), 0)
+	encrypted, err := session.EncryptChunk(fin)
+	if err != nil {
+		// Session may have been destroyed concurrently between handshake-OK
+		// and WS-upgrade-fail (Close() zeros SendKey; sendEpochPtr.Load()
+		// returns nil → fallback chunk.Encrypt sees empty key → AES-GCM
+		// init fails). Soft-fail by contract: caller already accepted that
+		// FIN may not arrive (server's 30s newborn-orphan sweeper handles
+		// the fallback). Holistic review I-1 (2026-05-02 final P2 pack).
+		slog.Debug("best-effort session FIN: encrypt failed (likely session destroyed)", "err", err)
+		return
+	}
+	body, err := buildDataEnvelope(token, encrypted)
+	if err != nil {
+		slog.Debug("best-effort session FIN: envelope build failed", "err", err)
+		return
+	}
+
+	// Test seam: intercept dispatch so the unit test can observe the POST
+	// without standing up an HTTPS server keyed to the production uTLS
+	// dialer. Production NEVER sets this — the variable stays nil.
+	if hook := bestEffortSessionFINHook; hook != nil {
+		hook(token, session, body)
+		return
+	}
+
+	go t.dispatchBestEffortSessionFIN(body)
+}
+
+// dispatchBestEffortSessionFIN does the actual POST. Split out so tests
+// that intercept via bestEffortSessionFINHook do not need to spin up a
+// real cold-path client.
+func (t *WebSocketTransport) dispatchBestEffortSessionFIN(body []byte) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Debug("best-effort session FIN: dispatch panic", "panic", r)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), bestEffortSessionFINTimeout)
+	defer cancel()
+
+	fp := t.connManager.ActiveFingerprint()
+	httpClient := t.buildColdPathClient(fp, bestEffortSessionFINTimeout)
+	defer httpClient.CloseIdleConnections()
+
+	url := t.baseURL + t.urlPool.NextUploadPath()
+	req, err := http.NewRequestWithContext(ctx, "POST", url, newBytesReader(body))
+	if err != nil {
+		slog.Debug("best-effort session FIN: build request failed", "err", err)
+		return
+	}
+	req.ContentLength = int64(len(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", fp.UserAgent())
+	req.Header.Set("Accept", "application/json")
+	browser.ApplyChromeCHUAForFingerprint(req.Header, fp)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		slog.Debug("best-effort session FIN: dispatch failed", "err", err)
+		return
+	}
+	defer resp.Body.Close()
+	// Drain (small) response body so the underlying TLS conn can be reused
+	// or cleanly torn down — same etiquette as cover GET.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4*1024))
+	slog.Debug("best-effort session FIN sent", "status", resp.StatusCode)
+}
+
+// buildFirstFramePayload packs the session token followed by an encrypted
+// FlagKeepalive chunk into the body-prefix wire format, which the server's
+// authenticateFirstFrame path uses to validate the WS session post-upgrade.
+// FlagKeepalive is chosen because it's semantically idempotent — the server
+// rejects any other flag (Connect/Data/StreamOpen) on the first frame.
+func (t *WebSocketTransport) buildFirstFramePayload(token []byte, session *core.Session) ([]byte, error) {
+	keepalive := &core.Chunk{
+		SessionID: session.ID,
+		SeqNum:    session.NextSeqNum(),
+		Flags:     core.FlagKeepalive,
+	}
+	encrypted, err := session.EncryptChunk(keepalive)
+	if err != nil {
+		return nil, err
+	}
+	return browser.BuildDataPayload(token, encrypted), nil
+}
+
 // SendChunk sends an encrypted chunk over WebSocket and reads response.
 // Small chunks (< 80 bytes) are padded to a distribution-realistic size to prevent
 // length-based fingerprinting of control messages (FlagConnect, FlagFin).
@@ -376,9 +698,13 @@ func (t *WebSocketTransport) SendChunk(ctx context.Context, data []byte, session
 
 	// Pad small control chunks to defeat length-based DPI fingerprinting.
 	// Chunks under 80 bytes are typically FlagConnect or FlagFin — pad to a
-	// distribution-realistic upload size.
+	// distribution-realistic size.
 	if len(data) < 80 {
-		data = browser.PadToSize(data, t.pd.UploadSize())
+		// A2-HIGH-7: padding distribution decoupled from PayloadDistribution
+		// (independent log-normal in browser.SamplePaddingTarget). Do not re-couple.
+		rng := mrand.New(mrand.NewSource(time.Now().UnixNano()))
+		target := browser.SamplePaddingTarget(rng)
+		data = browser.PadToSize(data, target)
 	}
 
 	// MED-8 fix: serialize writes via writeMu (gorilla requires single writer)
@@ -398,6 +724,22 @@ func (t *WebSocketTransport) SendChunk(ctx context.Context, data []byte, session
 	}
 
 	return respData, nil
+}
+
+// LastWriteUnixNano returns the wall-clock time (UnixNano) of the most recent
+// successful frame write through the async writer, or zero if either no
+// writer is active or no write has succeeded yet. Used by the slot reader's
+// frame-anomaly diagnostic capture to compute `last_write_age_ms` so log
+// reviewers can tell "read errored on an idle conn" from "read errored
+// while writes were active".
+func (t *WebSocketTransport) LastWriteUnixNano() int64 {
+	t.mu.Lock()
+	w := t.asyncWriter
+	t.mu.Unlock()
+	if w == nil {
+		return 0
+	}
+	return w.LastWriteUnixNano()
 }
 
 // ReadMessage reads the next message from the WebSocket (for server-initiated data).
@@ -454,6 +796,20 @@ func (t *WebSocketTransport) WriteControlMessage(data []byte) error {
 // StartReader runs the background WS message reader.
 // Dispatches decrypted chunks to the client's stream router.
 // Returns on WS error (caller should reconnect).
+//
+// C12 F5 (May audit, 2026-05-01): emits structured slog markers at every
+// significant transition — enter, first-frame received, exit-with-reason —
+// so a field log can answer "did the reader ever see traffic?" without
+// invasive instrumentation. Counters live on the slot reader path
+// (ws_pool.go); this function targets the single-WS / non-pooled fallback
+// where ws_pool's diagnostics do not run.
+//
+// TODO(C12 F5 follow-up): under VPS throttle the WS reader can stall on
+// `ReadMessage` even though the conn is half-alive. A poll-based fallback
+// (open a separate GET stream and treat its bytes as a backup data path
+// while keeping the WS open) would let us keep traffic flowing while the
+// WS recovers. Plan §C12 F5 explicitly says trace-only for this milestone;
+// implementing the fallback is deferred to a separate F-row.
 func (t *WebSocketTransport) StartReader(ctx context.Context, cl *Client) (retErr error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -462,11 +818,24 @@ func (t *WebSocketTransport) StartReader(ctx context.Context, cl *Client) (retEr
 	}()
 	msgCount := 0
 	errCount := 0
-	slog.Info("WS StartReader started")
+	startedAt := time.Now()
+	var sessionID uint32
+	if s := cl.Session(); s != nil {
+		sessionID = s.ID
+	}
+	slog.Info("WS StartReader started",
+		"sessionID", sessionID,
+		"transport", "websocket",
+	)
 	for {
 		select {
 		case <-ctx.Done():
-			slog.Info("WS StartReader stopped", "messages", msgCount, "errors", errCount)
+			slog.Info("WS StartReader stopped",
+				"messages", msgCount,
+				"errors", errCount,
+				"reason", "ctx_done",
+				"sessionAgeMs", time.Since(startedAt).Milliseconds(),
+			)
 			return ctx.Err()
 		default:
 		}
@@ -477,14 +846,29 @@ func (t *WebSocketTransport) StartReader(ctx context.Context, cl *Client) (retEr
 		if err != nil {
 			// On timeout, check if context was cancelled — if so, return cleanly
 			if ctx.Err() != nil {
-				slog.Info("WS StartReader context done", "messages", msgCount, "errors", errCount)
+				slog.Info("WS StartReader stopped",
+					"messages", msgCount,
+					"errors", errCount,
+					"reason", "ctx_done_during_read",
+					"sessionAgeMs", time.Since(startedAt).Milliseconds(),
+				)
 				return ctx.Err()
 			}
-			// Check if this is a timeout — retry the read
-			if netErr, ok := err.(interface{ Timeout() bool }); ok && netErr.Timeout() {
-				continue
-			}
-			slog.Warn("WS StartReader fatal error", "err", err, "messages", msgCount)
+			// Phase −1 hotfix mirror (2026-05-14): any read error is terminal.
+			// Previously: on Timeout()==true we called continue, looping back to
+			// ReadMessage. With gorilla/websocket v1.5.3 caching readErr (sticky),
+			// this created a tight loop that triggered a defensive panic at ~1000
+			// iterations. Same root cause as fixed in ws_pool.go (handleSlotDeath
+			// path). Removing the `continue` lets the structured slog.Warn exit
+			// path below handle all errors uniformly. Reader's caller will detect
+			// the exit and trigger reconnect via existing transport-level logic.
+			slog.Warn("WS StartReader stopped",
+				"err", err,
+				"messages", msgCount,
+				"errors", errCount,
+				"reason", "read_error",
+				"sessionAgeMs", time.Since(startedAt).Milliseconds(),
+			)
 			return fmt.Errorf("ws read: %w", err)
 		}
 
@@ -504,6 +888,17 @@ func (t *WebSocketTransport) StartReader(ctx context.Context, cl *Client) (retEr
 
 		if len(chunk.Payload) < 2 {
 			continue
+		}
+
+		// First-frame marker: useful in field logs to confirm the reader
+		// is alive AND seeing real decrypted traffic, not just bytes that
+		// failed decrypt. msgCount transitions 0→1 exactly once per reader
+		// lifetime; later transitions are no-op.
+		if msgCount == 0 {
+			slog.Info("WS StartReader first frame",
+				"sessionID", sessionID,
+				"timeToFirstMs", time.Since(startedAt).Milliseconds(),
+			)
 		}
 
 		msgCount++
@@ -526,8 +921,8 @@ func (t *WebSocketTransport) Close() error {
 	t.mu.Unlock()
 
 	if w != nil {
-		w.Close()      // signal Run() to stop
-		<-w.RunDone()  // wait for Run() to finish draining — prevents concurrent write with conn.Close()
+		w.Close()     // signal Run() to stop
+		<-w.RunDone() // wait for Run() to finish draining — prevents concurrent write with conn.Close()
 	}
 	if conn != nil {
 		conn.Close()
@@ -536,11 +931,16 @@ func (t *WebSocketTransport) Close() error {
 }
 
 // bytesReader wraps []byte as io.Reader
-type bytesReader struct{ data []byte; pos int }
+type bytesReader struct {
+	data []byte
+	pos  int
+}
 
 func newBytesReader(data []byte) *bytesReader { return &bytesReader{data: data} }
 func (r *bytesReader) Read(p []byte) (int, error) {
-	if r.pos >= len(r.data) { return 0, io.EOF }
+	if r.pos >= len(r.data) {
+		return 0, io.EOF
+	}
 	n := copy(p, r.data[r.pos:])
 	r.pos += n
 	return n, nil

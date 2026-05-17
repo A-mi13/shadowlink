@@ -70,7 +70,6 @@ These were found in audits but intentionally deferred:
 
 | Item | Reason | When to Fix |
 |------|--------|-------------|
-| UDP session_id plaintext prefix | Needed for O(1) lookup on UDP; acceptable for TURN relay MVP | Before VK TURN production |
 | ServerHello plaintext JSON | Visible to CDN; mitigated by nginx TLS termination | Before CDN-only deployment |
 | 100% POST traffic (no GET) | Architectural; would need fake page loads | Phase 2+ |
 | Static Bearer token | Never refreshes; would need token rotation protocol | Phase 2+ |
@@ -231,7 +230,6 @@ Two independent hostile auditor agents dispatched: one for goroutine/panic safet
 
 | Item | Reason | When to Fix |
 |------|--------|-------------|
-| UDP session_id plaintext prefix | Needed for O(1) lookup on UDP | Before VK TURN production |
 | ServerHello plaintext JSON | Visible to CDN; mitigated by nginx TLS | Before CDN-only deployment |
 | 100% POST traffic (no GET) | Architectural; needs fake page loads | Phase 2+ |
 | Static Bearer token | Never refreshes; needs rotation protocol | Phase 2+ |
@@ -274,7 +272,6 @@ Two independent re-review agents verified ALL Round 14+15 fixes correct. Found 4
 | ~~WS transport uses Go TLS not tls-client~~ | **FIXED** — uTLS via `NetDialTLSContext` | Done |
 | JA4 normalized fingerprint | DPI not using JA4 yet | Monitor |
 | Post-quantum key exchange (X25519MLKEM768) | uTLS doesn't support it; DPI blocks PQ, not its absence | When uTLS adds support |
-| WB TURN TUN mode: UDP-only apps fail | wbturn SOCKS5 = TCP only, DNS bypasses TUN | Phase 2: add UDP ASSOCIATE to wbturn |
 | 100% POST traffic (no GET) | Architectural; needs fake page loads | Phase 2+ |
 | Static Bearer token | Never refreshes; needs rotation protocol | Phase 2+ |
 

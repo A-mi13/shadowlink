@@ -18,7 +18,7 @@ func TestDecoyHandlerServesStaticFiles(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "style.css"),
 		[]byte("body{color:red}"), 0644))
 
-	handler := NewDecoyHandler(dir)
+	handler := NewDecoyHandler(dir, nil)
 	assert.True(t, handler.HasContent())
 
 	// Test index
@@ -35,7 +35,7 @@ func TestDecoyHandlerServesStaticFiles(t *testing.T) {
 }
 
 func TestDecoyHandlerDefaultPage(t *testing.T) {
-	handler := NewDecoyHandler("") // no dir
+	handler := NewDecoyHandler("", nil) // no dir
 
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
@@ -46,7 +46,7 @@ func TestDecoyHandlerDefaultPage(t *testing.T) {
 }
 
 func TestDecoyHandler404ForMissingFiles(t *testing.T) {
-	handler := NewDecoyHandler("")
+	handler := NewDecoyHandler("", nil)
 
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, httptest.NewRequest("GET", "/nonexistent.js", nil))
@@ -54,7 +54,7 @@ func TestDecoyHandler404ForMissingFiles(t *testing.T) {
 }
 
 func TestDecoyHandlerHasServerHeaders(t *testing.T) {
-	handler := NewDecoyHandler("")
+	handler := NewDecoyHandler("", nil)
 
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
@@ -65,7 +65,7 @@ func TestDecoyHandlerHasServerHeaders(t *testing.T) {
 }
 
 func TestDecoyHandlerNonexistentDir(t *testing.T) {
-	handler := NewDecoyHandler("/path/that/does/not/exist")
+	handler := NewDecoyHandler("/path/that/does/not/exist", nil)
 
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
@@ -76,7 +76,7 @@ func TestDecoyHandlerNonexistentDir(t *testing.T) {
 }
 
 func TestDecoyHandlerGETAndHEAD(t *testing.T) {
-	handler := NewDecoyHandler("")
+	handler := NewDecoyHandler("", nil)
 
 	// GET
 	w := httptest.NewRecorder()
@@ -94,7 +94,7 @@ func TestDecoyHandlerLooksLikeRealNginx(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "index.html"),
 		[]byte("<html><head><title>Blog</title></head><body><h1>My Blog</h1></body></html>"), 0644)
 
-	handler := NewDecoyHandler(dir)
+	handler := NewDecoyHandler(dir, nil)
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/", nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0")
@@ -109,7 +109,7 @@ func TestDecoyHandlerLooksLikeRealNginx(t *testing.T) {
 }
 
 func TestDecoyHandlerMultipleRequests(t *testing.T) {
-	handler := NewDecoyHandler("")
+	handler := NewDecoyHandler("", nil)
 
 	// Simulate TSPU probing multiple endpoints
 	paths := []string{"/", "/index.html", "/robots.txt", "/favicon.ico", "/.well-known/acme-challenge/test"}
@@ -122,7 +122,7 @@ func TestDecoyHandlerMultipleRequests(t *testing.T) {
 }
 
 func TestDecoyHandlerPOSTReturns404(t *testing.T) {
-	handler := NewDecoyHandler("")
+	handler := NewDecoyHandler("", nil)
 
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, httptest.NewRequest("POST", "/api/test", nil))

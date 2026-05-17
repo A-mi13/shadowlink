@@ -1,0 +1,132 @@
+// shadowlink/client/coldpath_pq_test.go
+package client
+
+import (
+	"crypto/tls"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/nixavpn/shadowlink/skins/browser"
+)
+
+// TestColdPath_PQ_OnWire_HandshakeIncrementsSuccess asserts that when
+// SHADOWLINK_TLS_PQ=1 is set, the cold-path uTLS dialer used by
+// buildUTLSHTTPClient (SendHandshake POST, WarmupRequests, cover GET,
+// SplitTransport upload POST) honors the flag and ticks the PQ success
+// counter — matching the WS upgrade path. Without this, flipping the
+// flag default-on re-instates the JA3 mismatch CRIT-1/2/3 of the
+// 2026-04 audit (WS = MLKEM on wire, cold-path = stock HelloChrome).
+func TestColdPath_PQ_OnWire_HandshakeIncrementsSuccess(t *testing.T) {
+	t.Setenv("SHADOWLINK_TLS_PQ", "1")
+
+	// Snapshot counters so this test is hermetic w.r.t. earlier tests.
+	before := Stats.PQHandshakeSuccess.Load()
+	beforeFb := Stats.PQHandshakeFallback.Load()
+	beforeErr := Stats.PQHandshakeError.Load()
+	t.Cleanup(func() {
+		Stats.PQHandshakeSuccess.Store(before)
+		Stats.PQHandshakeFallback.Store(beforeFb)
+		Stats.PQHandshakeError.Store(beforeErr)
+	})
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(srv.Close)
+
+	// httptest's TLS server uses an in-memory self-signed cert — skipVerify=true
+	// + ServerName=example.test (any non-empty SNI works; cert is wildcarded).
+	fp := browser.NewFingerprint(browser.ProfileChrome)
+	addr := srv.Listener.Addr().String()
+	client := buildUTLSHTTPClient(addr, "example.test", fp, true, 5*time.Second, "http/1.1")
+	defer client.CloseIdleConnections()
+
+	// Override scheme: httptest gives us https://127.0.0.1:PORT, but
+	// buildUTLSHTTPClient builds a Transport that dials addr directly. We
+	// just need a URL string with the matching host:port.
+	resp, err := client.Get("https://" + addr + "/")
+	if err != nil {
+		// Don't Fatal: handshake error is one of the two valid outcomes
+		// (Success OR Error counter ticks). We still want to assert
+		// counters fired below.
+		t.Logf("client.Get returned error (expected if stdlib TLS server rejects MLKEM ClientHello): %v", err)
+	} else {
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+	}
+
+	// Robust assertion: the primary regression risk we are guarding against
+	// is the cold-path silently ignoring SHADOWLINK_TLS_PQ. As long as
+	// EITHER Success OR Error ticked, the new branch is wired. Whether the
+	// stdlib httptest TLS server accepts a MLKEM ClientHello and completes
+	// (Success) or rejects it (Error) is Go/utls version-dependent and not
+	// what this test verifies. Fallback MUST stay at 0 — the helper
+	// pqClientHelloSpec() does not error today; if it ever does, the
+	// fallback delta exposes that.
+	deltaSucc := Stats.PQHandshakeSuccess.Load() - before
+	deltaErr := Stats.PQHandshakeError.Load() - beforeErr
+	deltaFb := Stats.PQHandshakeFallback.Load() - beforeFb
+	if deltaSucc+deltaErr < 1 {
+		t.Errorf("expected at least one PQ counter tick (success OR error), got success=%d error=%d", deltaSucc, deltaErr)
+	}
+	if deltaFb != 0 {
+		t.Errorf("PQHandshakeFallback unexpectedly ticked: delta=%d (pqClientHelloSpec should not error today)", deltaFb)
+	}
+	_ = tls.VersionTLS13 // import marker; cert verification is skipped above.
+	// NOTE (deviation from plan literal): the plan's final assertion
+	// `resp.TLS == nil despite Success counter` is unreachable for uTLS
+	// cold-path clients. net/http.Transport only populates Response.TLS
+	// when the dial returns a *crypto/tls.Conn — buildUTLSDialTLS returns
+	// a *utls.UConn (the entire reason this helper exists), so resp.TLS
+	// is always nil even on a successful handshake. The Success counter
+	// delta plus deltaFb==0 already proves the wiring; the resp.TLS check
+	// is an environmental false-negative.
+}
+
+// TestColdPath_PQ_OptOut_NoCounterTick asserts the cold-path counters stay
+// flat when the operator opts out via SHADOWLINK_TLS_PQ=0. Default is now
+// ON since the 2026-04-28 Phase 2 closure flip, so the only way to keep
+// PQ counters quiet is an explicit opt-out value.
+func TestColdPath_PQ_OptOut_NoCounterTick(t *testing.T) {
+	// Explicit opt-out: =0 routes through the legacy stock-helloID path.
+	t.Setenv("SHADOWLINK_TLS_PQ", "0")
+
+	before := Stats.PQHandshakeSuccess.Load()
+	beforeFb := Stats.PQHandshakeFallback.Load()
+	beforeErr := Stats.PQHandshakeError.Load()
+	t.Cleanup(func() {
+		Stats.PQHandshakeSuccess.Store(before)
+		Stats.PQHandshakeFallback.Store(beforeFb)
+		Stats.PQHandshakeError.Store(beforeErr)
+	})
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	fp := browser.NewFingerprint(browser.ProfileChrome)
+	addr := srv.Listener.Addr().String()
+	client := buildUTLSHTTPClient(addr, "example.test", fp, true, 5*time.Second, "http/1.1")
+	defer client.CloseIdleConnections()
+
+	resp, err := client.Get("https://" + addr + "/")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	resp.Body.Close()
+
+	if d := Stats.PQHandshakeSuccess.Load() - before; d != 0 {
+		t.Errorf("PQHandshakeSuccess delta = %d, want 0 (env unset)", d)
+	}
+	if d := Stats.PQHandshakeFallback.Load() - beforeFb; d != 0 {
+		t.Errorf("PQHandshakeFallback delta = %d, want 0 (env unset)", d)
+	}
+	if d := Stats.PQHandshakeError.Load() - beforeErr; d != 0 {
+		t.Errorf("PQHandshakeError delta = %d, want 0 (env unset)", d)
+	}
+}

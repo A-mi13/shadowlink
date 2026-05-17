@@ -43,16 +43,16 @@ type PoolConn interface {
 // Each connection transfers <=ChunkSize bytes then closes.
 // Preopen ensures next connections are ready before needed.
 type Pool struct {
-	config  PoolConfig
-	dialer  PoolDialer
+	config PoolConfig
+	dialer PoolDialer
 
-	ready    chan PoolConn       // pre-opened connections ready to use
-	mu       sync.Mutex
-	active   int32              // currently active connections (atomic)
-	total    atomic.Uint64      // total chunks sent (for stats)
-	closed   atomic.Bool
-	stopCh   chan struct{}
-	wg       sync.WaitGroup
+	ready  chan PoolConn // pre-opened connections ready to use
+	mu     sync.Mutex
+	active int32         // currently active connections (atomic)
+	total  atomic.Uint64 // total chunks sent (for stats)
+	closed atomic.Bool
+	stopCh chan struct{}
+	wg     sync.WaitGroup
 }
 
 // NewPool creates a connection pool with the given dialer.
@@ -81,6 +81,11 @@ func NewPool(config PoolConfig, dialer PoolDialer) *Pool {
 // Send sends data through an available connection.
 // Gets a pre-opened connection from the pool (or dials a new one),
 // sends the chunk, then the connection is discarded (short-lived per spec).
+//
+// A1-L4 fix: active-counter decrement is deferred only after successful acquire,
+// guaranteeing the counter is balanced even if SendChunk panics or the runtime
+// terminates the goroutine mid-send. Previous code did `-1` inline after Close,
+// leaking the counter on panic.
 func (p *Pool) Send(ctx context.Context, data []byte) ([]byte, error) {
 	if p.closed.Load() {
 		return nil, errors.New("pool closed")
@@ -90,12 +95,12 @@ func (p *Pool) Send(ctx context.Context, data []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Acquire succeeded — decrement is now guaranteed via defer.
+	defer atomic.AddInt32(&p.active, -1)
+	defer conn.Close()
 
 	// Send chunk — connection is used once then discarded
 	resp, err := conn.SendChunk(ctx, data)
-	conn.Close()
-	atomic.AddInt32(&p.active, -1)
-
 	if err != nil {
 		return nil, err
 	}
@@ -211,9 +216,9 @@ func (p *Pool) Close() error {
 // Stats returns pool statistics.
 func (p *Pool) Stats() PoolStats {
 	return PoolStats{
-		Active:     int(atomic.LoadInt32(&p.active)),
-		Ready:      len(p.ready),
-		TotalSent:  p.total.Load(),
+		Active:    int(atomic.LoadInt32(&p.active)),
+		Ready:     len(p.ready),
+		TotalSent: p.total.Load(),
 	}
 }
 

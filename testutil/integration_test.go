@@ -30,10 +30,16 @@ func setupE2E(t *testing.T) (*server.Server, *client.Client) {
 	require.NoError(t, err)
 	t.Cleanup(func() { srv.Stop() })
 
+	// Phase B: handshake dispatch assumes EncryptedClientIDSize=65 bytes (UUID-sized
+	// clientID), matching production. Short test strings ("e2e-test") produce 57-byte
+	// encClientID and land below the 97-byte payload threshold in handleNewFormatPost,
+	// falling to decoy instead of the handshake branch.
+	clientID := make([]byte, 16)
+	copy(clientID, "e2e-test-uuid-01") // 16 bytes, stable per test for reproducibility
 	cl := client.NewClient(client.ClientConfig{
 		ServerAddr:   srv.Addr(),
 		ServerPubKey: serverKey.Public,
-		ClientID:     []byte("e2e-test"),
+		ClientID:     clientID,
 		UseTLS:       false,
 	})
 	t.Cleanup(func() { cl.Close() })
@@ -126,7 +132,7 @@ func TestE2E_DPI16KBThreshold(t *testing.T) {
 	cl := client.NewClient(client.ClientConfig{
 		ServerAddr:   dpiAddr,
 		ServerPubKey: serverKey.Public,
-		ClientID:     []byte("dpi-test"),
+		ClientID:     []byte("dpi-test-uuid-pd"),
 		UseTLS:       false,
 	})
 	defer cl.Close()
@@ -166,7 +172,7 @@ func TestE2E_DestinationRouting(t *testing.T) {
 	cl := client.NewClient(client.ClientConfig{
 		ServerAddr:   srv.Addr(),
 		ServerPubKey: serverKey.Public,
-		ClientID:     []byte("routing-test"),
+		ClientID:     []byte("routing-test-uud"),
 		UseTLS:       false,
 	})
 	defer cl.Close()
@@ -219,7 +225,7 @@ func TestE2E_DestinationRoutingSSRFBlocked(t *testing.T) {
 	cl := client.NewClient(client.ClientConfig{
 		ServerAddr:   srv.Addr(),
 		ServerPubKey: serverKey.Public,
-		ClientID:     []byte("ssrf-test"),
+		ClientID:     []byte("ssrf-test-uuidp!"),
 		UseTLS:       false,
 	})
 	defer cl.Close()
@@ -250,7 +256,7 @@ func TestE2E_DestinationRoutingBadTarget(t *testing.T) {
 	cl := client.NewClient(client.ClientConfig{
 		ServerAddr:   srv.Addr(),
 		ServerPubKey: serverKey.Public,
-		ClientID:     []byte("bad-target-test"),
+		ClientID:     []byte("bad-target-test!"),
 		UseTLS:       false,
 	})
 	defer cl.Close()

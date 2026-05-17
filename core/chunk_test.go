@@ -392,3 +392,17 @@ func BenchmarkDecryptWith(b *testing.B) {
 		DecryptWith(encrypted, gcm)
 	}
 }
+
+func TestFlagStreamOpenValue(t *testing.T) {
+	if FlagStreamOpen != 0x09 {
+		t.Errorf("FlagStreamOpen = 0x%02x, want 0x09", FlagStreamOpen)
+	}
+	all := []byte{FlagData, FlagAck, FlagPadding, FlagKeepalive, FlagFin, FlagControl, FlagConnect, FlagUDP, FlagStreamOpen}
+	seen := map[byte]bool{}
+	for _, f := range all {
+		if seen[f] {
+			t.Errorf("flag collision at 0x%02x", f)
+		}
+		seen[f] = true
+	}
+}

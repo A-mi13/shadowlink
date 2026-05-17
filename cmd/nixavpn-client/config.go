@@ -17,8 +17,8 @@ import (
 
 // Config is the top-level configuration for the NixaVPN unified client.
 type Config struct {
-	Protocol   string            `yaml:"protocol"`   // auto | shadowlink | vless
-	SOCKS      string            `yaml:"socks"`      // "127.0.0.1:1080"
+	Protocol   string            `yaml:"protocol"` // auto | shadowlink | vless
+	SOCKS      string            `yaml:"socks"`    // "127.0.0.1:1080"
 	SystemVPN  bool              `yaml:"system_vpn"`
 	ShadowLink *ShadowLinkConfig `yaml:"shadowlink,omitempty"`
 	VLESS      *VLESSConfig      `yaml:"vless,omitempty"`
@@ -32,19 +32,19 @@ type Config struct {
 
 // ShadowLinkConfig holds ShadowLink protocol connection settings.
 type ShadowLinkConfig struct {
-	Server    string                `yaml:"server"`
-	PubKey    string                `yaml:"pubkey"`
-	WebSocket bool                  `yaml:"websocket"`
-	TLS       bool                  `yaml:"tls"`
-	Auto      bool                  `yaml:"auto"`
-	CDN       string                `yaml:"cdn,omitempty"`
-	ECH       bool                  `yaml:"ech,omitempty"`
+	Server     string                `yaml:"server"`
+	PubKey     string                `yaml:"pubkey"`
+	WebSocket  bool                  `yaml:"websocket"`
+	TLS        bool                  `yaml:"tls"`
+	Auto       bool                  `yaml:"auto"`
+	CDN        string                `yaml:"cdn,omitempty"`
+	ECH        bool                  `yaml:"ech,omitempty"`
 	Routing    *client.RoutingConfig `yaml:"routing,omitempty"`
-	Origin     string               `yaml:"origin,omitempty"`      // origin IP for direct WS (bypass CF CDN)
-	SNI        string               `yaml:"sni,omitempty"`         // TLS ServerName override for full-direct mode (IP host + domain SNI)
-	CFIP       string               `yaml:"cfip,omitempty"`        // specific Cloudflare edge IP (bypass DNS for WS)
-	WSPool     bool                 `yaml:"ws_pool,omitempty"`     // enable WS pool (default true for CDN+WS)
-	WSPoolSize int                  `yaml:"ws_pool_size,omitempty"` // pool size (default 2)
+	Origin     string                `yaml:"origin,omitempty"`       // origin IP for direct WS (bypass CF CDN)
+	SNI        string                `yaml:"sni,omitempty"`          // TLS ServerName override for full-direct mode (IP host + domain SNI)
+	CFIP       string                `yaml:"cfip,omitempty"`         // specific Cloudflare edge IP (bypass DNS for WS)
+	WSPool     bool                  `yaml:"ws_pool,omitempty"`      // enable WS pool (default true for CDN+WS)
+	WSPoolSize int                   `yaml:"ws_pool_size,omitempty"` // pool size (default 6)
 	// BackupServers are fallback "host:port" endpoints tried in order when
 	// the primary Server handshake fails (ТСПУ blocks the CF SNI, DNS
 	// poisoning, etc.). Must share the same X25519 pubkey.
@@ -53,14 +53,16 @@ type ShadowLinkConfig struct {
 
 // VLESSConfig holds VLESS+Reality connection settings.
 type VLESSConfig struct {
-	Address     string `yaml:"address"`
-	Port        int    `yaml:"port"`
-	UUID        string `yaml:"uuid"`
-	PublicKey   string `yaml:"public_key"`
-	ShortID     string `yaml:"short_id"`
-	SNI         string `yaml:"sni"`
-	Fingerprint string `yaml:"fingerprint"`
-	Flow        string `yaml:"flow"`
+	Address       string `yaml:"address"`
+	Port          int    `yaml:"port"`
+	UUID          string `yaml:"uuid"`
+	PublicKey     string `yaml:"public_key"`
+	ShortID       string `yaml:"short_id"`
+	SNI           string `yaml:"sni"`
+	Fingerprint   string `yaml:"fingerprint"`
+	Flow          string `yaml:"flow"`
+	Encryption    string `yaml:"encryption,omitempty"`     // VLESS encryption (mlkem768x25519plus...); пусто = "none"
+	Mldsa65Verify string `yaml:"mldsa65_verify,omitempty"` // ML-DSA-65 client verify (base64url); пусто = не передаётся
 }
 
 // APIConfig holds NixaVPN API connection settings for remote config fetch.

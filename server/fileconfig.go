@@ -6,6 +6,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -13,21 +14,64 @@ import (
 // FileConfig holds all server configuration fields from a YAML file.
 // Pointer fields distinguish "not set" from zero value, allowing CLI flags to override.
 type FileConfig struct {
-	Listen       string         `yaml:"listen"`
-	Cert         string         `yaml:"cert"`
-	Key          string         `yaml:"key"`
-	ServerKey    string         `yaml:"server_key"`
-	Decoy        string         `yaml:"decoy"`
-	MaxClients   *int           `yaml:"max_clients"`
-	MaxConns     *int           `yaml:"max_conns"`
-	ChunkSize    *int           `yaml:"chunk_size"`
-	BehindProxy  *bool          `yaml:"behind_proxy"`
-	EnableUDP    *bool          `yaml:"enable_udp"`
-	UDPListen    string         `yaml:"udp_listen"`
-	Management   *MgmtConfig    `yaml:"management"`
-	Mimicry      *MimicryConfig `yaml:"mimicry"`
-	BlockDomains      []string  `yaml:"block_domains"`
-	AuthorizedClients []string  `yaml:"authorized_clients"`
+	Listen            string               `yaml:"listen"`
+	Cert              string               `yaml:"cert"`
+	Key               string               `yaml:"key"`
+	ServerKey         string               `yaml:"server_key"`
+	Decoy             string               `yaml:"decoy"`
+	DomainDecoyMap    map[string]string    `yaml:"domain_decoy_map,omitempty"`
+	MaxClients        *int                 `yaml:"max_clients"`
+	MaxConns          *int                 `yaml:"max_conns"`
+	ChunkSize         *int                 `yaml:"chunk_size"`
+	BehindProxy       *bool                `yaml:"behind_proxy"`
+	Management        *MgmtConfig          `yaml:"management"`
+	Mimicry           *MimicryConfig       `yaml:"mimicry"`
+	LiveBlog          *FileLiveBlogConfig  `yaml:"live_blog"`
+	BlockDomains      []string             `yaml:"block_domains"`
+	AuthorizedClients []string             `yaml:"authorized_clients"`
+	RateLimit         *FileRateLimitConfig `yaml:"rate_limit"`
+}
+
+// FileRateLimitConfig is the YAML representation of RateLimitConfig.
+// All fields are pointers so "absent" is distinguishable from "zero" — only
+// explicitly-set values override the defaults applied at NewHandler.
+// Plan §C6 (May audit, 2026-05-02).
+type FileRateLimitConfig struct {
+	WSUpgrade             *FileRateLimitBucketSpec `yaml:"ws_upgrade"`
+	Handshake             *FileRateLimitBucketSpec `yaml:"handshake"`
+	ClientIDLruSize       *int                     `yaml:"client_id_lru_size"`
+	ClientIDTTLMin        *int                     `yaml:"client_id_ttl_min"`
+	ClientIDSoftLimit     *int                     `yaml:"client_id_soft_limit"`
+	ClientIDSoftWindowSec *int                     `yaml:"client_id_soft_window_sec"`
+}
+
+// FileRateLimitBucketSpec is the YAML representation of RateLimitBucketSpec.
+type FileRateLimitBucketSpec struct {
+	Burst        *int `yaml:"burst"`
+	RefillPerMin *int `yaml:"refill_per_min"`
+}
+
+// FileLiveBlogConfig holds live-blog decoy settings from YAML.
+// Duration fields are strings because YAML time.Duration parsing is awkward —
+// they are converted via time.ParseDuration in ApplyTo.
+// Pointer fields distinguish "not set" from zero value.
+type FileLiveBlogConfig struct {
+	Enabled           *bool    `yaml:"enabled"`
+	Upstream          string   `yaml:"upstream"`
+	CDNUpstream       string   `yaml:"cdn_upstream"`
+	CacheTTL          string   `yaml:"cache_ttl"`
+	CacheMaxEntries   *int     `yaml:"cache_max_entries"`
+	CacheStaleGrace   string   `yaml:"cache_stale_grace"`
+	UpstreamRPS       *float64 `yaml:"upstream_rps"`
+	UpstreamBurst     *int     `yaml:"upstream_burst"`
+	UpstreamTimeout   string   `yaml:"upstream_timeout"`
+	MaxBodyBytes      *int     `yaml:"max_body_bytes"`
+	CDNMaxBodyBytes   *int     `yaml:"cdn_max_body_bytes"`
+	CanaryArticleID   string   `yaml:"canary_article_id"`
+	CanaryInterval    string   `yaml:"canary_interval"`
+	TargetBrand       string   `yaml:"target_brand"`
+	TargetLogoPath    string   `yaml:"target_logo_path"`
+	TargetTitleSuffix string   `yaml:"target_title_suffix"`
 }
 
 // MgmtConfig holds management API configuration from the YAML file.
@@ -118,6 +162,9 @@ func (fc *FileConfig) ApplyTo(cfg *Config) {
 	if fc.Decoy != "" {
 		cfg.DecoyDir = fc.Decoy
 	}
+	if len(fc.DomainDecoyMap) > 0 {
+		cfg.DomainDecoyMap = fc.DomainDecoyMap
+	}
 	if fc.MaxClients != nil {
 		cfg.MaxClients = *fc.MaxClients
 	}
@@ -129,12 +176,6 @@ func (fc *FileConfig) ApplyTo(cfg *Config) {
 	}
 	if fc.BehindProxy != nil {
 		cfg.BehindProxy = *fc.BehindProxy
-	}
-	if fc.EnableUDP != nil {
-		cfg.EnableUDP = *fc.EnableUDP
-	}
-	if fc.UDPListen != "" {
-		cfg.UDPListenAddr = fc.UDPListen
 	}
 	if fc.Management != nil {
 		if fc.Management.Port != nil {
@@ -159,6 +200,96 @@ func (fc *FileConfig) ApplyTo(cfg *Config) {
 	if fc.Mimicry != nil {
 		if fc.Mimicry.Inflation != nil {
 			cfg.UseInflatedResponses = *fc.Mimicry.Inflation
+		}
+	}
+	if fc.LiveBlog != nil {
+		lb := &cfg.LiveBlog
+		if fc.LiveBlog.Enabled != nil {
+			lb.Enabled = *fc.LiveBlog.Enabled
+		}
+		if fc.LiveBlog.Upstream != "" {
+			lb.Upstream = fc.LiveBlog.Upstream
+		}
+		if fc.LiveBlog.CDNUpstream != "" {
+			lb.CDNUpstream = fc.LiveBlog.CDNUpstream
+		}
+		if fc.LiveBlog.CacheTTL != "" {
+			if d, err := time.ParseDuration(fc.LiveBlog.CacheTTL); err == nil {
+				lb.CacheTTL = d
+			}
+		}
+		if fc.LiveBlog.CacheMaxEntries != nil {
+			lb.CacheMaxEntries = *fc.LiveBlog.CacheMaxEntries
+		}
+		if fc.LiveBlog.CacheStaleGrace != "" {
+			if d, err := time.ParseDuration(fc.LiveBlog.CacheStaleGrace); err == nil {
+				lb.CacheStaleGrace = d
+			}
+		}
+		if fc.LiveBlog.UpstreamRPS != nil {
+			lb.UpstreamRPS = *fc.LiveBlog.UpstreamRPS
+		}
+		if fc.LiveBlog.UpstreamBurst != nil {
+			lb.UpstreamBurst = *fc.LiveBlog.UpstreamBurst
+		}
+		if fc.LiveBlog.UpstreamTimeout != "" {
+			if d, err := time.ParseDuration(fc.LiveBlog.UpstreamTimeout); err == nil {
+				lb.UpstreamTimeout = d
+			}
+		}
+		if fc.LiveBlog.MaxBodyBytes != nil {
+			lb.MaxBodyBytes = *fc.LiveBlog.MaxBodyBytes
+		}
+		if fc.LiveBlog.CDNMaxBodyBytes != nil {
+			lb.CDNMaxBodyBytes = *fc.LiveBlog.CDNMaxBodyBytes
+		}
+		if fc.LiveBlog.CanaryArticleID != "" {
+			lb.CanaryArticleID = fc.LiveBlog.CanaryArticleID
+		}
+		if fc.LiveBlog.CanaryInterval != "" {
+			if d, err := time.ParseDuration(fc.LiveBlog.CanaryInterval); err == nil {
+				lb.CanaryInterval = d
+			}
+		}
+		if fc.LiveBlog.TargetBrand != "" {
+			lb.TargetBrand = fc.LiveBlog.TargetBrand
+		}
+		if fc.LiveBlog.TargetLogoPath != "" {
+			lb.TargetLogoPath = fc.LiveBlog.TargetLogoPath
+		}
+		if fc.LiveBlog.TargetTitleSuffix != "" {
+			lb.TargetTitleSuffix = fc.LiveBlog.TargetTitleSuffix
+		}
+	}
+	if fc.RateLimit != nil {
+		rl := &cfg.RateLimit
+		if fc.RateLimit.WSUpgrade != nil {
+			if fc.RateLimit.WSUpgrade.Burst != nil {
+				rl.WSUpgrade.Burst = *fc.RateLimit.WSUpgrade.Burst
+			}
+			if fc.RateLimit.WSUpgrade.RefillPerMin != nil {
+				rl.WSUpgrade.RefillPerMin = *fc.RateLimit.WSUpgrade.RefillPerMin
+			}
+		}
+		if fc.RateLimit.Handshake != nil {
+			if fc.RateLimit.Handshake.Burst != nil {
+				rl.Handshake.Burst = *fc.RateLimit.Handshake.Burst
+			}
+			if fc.RateLimit.Handshake.RefillPerMin != nil {
+				rl.Handshake.RefillPerMin = *fc.RateLimit.Handshake.RefillPerMin
+			}
+		}
+		if fc.RateLimit.ClientIDLruSize != nil {
+			rl.ClientIDLruSize = *fc.RateLimit.ClientIDLruSize
+		}
+		if fc.RateLimit.ClientIDTTLMin != nil {
+			rl.ClientIDTTLMin = *fc.RateLimit.ClientIDTTLMin
+		}
+		if fc.RateLimit.ClientIDSoftLimit != nil {
+			rl.ClientIDSoftLimit = *fc.RateLimit.ClientIDSoftLimit
+		}
+		if fc.RateLimit.ClientIDSoftWindowSec != nil {
+			rl.ClientIDSoftWindowSec = *fc.RateLimit.ClientIDSoftWindowSec
 		}
 	}
 }

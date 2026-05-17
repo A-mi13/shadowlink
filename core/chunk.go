@@ -11,20 +11,21 @@ import (
 
 // Chunk flags per spec section 3.
 const (
-	FlagData      byte = 0x01
-	FlagAck       byte = 0x02
-	FlagPadding   byte = 0x03
-	FlagKeepalive byte = 0x04
-	FlagFin       byte = 0x05
-	FlagControl   byte = 0x06
-	FlagConnect   byte = 0x07 // payload = target address "host:port"
-	FlagUDP       byte = 0x08 // payload = [StreamID(2)] + [UDP data]
+	FlagData       byte = 0x01
+	FlagAck        byte = 0x02
+	FlagPadding    byte = 0x03
+	FlagKeepalive  byte = 0x04
+	FlagFin        byte = 0x05
+	FlagControl    byte = 0x06
+	FlagConnect    byte = 0x07 // payload = target address "host:port"
+	FlagUDP        byte = 0x08 // payload = [StreamID(2)] + [UDP data]
+	FlagStreamOpen byte = 0x09 // client requests a streaming POST response (server→client download channel)
 )
 
 const (
-	NonceSize  = 12         // AES-GCM nonce
-	HeaderSize = 4 + 4 + 1  // sess_id(4) + seq_num(4) + flags(1)
-	TagSize    = 16         // AES-GCM authentication tag
+	NonceSize  = 12        // AES-GCM nonce
+	HeaderSize = 4 + 4 + 1 // sess_id(4) + seq_num(4) + flags(1)
+	TagSize    = 16        // AES-GCM authentication tag
 	MinChunk   = NonceSize + HeaderSize + TagSize
 )
 
@@ -188,8 +189,8 @@ func NewDataChunk(sessID, seq uint32, payload []byte) *Chunk {
 // cap(chunk.Payload) is a pool tier size, which PutBuffer requires.
 func NewStreamDataChunk(sessID, seq uint32, streamID uint16, payload []byte) *Chunk {
 	pSize := 2 + len(payload)
-	pBuf := GetBuffer(pSize)      // cap == tier size (512/4096/16384/65536)
-	p := pBuf[:pSize]             // correct length; cap still == tier size
+	pBuf := GetBuffer(pSize) // cap == tier size (512/4096/16384/65536)
+	p := pBuf[:pSize]        // correct length; cap still == tier size
 	binary.BigEndian.PutUint16(p[0:2], streamID)
 	copy(p[2:], payload)
 	return &Chunk{SessionID: sessID, SeqNum: seq, Flags: FlagData, Payload: p}

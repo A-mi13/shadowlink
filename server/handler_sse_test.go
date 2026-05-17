@@ -2,8 +2,8 @@ package server
 
 import (
 	"encoding/base64"
+	"encoding/binary"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
@@ -30,41 +30,38 @@ func testSessionPair(t *testing.T) (sender *core.Session, receiver *core.Session
 	return sender, receiver
 }
 
-func TestWriteFrameSSE(t *testing.T) {
+// TestWriteFrameBinaryRoundtrip verifies the length-prefixed binary frame
+// format used by the SplitHTTP download stream:
+//
+//	[4-byte big-endian length][encrypted chunk bytes]
+//
+// The reader in client/split_transport.go parses exactly this shape. The
+// test used to expect an SSE framing (data: <base64>\n\n), but the transport
+// moved to the binary XHTTP pattern so CF CDN passes frames through without
+// applying SSE line-based buffering.
+func TestWriteFrameBinaryRoundtrip(t *testing.T) {
 	sender, receiver := testSessionPair(t)
-
 	rec := httptest.NewRecorder()
+	frameBuf := make([]byte, 4+32*1024)
 
 	payload := []byte("hello world test data")
-	b64Buf := make([]byte, base64.RawStdEncoding.EncodedLen(32*1024))
-
-	err := writeFrameSSE(rec, rec, sender, core.FlagData, payload, b64Buf)
-	if err != nil {
-		t.Fatalf("writeFrameSSE failed: %v", err)
+	if err := writeFrame(rec, rec, sender, core.FlagData, payload, frameBuf); err != nil {
+		t.Fatalf("writeFrame failed: %v", err)
 	}
 
-	body := rec.Body.String()
-
-	if !strings.HasPrefix(body, "data: ") {
-		t.Errorf("SSE frame must start with 'data: ', got: %q", body[:min(len(body), 20)])
+	body := rec.Body.Bytes()
+	if len(body) < 4 {
+		t.Fatalf("body too short: %d bytes", len(body))
 	}
-	if !strings.HasSuffix(body, "\n\n") {
-		t.Errorf("SSE frame must end with '\\n\\n', got suffix: %q", body[max(0, len(body)-10):])
-	}
-
-	b64str := strings.TrimPrefix(body, "data: ")
-	b64str = strings.TrimSuffix(b64str, "\n\n")
-
-	encrypted, err := base64.RawStdEncoding.DecodeString(b64str)
-	if err != nil {
-		t.Fatalf("base64 decode failed: %v", err)
+	frameLen := binary.BigEndian.Uint32(body[:4])
+	if int(frameLen) != len(body)-4 {
+		t.Fatalf("length prefix %d does not match body payload %d", frameLen, len(body)-4)
 	}
 
-	chunk, err := receiver.DecryptChunkSafe(encrypted)
+	chunk, err := receiver.DecryptChunkSafe(body[4:])
 	if err != nil {
 		t.Fatalf("decrypt failed: %v", err)
 	}
-
 	if chunk.Flags != core.FlagData {
 		t.Errorf("expected FlagData, got %d", chunk.Flags)
 	}
@@ -73,24 +70,43 @@ func TestWriteFrameSSE(t *testing.T) {
 	}
 }
 
-func TestWriteFrameSSENoNewlines(t *testing.T) {
-	sender, _ := testSessionPair(t)
+// TestWriteFrameBinaryLargePayload verifies frames with a full-chunk payload
+// still fit in a single write with a length prefix, and that the prefix
+// precisely describes the encrypted body so the reader never over- or
+// under-reads.
+func TestWriteFrameBinaryLargePayload(t *testing.T) {
+	sender, receiver := testSessionPair(t)
 	rec := httptest.NewRecorder()
-	b64Buf := make([]byte, base64.RawStdEncoding.EncodedLen(32*1024))
+	frameBuf := make([]byte, 4+32*1024)
 
 	payload := make([]byte, 12288)
 	for i := range payload {
 		payload[i] = byte(i % 256)
 	}
 
-	err := writeFrameSSE(rec, rec, sender, core.FlagData, payload, b64Buf)
-	if err != nil {
+	if err := writeFrame(rec, rec, sender, core.FlagData, payload, frameBuf); err != nil {
 		t.Fatal(err)
 	}
 
-	body := rec.Body.String()
-	lines := strings.Split(body, "\n")
-	if len(lines) != 3 {
-		t.Errorf("expected 3 lines (data + 2 empty), got %d: %v", len(lines), lines)
+	body := rec.Body.Bytes()
+	if len(body) < 4 {
+		t.Fatalf("body too short: %d", len(body))
+	}
+	frameLen := int(binary.BigEndian.Uint32(body[:4]))
+	if frameLen != len(body)-4 {
+		t.Fatalf("length prefix %d vs body payload %d", frameLen, len(body)-4)
+	}
+	// Encrypted chunk carries AES-GCM nonce (12) + ciphertext (plaintext + 9 header) + tag (16).
+	// No SSE wrapper, no base64 — the reader consumes raw bytes.
+	chunk, err := receiver.DecryptChunkSafe(body[4 : 4+frameLen])
+	if err != nil {
+		t.Fatalf("decrypt failed: %v", err)
+	}
+	if len(chunk.Payload) != len(payload) {
+		t.Errorf("payload length mismatch: got %d, want %d", len(chunk.Payload), len(payload))
 	}
 }
+
+// _ keeps the base64 import used by adjacent tests in the package — removing
+// it would break them if this file were compiled in isolation.
+var _ = base64.RawStdEncoding

@@ -28,9 +28,9 @@ func DefaultHeartbeatConfig() HeartbeatConfig {
 // Heartbeat manages keepalive probes with randomized jitter.
 // Fixed intervals are a behavioral fingerprint — jitter is mandatory.
 type Heartbeat struct {
-	config    HeartbeatConfig
-	missed    int
-	mu        sync.Mutex
+	config HeartbeatConfig
+	missed int
+	mu     sync.Mutex
 }
 
 // NewHeartbeat creates a heartbeat manager.

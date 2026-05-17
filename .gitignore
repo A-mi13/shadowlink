@@ -7,7 +7,6 @@ shadowlink-server
 
 # Third-party binaries
 tun2socks*
-wbturn.exe
 
 # Config with secrets (pubkey, passwords)
 config.yaml

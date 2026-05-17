@@ -325,27 +325,30 @@ func testCFEdge(ip, domain string, serverPub []byte, clientID string, duration t
 		}
 
 		// Read response (server echoes keepalive).
+		// Any error (including timeout) terminates this edge test — after a
+		// failed Read gorilla/websocket marks the conn as dead and any
+		// subsequent ReadMessage panics with "repeated read on failed
+		// websocket connection". So we don't retry.
 		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 		_, _, err = conn.ReadMessage()
 		if err != nil {
-			if ctx.Err() != nil {
-				r.Messages = msgCount
-				r.Duration = time.Since(wsStart)
-				return r
-			}
-			// Timeout is OK — maybe server doesn't respond to keepalive.
-			if netErr, ok := err.(interface{ Timeout() bool }); ok && netErr.Timeout() {
-				msgCount++
-				continue
-			}
 			r.Messages = msgCount
 			r.Duration = time.Since(wsStart)
 			return r
 		}
 
 		msgCount++
-		// ~1 msg/sec — gentle pace.
-		time.Sleep(1 * time.Second)
+		// ~1 msg/sec — gentle pace. Use ctx-aware sleep so an external
+		// cancel terminates within the loop's 1 s pacing instead of
+		// blocking on the unconditional Sleep (T4 P3 cleanup,
+		// 2026-05-03 final audit).
+		select {
+		case <-ctx.Done():
+			r.Messages = msgCount
+			r.Duration = time.Since(wsStart)
+			return r
+		case <-time.After(1 * time.Second):
+		}
 	}
 }
 

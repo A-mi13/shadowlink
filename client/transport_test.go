@@ -35,7 +35,7 @@ func TestDirectTransportHandshake(t *testing.T) {
 	transport := NewDirectTransport(srv.Addr(), false, false)
 	defer transport.Close()
 
-	clientHello, clientState, err := core.NewClientHello([]byte("transport-test"), serverKey.Public)
+	clientHello, clientState, err := core.NewClientHello([]byte("transport-test!!"), serverKey.Public)
 	require.NoError(t, err)
 
 	respBody, err := transport.SendHandshake(context.Background(), clientHello)
@@ -46,17 +46,18 @@ func TestDirectTransportHandshake(t *testing.T) {
 	require.NoError(t, err)
 
 	var shData struct {
-		EphPub    []byte `json:"eph"`
-		Token     []byte `json:"tok"`
-		MaxConns  uint8  `json:"mc"`
-		ChunkSize uint16 `json:"cs"`
+		EphPub       []byte `json:"eph"`
+		Token        []byte `json:"tok"`
+		MaxConns     uint8  `json:"mc"`
+		ChunkSize    uint16 `json:"cs"`
+		ProtoVersion *uint8 `json:"_v"`
 	}
 	require.NoError(t, json.Unmarshal(respData, &shData))
 
 	serverHello := &core.ServerHello{
 		EphemeralPub:          shData.EphPub,
 		EncryptedSessionToken: shData.Token,
-		
+		ProtoVersion:          shData.ProtoVersion,
 		MaxConnsPerClient:     shData.MaxConns,
 		ChunkSize:             shData.ChunkSize,
 	}
@@ -73,26 +74,35 @@ func TestDirectTransportSendChunk(t *testing.T) {
 	transport := NewDirectTransport(srv.Addr(), false, false)
 	defer transport.Close()
 
-	// Handshake first
-	clientHello, clientState, _ := core.NewClientHello([]byte("chunk-test"), serverKey.Public)
+	// B2 migration: body-prefix path expects UUID-sized clientID (16 B) on
+	// the new format. SendChunk now packs token+hint in the body, which
+	// means the server's findSessionByHint needs a v1-shaped token — which
+	// only comes from the v1 handshake.
+	clientID := []byte("chunk-test-uuid!")
+	require.Len(t, clientID, 16)
+	clientHello, clientState, _ := core.NewClientHello(clientID, serverKey.Public)
 	respBody, err := transport.SendHandshake(context.Background(), clientHello)
 	require.NoError(t, err)
 
 	respData, _, _ := browser.ParseDownloadResponse(respBody)
 	var shData struct {
-		EphPub    []byte `json:"eph"`
-		Token     []byte `json:"tok"`
-		MaxConns  uint8  `json:"mc"`
-		ChunkSize uint16 `json:"cs"`
+		EphPub       []byte `json:"eph"`
+		Token        []byte `json:"tok"`
+		MaxConns     uint8  `json:"mc"`
+		ChunkSize    uint16 `json:"cs"`
+		ProtoVersion *uint8 `json:"_v,omitempty"`
 	}
 	json.Unmarshal(respData, &shData)
 
 	serverHello := &core.ServerHello{
 		EphemeralPub:          shData.EphPub,
 		EncryptedSessionToken: shData.Token,
-		
+		ProtoVersion:          shData.ProtoVersion,
 	}
 	clientSession, _ := core.CompleteHandshake(clientState, serverHello)
+
+	// v1 needs the hint-prefixed token for server O(1) findSessionByHint.
+	tokenWithHint := browser.EncodeTokenWithHint(clientSession.ID, shData.Token)
 
 	// Put data in server's outgoing tunnel
 	tunnel, _ := srv.Handler().GetTunnel(clientSession.ID)
@@ -102,7 +112,7 @@ func TestDirectTransportSendChunk(t *testing.T) {
 	chunk := core.NewDataChunk(clientSession.ID, clientSession.NextSeqNum(), []byte("client-data"))
 	encChunk, _ := chunk.Encrypt(clientSession.SendKey)
 
-	encResp, err := transport.SendChunk(context.Background(), encChunk, shData.Token, chunk.SeqNum)
+	encResp, err := transport.SendChunk(context.Background(), encChunk, tokenWithHint, chunk.SeqNum)
 	require.NoError(t, err)
 
 	// Decrypt response
@@ -145,26 +155,31 @@ func TestDirectTransportWrongServer(t *testing.T) {
 	assert.Error(t, err, "connecting to closed port should fail")
 }
 
-// Helper to test that handshake result is valid
+// Helper to test that handshake result is valid. After B2 migration the
+// server advertises `_v=1` and returns raw `tok` — the caller is expected to
+// thread `_v` through CompleteHandshake and wrap the token with
+// EncodeTokenWithHint before using it on the body-prefix data path.
 func completeHandshake(t *testing.T, respBody []byte, clientState *core.HandshakeClientState) (*core.Session, []byte) {
 	t.Helper()
 	respData, _, err := browser.ParseDownloadResponse(respBody)
 	require.NoError(t, err)
 
 	var shData struct {
-		EphPub    []byte `json:"eph"`
-		Token     []byte `json:"tok"`
+		EphPub       []byte `json:"eph"`
+		Token        []byte `json:"tok"`
+		ProtoVersion *uint8 `json:"_v,omitempty"`
 	}
 	require.NoError(t, json.Unmarshal(respData, &shData))
 
 	session, err := core.CompleteHandshake(clientState, &core.ServerHello{
 		EphemeralPub:          shData.EphPub,
 		EncryptedSessionToken: shData.Token,
-		
+		ProtoVersion:          shData.ProtoVersion,
 	})
 	require.NoError(t, err)
 
-	return session, shData.Token
+	tokenWithHint := browser.EncodeTokenWithHint(session.ID, shData.Token)
+	return session, tokenWithHint
 }
 
 func TestDirectTransportMultipleChunks(t *testing.T) {
@@ -172,7 +187,10 @@ func TestDirectTransportMultipleChunks(t *testing.T) {
 	transport := NewDirectTransport(srv.Addr(), false, false)
 	defer transport.Close()
 
-	hello, state, _ := core.NewClientHello([]byte("multi"), serverKey.Public)
+	// B2: UUID-sized clientID for the v1 handshake path.
+	clientID := []byte("multi-chunk-uuid")
+	require.Len(t, clientID, 16)
+	hello, state, _ := core.NewClientHello(clientID, serverKey.Public)
 	respBody, _ := transport.SendHandshake(context.Background(), hello)
 	session, token := completeHandshake(t, respBody, state)
 

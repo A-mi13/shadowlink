@@ -12,6 +12,23 @@ import (
 	"github.com/nixavpn/shadowlink/core"
 )
 
+// udpMinReadySlots is the minimum number of ready WS-pool slots required
+// before HandleUDPAssociateWS will accept a UDP ASSOCIATE request. C12 F6
+// (May audit, 2026-05-01): under degraded pool a UDP relay socket bound
+// against a slot that never recovers can permanently hang the SOCKS5
+// client; fail-fast with a SOCKS5 0x03 (network unreachable) reply lets
+// the client retry or fall back to TCP without waiting on a dead transport.
+//
+// Threshold of 2 ensures we have at least one redundant slot — a single
+// ready slot is fragile because losing it produces exactly the cascade we
+// are guarding against. The handler does NOT block waiting for slots to
+// recover; "fail-fast" is plan-literal.
+//
+// Single-WS transports do not implement client.PoolReadiness and are
+// treated as always-ready (gate skipped) so non-pooled deployments are
+// not penalised.
+const udpMinReadySlots = 2
+
 // HandleUDPAssociateWS handles SOCKS5 UDP ASSOCIATE over WebSocket transport.
 // Opens a local UDP listener, relays datagrams through the encrypted WS tunnel.
 // conn is NOT closed by this function (caller handles it via defer).
@@ -21,6 +38,22 @@ func HandleUDPAssociateWS(ctx context.Context, conn net.Conn, cl *client.Client,
 			slog.Error("panic recovered in HandleUDPAssociateWS", "error", r)
 		}
 	}()
+
+	// C12 F6: pool readiness gate. If the underlying transport is a pool and
+	// it reports fewer than udpMinReadySlots ready slots, refuse the UDP
+	// ASSOCIATE with a 0x03 (network unreachable) reply. Plan-literal
+	// fail-fast — no retry, no wait. Transports that are not pools (single
+	// WS) skip this branch and proceed unchanged.
+	if pr, ok := wst.(client.PoolReadiness); ok {
+		if ready := pr.ReadyCount(); ready < udpMinReadySlots {
+			slog.Warn("SOCKS5 UDP ASSOCIATE rejected — pool starved",
+				"ready", ready,
+				"minRequired", udpMinReadySlots,
+			)
+			conn.Write(ReplyNetUnreachable)
+			return
+		}
+	}
 
 	// Open local UDP listener on loopback
 	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")

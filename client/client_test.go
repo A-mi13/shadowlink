@@ -25,10 +25,13 @@ func setupClientTest(t *testing.T) (*server.Server, *core.KeyPair, *Client) {
 	require.NoError(t, err)
 	t.Cleanup(func() { srv.Stop() })
 
+	// D4: ShadowLink Phase B expects UUID-sized (16 B) clientID on the new
+	// body-prefix handshake path — non-UUID IDs only land on the pre-migration
+	// legacy Bearer path, which the new client no longer uses by default.
 	cl := NewClient(ClientConfig{
 		ServerAddr:   srv.Addr(),
 		ServerPubKey: serverKey.Public,
-		ClientID:     []byte("test-client"),
+		ClientID:     []byte("test-client-uuid"), // 16 bytes
 		UseTLS:       false,
 	})
 	t.Cleanup(func() { cl.Close() })
@@ -149,11 +152,34 @@ func TestClientConnectWrongKey(t *testing.T) {
 	assert.Error(t, err, "should fail with wrong server key")
 }
 
+// TestClientSnapshot_AtomicTokenSessionPair guards the H4 review finding:
+// Snapshot must return a consistent (token, session) pair under a single
+// c.mu acquisition — a caller MUST NOT observe token=set + session=nil or
+// vice versa partway through Close().
+func TestClientSnapshot_AtomicTokenSessionPair(t *testing.T) {
+	_, _, cl := setupClientTest(t)
+
+	// Pre-connect: both must be nil.
+	tok, sess := cl.Snapshot()
+	assert.Nil(t, tok, "pre-connect token must be nil")
+	assert.Nil(t, sess, "pre-connect session must be nil")
+
+	require.NoError(t, cl.Connect(context.Background()))
+
+	// Post-connect: both must be non-nil and consistent.
+	tok, sess = cl.Snapshot()
+	require.NotNil(t, tok, "post-connect token must be non-nil")
+	require.NotNil(t, sess, "post-connect session must be non-nil")
+	assert.Equal(t, cl.SessionID(), sess.ID, "Snapshot session.ID must match Client.SessionID")
+	assert.Equal(t, cl.Token(), tok, "Snapshot token must match Client.Token")
+}
+
 func TestClientWithCustomTransport(t *testing.T) {
 	srv, serverKey := startServer(t)
 
 	transport := NewDirectTransport(srv.Addr(), false, false)
-	cl := NewClientWithTransport(transport, serverKey.Public, []byte("custom"))
+	// D4: Phase B body-prefix path requires a UUID-sized clientID.
+	cl := NewClientWithTransport(transport, serverKey.Public, []byte("custom-uuid-16!!"))
 	defer cl.Close()
 
 	err := cl.Connect(context.Background())

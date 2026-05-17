@@ -3,13 +3,13 @@ package client
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	stdhttp "net/http"
 	"sync"
 	"time"
@@ -61,6 +61,20 @@ type ControlPoolAware interface {
 	WriteControlMessageForStream(streamID uint16, data []byte) error
 }
 
+// PoolReadiness reports the live health of an underlying transport pool. Used
+// by the SOCKS5 UDP ASSOCIATE handler (C12 F6, May audit) to fail-fast when
+// the pool is starved of ready slots — without this gate, a UDP ASSOCIATE
+// can permanently hang on a slot that never recovers.
+//
+// Single-WS transports (DirectTransport, SplitTransport, WebSocketTransport)
+// do not implement this interface — callers must treat absence of the
+// interface as "always ready" so non-pooled deployments are not penalised.
+type PoolReadiness interface {
+	// ReadyCount returns the number of slots currently in slotReady state.
+	// Implementations MUST be safe to call concurrently with reconnects.
+	ReadyCount() int
+}
+
 // StreamWrite sends a data frame via the correct slot if transport is pool-aware, else via WriteMessage.
 func StreamWrite(wst StreamTransport, streamID uint16, data []byte) error {
 	if pa, ok := wst.(PoolAware); ok {
@@ -102,13 +116,20 @@ func StreamSession(wst StreamTransport, cl *Client, streamID uint16) *core.Sessi
 // - tls-client HTTP/2: internal stream retries duplicate seq_nums → server rejects
 // - Standard Go net/http with DisableKeepAlives: fresh TCP per POST, proven stable (download stream uses it)
 type SplitTransport struct {
-	uploadClient   *stdhttp.Client             // standard Go HTTP client for uploads (fresh TCP per POST)
-	streamMgr      *ConnManager                // for download stream (no timeout — persistent connection)
-	downloadClient *stdhttp.Client             // standard Go HTTP client for download stream
-	fpPool         *browser.FingerprintPool    // for User-Agent rotation
+	uploadClient   *stdhttp.Client          // standard Go HTTP client for uploads (fresh TCP per POST)
+	streamMgr      *ConnManager             // for download stream (no timeout — persistent connection)
+	downloadClient *stdhttp.Client          // standard Go HTTP client for download stream
+	fpPool         *browser.FingerprintPool // for User-Agent rotation
 	serverAddr     string
 	token          []byte
 	urlPool        *browser.URLPool
+
+	// uploadSem caps concurrent POSTs to prevent goroutine explosion. Under
+	// active browsing, hundreds of streams close per second — each fires a
+	// FIN POST which (with DisableKeepAlives + slow CF RTT) holds a goroutine
+	// for seconds. Without a cap, they pile up into tens of thousands of
+	// stuck goroutines. 16 concurrent POSTs is plenty for 30-50 Mbps.
+	uploadSem chan struct{}
 
 	mu         sync.Mutex
 	downloadRC io.ReadCloser // download stream response body
@@ -116,6 +137,11 @@ type SplitTransport struct {
 	// onResponse is called with encrypted response data from every upload POST.
 	// This turns every upload into a download poll — no persistent stream dependency.
 	onResponse func(encResp []byte)
+
+	// decoy emits fake GET requests to decoy paths while the session is
+	// active, shifting the POST-only traffic profile toward a realistic
+	// browser mix. See DPI audit vector V5.
+	decoy *DecoyTraffic
 }
 
 // SetOnResponse sets a callback that receives encrypted download data from POST responses.
@@ -126,46 +152,94 @@ func (t *SplitTransport) SetOnResponse(fn func([]byte)) {
 // NewSplitTransport creates a SplitHTTP transport.
 // Upload: standard Go net/http with DisableKeepAlives (fresh TCP per POST).
 // Download: standard Go net/http with persistent chunked GET.
-func NewSplitTransport(serverAddr string, token []byte) *SplitTransport {
+// If cfIP is non-empty, all TCP dials are pinned to cfIP:port (skipping DNS
+// and the round-robin of bad CF edges), while TLS SNI stays the domain in
+// serverAddr. Critical for Russia 2026 where CF DNS returns many blocked IPs.
+//
+// TLS handshake goes through refraction-networking/utls with a browser-
+// identical ClientHello, not the Go stdlib (DPI audit P0.5, 2026-04).
+// The fingerprint is fixed at construction so every POST in this session
+// shares the same JA3 — rotating per request would itself be a signal and
+// would also clash with the locked-per-user consistency posture.
+//
+// Optional lockedFP pins the fingerprint to a specific profile (for per-user
+// JA3 consistency); without it, one is drawn from the pool at construction.
+func NewSplitTransport(serverAddr string, token []byte, cfIP string, lockedFP ...*browser.Fingerprint) *SplitTransport {
 	fpPool := browser.NewFingerprintPool()
 
-	// Upload client: fresh TCP connection per POST request.
+	// Pin one fingerprint for the whole SplitTransport lifetime — real
+	// users do not swap browsers mid-session, and rotating per-POST would
+	// be detectable on its own.
+	var fp *browser.Fingerprint
+	if len(lockedFP) > 0 && lockedFP[0] != nil {
+		fp = lockedFP[0]
+	} else {
+		fp = fpPool.Next()
+	}
+
+	// Custom dialer: apply a hard TCP connect timeout.
+	// Without this, Go's net/http uses no default connect timeout (stuck
+	// TCPs hang forever). cfIP pinning happens inside the uTLS dialer.
+	dialer := &net.Dialer{
+		Timeout:   3 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+
+	// TLS config: ServerName must match the domain (cert matching) even
+	// though TCP goes to cfIP. Extract domain from serverAddr.
+	tlsServerName := serverAddr
+	if h, _, err := net.SplitHostPort(serverAddr); err == nil {
+		tlsServerName = h
+	}
+
+	// uTLS dial replaces stdlib TLSClientConfig: the Transport never sees
+	// a crypto/tls handshake, and the ClientHello carries Chrome/Safari/
+	// Firefox bytes (whichever fp picked) instead of Go's fingerprint.
+	// nextProto pinned to http/1.1 — our Transport disables HTTP/2 anyway,
+	// and the server is plain HTTP/1.1 behind nginx.
+	dialTLS := buildUTLSDialTLS(cfIP, tlsServerName, fp, dialer, false, "http/1.1")
+
+	// Upload client: fresh TCP connection per POST request, pinned to cfIP.
 	// DisableKeepAlives prevents CF from killing idle connections (no keep-alive = no stale connections).
-	// tls-client (bogdanfinn) is NOT used: it buffers responses (HTTP/1.1) and
-	// duplicates requests via internal retries (HTTP/2), both breaking SplitHTTP.
 	ulClient := &stdhttp.Client{
 		Transport: &stdhttp.Transport{
-			TLSClientConfig:    &tls.Config{},
-			DisableCompression: true,
-			DisableKeepAlives:  true, // fresh TCP per request — immune to CF keep-alive kills
-			ForceAttemptHTTP2:  false,
-			TLSNextProto:      make(map[string]func(string, *tls.Conn) stdhttp.RoundTripper),
+			DialTLSContext:      dialTLS,
+			DisableCompression:  true,
+			DisableKeepAlives:   true, // fresh TCP per request — immune to CF keep-alive kills
+			ForceAttemptHTTP2:   false,
+			TLSHandshakeTimeout: 5 * time.Second,
 		},
-		Timeout: 25 * time.Second, // CF CDN round-trip can take 10-15s under load; 10s caused mass timeouts
+		// 8s timeout: TSPU 2026 freezes TCP after ~15-20KB downstream — stuck
+		// POSTs give no signal except slow/no response. 8s is enough for a
+		// healthy round-trip (Russia→Stockholm ~375ms) but kills frozen TCPs
+		// fast so downstream streams don't hang 25s before failing over.
+		Timeout: 8 * time.Second,
 	}
 
 	// Separate ConnManager for download stream — no timeout for persistent chunked GET.
 	streamCM := NewConnManager(ConnManagerConfig{
-		ServerAddr:  serverAddr,
-		UseTLS:      true,
-		NoTimeout:   true,
-		FPPool:      fpPool,
-		MinRotation: 5 * time.Minute,
-		MaxRotation: 10 * time.Minute,
+		ServerAddr:    serverAddr,
+		UseTLS:        true,
+		NoTimeout:     true,
+		FPPool:        fpPool,
+		LockedProfile: fp, // keep download stream on the same uTLS profile as uploads
+		MinRotation:   5 * time.Minute,
+		MaxRotation:   10 * time.Minute,
 	})
 
-	// Download client: persistent chunked GET (same proven approach as before).
+	// Download client: persistent chunked GET. Shares the same uTLS dialer
+	// as uploads so download and upload TLS fingerprints stay identical.
 	dlClient := &stdhttp.Client{
 		Transport: &stdhttp.Transport{
-			TLSClientConfig:    &tls.Config{},
-			DisableCompression: true,
-			ForceAttemptHTTP2:  false,
-			TLSNextProto:      make(map[string]func(string, *tls.Conn) stdhttp.RoundTripper),
+			DialTLSContext:      dialTLS,
+			DisableCompression:  true,
+			ForceAttemptHTTP2:   false,
+			TLSHandshakeTimeout: 5 * time.Second,
 		},
 		Timeout: 0, // no timeout — persistent stream
 	}
 
-	return &SplitTransport{
+	t := &SplitTransport{
 		uploadClient:   ulClient,
 		streamMgr:      streamCM,
 		downloadClient: dlClient,
@@ -173,6 +247,25 @@ func NewSplitTransport(serverAddr string, token []byte) *SplitTransport {
 		serverAddr:     serverAddr,
 		token:          token,
 		urlPool:        browser.NewURLPool(),
+		uploadSem:      make(chan struct{}, 32),
+	}
+
+	// V5: decoy generator is constructed but inert. The caller enables it
+	// via StartDecoyTraffic() after a successful handshake so that a
+	// failed session (handshake error, early abort) does not leak a live
+	// goroutine that keeps hitting CF with fake GETs forever.
+	baseURL := "https://" + serverAddr
+	t.decoy = NewDecoyTraffic(baseURL, ulClient, fpPool)
+
+	return t
+}
+
+// StartDecoyTraffic begins emitting fake GET requests to decoy paths. Call
+// this once after a successful session handshake. Close() stops the generator.
+// Calling more than once is a no-op.
+func (t *SplitTransport) StartDecoyTraffic() {
+	if t.decoy != nil {
+		t.decoy.Start()
 	}
 }
 
@@ -201,8 +294,13 @@ func (t *SplitTransport) Poll(session *core.Session) error {
 }
 
 // buildUploadRequest creates a standard net/http POST request with analytics JSON envelope.
+//
+// D2 migration (2026-04): session token is packed into the body via BuildDataPayload
+// instead of being sent as `Authorization: Bearer`. Wire format matches the new
+// body-prefix dispatch path on the server (Phase B handleNewFormatPost).
 func (t *SplitTransport) buildUploadRequest(data []byte) (*stdhttp.Request, error) {
-	payload := base64.RawURLEncoding.EncodeToString(data)
+	combined := browser.BuildDataPayload(t.token, data)
+	payload := base64.RawURLEncoding.EncodeToString(combined)
 	type evt struct {
 		Type string `json:"type"`
 		TS   int64  `json:"ts"`
@@ -226,7 +324,7 @@ func (t *SplitTransport) buildUploadRequest(data []byte) (*stdhttp.Request, erro
 
 	ua := t.fpPool.Next().UserAgent()
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+base64.RawURLEncoding.EncodeToString(t.token))
+	// D2: Authorization header removed — token travels inside the JSON body.
 	req.Header.Set("X-Request-Id", fmt.Sprintf("%08x", browser.RandomUint32()))
 	req.Header.Set("User-Agent", ua)
 	req.Header.Set("Accept", "application/json")
@@ -234,11 +332,25 @@ func (t *SplitTransport) buildUploadRequest(data []byte) (*stdhttp.Request, erro
 	req.Header.Set("Origin", baseURL)
 	req.Header.Set("Referer", baseURL+"/")
 	req.Header.Set("Cache-Control", "no-cache")
+	// 2026-05-02 wire-trigger followup NEW-2: Chrome-family UAs need the
+	// sec-ch-ua header set to avoid a browser-class contradiction with the
+	// JA4 fingerprint.
+	browser.ApplyChromeCHUAForUA(req.Header, ua)
 	return req, nil
 }
 
 // doUpload sends a single POST via standard Go net/http client.
 func (t *SplitTransport) doUpload(data []byte) error {
+	// Cap concurrent POSTs to prevent goroutine explosion under heavy browsing.
+	// Each stream close fires a FIN POST — with DisableKeepAlives + slow CF RTT
+	// these pile up into tens of thousands of stuck goroutines otherwise.
+	select {
+	case t.uploadSem <- struct{}{}:
+		defer func() { <-t.uploadSem }()
+	case <-time.After(2 * time.Second):
+		return fmt.Errorf("split upload: semaphore timeout (too many concurrent POSTs)")
+	}
+
 	uploadStart := time.Now()
 
 	req, err := t.buildUploadRequest(data)
@@ -292,6 +404,14 @@ func (t *SplitTransport) SendChunkSync(data []byte) ([]byte, error) {
 
 // doUploadSync sends a POST and returns the encrypted response chunk directly.
 func (t *SplitTransport) doUploadSync(data []byte) ([]byte, error) {
+	// Same concurrency cap as doUpload — CONNECTs share the pool of POSTs.
+	select {
+	case t.uploadSem <- struct{}{}:
+		defer func() { <-t.uploadSem }()
+	case <-time.After(2 * time.Second):
+		return nil, fmt.Errorf("split sync upload: semaphore timeout")
+	}
+
 	uploadStart := time.Now()
 
 	req, err := t.buildUploadRequest(data)
@@ -321,25 +441,66 @@ func (t *SplitTransport) doUploadSync(data []byte) ([]byte, error) {
 	return encResp, nil
 }
 
-// OpenDownloadStream opens a persistent GET connection for receiving data.
+// OpenDownloadStream opens a persistent connection for receiving data from the server.
 // Server responds with chunked Transfer-Encoding, pushing encrypted frames.
+//
+// D2 migration (2026-04): previously a bare GET with `Authorization: Bearer`.
+// Now a POST whose JSON body carries [session token][encrypted FlagStreamOpen chunk]
+// via BuildDataPayload, matching the body-prefix dispatch path on the server
+// (handleDownloadStreamV2 in Phase B). The session is required to produce the
+// encrypted FlagStreamOpen chunk — callers must pass the active session.
+//
 // Uses standard Go net/http client — tls-client (bogdanfinn) buffers response
 // bodies internally, breaking chunked streaming through CF CDN.
-func (t *SplitTransport) OpenDownloadStream() (io.ReadCloser, error) {
+func (t *SplitTransport) OpenDownloadStream(session *core.Session) (io.ReadCloser, error) {
+	if session == nil {
+		return nil, fmt.Errorf("split download open: nil session")
+	}
+
+	// Build an encrypted FlagStreamOpen chunk — tells the server this POST is
+	// the streaming download channel, not a regular upload.
+	streamOpenChunk := &core.Chunk{
+		SessionID: session.ID,
+		SeqNum:    session.NextSeqNum(),
+		Flags:     core.FlagStreamOpen,
+	}
+	encrypted, err := session.EncryptChunk(streamOpenChunk)
+	if err != nil {
+		return nil, fmt.Errorf("split download open: encrypt stream-open chunk: %w", err)
+	}
+	combined := browser.BuildDataPayload(t.token, encrypted)
+	payload := base64.RawURLEncoding.EncodeToString(combined)
+
+	type evt struct {
+		Type string `json:"type"`
+		TS   int64  `json:"ts"`
+		Data string `json:"data"`
+	}
+	type envelope struct {
+		Events []evt `json:"events"`
+	}
+	body, _ := json.Marshal(envelope{Events: []evt{{
+		Type: browser.RandomEventType(),
+		TS:   time.Now().UnixMilli(),
+		Data: payload,
+	}}})
+
 	baseURL := fmt.Sprintf("https://%s", t.serverAddr)
 	url := baseURL + t.urlPool.NextDownloadPath()
 
-	req, err := stdhttp.NewRequest("GET", url, nil)
+	req, err := stdhttp.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 
 	ua := t.streamMgr.ActiveFingerprint().UserAgent()
-	req.Header.Set("Authorization", "Bearer "+base64.RawURLEncoding.EncodeToString(t.token))
+	// D2: Authorization header removed — token packed in body.
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", ua)
 	req.Header.Set("Accept", "application/octet-stream")
 	req.Header.Set("Accept-Encoding", "identity")
 	req.Header.Set("Cache-Control", "no-cache")
+	browser.ApplyChromeCHUAForUA(req.Header, ua)
 
 	resp, err := t.downloadClient.Do(req)
 	if err != nil {
@@ -359,8 +520,22 @@ func (t *SplitTransport) OpenDownloadStream() (io.ReadCloser, error) {
 // decrypts them, and routes to the client's stream channels.
 // Frame format: [4-byte big-endian length][encrypted chunk bytes].
 // Same interface as WebSocketTransport.StartReader().
+//
+// Note on TSPU (Russia DPI, 2026): the persistent GET is one long TCP that
+// eventually hits the 15-20KB freeze cliff. We previously tried preemptive
+// rotation here but the server returns HTTP 404 on repeat opens under the
+// same session. So we let the GET live its natural life — when TSPU freezes
+// it, the read timeout fires, StartReader exits, poll workers take over via
+// streamReaderLoop's downloadActive=false signal. POST responses also carry
+// downstream data (onResponse callback), so downstream keeps flowing.
 func (t *SplitTransport) StartReader(ctx context.Context, cl *Client) error {
-	rc, err := t.OpenDownloadStream()
+	// D2: OpenDownloadStream now needs the session to encrypt the FlagStreamOpen
+	// chunk that rides in the POST body (was a bare GET with Bearer header).
+	session := cl.Session()
+	if session == nil {
+		return fmt.Errorf("open download stream: no session")
+	}
+	rc, err := t.OpenDownloadStream(session)
 	if err != nil {
 		return fmt.Errorf("open download stream: %w", err)
 	}
@@ -379,8 +554,11 @@ func (t *SplitTransport) StartReader(ctx context.Context, cl *Client) error {
 	lenBuf := make([]byte, 4)
 	msgCount := 0
 
-	// Read timeout must be > server keepalive interval (25s).
-	const readTimeout = 45 * time.Second
+	// Read timeout: TSPU freezes TCPs after ~15-20KB with no signal. 20s is
+	// short enough to escape a frozen GET fast (so poll workers take over)
+	// while staying above server keepalive (25s is too close — use server
+	// keepalive tuned to 15s to pair with this).
+	const readTimeout = 20 * time.Second
 	readWithTimeout := func(buf []byte) error {
 		type result struct{ err error }
 		ch := make(chan result, 1)
@@ -463,6 +641,9 @@ func (t *SplitTransport) StartReader(ctx context.Context, cl *Client) error {
 
 // Close closes the download stream and underlying connection manager.
 func (t *SplitTransport) Close() error {
+	if t.decoy != nil {
+		t.decoy.Stop()
+	}
 	t.mu.Lock()
 	rc := t.downloadRC
 	t.mu.Unlock()

@@ -90,6 +90,71 @@ func TestWSAsyncWriter_DecouplesProducersFromSlowConnection(t *testing.T) {
 	}, 5*time.Second, 10*time.Millisecond, "writer did not drain queue")
 }
 
+// TestWSAsyncWriter_LastWriteUnixNano_TracksSuccess verifies the timestamp
+// only ticks on successful writes — failed writes must not advance it, so
+// the slot reader's diagnostic capture sees a stale (or zero) value when
+// the conn was dead at the time of the read error.
+func TestWSAsyncWriter_LastWriteUnixNano_TracksSuccess(t *testing.T) {
+	conn := &fakeConnWriter{}
+	w := NewWSAsyncWriter(conn, 16)
+	go w.Run()
+	defer w.Close()
+
+	assert.Equal(t, int64(0), w.LastWriteUnixNano(), "before any write should be zero")
+
+	require.NoError(t, w.Enqueue(websocket.BinaryMessage, []byte("hello")))
+	// Wait on LastWriteUnixNano directly — the timestamp Store happens AFTER
+	// fakeConnWriter increments its calls counter, so polling on calls would
+	// be racy.
+	require.Eventually(t, func() bool {
+		return w.LastWriteUnixNano() > 0
+	}, time.Second, 1*time.Millisecond)
+
+	first := w.LastWriteUnixNano()
+
+	time.Sleep(2 * time.Millisecond)
+	require.NoError(t, w.Enqueue(websocket.BinaryMessage, []byte("world")))
+	require.Eventually(t, func() bool {
+		return w.LastWriteUnixNano() > first
+	}, time.Second, 1*time.Millisecond)
+
+	second := w.LastWriteUnixNano()
+	assert.Greater(t, second, first, "second successful write should advance further")
+}
+
+// TestWSAsyncWriter_LastWriteUnixNano_FrozenOnFailure: when the underlying
+// conn returns an error, the timestamp must NOT advance — a Run-exit-on-error
+// is exactly the case the slot reader's diagnostic capture cares about
+// (writer dead → likely middlebox-induced stall → log shows old timestamp →
+// reviewer sees `last_write_age_ms` is large → CF/origin stall confirmed).
+func TestWSAsyncWriter_LastWriteUnixNano_FrozenOnFailure(t *testing.T) {
+	failErr := errors.New("simulated CF stall")
+	conn := &fakeConnWriter{failAt: 2, failErr: failErr}
+	w := NewWSAsyncWriter(conn, 16)
+	runErr := make(chan error, 1)
+	go func() { runErr <- w.Run() }()
+	defer w.Close()
+
+	require.NoError(t, w.Enqueue(websocket.BinaryMessage, []byte("ok-1")))
+	require.Eventually(t, func() bool {
+		return w.LastWriteUnixNano() > 0
+	}, time.Second, 1*time.Millisecond)
+
+	good := w.LastWriteUnixNano()
+
+	// Second write fails — Run() exits.
+	require.NoError(t, w.Enqueue(websocket.BinaryMessage, []byte("fail-2")))
+	select {
+	case err := <-runErr:
+		require.ErrorIs(t, err, failErr)
+	case <-time.After(time.Second):
+		t.Fatal("Run did not exit after underlying write error")
+	}
+
+	assert.Equal(t, good, w.LastWriteUnixNano(),
+		"failed write must not advance lastWriteUnixNano")
+}
+
 func TestWSAsyncWriter_OrderingPreserved(t *testing.T) {
 	conn := &fakeConnWriter{}
 	w := NewWSAsyncWriter(conn, 64)

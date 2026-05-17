@@ -3,13 +3,20 @@ package main
 import (
 	"fmt"
 	"log/slog"
+	"net"
 	"os/exec"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
 
+	tunsdialer "github.com/xjasonlyu/tun2socks/v2/dialer"
 	"github.com/xjasonlyu/tun2socks/v2/engine"
+	"github.com/xjasonlyu/tun2socks/v2/proxy"
+	t2tunnel "github.com/xjasonlyu/tun2socks/v2/tunnel"
+
+	"github.com/nixavpn/shadowlink/client"
+	"github.com/nixavpn/shadowlink/client/bypassroute"
 )
 
 // Tunnel управляет TUN-интерфейсом для системного VPN-режима.
@@ -21,8 +28,26 @@ type Tunnel struct {
 	proxyPass string
 	serverIPs []string // one or more IPs for escape routes
 
+	bypassEnabled  bool
+	bypassOverride *bypassroute.AdminOverride
+
 	mu      sync.Mutex
 	started bool
+
+	// nicWatcherStop signals the NIC-switching watcher (started in Start)
+	// to exit. Closed by Stop. Nil when bypass is disabled or determination
+	// failed at Start.
+	nicWatcherStop chan struct{}
+}
+
+// WithBypass настраивает bypass-маршрутизацию для Tunnel. Когда включено,
+// dial-вызовы к IP-адресам из встроенного RU CIDR-снапшота (плюс опциональный
+// admin override) идут через физическую сеть, а не через SOCKS5 + ShadowLink.
+// Phase B будет наполнять override через admin API; пока передаём nil.
+func (t *Tunnel) WithBypass(enabled bool, override *bypassroute.AdminOverride) *Tunnel {
+	t.bypassEnabled = enabled
+	t.bypassOverride = override
+	return t
 }
 
 // NewTunnel создаёт Tunnel.
@@ -58,10 +83,47 @@ func (t *Tunnel) Start() error {
 		}
 	}
 
+	// Determine physical interface BEFORE tun2socks publishes its TUN-bound
+	// DefaultDialer. We set `dialer.DefaultDialer.InterfaceName/Index.Store(...)`
+	// directly here instead of via `engine.Key.Interface` to close the
+	// TOCTOU window where tun2socks `general()` would re-resolve the iface
+	// name and `log.Fatalf` (→ os.Exit(1)) on a transient
+	// `net.InterfaceByName` failure (Wi-Fi suspend, USB-Ethernet unplug).
+	// We resolve once here, log a warn on failure, and continue without
+	// bypass binding. Opus review I-1 (final-audit-2026-05-05).
+	//
+	// Effect: `proxy.NewDirect()` (used by BypassDialer) binds each socket
+	// to the physical interface via IP_BOUND_IF / SO_BINDTODEVICE /
+	// IP_UNICAST_IF. Without it, direct dials fall through default routing
+	// and the split-routes (0.0.0.0/1 + 128.0.0.0/1) re-capture the packets
+	// back into the TUN — bypass routing silently no-ops and ALL traffic
+	// (including RU CIDR matches) exits through the VPN. Loopback dials for
+	// our local SOCKS5 (127.0.0.1:port) are skipped by the per-platform
+	// `IsGlobalUnicast()` guard in sockopt_*.go, so SOCKS5 keeps working.
+	physicalIface := determinePhysicalInterface()
+	physicalIfaceIdx := 0
+	if physicalIface != "" {
+		if iface, err := net.InterfaceByName(physicalIface); err == nil {
+			tunsdialer.DefaultDialer.InterfaceName.Store(iface.Name)
+			tunsdialer.DefaultDialer.InterfaceIndex.Store(int32(iface.Index))
+			physicalIfaceIdx = iface.Index
+			slog.Info("физический интерфейс для bypass определён",
+				"name", iface.Name, "index", iface.Index)
+		} else {
+			slog.Warn("net.InterfaceByName fail для bypass — продолжаем без bind",
+				"name", physicalIface, "err", err)
+			physicalIface = ""
+		}
+	} else {
+		slog.Warn("физический интерфейс не определён — bypass routing будет no-op")
+	}
+
 	// Загружаем конфиг tun2socks и запускаем движок.
 	// Proxy URL включает credentials: socks5://user:pass@host:port
 	proxyURL := fmt.Sprintf("socks5://%s:%s@%s", t.proxyUser, t.proxyPass, t.socksAddr)
 	// W7: MTU 1400 to account for ShadowLink encryption + WebSocket + TLS overhead.
+	// `Interface` НЕ устанавливаем — tun2socks general() сделал бы повторный
+	// `net.InterfaceByName` (TOCTOU). DefaultDialer уже выставлен выше.
 	key := &engine.Key{
 		Device:     device,
 		Proxy:      proxyURL,
@@ -101,6 +163,23 @@ func (t *Tunnel) Start() error {
 		return fmt.Errorf("TUN-интерфейс не готов: %w", err)
 	}
 
+	// Устанавливаем bypass dialer, если включён. При любой ошибке шага —
+	// логируем warning и продолжаем: VPN работает и без bypass.
+	if t.bypassEnabled {
+		if err := t.installBypassDialer(); err != nil {
+			slog.Warn("bypass dialer не активирован", "err", err)
+		}
+		// NIC-switching watcher: Wi-Fi → Ethernet (док-станция, suspend/resume,
+		// USB-NIC замена) меняет default route. DefaultDialer.InterfaceIndex
+		// без обновления указывает на down-адаптер → bypass dial fails с
+		// ENETDOWN/ENETUNREACH. Раз в 30s проверяем gw + iface, при изменении
+		// атомарно Store. Opus review I-2 (final-audit-2026-05-05).
+		if physicalIface != "" {
+			t.nicWatcherStop = make(chan struct{})
+			go t.runNICWatcher(physicalIfaceIdx)
+		}
+	}
+
 	// W4: route setup failure is fatal — without routes, TUN is useless
 	// and LeakGuard kill switch would block all traffic.
 	if err := setupRoutes(device, t.serverIPs); err != nil {
@@ -122,6 +201,13 @@ func (t *Tunnel) Stop() error {
 		return nil
 	}
 
+	// Сигнализируем NIC watcher'у завершиться. Закрытие канала идемпотентно
+	// под mu (повторный Stop short-circuit'ит на !t.started выше).
+	if t.nicWatcherStop != nil {
+		close(t.nicWatcherStop)
+		t.nicWatcherStop = nil
+	}
+
 	device := tunDeviceName()
 
 	if err := cleanupRoutes(device, t.serverIPs); err != nil {
@@ -132,6 +218,82 @@ func (t *Tunnel) Stop() error {
 
 	t.started = false
 	slog.Info("TUN-туннель остановлен")
+	return nil
+}
+
+// nicWatchInterval — как часто перепроверять физический интерфейс.
+// 30s — компромисс между responsiveness (Wi-Fi → Ethernet swap) и
+// нагрузкой на `route print 0.0.0.0` (Windows exec несколько ms).
+const nicWatchInterval = 30 * time.Second
+
+// runNICWatcher следит за сменой физического интерфейса (Wi-Fi → Ethernet,
+// suspend/resume, USB-NIC unplug). При изменении переписывает
+// `tunsdialer.DefaultDialer.InterfaceName/Index.Store(...)` атомарно —
+// все последующие direct-dials уходят через новый NIC.
+//
+// initialIdx — индекс, выставленный при Start. Используется как baseline
+// для сравнения. Если getDefaultGateway() / getInterfaceForGateway падают,
+// сохраняем старое значение (избегаем "флапа на nil-iface" во время
+// transient outage).
+func (t *Tunnel) runNICWatcher(initialIdx int) {
+	currentIdx := initialIdx
+	ticker := time.NewTicker(nicWatchInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-t.nicWatcherStop:
+			slog.Debug("NIC watcher остановлен")
+			return
+		case <-ticker.C:
+			gw, err := getDefaultGateway()
+			if err != nil {
+				slog.Debug("NIC watcher: gw lookup fail", "err", err)
+				continue
+			}
+			name, err := getInterfaceForGateway(gw)
+			if err != nil {
+				slog.Debug("NIC watcher: iface lookup fail", "gw", gw, "err", err)
+				continue
+			}
+			iface, err := net.InterfaceByName(name)
+			if err != nil {
+				slog.Debug("NIC watcher: InterfaceByName fail", "name", name, "err", err)
+				continue
+			}
+			if iface.Index == currentIdx {
+				continue // unchanged
+			}
+			tunsdialer.DefaultDialer.InterfaceName.Store(iface.Name)
+			tunsdialer.DefaultDialer.InterfaceIndex.Store(int32(iface.Index))
+			slog.Info("NIC switched, обновили DefaultDialer",
+				"old_idx", currentIdx, "new_name", iface.Name, "new_idx", iface.Index)
+			currentIdx = iface.Index
+		}
+	}
+}
+
+// installBypassDialer loads the RU CIDR trie and installs a BypassDialer as the
+// active tun2socks dialer. Must be called after engine.Start() (tun2socks
+// publishes its tunnel singleton during Start) and before setupRoutes so
+// the dialer is in place before any packets flow through the TUN.
+func (t *Tunnel) installBypassDialer() error {
+	resolved, err := bypassroute.Load(bypassroute.Source{
+		Embedded: true,
+		Override: t.bypassOverride,
+	})
+	if err != nil {
+		return fmt.Errorf("load bypass trie: %w", err)
+	}
+	socks, err := proxy.NewSocks5(t.socksAddr, t.proxyUser, t.proxyPass)
+	if err != nil {
+		return fmt.Errorf("build socks5 dialer: %w", err)
+	}
+	bypass := bypassroute.NewBypassDialer(socks, resolved).
+		WithMetrics(client.Stats.IncBypassMatch, client.Stats.IncBypassMiss)
+	t2tunnel.T().SetDialer(bypass)
+	slog.Info("bypass routing активирован",
+		"include", resolved.Size(),
+		"exclude", resolved.Excludes())
 	return nil
 }
 
@@ -281,14 +443,30 @@ func addSplitRoutes(device, gw string) error {
 			}
 		}
 	case "windows":
-		// DNS: задать DNS на TUN-интерфейсе чтобы приложения резолвили через VPN.
+		// DNS на TUN: используем Yandex DNS (RU) как primary + Cloudflare как
+		// fallback. RU primary критично для bypass routing — DNS-запросы к
+		// RU resolver'у возвращают geo-localized RU IP'ы для российских
+		// сайтов (yandex.ru, mail.ru, vk.com, 2ip.ru), которые попадают в
+		// embedded RU CIDR snapshot и идут direct через физический NIC.
+		// Field-test 2026-05-05: с CF DNS (1.1.1.1) российские сайты
+		// резолвились в global anycast IP'ы (не в RU snapshot) → весь
+		// трафик уходил через VPN. С Yandex DNS bypass работает.
+		//
+		// Yandex DNS 77.88.8.8 / 77.88.8.1 — public RU resolver'ы, доступны
+		// из любой сети, поддерживают как RU так и foreign домены, в RIPE-RU
+		// snapshot включены (bypass match для самих DNS-пакетов работает).
+		// Cloudflare 1.1.1.1 как secondary на случай Yandex DNS outage.
 		tunName := strings.TrimPrefix(device, "tun://")
 		if out, err := exec.Command("netsh", "interface", "ip", "set", "dns",
-			tunName, "static", "1.1.1.1").CombinedOutput(); err != nil {
+			tunName, "static", "77.88.8.8").CombinedOutput(); err != nil {
 			slog.Warn("не удалось установить основной DNS на TUN", "err", err, "output", strings.TrimSpace(string(out)))
 		}
 		if out, err := exec.Command("netsh", "interface", "ip", "add", "dns",
-			tunName, "8.8.8.8", "index=2").CombinedOutput(); err != nil {
+			tunName, "77.88.8.1", "index=2").CombinedOutput(); err != nil {
+			slog.Warn("не удалось установить вторичный DNS на TUN", "err", err, "output", strings.TrimSpace(string(out)))
+		}
+		if out, err := exec.Command("netsh", "interface", "ip", "add", "dns",
+			tunName, "1.1.1.1", "index=3").CombinedOutput(); err != nil {
 			slog.Warn("не удалось установить резервный DNS на TUN", "err", err, "output", strings.TrimSpace(string(out)))
 		}
 		if out, err := exec.Command("netsh", "interface", "ip", "set", "interface",
@@ -296,7 +474,7 @@ func addSplitRoutes(device, gw string) error {
 			slog.Warn("не удалось установить метрику TUN-интерфейса", "err", err, "output", strings.TrimSpace(string(out)))
 		}
 		exec.Command("ipconfig", "/flushdns").Run()
-		slog.Info("DNS настроен на TUN", "dns1", "1.1.1.1", "dns2", "8.8.8.8", "metric", 1)
+		slog.Info("DNS настроен на TUN", "primary", "77.88.8.8 (Yandex)", "secondary", "77.88.8.1", "fallback", "1.1.1.1", "metric", 1)
 
 		// Split-routing через TUN-интерфейс.
 		tunGW := "198.18.0.1"
@@ -497,6 +675,141 @@ func waitForTUNReady(device string, timeout time.Duration) error {
 		time.Sleep(2 * time.Second) // fallback: just wait
 		return nil
 	}
+}
+
+// determinePhysicalInterface returns the OS name of the network interface that
+// owns the default-route gateway. We pass it to tun2socks via `engine.Key.Interface`
+// so `dialer.DefaultDialer` (used by `proxy.NewDirect()` from the bypass path)
+// binds outbound sockets to the physical NIC instead of letting the kernel
+// route them through the freshly-installed TUN split-routes.
+//
+// Returns "" on any error — the caller logs a warning and continues without
+// bypass binding (VPN itself still works, only RU bypass is no-op).
+func determinePhysicalInterface() string {
+	gw, err := getDefaultGateway()
+	if err != nil {
+		slog.Warn("не удалось определить шлюз для bypass", "err", err)
+		return ""
+	}
+	name, err := getInterfaceForGateway(gw)
+	if err != nil {
+		slog.Warn("не удалось найти интерфейс шлюза", "gw", gw, "err", err)
+		return ""
+	}
+	return name
+}
+
+// virtualIfacePrefixes is a Windows-centric list of name prefixes that
+// almost always belong to virtualization / VPN / tunneling software, never
+// to the physical NIC actually carrying internet traffic. When multiple
+// interfaces' subnets contain the default gateway IP (rare but real — WSL
+// + Hyper-V Default Switch may overlap with home subnets), preferring a
+// non-virtual match avoids binding bypass dials to a dead-end virtual
+// switch.
+//
+// Order matters only for log readability; matching is case-insensitive
+// substring (not anchored prefix) so "vEthernet (WSL)" / "Hyper-V Virtual
+// Ethernet Adapter" / "VMware Network Adapter VMnet1" all hit.
+//
+// Linux/macOS rarely need this filter (physical NICs have stable names
+// like eth0/en0 and virtual ones come up later in the enumeration), but
+// the heuristic does not harm them — it falls through to the first match
+// when no name hits the blacklist.
+var virtualIfacePrefixes = []string{
+	"veth",       // Linux veth pairs
+	"vethernet",  // Windows Hyper-V virtual switches
+	"hyper-v",    // Windows Hyper-V
+	"vmware",     // VMware adapters
+	"virtualbox", // VirtualBox host-only / NAT
+	"vbox",       // shorter VirtualBox naming
+	"docker",     // Docker bridge / NAT
+	"wsl",        // explicit WSL vEthernet
+	"tap",        // OpenVPN / Tailscale TAP
+	"tun",        // tun-based VPN devices (incl. our own NixaVPN if a previous run left one)
+	"wireguard",  // WireGuard interfaces
+	"openvpn",    // OpenVPN named interfaces
+	"tailscale",  // Tailscale interface
+	"nordlynx",   // NordVPN WireGuard
+	"loopback",   // any "Loopback Pseudo-Interface" Windows variant
+	"bluetooth",  // Bluetooth PAN
+}
+
+func isVirtualIface(name string) bool {
+	low := strings.ToLower(name)
+	for _, p := range virtualIfacePrefixes {
+		if strings.Contains(low, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// getInterfaceForGateway returns the name of the up, non-loopback interface
+// whose subnet contains the supplied gateway IP. This works on Windows, Linux
+// and macOS without parsing per-platform `route` / `ip` text output beyond
+// the gateway itself.
+//
+// Multiple-match selection (Opus review I-3, 2026-05-05): when more than
+// one up interface's subnet contains gw (e.g. WSL/Hyper-V vEthernet adapter
+// with same /24 as the home router), prefer the first NON-virtual match —
+// see virtualIfacePrefixes. Falls back to the first match overall if every
+// candidate is virtual (unusual but graceful).
+func getInterfaceForGateway(gw string) (string, error) {
+	gwIP := net.ParseIP(gw)
+	if gwIP == nil {
+		return "", fmt.Errorf("неверный IP шлюза: %s", gw)
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "", fmt.Errorf("net.Interfaces: %w", err)
+	}
+	var (
+		firstMatch        string
+		firstNonVirtMatch string
+		matchCount        int
+	)
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ipnet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			if !ipnet.Contains(gwIP) {
+				continue
+			}
+			matchCount++
+			if firstMatch == "" {
+				firstMatch = iface.Name
+			}
+			if firstNonVirtMatch == "" && !isVirtualIface(iface.Name) {
+				firstNonVirtMatch = iface.Name
+			}
+			break // one match per iface is enough
+		}
+	}
+	switch {
+	case firstNonVirtMatch != "":
+		if matchCount > 1 {
+			slog.Info("несколько интерфейсов содержат шлюз, выбран физический",
+				"chosen", firstNonVirtMatch, "candidates", matchCount, "gw", gw)
+		}
+		return firstNonVirtMatch, nil
+	case firstMatch != "":
+		slog.Warn("только virtual-интерфейсы содержат шлюз, использую первый",
+			"chosen", firstMatch, "gw", gw)
+		return firstMatch, nil
+	}
+	return "", fmt.Errorf("не найден интерфейс с подсетью шлюза %s", gw)
 }
 
 // getWindowsInterfaceIndex возвращает числовой индекс TUN-интерфейса Windows

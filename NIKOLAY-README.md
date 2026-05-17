@@ -64,7 +64,6 @@ shadowlink/client/            # ShadowLink client library (reuse via gomobile)
   client.go               # Client struct, Connect(), Close()
   transport.go            # DirectTransport, CDNTransport
   ws_transport.go         # WebSocket full-duplex transport
-  wbturn_transport.go     # WB TURN relay (whitelist bypass)
   probe.go                # Network detection, AutoConnect()
   leakguard/              # DNS/IPv6 leak prevention, kill switch
   dnsrouter/              # Domain-based bypass routing
@@ -161,7 +160,7 @@ type Engine interface {
 - VPN data is AES-256-GCM encrypted, base64-encoded
 - Wrapped in fake analytics JSON: `{"events":[{"type":"page_view","data":"BASE64"}]}`
 - Works through Cloudflare CDN (CF can't see the payload)
-- 5 transport modes: Direct, CDN, WebSocket, WB TURN, VK TURN
+- 3 transport modes: Direct, CDN, WebSocket
 
 **For mobile:** Import `shadowlink/client` via gomobile. Key API:
 ```go

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -9,33 +10,81 @@ import (
 // DecoyHandler serves a static website to unauthenticated requests.
 // This is the "real website" that TSPU active probes see.
 // Key difference from VLESS+Reality: we HOST our own site, not proxy someone else's.
+//
+// Sub-phase B (Domain Diversity): supports per-Host decoy serving.
+// When domainMap is non-empty, ServeHTTP picks a directory based on r.Host;
+// each unique directory gets its own precomputed http.FileServer.
 type DecoyHandler struct {
-	fileServer http.Handler
-	hasIndex   bool
+	defaultDir    string
+	defaultServer http.Handler
+	hasIndex      bool
+
+	// domainMap maps Host (no port) → decoy directory path.
+	// nil/empty → all requests served by defaultServer.
+	domainMap map[string]string
+
+	// perDirServers caches precomputed http.FileServer per unique directory
+	// referenced by domainMap. Built once in NewDecoyHandler.
+	perDirServers map[string]http.Handler
 }
 
-// NewDecoyHandler creates a handler serving static files from dir.
-// If dir is empty or doesn't exist, serves a minimal default page.
-func NewDecoyHandler(dir string) *DecoyHandler {
-	d := &DecoyHandler{}
-
-	if dir != "" {
-		if info, err := os.Stat(dir); err == nil && info.IsDir() {
-			d.fileServer = http.FileServer(http.Dir(dir))
-			// Check if index.html exists
-			_, err := os.Stat(filepath.Join(dir, "index.html"))
-			d.hasIndex = err == nil
-			return d
-		}
+// NewDecoyHandler creates a handler serving static files from defaultDir.
+// If defaultDir is empty or doesn't exist, serves a minimal default page.
+//
+// domainMap (optional) maps Host → directory for per-domain decoy serving.
+// Pass nil to preserve legacy single-dir behaviour.
+func NewDecoyHandler(defaultDir string, domainMap map[string]string) *DecoyHandler {
+	d := &DecoyHandler{
+		defaultDir:    defaultDir,
+		domainMap:     domainMap,
+		perDirServers: make(map[string]http.Handler),
 	}
 
-	// Fallback: minimal page that looks like a real site
-	d.fileServer = http.HandlerFunc(defaultDecoyPage)
-	d.hasIndex = true
+	var defaultDirOK bool
+	d.defaultServer, defaultDirOK = buildDirServer(defaultDir)
+	// hasIndex semantics retained: true if defaultDir served real files with index.html OR fallback is in use.
+	if defaultDirOK {
+		_, idxErr := os.Stat(filepath.Join(defaultDir, "index.html"))
+		d.hasIndex = idxErr == nil
+	} else {
+		// fallback page always renders "/" → 200, treat as content.
+		d.hasIndex = true
+	}
+
+	// Pre-build per-dir servers for every unique directory referenced by domainMap.
+	// Skip empty values (treated as "use default" by resolveDecoyDir).
+	seen := map[string]bool{defaultDir: true}
+	for host, dir := range domainMap {
+		if dir == "" || seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		srv, dirOK := buildDirServer(dir)
+		if !dirOK {
+			slog.Warn("decoy: configured directory unavailable, falling back to default page",
+				"host", host, "dir", dir)
+		}
+		d.perDirServers[dir] = srv
+	}
+
 	return d
 }
 
+// buildDirServer constructs an http.Handler serving files from dir.
+// If dir is empty or doesn't exist, returns the default minimal page and dirOK=false.
+// Caller is responsible for computing hasIndex semantics separately.
+func buildDirServer(dir string) (handler http.Handler, dirOK bool) {
+	if dir != "" {
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			srv := http.FileServer(http.Dir(dir))
+			return srv, true
+		}
+	}
+	return http.HandlerFunc(defaultDecoyPage), false
+}
+
 // ServeHTTP serves the decoy site with proper headers matching a real web server.
+// Selects the directory via Host header → domainMap lookup; falls back to defaultDir.
 func (d *DecoyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Add headers that a real nginx/caddy would send
 	w.Header().Set("Server", "nginx/1.27.3")
@@ -43,7 +92,16 @@ func (d *DecoyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Frame-Options", "SAMEORIGIN")
 	w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 
-	d.fileServer.ServeHTTP(w, r)
+	server := d.defaultServer
+	if d.domainMap != nil {
+		dir := resolveDecoyDir(r.Host, d.domainMap, d.defaultDir)
+		if dir != d.defaultDir {
+			if srv, ok := d.perDirServers[dir]; ok {
+				server = srv
+			}
+		}
+	}
+	server.ServeHTTP(w, r)
 }
 
 // HasContent returns true if the decoy has actual content to serve.

@@ -2,14 +2,54 @@ package client
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"log/slog"
+	mathrand "math/rand/v2"
 	"net"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
+
+	"github.com/nixavpn/shadowlink/skins/browser"
 )
+
+// defaultRuCheckURLs is the rotation pool used by ProbeEngine when the caller
+// does not supply RuCheckURLs explicitly. A2-MED-8 (2026-04 audit) closure:
+// the previous single hardcoded ya.ru meant every cold start emitted a
+// deterministic HTTPS HEAD to the same RU domain — a startup signal a passive
+// observer can use to flag the client. We rotate across the top-7 RU sites
+// that any normal Russian browser would hit organically. All entries are
+// HTTPS-only to keep the JA3 emission consistent across rounds.
+var defaultRuCheckURLs = []string{
+	"https://yandex.ru",
+	"https://mail.ru",
+	"https://vk.com",
+	"https://ok.ru",
+	"https://dzen.ru",
+	"https://gosuslugi.ru",
+	"https://ria.ru",
+}
+
+// newHTTPRequestHEAD builds a HEAD request with a browser User-Agent. Local
+// helper for probe.go's CRIT-3 fix — keeps the HEAD construction identical
+// across probe targets (CDN domain, ya.ru, etc.).
+//
+// 2026-05-02 wire-trigger followup NEW-2: when ua is Chrome-family, attach
+// the sec-ch-ua header set so the cold-path probe HEAD looks like a real
+// Chrome request (Chrome 90+ emits these unconditionally).
+func newHTTPRequestHEAD(ctx context.Context, target, ua string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, target, nil)
+	if err != nil {
+		return nil, err
+	}
+	if ua != "" {
+		req.Header.Set("User-Agent", ua)
+		browser.ApplyChromeCHUAForUA(req.Header, ua)
+	}
+	req.Header.Set("Accept", "*/*")
+	return req, nil
+}
 
 // NetworkType classifies the current network environment.
 type NetworkType int
@@ -17,7 +57,6 @@ type NetworkType int
 const (
 	NetworkOpen     NetworkType = iota // Direct access to server works
 	NetworkDPIBlock                    // Server IP blocked, but CDN/global IPs work
-	NetworkWhitelist                   // Only Russian IPs accessible
 	NetworkOffline                     // No internet at all
 )
 
@@ -27,8 +66,6 @@ func (n NetworkType) String() string {
 		return "OPEN"
 	case NetworkDPIBlock:
 		return "DPI_BLOCK"
-	case NetworkWhitelist:
-		return "WHITELIST"
 	case NetworkOffline:
 		return "OFFLINE"
 	default:
@@ -37,20 +74,28 @@ func (n NetworkType) String() string {
 }
 
 // ProbeConfig controls the Probe Engine behavior.
+//
+// RuCheckURLs is a rotation pool — each Probe round picks one entry at random.
+// A nil/empty slice falls back to defaultRuCheckURLs so callers that don't
+// care about the pool still get the cold-path-safe behavior.
 type ProbeConfig struct {
 	ServerAddr  string        // direct server "host:port"
 	CDNDomain   string        // Cloudflare domain (optional)
-	RuCheckURL  string        // Russian URL for whitelist detection (default: ya.ru)
+	RuCheckURLs []string      // RU rotation pool (nil/empty → defaultRuCheckURLs)
 	Timeout     time.Duration // probe timeout (default: 3s)
 }
 
 // DefaultProbeConfig returns spec-compliant defaults.
 func DefaultProbeConfig(serverAddr, cdnDomain string) ProbeConfig {
+	// Copy the package-level default so callers can mutate the slice without
+	// affecting other engines.
+	pool := make([]string, len(defaultRuCheckURLs))
+	copy(pool, defaultRuCheckURLs)
 	return ProbeConfig{
-		ServerAddr: serverAddr,
-		CDNDomain:  cdnDomain,
-		RuCheckURL: "https://ya.ru",
-		Timeout:    3 * time.Second,
+		ServerAddr:  serverAddr,
+		CDNDomain:   cdnDomain,
+		RuCheckURLs: pool,
+		Timeout:     3 * time.Second,
 	}
 }
 
@@ -70,9 +115,6 @@ func Classify(r ProbeResults) NetworkType {
 	}
 	if r.CDNOK {
 		return NetworkDPIBlock
-	}
-	if r.RuOK {
-		return NetworkWhitelist
 	}
 	return NetworkOffline
 }
@@ -103,6 +145,12 @@ func (p *ProbeEngine) Probe(ctx context.Context) (NetworkType, ProbeResults) {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
+	// Pick one fingerprint for the whole probe round so the CDN HEAD and the
+	// ya.ru HEAD share a JA3 — independent picks would let an observer
+	// correlate "client did 2 HTTPS HEADs at startup with 2 different
+	// fingerprints" which is itself a behavioral signal. CRIT-3 fix.
+	probeFP := browser.NewFingerprintPool().Next()
+
 	// Probe A: TCP connect to server
 	wg.Add(1)
 	go func() {
@@ -118,22 +166,25 @@ func (p *ProbeEngine) Probe(ctx context.Context) (NetworkType, ProbeResults) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ok := probeHTTPS(probeCtx, "https://"+p.config.CDNDomain)
+			ok := probeHTTPS(probeCtx, "https://"+p.config.CDNDomain, probeFP)
 			mu.Lock()
 			results.CDNOK = ok
 			mu.Unlock()
 		}()
 	}
 
-	// Probe C: HTTPS to Russian site
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		ok := probeHTTPS(probeCtx, p.config.RuCheckURL)
-		mu.Lock()
-		results.RuOK = ok
-		mu.Unlock()
-	}()
+	// Probe C: HTTPS to Russian site (rotated across the pool per round, A2-MED-8).
+	ruTarget := pickRuTarget(p.config.RuCheckURLs)
+	if ruTarget != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ok := probeHTTPS(probeCtx, ruTarget, probeFP)
+			mu.Lock()
+			results.RuOK = ok
+			mu.Unlock()
+		}()
+	}
 
 	// Probe D: DNS resolve
 	wg.Add(1)
@@ -182,11 +233,25 @@ func SelectTransport(netType NetworkType) string {
 		return "direct"
 	case NetworkDPIBlock:
 		return "cdn"
-	case NetworkWhitelist:
-		return "cloud_relay" // Yandex Cloud Functions or VK TURN
 	default:
 		return ""
 	}
+}
+
+// pickRuTarget chooses a random URL from the configured pool. Empty/nil pool
+// falls back to defaultRuCheckURLs. Returns "" only if both are empty (which
+// shouldn't happen since defaultRuCheckURLs is a const-like package var).
+func pickRuTarget(pool []string) string {
+	if len(pool) == 0 {
+		pool = defaultRuCheckURLs
+	}
+	if len(pool) == 0 {
+		return ""
+	}
+	if len(pool) == 1 {
+		return pool[0]
+	}
+	return pool[mathrand.IntN(len(pool))]
 }
 
 // probeTCP attempts a TCP connection to addr.
@@ -200,18 +265,44 @@ func probeTCP(ctx context.Context, addr string) bool {
 	return true
 }
 
-// probeHTTPS makes a HEAD request to a URL.
-func probeHTTPS(ctx context.Context, url string) bool {
-	client := &http.Client{
-		Timeout: 3 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
-			DisableKeepAlives: true, // prevent connection leak
-		},
+// probeHTTPS makes a HEAD request to a URL via uTLS.
+//
+// CRIT-3 (2026-04 audit): the previous implementation built a vanilla
+// `&http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{
+// InsecureSkipVerify: true}}}` — Go-stdlib JA3 + skipped cert verification on
+// **ya.ru** and on the project's CF domain at every startup. That JA3 is the
+// canonical "Go proxy" fingerprint and TSPU's connection-based TLS policing
+// (bbs#546, 2025-11) cross-correlates such cold-path emissions with later
+// CF-domain hits. The fix routes probes through the same uTLS dialer family
+// used on the data path (Chrome/Safari/Firefox) and drops InsecureSkipVerify
+// — both ya.ru and the CF domain serve real certs that validate normally.
+func probeHTTPS(ctx context.Context, target string, fp *browser.Fingerprint) bool {
+	parsed, err := url.Parse(target)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	host := parsed.Hostname()
+	port := parsed.Port()
+	if port == "" {
+		if parsed.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	dialAddr := net.JoinHostPort(host, port)
+
+	var client *http.Client
+	if parsed.Scheme == "https" {
+		client = buildUTLSHTTPClient(dialAddr, host, fp, false, 3*time.Second, "http/1.1")
+	} else {
+		// Plaintext fallback — only used by unit tests against httptest.NewServer
+		// (which is http://). No JA3 to worry about on plain HTTP.
+		client = &http.Client{Timeout: 3 * time.Second}
 	}
 	defer client.CloseIdleConnections()
 
-	req, err := http.NewRequestWithContext(ctx, "HEAD", url, nil)
+	req, err := newHTTPRequestHEAD(ctx, target, fp.UserAgent())
 	if err != nil {
 		return false
 	}
@@ -258,45 +349,6 @@ func AutoConnect(ctx context.Context, config ClientConfig, probeConfig ProbeConf
 		cl := NewClient(config) // CDNDomain is set, will use CDN transport
 		if err := cl.Connect(ctx); err != nil {
 			return nil, fmt.Errorf("CDN connect: %w", err)
-		}
-		return cl, nil
-
-	case NetworkWhitelist:
-		// Cascade: WB TURN (fast, no account needed) → VK TURN (fallback)
-		if config.ServerUDPAddr != "" && config.WBTurnEnabled {
-			slog.Info("network: WHITELIST — trying WB TURN transport first")
-			wbt, err := NewWBTurnTransport(config.ServerUDPAddr)
-			if err == nil {
-				cl := NewClientWithTransport(wbt, config.ServerPubKey, config.ClientID)
-				if err := cl.Connect(ctx); err != nil {
-					wbt.Close()
-					slog.Warn("WB TURN connect failed, trying VK TURN", "error", err)
-				} else {
-					return cl, nil
-				}
-			} else {
-				slog.Warn("WB TURN transport failed, trying VK TURN", "error", err)
-			}
-		}
-
-		// Fallback: VK TURN (Call Skin)
-		if config.TURNServer == "" {
-			return nil, fmt.Errorf("whitelist mode — no TURN server configured and WB TURN failed")
-		}
-		slog.Info("network: WHITELIST — using VK TURN (Call Skin) transport", "turn", config.TURNServer)
-		callTransport, err := NewCallSkinTransport(CallSkinConfig{
-			TURNServer:    config.TURNServer,
-			TURNUsername:  config.TURNUsername,
-			TURNPassword:  config.TURNPassword,
-			ServerUDPAddr: config.ServerUDPAddr,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("call skin transport: %w", err)
-		}
-		cl := NewClientWithTransport(callTransport, config.ServerPubKey, config.ClientID)
-		if err := cl.Connect(ctx); err != nil {
-			callTransport.Close()
-			return nil, fmt.Errorf("call skin connect: %w", err)
 		}
 		return cl, nil
 

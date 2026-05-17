@@ -2,6 +2,7 @@ package socks5
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -28,7 +29,41 @@ type PerStreamWSConfig struct {
 	// upgrade cost) for every SOCKS5 CONNECT. The pool itself handles replenishment
 	// and keepalives; the handler just Acquires → uses → Closes.
 	Pool *client.WSReadyPool
+
+	// dispatcher is the lazily-initialized coalescing dispatcher in front of Pool.
+	// Shared across all SOCKS5 CONNECTs so concurrent demand within the 50ms
+	// window is batched against the same pool — without sharing, each CONNECT
+	// would build its own single-request dispatcher and just add latency.
+	// Initialized via dispatcherOnce on first acquire.
+	dispatcher     PoolAcquirer
+	dispatcherOnce sync.Once
 }
+
+// AcquireWS pulls a WS from the configured pool, optionally coalescing
+// concurrent acquires via CoalescingDispatcher (default ON, opt-out via
+// SHADOWLINK_SOCKS5_COALESCE=0|false|no|off). Returns a usable transport
+// or an error. Callers MUST Close() the returned transport when done.
+func (cfg *PerStreamWSConfig) AcquireWS(ctx context.Context) (*client.WebSocketTransport, error) {
+	cfg.dispatcherOnce.Do(func() {
+		var base PoolAcquirer = wsReadyPoolAdapter{pool: cfg.Pool}
+		if socks5CoalesceEnabled() {
+			cfg.dispatcher = NewCoalescingDispatcher(base, coalesceWindow, coalesceMaxParallel)
+		} else {
+			cfg.dispatcher = base
+		}
+	})
+	acquired, err := cfg.dispatcher.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	wst, ok := acquired.(*client.WebSocketTransport)
+	if !ok || wst == nil {
+		return nil, errInvalidAcquireType
+	}
+	return wst, nil
+}
+
+var errInvalidAcquireType = errors.New("socks5: pool dispatcher returned unexpected type")
 
 // Server is a SOCKS5 proxy that tunnels traffic through a ShadowLink client.
 // If WST is non-nil, WebSocket (full-duplex) mode is used; otherwise poll mode.
@@ -41,7 +76,7 @@ type Server struct {
 	Addr        string // "127.0.0.1:1080"
 	Username    string // если задан — требуется RFC 1929 auth
 	Password    string
-	ViaCDN      bool   // true when traffic goes through CF CDN (shorter CONNECT timeout)
+	ViaCDN      bool // true when traffic goes through CF CDN (shorter CONNECT timeout)
 	listener    net.Listener
 	mu          sync.Mutex
 

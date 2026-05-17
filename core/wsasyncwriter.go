@@ -3,6 +3,7 @@ package core
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -48,6 +49,12 @@ type WSAsyncWriter struct {
 	runDone      chan struct{} // closed when Run() returns — callers can wait on this
 	closeOnce    sync.Once
 	writeTimeout time.Duration
+
+	// lastWriteUnixNano stores the wall-clock time of the most recent successful
+	// frame write (UnixNano). Read via LastWriteUnixNano(). Diagnostic capture
+	// in the slot reader uses this to tell "was a write recently in flight?"
+	// from "was the conn idle?" when classifying read-error anomalies.
+	lastWriteUnixNano atomic.Int64
 }
 
 // NewWSAsyncWriter constructs a WSAsyncWriter with the given outbound data
@@ -134,7 +141,19 @@ func (w *WSAsyncWriter) RunDone() <-chan struct{} {
 
 func (w *WSAsyncWriter) writeFrame(msg wsOutboundMsg) error {
 	_ = w.conn.SetWriteDeadline(time.Now().Add(w.writeTimeout))
-	return w.conn.WriteMessage(msg.msgType, msg.data)
+	if err := w.conn.WriteMessage(msg.msgType, msg.data); err != nil {
+		return err
+	}
+	w.lastWriteUnixNano.Store(time.Now().UnixNano())
+	return nil
+}
+
+// LastWriteUnixNano returns the wall-clock time (UnixNano) of the most recent
+// successful frame write, or zero if no write has succeeded yet. Used by
+// diagnostic capture in the slot reader to classify whether a read error
+// happened on an idle conn (no recent write) or under active traffic.
+func (w *WSAsyncWriter) LastWriteUnixNano() int64 {
+	return w.lastWriteUnixNano.Load()
 }
 
 // drainRemaining flushes queued messages (control first, then data) on

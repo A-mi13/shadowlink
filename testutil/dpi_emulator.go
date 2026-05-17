@@ -20,10 +20,10 @@ type DPIEmulator struct {
 	ByteLimit int64
 
 	// Stats
-	TotalConns       atomic.Int64
-	TotalBytesUp     atomic.Int64
-	TotalBytesDown   atomic.Int64
-	FrozenConns      atomic.Int64
+	TotalConns     atomic.Int64
+	TotalBytesUp   atomic.Int64
+	TotalBytesDown atomic.Int64
+	FrozenConns    atomic.Int64
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -190,10 +190,10 @@ func AnalyzeEntropy(data []byte) float64 {
 
 // AnalyzeSizeDistribution returns stats about packet sizes.
 type SizeStats struct {
-	Min    int
-	Max    int
-	Mean   float64
-	Count  int
+	Min   int
+	Max   int
+	Mean  float64
+	Count int
 }
 
 // ComputeSizeStats analyzes a slice of packet sizes.

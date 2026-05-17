@@ -320,7 +320,7 @@ var killSwitchRuleNames = []string{
 	"SL-Allow-Server-UDP",
 	"SL-Allow-Loopback",
 	"SL-Allow-DHCP",
-	"SL-Allow-Escape-UDP", // WB TURN / VK TURN relay IPs
+	"SL-Allow-Escape-UDP", // optional escape route for extra UDP destinations
 }
 
 // enableKillSwitch adds Windows Firewall rules that block all traffic except
@@ -382,7 +382,7 @@ func (g *windowsGuard) enableKillSwitch(cfg LeakGuardConfig) (KillSwitchState, e
 		},
 	}
 
-	// Add escape rules for extra IPs (TURN relay servers, etc.)
+	// Add escape rules for extra IPs (optional UDP relays bypassing the TUN).
 	if len(cfg.ExtraEscapeIPs) > 0 {
 		var escapeIPs []string
 		for _, ip := range cfg.ExtraEscapeIPs {

@@ -14,8 +14,9 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"runtime"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -25,6 +26,7 @@ import (
 	// tun2socks: provides system VPN (TUN interface) as embedded Go library
 	_ "github.com/xjasonlyu/tun2socks/v2/engine"
 
+	"github.com/nixavpn/shadowlink/client/bypassroute"
 	"github.com/nixavpn/shadowlink/client/leakguard"
 )
 
@@ -143,7 +145,60 @@ func main() {
 			os.Exit(1)
 		}
 
-		tun = NewTunnel(eng.SOCKSAddr(), cfg.ProxyUser, cfg.ProxyPass, serverIPs)
+		bypassOn := bypassEnabledFromEnv()
+		slog.Info("bypass routing", "enabled", bypassOn)
+
+		// Fetch admin-managed CIDR override list (B7).
+		// Server publishes signed override; client persists per-user cache.
+		// HMAC key MUST come from SHADOWLINK_BYPASS_HMAC_KEY env (out-of-band).
+		// SHADOWLINK_ADMIN_OVERRIDE=0/false/no/off (spec §10) skips the
+		// network fetch and uses only the on-disk cache (which itself can be
+		// empty → embedded baseline only).
+		var override *bypassroute.AdminOverride
+		if bypassOn {
+			hmacKey, hmacOK := loadBypassHMACKey()
+			if hmacOK && cfg.API != nil && cfg.API.URL != "" && cfg.API.Token != "" {
+				cacheDir := userBypassCacheDir()
+				cached, _ := bypassroute.LoadCachedOverride(cacheDir, hmacKey)
+
+				if !adminOverrideEnabled() {
+					slog.Info("bypass admin override disabled by env, using cache only")
+					override = cached
+				} else {
+					cachedEtag := ""
+					cachedSigVersion := ""
+					if cached != nil {
+						cachedEtag = cached.Etag
+						cachedSigVersion = cached.SigVersion
+					}
+
+					httpClient := &http.Client{Timeout: 5 * time.Second}
+					// previousSigVersion=cachedSigVersion enforces sticky-v2:
+					// once a client has accepted a v2 reply from this server,
+					// any later v1 reply is treated as a downgrade and rejected.
+					fresh, ferr := bypassroute.FetchAdminOverride(httpClient, cfg.API.URL, cfg.API.Token, cachedEtag, hmacKey, cachedSigVersion)
+					switch {
+					case ferr != nil:
+						slog.Warn("bypass override fetch failed, using cached", "err", ferr)
+						override = cached
+					case fresh == nil:
+						// 304 Not Modified — кэш актуален.
+						override = cached
+					default:
+						if perr := bypassroute.PersistOverride(cacheDir, fresh, hmacKey); perr != nil {
+							slog.Warn("bypass override cache persist failed", "err", perr)
+						}
+						override = fresh
+					}
+				}
+				if override != nil {
+					slog.Info("bypass override loaded", "adds", len(override.Adds), "excludes", len(override.Excludes), "etag", override.Etag)
+				}
+			}
+		}
+
+		tun = NewTunnel(eng.SOCKSAddr(), cfg.ProxyUser, cfg.ProxyPass, serverIPs).
+			WithBypass(bypassOn, override)
 		if err := tun.Start(); err != nil {
 			fmt.Fprintf(os.Stderr, "ошибка запуска TUN-туннеля: %v\n", err)
 			_ = eng.Close()
@@ -332,8 +387,8 @@ func resolveServerIPs(protocol string, cfg *Config) []string {
 			}
 		}
 
-	// If origin IP is set (direct WS mode), we also need escape route for it.
-	// This is handled below after normal resolution — we append origin IP to the list.
+		// If origin IP is set (direct WS mode), we also need escape route for it.
+		// This is handled below after normal resolution — we append origin IP to the list.
 
 	}
 
@@ -471,6 +526,68 @@ func generateProxyCredentials() (user, pass string) {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
 	return "nix", hex.EncodeToString(b)
+}
+
+// bypassEnabledFromEnv reports whether bypass routing is enabled.
+// Default is ON — set SHADOWLINK_BYPASS_ENABLED=0 (or "false"/"no"/"off")
+// to disable. Mirrors the pqEnabled() semantics from client/utls_http.go.
+func bypassEnabledFromEnv() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SHADOWLINK_BYPASS_ENABLED"))) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+// adminOverrideEnabled reports whether admin override network fetch is
+// enabled (spec §10). Default ON; SHADOWLINK_ADMIN_OVERRIDE=0/false/no/off
+// disables the network call so the client uses only the on-disk cache (which
+// itself can be empty → embedded baseline only). Same semantics as
+// bypassEnabledFromEnv() and the server-side useTokenBucket() flag.
+func adminOverrideEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SHADOWLINK_ADMIN_OVERRIDE"))) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+// loadBypassHMACKey reads the admin override HMAC key from
+// SHADOWLINK_BYPASS_HMAC_KEY (hex-encoded). Returns the decoded bytes plus
+// a flag indicating whether admin override fetching is enabled.
+//
+// The server derives this key from JWT_SECRET; the client cannot — so the
+// key MUST be provisioned out-of-band. If the env is unset or invalid,
+// fetching is disabled and the caller proceeds with nil override.
+func loadBypassHMACKey() ([]byte, bool) {
+	raw := strings.TrimSpace(os.Getenv("SHADOWLINK_BYPASS_HMAC_KEY"))
+	if raw == "" {
+		slog.Info("admin bypass override disabled — SHADOWLINK_BYPASS_HMAC_KEY not set")
+		return nil, false
+	}
+	key, err := hex.DecodeString(raw)
+	if err != nil {
+		slog.Warn("admin bypass override disabled — SHADOWLINK_BYPASS_HMAC_KEY hex decode failed", "err", err)
+		return nil, false
+	}
+	if len(key) < 16 {
+		slog.Warn("admin bypass override disabled — SHADOWLINK_BYPASS_HMAC_KEY too short", "bytes", len(key), "min", 16)
+		return nil, false
+	}
+	return key, true
+}
+
+// userBypassCacheDir returns the per-user cache directory used to persist
+// the signed admin bypass override blob. Falls back to a relative dir if
+// os.UserConfigDir() is unavailable.
+func userBypassCacheDir() string {
+	d, err := os.UserConfigDir()
+	if err != nil {
+		return ".nixavpn-cache"
+	}
+	return filepath.Join(d, "nixavpn", "bypass")
 }
 
 // randomSOCKSAddr выбирает случайный порт в диапазоне 10000-60000.

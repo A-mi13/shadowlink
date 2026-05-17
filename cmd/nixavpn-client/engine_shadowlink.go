@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/nixavpn/shadowlink/client"
 	"github.com/nixavpn/shadowlink/core"
 	"github.com/nixavpn/shadowlink/proxy/socks5"
@@ -27,8 +28,8 @@ type ShadowLinkEngine struct {
 	// W8: error channel — signals main loop when engine dies
 	errCh         chan error
 	once          sync.Once
-	pollWG        sync.WaitGroup    // tracks poll worker goroutines for clean shutdown
-	pollTransport client.Transport  // dedicated transport for polls (separate from CONNECTs)
+	pollWG        sync.WaitGroup   // tracks poll worker goroutines for clean shutdown
+	pollTransport client.Transport // dedicated transport for polls (separate from CONNECTs)
 
 	// Pre-warmed WS pool for per-stream CF CDN mode. Nil in other transport modes.
 	// Keeps ~20 WS connections upgraded-and-idle so each SOCKS5 CONNECT can grab
@@ -72,10 +73,17 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 		return fmt.Errorf("неверный pubkey: %w", err)
 	}
 
+	// ClientID должен быть ровно 16 байт (UUID) — сервер v1 (post Phase 0/1) не принимает
+	// legacy v0 handshake. Раньше тут было []byte("nixavpn-client") = 14 bytes,
+	// что роняло handshake на server retire'нувшем v0. Генерируем UUIDv4 per-process;
+	// сервер в open-mode (authorized_clients пуст) принимает любой UUID.
+	u := uuid.New()
+	clientID := u[:]
+
 	clientCfg := client.ClientConfig{
 		ServerAddr:   slCfg.Server,
 		ServerPubKey: pubKey,
-		ClientID:     []byte("nixavpn-client"),
+		ClientID:     clientID,
 		UseTLS:       slCfg.TLS,
 		CDNDomain:    slCfg.CDN,
 		ECHEnabled:   slCfg.ECH,
@@ -151,7 +159,7 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 
 	// System VPN or WebSocket mode: use WS Pool (preferred) or SplitHTTP (fallback).
 	// If origin IP is set, WS goes directly to origin (bypasses CF CDN for speed).
-	if (e.cfg.SystemVPN || slCfg.WebSocket) && e.cl.TransportName() != "wb_turn" {
+	if e.cfg.SystemVPN || slCfg.WebSocket {
 		// Determine WS target: origin IP (direct) or server address (through CF).
 		// When origin is set: WS connects to origin:443 with SNI=CDN domain.
 		// This bypasses CF CDN entirely — full speed, no 30s kill.
@@ -230,9 +238,18 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 			}
 			poolOK = true
 		} else {
-			// Default: WS Pool (multiplexed). Works for both CDN and direct/SNI.
-			// This is the path that was proven on 2026-04-13 for CDN mode.
-			usePool := slCfg.CDN != "" || slCfg.WSPool || slCfg.WebSocket || slCfg.SNI != ""
+			// Default: WS Pool (multiplexed). Works for both direct/SNI and
+			// originally also CDN — but TSPU 2026 freezes per-TCP at ~15-20KB
+			// which makes pooled long-lived WSs unreliable through CF.
+			// viaCF now defaults to SplitHTTP (fresh TCP per POST = TSPU-immune).
+			// User can force WS Pool via NIXAVPN_FORCE_WS_POOL=1 for A/B testing.
+			viaCFDefault := slCfg.CDN != "" && slCfg.Origin == "" && slCfg.SNI == ""
+			forceWSPool := os.Getenv("NIXAVPN_FORCE_WS_POOL") == "1"
+			usePool := (slCfg.CDN != "" || slCfg.WSPool || slCfg.WebSocket || slCfg.SNI != "") &&
+				(!viaCFDefault || forceWSPool)
+			if viaCFDefault && !forceWSPool {
+				slog.Info("viaCF: using SplitHTTP (TSPU-immune fresh-TCP-per-POST)")
+			}
 			poolSize := slCfg.WSPoolSize
 			if poolSize < 1 {
 				poolSize = 8
@@ -261,11 +278,11 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 				// field-test 2026-04-15) → data stalls, decrypts stop
 				// arriving. 4 streams/slot × 8 slots = 32 concurrent streams
 				// which covers a typical page load while keeping each WS light.
-				maxStreamsPerSlot := 0          // unlimited for direct
-				maxPendingPerSlot := 0          // default 4 for direct
-				var writeTimeout time.Duration  // 0 → 30s default for direct
-				var staggerDelay time.Duration  // 0 → no stagger for direct
-				poolCFIP := slCfg.CFIP
+				maxStreamsPerSlot := 0         // unlimited for direct
+				maxPendingPerSlot := 0         // default 4 for direct
+				var writeTimeout time.Duration // 0 → 30s default for direct
+				var staggerDelay time.Duration // 0 → no stagger for direct
+				var maxBytesPerSlot int64      // 0 = disabled (direct has no TSPU limit)
 				viaCF := slCfg.CDN != "" && slCfg.Origin == "" && slCfg.SNI == ""
 				if viaCF {
 					maxStreamsPerSlot = 4
@@ -277,28 +294,22 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 					// 300ms × idx so 8 TCP SYNs don't arrive at CF in
 					// the same millisecond and trip burst heuristics.
 					staggerDelay = 300 * time.Millisecond
+					// Russia TSPU 2026 mitigation: DPI silently freezes
+					// foreign-IP TCP after ~15-20KB downstream over TLS 1.3.
+					// Rotate each slot at 15KB so we get a fresh TCP before
+					// the censor's counter triggers. See habr.com/990236
+					// ("Clumsy Hands or a New Level of DPI") for background.
+					maxBytesPerSlot = 15 * 1024
 
-					// R4: pre-resolve CF domain once and pin the same
-					// edge IP across all slots when no explicit CFIP is
-					// supplied. Without this, gorilla's dial does an
-					// independent DNS lookup per slot → CF round-robins
-					// 3-5 different edges → if one degrades, several
-					// slots die in a correlated burst (DNS-spray).
-					if poolCFIP == "" {
-						host, _, splitErr := net.SplitHostPort(slCfg.Server)
-						if splitErr != nil {
-							host = slCfg.Server
-						}
-						resolveCtx, cancelResolve := context.WithTimeout(ctx2, 3*time.Second)
-						addrs, lookupErr := net.DefaultResolver.LookupHost(resolveCtx, host)
-						cancelResolve()
-						if lookupErr == nil && len(addrs) > 0 {
-							poolCFIP = addrs[0] // pin to first returned edge
-							slog.Info("CF edge pinned for pool", "domain", host, "edge", poolCFIP)
-						} else if lookupErr != nil {
-							slog.Warn("CF edge pre-resolve failed (using DNS per slot)", "err", lookupErr)
-						}
-					}
+					// R4 reverted 2026-04-15 after field test: pinning all 8
+					// slots to a single pre-resolved CF edge turned out to
+					// guarantee the very outage we were trying to avoid —
+					// when the chosen edge degrades, every slot dies together
+					// (meltdown deaths=6/6 observed). Letting gorilla's dial
+					// do its own DNS per slot gives us CF's round-robin back;
+					// some slots land on healthy edges and keep traffic
+					// flowing while writer_timeout kills slots on bad ones.
+					// Users can still pin manually via &cfip= in the URL.
 				}
 
 				pool := client.NewWSPoolTransport(e.cl, client.WSPoolConfig{
@@ -307,14 +318,21 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 					UseTLS:            slCfg.TLS,
 					SkipVerify:        false,
 					SNIHost:           sniHost,
-					CFIP:              poolCFIP,
+					CFIP:              slCfg.CFIP,
 					MaxStreamsPerSlot: maxStreamsPerSlot,
 					MaxPendingPerSlot: maxPendingPerSlot,
+					MaxBytesPerSlot:   maxBytesPerSlot,
 					WriteTimeout:      writeTimeout,
 					StaggerDelay:      staggerDelay,
 				})
 				if err := pool.Connect(ctx2); err != nil {
 					slog.Warn("WS Pool не удался, fallback на SplitHTTP", "err", err)
+					// Critical: Connect() already spawned reconnectLoop goroutines
+					// for every failed slot (ws_pool.go:225). Without Close() those
+					// zombie loops keep hammering the dead CF IP forever, sharing
+					// p.client.transport with the SplitTransport flow. Close cancels
+					// p.ctx so all reconnect loops exit cleanly.
+					pool.Close()
 				} else {
 					e.stream = pool
 					go e.streamReaderLoop(ctx2)
@@ -325,7 +343,7 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 						"viaCF", viaCF,
 						"writeTimeout", writeTimeout,
 						"staggerDelay", staggerDelay,
-						"cfIP", poolCFIP)
+						"cfIP", slCfg.CFIP)
 					poolOK = true
 				}
 			}
@@ -342,7 +360,13 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 			if slCfg.CDN != "" {
 				splitAddr = slCfg.CDN + ":443"
 			}
-			split := client.NewSplitTransport(splitAddr, token)
+			// Pass cfIP so SplitHTTP pins TCP dials to the user-scanned edge
+			// instead of resolving CDN domain each POST (CF DNS round-robins
+			// through many blocked IPs from Russian ISPs in 2026).
+			split := client.NewSplitTransport(splitAddr, token, slCfg.CFIP)
+			if slCfg.CFIP != "" {
+				slog.Info("SplitHTTP pinned to CF edge", "cfip", slCfg.CFIP)
+			}
 
 			split.SetOnResponse(func(encResp []byte) {
 				session := e.cl.Session()
@@ -369,6 +393,11 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 			e.startPollWorkers(ctx2, pollTransport)
 			go e.streamReaderLoop(ctx2)
 			e.streamCtx = ctx2
+
+			// V5 / P0.3: start decoy GET traffic only after the session is
+			// wired up. If anything above had failed we would not reach here,
+			// so the goroutine is not leaked on handshake/setup failure.
+			split.StartDecoyTraffic()
 
 			slog.Info("SplitHTTP транспорт: stream (primary) + poll (fallback)")
 		} else if !poolOK {

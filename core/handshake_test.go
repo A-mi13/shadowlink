@@ -1,6 +1,9 @@
 package core
 
 import (
+	"bytes"
+	"crypto/rand"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,7 +14,7 @@ import (
 func TestHandshakeRoundtrip(t *testing.T) {
 	serverStatic, err := GenerateKeyPair()
 	require.NoError(t, err)
-	clientID := []byte("test-client")
+	clientID := []byte("test-client-uuid") // 16-byte UUID-shaped ID required post A1-M4
 	sm := NewSessionManager(5 * time.Minute)
 
 	// Client creates ClientHello
@@ -42,7 +45,7 @@ func TestHandshakeRoundtrip(t *testing.T) {
 func TestHandshakeWrongServerKey(t *testing.T) {
 	serverStatic, _ := GenerateKeyPair()
 	wrongServer, _ := GenerateKeyPair()
-	clientID := []byte("test-client")
+	clientID := []byte("test-client-uuid") // 16 bytes
 	sm := NewSessionManager(5 * time.Minute)
 
 	clientHello, _, _ := NewClientHello(clientID, wrongServer.Public)
@@ -54,7 +57,7 @@ func TestHandshakeWrongServerKey(t *testing.T) {
 
 func TestHandshakeDataTransfer(t *testing.T) {
 	serverStatic, _ := GenerateKeyPair()
-	clientID := []byte("user-42")
+	clientID := []byte("user-42-paddingX") // 16 bytes
 	sm := NewSessionManager(5 * time.Minute)
 
 	clientHello, clientState, _ := NewClientHello(clientID, serverStatic.Public)
@@ -92,7 +95,8 @@ func TestHandshakeMultipleSessions(t *testing.T) {
 	// Create 10 sessions
 	sessions := make([]*Session, 10)
 	for i := range 10 {
-		clientID := []byte("client-" + string(rune('A'+i)))
+		// 16-byte UUID-shaped ID with per-session distinguishing rune (post A1-M4).
+		clientID := []byte("client-" + string(rune('A'+i)) + "-padding")
 		ch, cs, _ := NewClientHello(clientID, serverStatic.Public)
 		sh, _, _, _ := HandleClientHello(ch, serverStatic, 8, 12288, sm)
 		sess, _ := CompleteHandshake(cs, sh)
@@ -110,7 +114,7 @@ func TestHandshakeMultipleSessions(t *testing.T) {
 
 func TestHandshakeTamperedClientHello(t *testing.T) {
 	serverStatic, _ := GenerateKeyPair()
-	clientID := []byte("client")
+	clientID := []byte("client-paddingXY") // 16 bytes
 	sm := NewSessionManager(5 * time.Minute)
 
 	hello, _, _ := NewClientHello(clientID, serverStatic.Public)
@@ -120,4 +124,133 @@ func TestHandshakeTamperedClientHello(t *testing.T) {
 
 	_, _, _, err := HandleClientHello(hello, serverStatic, 8, 12288, sm)
 	assert.Error(t, err)
+}
+
+func TestServerHelloProtoVersionField(t *testing.T) {
+	v := uint8(1)
+	sh := &ServerHello{ProtoVersion: &v}
+	if sh.ProtoVersion == nil {
+		t.Fatal("ProtoVersion not assignable")
+	}
+	if *sh.ProtoVersion != 1 {
+		t.Fatalf("ProtoVersion = %d, want 1", *sh.ProtoVersion)
+	}
+	// nil case — pointer must distinguish "absent" from "=0"
+	sh2 := &ServerHello{}
+	if sh2.ProtoVersion != nil {
+		t.Fatal("nil ProtoVersion should be distinguishable from zero")
+	}
+}
+
+func TestDeriveSessionKeys_VersionBinding(t *testing.T) {
+	shared := bytes.Repeat([]byte{0xAB}, 32)
+	clientEph := bytes.Repeat([]byte{0x01}, 32)
+	serverEph := bytes.Repeat([]byte{0x02}, 32)
+	clientID := []byte("test-client-id-0")
+
+	keysV0, err := DeriveSessionKeys(shared, clientEph, serverEph, clientID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keysV1, err := DeriveSessionKeys(shared, clientEph, serverEph, clientID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if bytes.Equal(keysV0.SendKey, keysV1.SendKey) {
+		t.Error("SendKey identical across versions — HKDF binding missing")
+	}
+	if bytes.Equal(keysV0.RecvKey, keysV1.RecvKey) {
+		t.Error("RecvKey identical across versions — HKDF binding missing")
+	}
+}
+
+func TestEncryptedClientIDSize(t *testing.T) {
+	serverStatic, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ephemeral, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientID := make([]byte, 16) // UUID-size plaintext
+	if _, err := rand.Read(clientID); err != nil {
+		t.Fatal(err)
+	}
+
+	enc, err := EncryptClientID(clientID, serverStatic.Public, ephemeral)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(enc) != EncryptedClientIDSize {
+		t.Errorf("EncryptedClientIDSize = %d, got actual %d — update constant or fix encryption", EncryptedClientIDSize, len(enc))
+	}
+}
+
+func TestEncryptClientID_RoundTripWithTimestamp(t *testing.T) {
+	ss, _ := GenerateKeyPair()
+	eph, _ := GenerateKeyPair()
+	clientID := []byte("id-0123456789abc")
+
+	enc, err := EncryptClientID(clientID, ss.Public, eph)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec, err := DecryptClientID(enc, eph.Public, ss)
+	if err != nil {
+		t.Fatalf("fresh decrypt: %v", err)
+	}
+	if !bytes.Equal(dec, clientID) {
+		t.Errorf("round-trip mismatch: got %q want %q", dec, clientID)
+	}
+}
+
+func TestDecryptClientID_RejectsExpiredTimestamp(t *testing.T) {
+	ss, _ := GenerateKeyPair()
+	eph, _ := GenerateKeyPair()
+	clientID := []byte("id-0123456789abc")
+
+	origNow := timeNow
+	defer func() { timeNow = origNow }()
+	// Freeze time 301 seconds in the past — just outside the 5-minute window
+	timeNow = func() int64 { return origNow() - 301 }
+
+	enc, err := EncryptClientID(clientID, ss.Public, eph)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Restore clock for decrypt
+	timeNow = origNow
+
+	_, err = DecryptClientID(enc, eph.Public, ss)
+	if err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Errorf("expected timestamp expired error, got %v", err)
+	}
+}
+
+func TestDecryptClientID_AcceptsWithinWindow(t *testing.T) {
+	ss, _ := GenerateKeyPair()
+	eph, _ := GenerateKeyPair()
+	clientID := []byte("id-0123456789abc")
+
+	origNow := timeNow
+	defer func() { timeNow = origNow }()
+	// Freeze 60 seconds in the past — well within window
+	timeNow = func() int64 { return origNow() - 60 }
+
+	enc, err := EncryptClientID(clientID, ss.Public, eph)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	timeNow = origNow
+	dec, err := DecryptClientID(enc, eph.Public, ss)
+	if err != nil {
+		t.Fatalf("within window should pass: %v", err)
+	}
+	if !bytes.Equal(dec, clientID) {
+		t.Error("round-trip mismatch")
+	}
 }

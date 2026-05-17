@@ -1,0 +1,24 @@
+groups:
+- name: shadowlink-cold-start
+  rules:
+  - alert: ShadowlinkColdStartSlow
+    expr: histogram_quantile(0.95, rate(shadowlink_first_stream_ms_bucket[5m])) > 5000
+    for: 10m
+    labels: { severity: warning }
+    annotations:
+      summary: "ShadowLink cold-start p95 > 5s for 10m"
+  - alert: ShadowlinkRateLimitCascade
+    expr: rate(shadowlink_handshake_decoy_received_total[5m]) > 5
+    for: 5m
+    labels: { severity: critical }
+    annotations:
+      summary: "Decoy responses >=5/sec - server rate-limit cascading"
+  # NOTE: requires shadowlink_ws_pool_ready_count gauge - see plan E2 step 2 note
+  # for rollout caveat. If gauge not yet exposed, this alert will be a no-op
+  # (Prometheus evaluates absent series as no data, won't fire).
+  - alert: ShadowlinkPoolStarved
+    expr: shadowlink_ws_pool_ready_count < 2
+    for: 1m
+    labels: { severity: critical }
+    annotations:
+      summary: "WS ready pool starved (<2 slots) for 1m"

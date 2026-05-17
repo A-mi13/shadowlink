@@ -1,0 +1,17 @@
+{
+  "title": "ShadowLink Cold-Start + Bypass",
+  "uid": "shadowlink-coldstart-bypass",
+  "panels": [
+    {"title":"First-stream ms (p95)","type":"timeseries","targets":[{"expr":"histogram_quantile(0.95, rate(shadowlink_first_stream_ms_bucket[5m]))"}]},
+    {"title":"Pool warmup ms (p95)","type":"timeseries","targets":[{"expr":"histogram_quantile(0.95, rate(shadowlink_pool_warmup_ms_bucket[5m]))"}]},
+    {"title":"Handshake decoy received /min","type":"timeseries","targets":[{"expr":"rate(shadowlink_handshake_decoy_received_total[1m])*60"}]},
+    {"title":"Bypass match ratio","type":"timeseries","targets":[{"expr":"rate(shadowlink_bypass_cidr_match_total[5m]) / (rate(shadowlink_bypass_cidr_match_total[5m]) + rate(shadowlink_bypass_cidr_miss_total[5m]))"}]},
+    {"title":"Rate-limit burst consumed (handshake)","type":"timeseries","targets":[{"expr":"rate(shadowlink_ratelimit_burst_consumed_total{path=\"handshake\"}[5m])"}]},
+    {"title":"Rate-limit burst consumed (ws_upgrade)","type":"timeseries","targets":[{"expr":"rate(shadowlink_ratelimit_burst_consumed_total{path=\"ws_upgrade\"}[5m])"}]},
+    {"title":"ClientID exempted /min","type":"timeseries","targets":[{"expr":"rate(shadowlink_ratelimit_clientid_exempted_total[1m])*60"}]},
+    {"title":"WS frame anomaly by type","type":"timeseries","targets":[{"expr":"sum by (type) (rate(shadowlink_ws_frame_anomaly_total[5m]))"}]}
+  ],
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "10s"
+}

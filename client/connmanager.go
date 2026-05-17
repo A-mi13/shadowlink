@@ -39,10 +39,17 @@ type ConnManager struct {
 	fingerprint *browser.Fingerprint  // locked for this connection's lifetime
 	createdAt   time.Time
 
-	minRotation time.Duration
-	maxRotation time.Duration
+	// minRotation, maxRotation, lifecycle: write-once at init (NewConnManager),
+	// read-only thereafter. May-audit C11.1 closure (2026-05-02): startRotation
+	// reads these fields without holding cm.mu.RLock — that is intentional
+	// because the values are immutable post-construction. If a setter is ever
+	// added (e.g. SetRotationBounds, SetLifecycle), introduce an RWMutex around
+	// these fields AND update TestConnManagerLifecycle_DocsImmutable to assert
+	// the new synchronization contract.
+	minRotation   time.Duration
+	maxRotation   time.Duration
 	lifecycle     *browser.SessionLifecycle
-	warmupDone   bool
+	warmupDone    bool
 	warmupEnabled bool
 	stopCh        chan struct{}
 	stopped       bool
@@ -51,7 +58,8 @@ type ConnManager struct {
 	echDomain  string
 	echCache   *ECHConfig
 
-	sniOverride string // TLS ServerName override (full-direct mode)
+	sniOverride string      // TLS ServerName override (full-direct mode OR DomainPool pick)
+	domainPool  *DomainPool // optional: rotates sniOverride per reconnect
 }
 
 // stdHTTPClient wraps standard net/http for non-TLS testing.
@@ -61,19 +69,19 @@ type stdHTTPClient struct {
 
 // ConnManagerConfig configures the connection manager.
 type ConnManagerConfig struct {
-	ServerAddr      string
-	UseTLS          bool
-	SkipVerify      bool
-	NoTimeout       bool                 // If true, HTTP client has no timeout (for persistent streams)
-	TimeoutSec      int                  // HTTP client timeout in seconds. 0 = use default (10s). NoTimeout overrides this.
-	AllowHTTP2      bool                 // If true, allow HTTP/2 multiplexing (for CDN upload). Default false = force HTTP/1.1.
-	FPPool          *browser.FingerprintPool
-	LockedProfile   *browser.Fingerprint // If set, use this fingerprint instead of rotating
-	MinRotation     time.Duration        // default 2m (mimicry: shorter rotation defeats connection-duration fingerprinting)
-	MaxRotation     time.Duration        // default 8m
-	ECHEnabled      bool
-	ECHDomain       string
-	SNIOverride     string // TLS ServerName override. Set when dialing origin IP with CF-domain SNI (full-direct mode).
+	ServerAddr    string
+	UseTLS        bool
+	SkipVerify    bool
+	NoTimeout     bool // If true, HTTP client has no timeout (for persistent streams)
+	TimeoutSec    int  // HTTP client timeout in seconds. 0 = use default (10s). NoTimeout overrides this.
+	AllowHTTP2    bool // If true, allow HTTP/2 multiplexing (for CDN upload). Default false = force HTTP/1.1.
+	FPPool        *browser.FingerprintPool
+	LockedProfile *browser.Fingerprint // If set, use this fingerprint instead of rotating
+	MinRotation   time.Duration        // default 2m (mimicry: shorter rotation defeats connection-duration fingerprinting)
+	MaxRotation   time.Duration        // default 8m
+	ECHEnabled    bool
+	ECHDomain     string
+	SNIOverride   string // TLS ServerName override. Set when dialing origin IP with CF-domain SNI (full-direct mode).
 }
 
 // NewConnManager creates a connection manager and establishes the first connection.
@@ -136,8 +144,28 @@ func (cm *ConnManager) WarmupDelay() {
 	time.Sleep(delay)
 }
 
+// SetDomainPool installs a domain pool that drives sniOverride on each reconnect.
+// Passing nil clears the pool. Note: clearing does NOT revert sniOverride to the
+// value passed in ConnManagerConfig — the field stays at whatever the last Pick
+// wrote. Callers that want to fully revert should set sniOverride explicitly via
+// a future setter, or accept that the last picked domain remains until the next
+// non-pool change.
+func (cm *ConnManager) SetDomainPool(p *DomainPool) {
+	cm.mu.Lock()
+	cm.domainPool = p
+	cm.mu.Unlock()
+}
+
 // connect creates a new tls-client with the locked or rotated browser profile.
 func (cm *ConnManager) connect() {
+	// DomainPool integration: if pool is set, pick a fresh domain to use as SNI.
+	// Pool's own mutex serializes Pick — it's safe to call while we hold cm.mu.
+	if cm.domainPool != nil {
+		if d := cm.domainPool.Pick(); d != "" {
+			cm.sniOverride = d
+		}
+	}
+
 	var fp *browser.Fingerprint
 	if cm.lockedProfile != nil {
 		fp = cm.lockedProfile // persistent per-user fingerprint (weekly rotation)
@@ -221,18 +249,39 @@ func (cm *ConnManager) connect() {
 	}
 }
 
-// profileForFingerprint maps our fingerprint name to tls-client profile.
+// profileForFingerprint maps our fingerprint name to a tls-client profile.
+//
+// 2026-05-02 wire-trigger followup (F2 lockstep): all Chrome surfaces (uTLS
+// JA4, bogdanfinn H2 SETTINGS, User-Agent string, sec-ch-ua header) now
+// align to a single Chrome major — `browser.LockedChromeMajor` (133).
+// Previously the bogdanfinn hot path returned Chrome_146 by default and
+// only fell back to Chrome_133 when SHADOWLINK_TLS_PQ=0 (May-audit C2
+// closure for opt-out symmetry). Per-major mismatch (uTLS=133, bogdanfinn=
+// 146, UA=134, defaultUA=131) was an ML-classifier signal that no real
+// Chrome client emits. Anchoring everything to 133 closes the quad.
+//
+// utls upstream lacks HelloChrome_135+ so 133 is the highest non-PSK ID we
+// can pin to. Bumping the lockstep major requires upstream catching up
+// AND a coordinated bump of `browser.LockedChromeMajor` + tests.
+//
+// PQ status: bogdanfinn Chrome_133 ships without MLKEM in key_share —
+// matching the cold-path HelloChrome_133 default. The cold-path
+// pqClientHelloSpec safety-bridge prepends MLKEM when SHADOWLINK_TLS_PQ
+// is enabled; the bogdanfinn hot-path does NOT honor PQ and emits stock
+// Chrome_133 always. Wire effect: with PQ default-on, cold-path emits
+// MLKEM keyshare while hot-path does not — same JA3/JA4 cipher list, same
+// extensions, only key_share content differs. This is acceptable because
+// the cold-path is a small fraction of total handshakes (one per slot
+// reconnect + initial handshake) and a passive ML classifier sees both
+// flavors as "Chrome 133 family". With PQ off both paths emit identical
+// stock Chrome_133.
+//
+// 2026-05-05: non-Chrome fingerprints retired (TSPU блокирует Safari/Firefox/
+// Edge). Switch свёрнут — функция всегда возвращает Chrome_133 независимо от
+// fp.Name(). Сигнатура сохранена для совместимости со всеми каллерами.
 func profileForFingerprint(fp *browser.Fingerprint) profiles.ClientProfile {
-	switch fp.Name() {
-	case browser.ProfileChrome:
-		return profiles.Chrome_133
-	case browser.ProfileSafari:
-		return profiles.Safari_16_0
-	case browser.ProfileFirefox:
-		return profiles.Firefox_135
-	default:
-		return profiles.Chrome_133
-	}
+	_ = fp // legacy parameter: всегда Chrome
+	return browser.LockedBogdanfinnChromeProfile()
 }
 
 // Do executes an HTTP request using the active tls-client.
@@ -259,6 +308,16 @@ func (cm *ConnManager) Do(req *http.Request) (*http.Response, error) {
 	// HTTP errors (4xx, 5xx) return a valid response with no error — won't trigger rotation.
 	// Force rotate so the next request through this CM gets a fresh TLS connection.
 	if err != nil {
+		// DomainPool integration: mark the current SNI domain as failed before
+		// rotating so the next connect() picks a different alive domain from the pool.
+		// Capture under RLock (no nested-lock risk: DomainPool has its own mutex).
+		cm.mu.RLock()
+		pool := cm.domainPool
+		failedSNI := cm.sniOverride
+		cm.mu.RUnlock()
+		if pool != nil && failedSNI != "" {
+			pool.MarkFailed(failedSNI)
+		}
 		cm.rotate()
 	}
 

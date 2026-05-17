@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"reflect"
 	"testing"
 	"time"
 
@@ -115,5 +116,69 @@ func TestWSReadyPool_StopIdempotent(t *testing.T) {
 	case <-pw.stopCh:
 	default:
 		t.Fatal("stopCh not closed after pw.stop()")
+	}
+}
+
+// --- phaseCoordinator tests --------------------------------------------------
+
+func TestPhaseCoordinator_OrderingRequireDone(t *testing.T) {
+	phases := []WarmupPhase{
+		{Slots: []int{0}, Delay: 0, RequireDone: true},
+		{Slots: []int{1, 2}, Delay: 0, RequireDone: true},
+	}
+	pc := newPhaseCoordinator(phases)
+	ctx := context.Background()
+	// phase 1 should not start until phase 0 done
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		pc.MarkSlotReady(0) // closes done[0]
+	}()
+	start := time.Now()
+	if err := pc.WaitPrior(ctx, 1); err != nil {
+		t.Fatalf("WaitPrior returned error: %v", err)
+	}
+	if time.Since(start) < 40*time.Millisecond {
+		t.Error("WaitPrior should have blocked ≥ 40ms")
+	}
+}
+
+func TestPhaseCoordinator_NotRequireDoneOpensImmediately(t *testing.T) {
+	phases := []WarmupPhase{
+		{Slots: []int{0, 1}, Delay: 0, RequireDone: false},
+	}
+	pc := newPhaseCoordinator(phases)
+	pc.MarkSlotReady(0)
+	select {
+	case <-pc.done[0]:
+		// good — first slot ready closed done immediately
+	default:
+		t.Fatal("RequireDone=false should close phase done immediately on first slot")
+	}
+}
+
+func TestEffectiveWarmup_Default6(t *testing.T) {
+	c := WSReadyPoolConfig{Size: 6}
+	w := c.effectiveWarmup()
+	if len(w) != 3 {
+		t.Fatalf("want 3 phases for size=6, got %d", len(w))
+	}
+	if !reflect.DeepEqual(w[0].Slots, []int{0}) {
+		t.Errorf("phase 0 slots: got %v, want [0]", w[0].Slots)
+	}
+	if !reflect.DeepEqual(w[1].Slots, []int{1, 2}) {
+		t.Errorf("phase 1 slots: got %v, want [1 2]", w[1].Slots)
+	}
+	if !reflect.DeepEqual(w[2].Slots, []int{3, 4, 5}) {
+		t.Errorf("phase 2 slots: got %v, want [3 4 5]", w[2].Slots)
+	}
+	// verify RequireDone values
+	if !w[0].RequireDone {
+		t.Error("phase 0: want RequireDone=true")
+	}
+	if !w[1].RequireDone {
+		t.Error("phase 1: want RequireDone=true")
+	}
+	if w[2].RequireDone {
+		t.Error("phase 2 (tail): want RequireDone=false")
 	}
 }

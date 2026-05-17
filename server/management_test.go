@@ -16,11 +16,11 @@ const testMgmtKey = "test-secret-key-42"
 func newTestManagement() (*ManagementHandler, *ClientAuth) {
 	ca := NewClientAuth([]string{"u1:d1", "u1:d2", "u2:d1"})
 	ca.defaultMax = 3
-	mh := NewManagementHandler(ca, testMgmtKey)
+	mh := NewManagementHandler(ca, NewMetrics(), testMgmtKey)
 	return mh, ca
 }
 
-func mgmtRequest(t *testing.T, method, path string, body interface{}, key string) *http.Request {
+func mgmtRequest(t *testing.T, method, path string, body any, key string) *http.Request {
 	t.Helper()
 	var buf bytes.Buffer
 	if body != nil {
@@ -186,18 +186,63 @@ func TestManagementStatus(t *testing.T) {
 	assert.Contains(t, resp.Clients, "u2:d1")
 }
 
+// TestManagementMetricsEndpoint verifies the /metrics route added in the H4
+// deploy fix: GET /metrics with a valid management key serves Prometheus text
+// format (via ?format=prom) and includes the migration counters.
+func TestManagementMetricsEndpoint(t *testing.T) {
+	mh, _ := newTestManagement()
+	mh.metrics.NewPathHits.Add(9)
+	mh.metrics.HandshakesNewTotal.Add(3)
+
+	req := httptest.NewRequest("GET", "/metrics?format=prom", nil)
+	req.Header.Set("X-Management-Key", testMgmtKey)
+	rr := httptest.NewRecorder()
+	mh.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	body := rr.Body.String()
+	assert.Contains(t, body, "shadowlink_new_path_hits_total 9")
+	assert.Contains(t, body, "shadowlink_handshakes_new_total 3")
+}
+
+// TestManagementMetrics_XAPIKeyAlias verifies the convenience alias — some
+// scraper tools only support the `X-API-Key` header name; we accept both.
+func TestManagementMetrics_XAPIKeyAlias(t *testing.T) {
+	mh, _ := newTestManagement()
+	mh.metrics.NewPathHits.Add(5)
+
+	req := httptest.NewRequest("GET", "/metrics?format=prom", nil)
+	req.Header.Set("X-API-Key", testMgmtKey)
+	rr := httptest.NewRecorder()
+	mh.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "shadowlink_new_path_hits_total 5")
+}
+
+// TestManagementMetrics_WrongKeyForbidden confirms that /metrics is gated by
+// the same API key check as the rest of management.
+func TestManagementMetrics_WrongKeyForbidden(t *testing.T) {
+	mh, _ := newTestManagement()
+	req := httptest.NewRequest("GET", "/metrics?format=prom", nil)
+	req.Header.Set("X-Management-Key", "wrong")
+	rr := httptest.NewRecorder()
+	mh.ServeHTTP(rr, req)
+	assert.Equal(t, http.StatusForbidden, rr.Code)
+}
+
 func TestManagementSetLimitMissingFields(t *testing.T) {
 	mh, _ := newTestManagement()
 
 	// Missing user_id.
-	body := map[string]interface{}{"max_devices": 5}
+	body := map[string]any{"max_devices": 5}
 	req := mgmtRequest(t, "POST", "/manage/set-limit", body, testMgmtKey)
 	rr := httptest.NewRecorder()
 	mh.ServeHTTP(rr, req)
 	assert.Equal(t, http.StatusBadRequest, rr.Code)
 
 	// Missing max_devices (will be 0).
-	body2 := map[string]interface{}{"user_id": "u1"}
+	body2 := map[string]any{"user_id": "u1"}
 	req2 := mgmtRequest(t, "POST", "/manage/set-limit", body2, testMgmtKey)
 	rr2 := httptest.NewRecorder()
 	mh.ServeHTTP(rr2, req2)

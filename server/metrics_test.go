@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -118,4 +119,106 @@ func TestMetricsRejectedOverload(t *testing.T) {
 
 	snap := m.Snapshot()
 	assert.Equal(t, uint64(3), snap.RejectedOverload)
+}
+
+// TestExposer_IncludesPhase0Fields verifies that the Prometheus text exposer
+// renders the 8 new Phase 0 counter/gauge fields added in Task 0.3. Regression
+// guard — if a field is missing from writePromMetrics this test fails.
+func TestExposer_IncludesPhase0Fields(t *testing.T) {
+	m := NewMetrics()
+
+	// Set non-zero values on a representative subset of the new fields.
+	m.HandshakesOK.Store(42)
+	m.HandshakesAuthFailed.Store(3)
+	m.HandshakesMalformed.Store(1)
+	m.RateLimitEmittedByBody.Store(7)
+	m.RateLimitEmittedByBodyMissing.Store(2)
+	m.RatelimitBucketHandshake.Store(95)
+	m.RatelimitBucketWSUpgrade.Store(50)
+	m.RatelimitBucketData.Store(200)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/metrics?format=prom", nil)
+	m.ServeHTTP(w, r)
+
+	require.Equal(t, 200, w.Code)
+	body := w.Body.String()
+
+	expected := []string{
+		"shadowlink_handshakes_ok_total 42",
+		"shadowlink_handshakes_auth_failed_total 3",
+		"shadowlink_handshakes_malformed_total 1",
+		"shadowlink_ratelimit_emitted_by_body_total 7",
+		"shadowlink_ratelimit_emitted_by_body_missing_total 2",
+		"shadowlink_ratelimit_bucket_handshake 95",
+		"shadowlink_ratelimit_bucket_ws_upgrade 50",
+		"shadowlink_ratelimit_bucket_data 200",
+	}
+	for _, line := range expected {
+		assert.True(t, strings.Contains(body, line),
+			"prom output missing line %q\nbody:\n%s", line, body)
+	}
+}
+
+// TestRatelimitBurstCounters verifies that IncRatelimitBurstConsumed /
+// IncRatelimitBurstRejected route per-path increments correctly, that an
+// unknown path is a safe no-op, and that the JSON snapshot + Prom exposition
+// surface the values with the expected labels. Plan §C7 (May audit,
+// 2026-05-02).
+func TestRatelimitBurstCounters(t *testing.T) {
+	m := NewMetrics()
+
+	// 3× ws_upgrade Consumed, 2× data Rejected, 1× unknown (no-op).
+	m.IncRatelimitBurstConsumed("ws_upgrade")
+	m.IncRatelimitBurstConsumed("ws_upgrade")
+	m.IncRatelimitBurstConsumed("ws_upgrade")
+	m.IncRatelimitBurstRejected("data")
+	m.IncRatelimitBurstRejected("data")
+	m.IncRatelimitBurstConsumed("unknown") // safe no-op
+	m.IncRatelimitBurstRejected("garbage") // safe no-op
+
+	// Internal atomic counters.
+	assert.Equal(t, uint64(3), m.RatelimitBurstConsumed_WSUpgrade.Load(),
+		"ws_upgrade Consumed must equal 3")
+	assert.Equal(t, uint64(0), m.RatelimitBurstConsumed_Handshake.Load(),
+		"handshake Consumed must remain 0")
+	assert.Equal(t, uint64(0), m.RatelimitBurstConsumed_Data.Load(),
+		"data Consumed must remain 0")
+	assert.Equal(t, uint64(0), m.RatelimitBurstRejected_WSUpgrade.Load(),
+		"ws_upgrade Rejected must remain 0")
+	assert.Equal(t, uint64(0), m.RatelimitBurstRejected_Handshake.Load(),
+		"handshake Rejected must remain 0")
+	assert.Equal(t, uint64(2), m.RatelimitBurstRejected_Data.Load(),
+		"data Rejected must equal 2")
+
+	// JSON snapshot mirror.
+	snap := m.Snapshot()
+	assert.Equal(t, uint64(3), snap.RatelimitBurstConsumedWSUpgrade)
+	assert.Equal(t, uint64(0), snap.RatelimitBurstConsumedHandshake)
+	assert.Equal(t, uint64(0), snap.RatelimitBurstConsumedData)
+	assert.Equal(t, uint64(0), snap.RatelimitBurstRejectedWSUpgrade)
+	assert.Equal(t, uint64(0), snap.RatelimitBurstRejectedHandshake)
+	assert.Equal(t, uint64(2), snap.RatelimitBurstRejectedData)
+
+	// Prometheus exposition.
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/metrics?format=prom", nil)
+	m.ServeHTTP(w, r)
+	require.Equal(t, 200, w.Code)
+	body := w.Body.String()
+
+	expected := []string{
+		`shadowlink_ratelimit_burst_consumed_total{path="ws_upgrade"} 3`,
+		`shadowlink_ratelimit_burst_consumed_total{path="handshake"} 0`,
+		`shadowlink_ratelimit_burst_consumed_total{path="data"} 0`,
+		`shadowlink_ratelimit_burst_rejected_total{path="ws_upgrade"} 0`,
+		`shadowlink_ratelimit_burst_rejected_total{path="handshake"} 0`,
+		`shadowlink_ratelimit_burst_rejected_total{path="data"} 2`,
+		`# TYPE shadowlink_ratelimit_burst_consumed_total counter`,
+		`# TYPE shadowlink_ratelimit_burst_rejected_total counter`,
+	}
+	for _, line := range expected {
+		assert.True(t, strings.Contains(body, line),
+			"prom output missing line %q\nbody:\n%s", line, body)
+	}
 }

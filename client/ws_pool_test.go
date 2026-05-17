@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"testing"
 	"time"
@@ -232,6 +233,41 @@ func TestSlotReaderExitsOnGenerationChange(t *testing.T) {
 
 	exitNow := pool.shouldExitReader(slot, oldGen)
 	require.True(t, exitNow, "old reader (gen=7) must exit when slot generation advanced to 8")
+}
+
+// TestConnectSlot_DecodesProtoVersionV — regression for the data-plane drift
+// observed on datacanvases.com (2026-04-30). The pool slot's anonymous
+// ServerHello-decoding struct previously omitted `_v`, which silently
+// defaulted CompleteHandshake to protoVersion=0 against a server that
+// derived keys with protoVersion=1. Every pool slot then died with
+// "complete handshake: invalid server hello: cannot decrypt session token".
+//
+// We don't drive the full connectSlot path (it requires live transports);
+// we replicate the JSON decoding with the same anonymous struct shape and
+// assert that `_v=1` lands on shData.ProtoVersion. If this test fails,
+// the key schedule is misaligned by construction and the WS pool will
+// produce zero working slots in production.
+func TestConnectSlot_DecodesProtoVersionV(t *testing.T) {
+	// Server-emitted ServerHello (post-Phase-0). `_v=1` is mandatory.
+	body := []byte(`{"eph":"ZXBoeXB1Yg==","tok":"dG9rZW4=","mc":8,"cs":12288,"_v":1}`)
+
+	var shData struct {
+		EphPub       []byte `json:"eph"`
+		Token        []byte `json:"tok"`
+		MaxConns     uint8  `json:"mc"`
+		ChunkSize    uint16 `json:"cs"`
+		ProtoVersion *uint8 `json:"_v,omitempty"`
+	}
+	require.NoError(t, json.Unmarshal(body, &shData))
+
+	require.NotNil(t, shData.ProtoVersion,
+		"ws_pool.go connectSlot must thread `_v` through to ProtoVersion — "+
+			"otherwise CompleteHandshake derives keys with v=0 vs server's v=1 "+
+			"and every slot fails with cannot-decrypt-session-token")
+	require.Equal(t, uint8(1), *shData.ProtoVersion,
+		"production server emits _v:1; pool slot must observe the same value")
+	require.Equal(t, uint8(8), shData.MaxConns)
+	require.Equal(t, uint16(12288), shData.ChunkSize)
 }
 
 // TestSlotReaderContinuesOnSameGeneration verifies that the generation

@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	crand "crypto/rand"
 	"log/slog"
+	mathrand "math/rand/v2"
 	"net"
 	"net/http"
 	"sync"
@@ -11,17 +13,138 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/nixavpn/shadowlink/core"
-	"github.com/nixavpn/shadowlink/skins/browser"
 )
 
 // maxStreamsPerSession limits concurrent multiplexed streams per WebSocket session
 // to prevent resource exhaustion attacks.
 const maxStreamsPerSession = 256
 
+// noopUpgradeError suppresses gorilla's default 400-with-text response on
+// failed WebSocket upgrade. We route the request through failClosedToDecoy
+// instead so probe vectors cannot distinguish a WS endpoint from a random
+// path. Closes A2-MED-6.
+func noopUpgradeError(_ http.ResponseWriter, _ *http.Request, _ int, _ error) {}
+
 var wsUpgrader = websocket.Upgrader{
 	ReadBufferSize:  131072,
 	WriteBufferSize: 131072,
 	CheckOrigin:     func(r *http.Request) bool { return true },
+	Error:           noopUpgradeError,
+}
+
+// firstFrameAuthTimeout bounds how long the server waits for a client's first
+// WebSocket binary frame after the upgrade completes. 1500ms tolerates mobile
+// RTT + CF edge variance while denying a slow-read channel to unauthenticated
+// peers (which would otherwise pin a goroutine indefinitely).
+const firstFrameAuthTimeout = 1500 * time.Millisecond
+
+// firstFrameReadLimit is the max size of the first frame during auth. Large
+// enough for [hint+token] (36 B) + encrypted keepalive/connect chunk (well
+// under 1 KiB) with headroom. Callers must restore the session-level read
+// limit after a successful return; see handleWebSocket.
+const firstFrameReadLimit = 8 * 1024
+
+// authenticateFirstFrame reads the first binary frame after WebSocket upgrade
+// and performs body-prefix session auth. Returns the resolved session on
+// success, nil on any failure (wrong frame type, bad length, unknown session,
+// bad GCM tag, replayed seq_num, disallowed flag, or missing tunnel).
+//
+// Protocol: frame layout is [hint(4) || encrypted_session_token(32) || encrypted_chunk].
+// Only FlagKeepalive is accepted as the first frame — this prevents early-data
+// injection (FlagData) and sidesteps the half-dispatch problem of FlagConnect
+// (seq_num would be consumed without the target actually dialed; callers would
+// time out waiting for CONNECT_OK). Clients MUST send keepalive first, then
+// FlagConnect through the relay loop. The session must already have an active
+// tunnel (created by the handshake POST); orphan sessions are refused.
+//
+// DoS hygiene: a tight 8 KiB read limit and 1500ms deadline apply only during
+// auth. On successful return, the caller (handleWebSocket) restores the normal
+// 256 KiB read limit and removes the deadline.
+func (h *Handler) authenticateFirstFrame(conn *websocket.Conn) *core.Session {
+	conn.SetReadLimit(firstFrameReadLimit)
+	conn.SetReadDeadline(time.Now().Add(firstFrameAuthTimeout))
+	defer conn.SetReadDeadline(time.Time{})
+
+	msgType, data, err := conn.ReadMessage()
+	if err != nil || msgType != websocket.BinaryMessage {
+		return nil
+	}
+
+	tokenLen := h.sessionTokenSize()
+	if len(data) < tokenLen+core.MinChunk {
+		return nil
+	}
+
+	session := h.findSessionByHint(data[:tokenLen])
+	if session == nil {
+		return nil
+	}
+
+	chunk, err := session.DecryptChunkSafe(data[tokenLen:])
+	if err != nil {
+		return nil
+	}
+	if !session.AcceptSeqNum(chunk.SeqNum) {
+		return nil
+	}
+
+	if chunk.Flags != core.FlagKeepalive {
+		return nil
+	}
+
+	h.tunnelsMu.RLock()
+	tunnel, ok := h.tunnels[session.ID]
+	h.tunnelsMu.RUnlock()
+	if !ok {
+		return nil
+	}
+
+	// A3-S-HIGH-2 (2026-04-25): gate concurrent WS attaches. CAS prevents
+	// two WS upgrades from sharing one session — the second attempt loses
+	// and falls into fakeAckAndClose (same wire shape as a bad-auth
+	// rejection). Without this, an attacker holding a session token can
+	// race the legit client and starve seq-num space / inject CONNECTs.
+	if !tunnel.WSAttached.CompareAndSwap(false, true) {
+		return nil
+	}
+
+	// Plan §C10 M2 (May 2026 audit): record the attach time so the cleanup
+	// loop can distinguish "newborn orphan" sessions (handshake OK + WS
+	// upgrade never landed) from sessions that had a transport at some
+	// point. A non-zero AttachedAt removes the session from the 30s
+	// fast-path eviction policy — it falls under the regular idle timeout.
+	session.AttachedAt.Store(time.Now().UnixNano())
+
+	return session
+}
+
+// fakeAckAndClose replies to a failed first-frame auth with a random binary
+// frame (200-2000 B) followed by a normal WebSocket close, then tears the
+// connection down. The goal is to match the wire trace of a successful auth
+// path — an observer seeing an immediate RST / abrupt close after upgrade
+// would have a cheap oracle distinguishing bad auth from good. ackJitter()
+// further blends the close timing into the normal ACK distribution.
+//
+// The control-write deadline is short (500 ms) so a dead/slow client cannot
+// pin this goroutine.
+func (h *Handler) fakeAckAndClose(conn *websocket.Conn) {
+	defer conn.Close()
+
+	ackLen := 200 + mathrand.IntN(1801) // inclusive range [200, 2000]
+	fakeAck := make([]byte, ackLen)
+	_, _ = crand.Read(fakeAck)
+	if err := conn.WriteMessage(websocket.BinaryMessage, fakeAck); err != nil {
+		return
+	}
+
+	time.Sleep(ackJitter())
+
+	closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
+	_ = conn.WriteControl(
+		websocket.CloseMessage,
+		closeMsg,
+		time.Now().Add(500*time.Millisecond),
+	)
 }
 
 // wsStream represents one multiplexed stream with async write buffer.
@@ -49,17 +172,6 @@ func newPendingWSStream() *wsStream {
 		writeCh: make(chan []byte, 256),
 		done:    make(chan struct{}),
 	}
-}
-
-func newWSStream(tc net.Conn) *wsStream {
-	s := &wsStream{
-		targetConn: tc,
-		writeCh:    make(chan []byte, 256),
-		done:       make(chan struct{}),
-		connected:  true,
-	}
-	s.startWriter()
-	return s
 }
 
 // Activate transitions stream from pending to connected: sets target conn,
@@ -159,35 +271,110 @@ func (s *wsStream) Close() {
 	})
 }
 
-// handleWebSocket upgrades to WebSocket for full-duplex stream-multiplexed relay.
+// handleWebSocket dispatches a WebSocket upgrade request. Two pre-upgrade
+// gates run cheaply before Hijack: the URL must be in the WS whitelist
+// (IsAllowedWSPath) and the client IP must be under its WSUpgrade rate
+// budget. Both failures route to the decoy so an external observer cannot
+// distinguish a bad URL or flood from a probe for a non-existent resource.
+//
+// Auth is body-prefix only: after the upgrade the client sends
+// [hint+token+encrypted_chunk] as the first binary WS frame, and
+// authenticateFirstFrame resolves it. On failure, fakeAckAndClose emits a
+// random binary frame + normal close so the rejection blends into the timing
+// distribution of a legitimate close.
+//
+// Post-auth, runWebSocketSession owns the per-session relay loop.
 func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	tokenBytes, err := browser.ExtractSessionToken(r)
-	if err != nil {
+	if !IsAllowedWSPath(r.URL.Path) {
+		// Direct decoy serve OK — non-WS path matches generic random-GET decoy
+		// behavior; no additional sanitation needed (path is not WS-leaky).
 		h.decoy.ServeHTTP(w, r)
 		return
 	}
-
-	session := h.findSession(tokenBytes)
-	if session == nil {
-		h.decoy.ServeHTTP(w, r)
-		return
+	clientIP := ClientIPFromRequest(r, h.config.BehindProxy)
+	allowWS, remaining, retryAfter := h.rateLimiters.AllowWSUpgrade(clientIP)
+	if allowWS {
+		// Plan §C7 (May audit, 2026-05-02): WS-upgrade gate fires before
+		// any clientID is known (no first-frame yet), so there is no
+		// exemption interaction here — every allowed upgrade ticks the
+		// consumed series, every reject ticks the rejected series.
+		h.metrics.IncRatelimitBurstConsumed("ws_upgrade")
 	}
-
-	h.tunnelsMu.RLock()
-	_, ok := h.tunnels[session.ID]
-	h.tunnelsMu.RUnlock()
-	if !ok {
-		h.decoy.ServeHTTP(w, r)
+	if !allowWS {
+		// Pre-upgrade WS-path rate-limit hit: route through failClosedToDecoy
+		// to sanitize URL-echo. Without this, decoy.ServeHTTP(w, r) would
+		// serve a body whose length depends on r.URL.Path — leaking that
+		// the client tried a known WS endpoint. A2-MED-6.
+		//
+		// Task A2 (May audit): emit X-SL-RL sentinel so client switches from
+		// exp backoff to a fixed per-bucket cool-down. C5 (2026-05-02)
+		// upgraded the wire format to verbose key=value (bucket / burst_left /
+		// refill_in / exempt). Other failClosedToDecoy branches below (gorilla
+		// Upgrade fail, etc.) keep the generic variant — they are not
+		// rate-limit cases.
+		//
+		// §C4 note: WS-upgrade gate fires BEFORE the body-prefix first frame
+		// is read, so the server has no clientID yet to consult the
+		// exemption LRU. Exempt=0 stays here by design — a future
+		// "WS first-frame exemption" would need to defer the rate-limit
+		// gate until after authenticateFirstFrame, which trades the upgrade-
+		// flood DoS protection for a smoother reconnect path. Not in scope
+		// for §C4; the data-path exemption already covers post-attach
+		// throughput, and the handshake exemption covers pool reconnect
+		// handshakes.
+		// Plan §C7 (May audit, 2026-05-02): bucket-empty rejection on the
+		// WS-upgrade gate.
+		h.metrics.IncRatelimitBurstRejected("ws_upgrade")
+		h.failClosedToDecoyRateLimitedV2(w, r, RLSentinel{
+			Bucket:    "ws_upgrade",
+			BurstLeft: remaining,
+			RefillIn:  retryAfter,
+			Exempt:    0,
+		})
 		return
 	}
 
 	conn, err := wsUpgrader.Upgrade(w, r, nil)
 	if err != nil {
+		// gorilla's noopUpgradeError suppressed the default 400 response.
+		// Sanitize via failClosedToDecoy so probe responses look identical
+		// to random-path 200 decoy serves. A2-MED-6.
+		h.failClosedToDecoyWithReason(w, r, DecoyReasonProtocolUnknown)
 		return
 	}
 
-	conn.SetReadLimit(256 * 1024) // 256KB — large enough for any encrypted chunk
+	session := h.authenticateFirstFrame(conn)
+	if session == nil {
+		h.fakeAckAndClose(conn)
+		return
+	}
 
+	// Restore the relay read limit and hand off to the relay loop.
+	conn.SetReadLimit(256 * 1024)
+
+	// A3-S-HIGH-2 (2026-04-25): release the WSAttached latch when this
+	// transport ends so a legitimate client reconnect can re-attach. The
+	// release is keyed on the tunnel observed *now* — closeTunnel during
+	// runWebSocketSession may have removed the tunnel from h.tunnels; in
+	// that case the latch is moot (the tunnel is gone) and the client
+	// will create a fresh handshake on next reconnect.
+	defer func() {
+		h.tunnelsMu.RLock()
+		t, ok := h.tunnels[session.ID]
+		h.tunnelsMu.RUnlock()
+		if ok {
+			t.WSAttached.Store(false)
+		}
+	}()
+
+	h.runWebSocketSession(conn, session)
+}
+
+// runWebSocketSession runs the per-session WebSocket relay: async writer,
+// 20 s ping, pong-reset read deadlines, and the inbound dispatcher for
+// data/connect/fin/keepalive/udp chunks. Returns when either side closes
+// the connection.
+func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Session) {
 	// Async write queue: decouples per-stream relay goroutines and CONNECT_OK
 	// responses from a slow underlying TCP send buffer (CF egress under load).
 	// Previously a single writeMu serialized every WriteMessage call, so a
@@ -225,20 +412,29 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 
-	// Server-side WS ping every 20s — keeps CF proxy connection alive.
-	// Routed through the same async writer so it cannot stall behind a slow
-	// data write, and cannot itself stall data writes.
+	// Server-side WS ping every ~20s with log-normal jitter (sigma=0.5) —
+	// keeps CF proxy connection alive без FFT-visible periodic peak'а на
+	// 20s AND defeats ML classifiers, отличающие uniform jitter через
+	// KS-test против log-normal reference. Routed through the same async
+	// writer so it cannot stall behind a slow data write. Final audit
+	// 2026-05-03 P0-1 + P1-3.
+	//
+	// Opus review M-1 (2026-05-05): per-tick `time.After()` аллокировал
+	// *Timer + chan на каждой итерации (GC pressure под тысячами concurrent
+	// WS sessions). Замена на `time.NewTimer` + `Reset` — один Timer на
+	// весь loop. Reset безопасен после `<-t.C` без drain'а (Go-канон).
 	go func() {
-		ticker := time.NewTicker(20 * time.Second)
-		defer ticker.Stop()
+		t := time.NewTimer(core.JitteredIntervalLogNormal(20*time.Second, 0.5))
+		defer t.Stop()
 		for {
 			select {
 			case <-done:
 				return
-			case <-ticker.C:
+			case <-t.C:
 				if err := writer.EnqueueControl(websocket.PingMessage, nil); err != nil {
 					return
 				}
+				t.Reset(core.JitteredIntervalLogNormal(20*time.Second, 0.5))
 			}
 		}
 	}()
@@ -308,6 +504,15 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				streamsMu.Unlock()
 
 				// ASYNC dial: SafeDial blocks up to 10s per target.
+				// P1-8 fix (final audit 2026-05-03): bind the dial context
+				// to the session's `done` channel so a client disconnect
+				// during the 10s SafeDial budget cancels the dial instead
+				// of leaking a goroutine for the full timeout window.
+				// Mirrors the POST CONNECT pattern at handler.go:1228-1241
+				// (A3-S-HIGH-3, 2026-04-25). Under the 8-slot WS pool
+				// reconnect cascade observed during VPS throttle, every
+				// rejected upgrade could otherwise leave a SafeDial in
+				// kernel SYN backoff for ~10s past WS close.
 				go func(sid uint16, tgt string, s *wsStream) {
 					// X-1 fix: check server-side block list before dialing
 					if len(h.config.BlockDomains) > 0 {
@@ -330,9 +535,19 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 						}
 					}
 
+					dialCtx, cancelDial := context.WithCancel(context.Background())
+					defer cancelDial()
+					go func() {
+						select {
+						case <-done:
+							cancelDial()
+						case <-dialCtx.Done():
+						}
+					}()
+
 					dialStart := time.Now()
 					slog.Info("WS CONNECT dial start", "stream", sid, "target", tgt)
-					tc, err := SafeDial(context.Background(), tgt, 10*time.Second)
+					tc, err := h.safeDialFn(dialCtx, tgt, 10*time.Second)
 					dialElapsed := time.Since(dialStart).Round(time.Millisecond)
 					if err != nil {
 						slog.Warn("WS CONNECT dial FAIL", "stream", sid, "target", tgt,
@@ -351,6 +566,21 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					slog.Info("WS CONNECT dial OK", "stream", sid, "target", tgt,
 						"elapsed", dialElapsed)
 
+					// P1-8: WS may have closed during the dial. If `done`
+					// fired we still hold a freshly-dialed target conn —
+					// close it and skip the relay setup so we don't wire
+					// CONNECT_OK into a dead WS or leak the TCP socket.
+					select {
+					case <-done:
+						tc.Close()
+						s.Close()
+						streamsMu.Lock()
+						delete(streams, sid)
+						streamsMu.Unlock()
+						return
+					default:
+					}
+
 					// Activate: set target conn, flush buffered data, start writer.
 					s.Activate(tc)
 
@@ -362,11 +592,32 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					core.PutBuffer(resp.Payload)
 					slog.Info("WS CONNECT_OK sent", "stream", sid, "target", tgt)
 
+					// T3 P3 (audit 2026-05-03): bind relay lifetime to `done`.
+					// Без watchdog'а `tc.Read(buf)` блокируется до timeout'а
+					// target conn'а, пока WS reader уже вышел и parent
+					// cleanup закрыл streams. Goroutine'а dereference'ит
+					// streams[sid] / delete(streams, sid) под streamsMu —
+					// формально ОК (closure capture by ref + sync.Mutex),
+					// но превращается в use-after-free если будущий patch
+					// присвоит `streams = nil` в cleanup'е. Watchdog
+					// закрывает `tc` на `<-done`, что unblock'ит Read и
+					// позволит relay-deferу очистить streams[sid] до
+					// parent'овского pickup'а.
+					relayDone := make(chan struct{})
+					go func() {
+						select {
+						case <-done:
+							tc.Close()
+						case <-relayDone:
+						}
+					}()
+
 					// Per-stream relay: target → WS (instant push)
 					defer func() {
 						if r := recover(); r != nil {
 							slog.Error("panic recovered in ws stream relay", "error", r, "stream_id", sid)
 						}
+						close(relayDone)
 						s.Close()
 						streamsMu.Lock()
 						delete(streams, sid)
@@ -458,7 +709,13 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// Stop the writer (idempotent; Run drains any in-flight queue then exits)
 	// before closing the conn so an in-progress WriteMessage isn't aborted
-	// mid-frame.
+	// mid-frame. Wait for Run() to finish draining so conn.Close() never
+	// races with a still-in-flight WriteMessage — mirrors the client-side
+	// pattern in client/ws_transport.go:828-834. Without RunDone(), graceful
+	// shutdown surfaced as a slog WARN ("write: connection reset" or
+	// "websocket: close sent") because the conn closed under an in-progress
+	// write of the final drain frame.
 	writer.Close()
+	<-writer.RunDone()
 	conn.Close()
 }

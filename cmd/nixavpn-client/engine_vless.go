@@ -38,69 +38,81 @@ func (e *VLESSEngine) Connect(_ context.Context) error {
 
 	// Строим JSON-конфиг xray-core программно через анонимные структуры,
 	// чтобы не тащить зависимость от infra/conf напрямую.
-	cfg := map[string]interface{}{
-		"dns": map[string]interface{}{
+	cfg := map[string]any{
+		"dns": map[string]any{
 			"servers": []string{"1.1.1.1", "8.8.8.8"},
 		},
-		"inbounds": []map[string]interface{}{
+		"inbounds": []map[string]any{
 			{
 				"tag":      "socks-in",
 				"protocol": "socks",
 				"listen":   socksHost,
 				"port":     socksPort,
-				"settings": map[string]interface{}{
+				"settings": map[string]any{
 					"auth": "password",
-					"accounts": []map[string]interface{}{
+					"accounts": []map[string]any{
 						{"user": e.cfg.ProxyUser, "pass": e.cfg.ProxyPass},
 					},
 					"udp": true,
 				},
-				"sniffing": map[string]interface{}{
+				"sniffing": map[string]any{
 					"enabled":      true,
 					"destOverride": []string{"http", "tls", "quic"},
 				},
 			},
 		},
-		"outbounds": []map[string]interface{}{
+		"outbounds": []map[string]any{
 			{
 				"tag":      "vless-out",
 				"protocol": "vless",
-				"settings": map[string]interface{}{
-					"vnext": []map[string]interface{}{
+				"settings": map[string]any{
+					"vnext": []map[string]any{
 						{
 							"address": vc.Address,
 							"port":    vc.Port,
-							"users": []map[string]interface{}{
-								{
-									"id":         vc.UUID,
-									"encryption": "none",
-									"flow":       vc.Flow,
-								},
+							"users": []map[string]any{
+								func() map[string]any {
+									enc := vc.Encryption
+									if enc == "" {
+										enc = "none"
+									}
+									return map[string]any{
+										"id":         vc.UUID,
+										"encryption": enc,
+										"flow":       vc.Flow,
+									}
+								}(),
 							},
 						},
 					},
 				},
-				"streamSettings": map[string]interface{}{
+				"streamSettings": map[string]any{
 					"network":  "tcp",
 					"security": "reality",
-					"realitySettings": map[string]interface{}{
-						"fingerprint": vc.Fingerprint,
-						"serverName":  vc.SNI,
-						"publicKey":   vc.PublicKey,
-						"shortId":     vc.ShortID,
-						"spiderX":     "/",
-					},
+					"realitySettings": func() map[string]any {
+						rs := map[string]any{
+							"fingerprint": vc.Fingerprint,
+							"serverName":  vc.SNI,
+							"publicKey":   vc.PublicKey,
+							"shortId":     vc.ShortID,
+							"spiderX":     "/",
+						}
+						if vc.Mldsa65Verify != "" {
+							rs["mldsa65Verify"] = vc.Mldsa65Verify
+						}
+						return rs
+					}(),
 				},
 			},
 			{
 				"tag":      "direct",
 				"protocol": "freedom",
-				"settings": map[string]interface{}{},
+				"settings": map[string]any{},
 			},
 		},
-		"routing": map[string]interface{}{
+		"routing": map[string]any{
 			"domainStrategy": "IPIfNonMatch",
-			"rules": []map[string]interface{}{
+			"rules": []map[string]any{
 				// RU-домены и RU-IP — напрямую, без VPN.
 				{
 					"type":        "field",

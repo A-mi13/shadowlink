@@ -46,9 +46,9 @@ func TestPayloadDistributionDownload(t *testing.T) {
 	pd := NewPayloadDistribution()
 	const N = 10000
 	buckets := map[string]int{
-		"50-100":   0,
-		"201-600":  0,
-		"601-2000": 0,
+		"50-100":    0,
+		"201-600":   0,
+		"601-2000":  0,
 		"2001-8000": 0,
 	}
 
@@ -179,12 +179,17 @@ func TestPadToSizeNoOpWhenBigger(t *testing.T) {
 	assert.Equal(t, data, padded, "should return original if already bigger")
 }
 
+// TestSessionLifecycleActiveInterval pins the truncation bounds of the
+// log-normal lifetime distribution introduced for HIGH-3 (May 2026 audit
+// follow-up). Was uniform [120, 480]s; is now log-normal with median ≈ 300s
+// truncated to [60, 86400]s. Detailed shape assertions live in the
+// mimicry_lifetime_test.go companion file.
 func TestSessionLifecycleActiveInterval(t *testing.T) {
 	sl := NewSessionLifecycle()
-	for range 100 {
+	for range 1000 {
 		interval := sl.NextActiveInterval()
-		assert.GreaterOrEqual(t, interval, 120)
-		assert.LessOrEqual(t, interval, 480)
+		assert.GreaterOrEqual(t, interval, 60)
+		assert.LessOrEqual(t, interval, 86400)
 	}
 }
 

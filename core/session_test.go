@@ -24,9 +24,9 @@ func TestSessionRejectsReplay(t *testing.T) {
 func TestSessionAcceptsOutOfOrder(t *testing.T) {
 	s := NewSession(1, make([]byte, 32), make([]byte, 32))
 	assert.True(t, s.AcceptSeqNum(0))
-	assert.True(t, s.AcceptSeqNum(3))  // skip 1,2
-	assert.True(t, s.AcceptSeqNum(1))  // late arrival
-	assert.True(t, s.AcceptSeqNum(2))  // late arrival
+	assert.True(t, s.AcceptSeqNum(3)) // skip 1,2
+	assert.True(t, s.AcceptSeqNum(1)) // late arrival
+	assert.True(t, s.AcceptSeqNum(2)) // late arrival
 }
 
 func TestSessionSlidingWindowLimit(t *testing.T) {
@@ -39,7 +39,7 @@ func TestSessionSlidingWindowEdge(t *testing.T) {
 	s := NewSession(1, make([]byte, 32), make([]byte, 32))
 	assert.True(t, s.AcceptSeqNum(0))
 	assert.True(t, s.AcceptSeqNum(WindowSize-1)) // exactly at window edge
-	assert.True(t, s.AcceptSeqNum(0))             // still within window
+	assert.True(t, s.AcceptSeqNum(0))            // still within window
 }
 
 func TestSessionLargeJump(t *testing.T) {
@@ -48,8 +48,8 @@ func TestSessionLargeJump(t *testing.T) {
 	high := uint32(WindowSize + 5000) // always larger than WindowSize
 	assert.True(t, s.AcceptSeqNum(high))
 	assert.False(t, s.AcceptSeqNum(0), "old seq after large jump")
-	assert.True(t, s.AcceptSeqNum(high-1))              // within new window
-	assert.True(t, s.AcceptSeqNum(high-WindowSize+1))   // exactly at edge
+	assert.True(t, s.AcceptSeqNum(high-1))            // within new window
+	assert.True(t, s.AcceptSeqNum(high-WindowSize+1)) // exactly at edge
 	assert.False(t, s.AcceptSeqNum(high-WindowSize), "just outside window")
 }
 
@@ -266,4 +266,15 @@ func TestSessionCreateReturnsError(t *testing.T) {
 	// Bad key length — should fail
 	_, err := sm.Create([]byte("short"), []byte("short"))
 	assert.Error(t, err, "bad key length should return error")
+}
+
+// TestSession_ProtoVersionPin verifies that the wire-format version field
+// defaults to 0 (legacy) and can be pinned after handshake. D5 of Bearer→body-prefix
+// migration.
+func TestSession_ProtoVersionPin(t *testing.T) {
+	s := NewSession(42, make([]byte, 32), make([]byte, 32))
+	assert.Equal(t, uint8(0), s.ProtoVersion, "default proto version should be 0 (legacy)")
+
+	s.ProtoVersion = 1
+	assert.Equal(t, uint8(1), s.ProtoVersion, "proto version not pinnable")
 }

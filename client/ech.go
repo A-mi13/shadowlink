@@ -8,7 +8,37 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/nixavpn/shadowlink/skins/browser"
 )
+
+// dohServerAddr — Cloudflare 1.1.1.1 DoH endpoint. Pinned IP avoids plaintext
+// DNS resolution of the resolver itself (would defeat the point of DoH).
+const dohServerAddr = "1.1.1.1:443"
+
+// dohSNI — the ServerName presented in the TLS handshake. Cloudflare's 1.1.1.1
+// DoH endpoint serves a cert valid for `cloudflare-dns.com` and `one.one.one.one`;
+// we use `cloudflare-dns.com` because it's the canonical public name.
+const dohSNI = "cloudflare-dns.com"
+
+// newDoHClient constructs the HTTP client used for DNS-over-HTTPS queries to
+// Cloudflare's 1.1.1.1 endpoint.
+//
+// A2-MED-1 (2026-04 audit) cure: the previous implementation built a vanilla
+// `&http.Client{Timeout: 5 * time.Second}` and POSTed to `https://1.1.1.1/dns-query`,
+// emitting the canonical Go-stdlib JA3 from the same client IP that minutes
+// later spoke Chrome/Safari/Firefox JA3 over the ShadowLink data path. Even
+// though 1.1.1.1 itself is benign, the JA3 inconsistency is a passive
+// fingerprint signal for any observer who can co-locate the DoH and VPN flows.
+//
+// This unifies the DoH client onto the same uTLS dialer used by the data path
+// (see buildUTLSHTTPClient + ws_transport / split_transport).
+func newDoHClient() *http.Client {
+	// Pick a Chrome fingerprint for DoH. Chrome is the most common browser
+	// fingerprint, so a Chrome JA3 hitting 1.1.1.1 is the highest-volume
+	// background traffic to blend into.
+	fp := browser.NewFingerprint(browser.ProfileChrome)
+	return buildUTLSHTTPClient(dohServerAddr, dohSNI, fp, false, 5*time.Second, "http/1.1")
+}
 
 // ResolveECHConfig queries DNS HTTPS record (type 65) for domain
 // and extracts ECHConfigList from the ech= SvcParam.
@@ -24,13 +54,24 @@ func ResolveECHConfig(domain string) ([]byte, error) {
 		return nil, fmt.Errorf("dns pack failed: %w", err)
 	}
 
-	// Send via DNS-over-HTTPS to Cloudflare (encrypted, no plaintext domain leak)
-	httpClient := &http.Client{Timeout: 5 * time.Second}
-	resp, err := httpClient.Post(
-		"https://1.1.1.1/dns-query",
-		"application/dns-message",
-		bytes.NewReader(packed),
-	)
+	// Send via DNS-over-HTTPS to Cloudflare (encrypted, no plaintext domain leak).
+	// uTLS-routed (A2-MED-1 fix) — see newDoHClient godoc.
+	//
+	// 2026-05-02 wire-trigger followup NEW-2: build the request manually so we
+	// can attach the Chrome User-Agent + sec-ch-ua header set. Stdlib
+	// http.Client.Post sends no UA, leaving a uTLS Chrome ClientHello followed
+	// by a UA-less POST — internally inconsistent.
+	httpClient := newDoHClient()
+	defer httpClient.CloseIdleConnections()
+	req, err := http.NewRequest(http.MethodPost, "https://"+dohSNI+"/dns-query", bytes.NewReader(packed))
+	if err != nil {
+		return nil, fmt.Errorf("doh build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/dns-message")
+	req.Header.Set("Accept", "application/dns-message")
+	req.Header.Set("User-Agent", browser.LockedChromeUA())
+	browser.ApplyChromeCHUA(req.Header)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("doh query failed: %w", err)
 	}

@@ -3,16 +3,129 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"math"
+	mrand "math/rand"
 	"math/rand/v2"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	"github.com/nixavpn/shadowlink/core"
 	"github.com/nixavpn/shadowlink/skins/browser"
 )
+
+// ErrRateLimited — see ratelimit_signal.go for the canonical declaration.
+// Callers use errors.Is; the typed sentinel is now shared across the carrier
+// chain (Phase 2.1) and the legacy header detection path.
+//
+// Task A2 (May audit, 2026-05-01). Moved to ratelimit_signal.go (Phase 2.1).
+//
+// Note: kept as a doc comment only — the var lives in ratelimit_signal.go.
+
+// slotRateLimitedCooldown returns the wait duration applied by reconnectLoop
+// when connectSlot surfaces ErrRateLimited. Spec: 180s ± 30% jitter, drawn
+// uniformly from [126s, 234s].
+//
+// Why fixed (not exp): server told us "you are flooding me". We need to wait
+// long enough for the per-IP rate window (1 minute) to elapse twice over,
+// plus a safety margin so we don't immediately hit the limiter again. exp
+// backoff would either undercut the window (attempt 0-2) or overshoot it
+// massively (attempt 5+ → 60s cap which is still under window safety).
+//
+// Why ±30% (not ±10%): when N slots in a pool die together and all see the
+// rate-limit sentinel, we need their cool-downs to spread enough that the
+// post-cool-down handshake burst is decorrelated. 180s × 30% = 108s spread
+// across 8 slots is comfortably bigger than the limiter window — the storm
+// gets broken up.
+//
+// Why disjoint from slotBackoffDuration's [5s, 60s] range: failure-mode
+// classification on the dashboard depends on the cool-down counter ticking
+// only when the sentinel fires, not when the network just hiccupped. The
+// floor at 126s is double the exp cap, so a single-slot dashboard panel can
+// distinguish the two reconnect cadences cleanly.
+func slotRateLimitedCooldown() time.Duration {
+	const base = 180 * time.Second
+	// Uniform [-0.30, +0.30) draw — math/rand/v2 Float64 is concurrent-safe.
+	jitter := (rand.Float64()*0.6 - 0.3)
+	return time.Duration(float64(base) * (1.0 + jitter))
+}
+
+// rateLimitRefillFloor / rateLimitRefillCeil are sanity bounds applied when
+// honoring a server-directed RefillIn from *RateLimitError.Signal. They
+// prevent the client from sleeping for less than 5 s (renders the rate-limit
+// protection ineffective) or more than 30 min (excessive; likely a clock
+// skew / config bug on the server side).
+const (
+	rateLimitRefillFloor = 5 * time.Second
+	rateLimitRefillCeil  = 30 * time.Minute
+)
+
+// clampRefillIn applies [rateLimitRefillFloor, rateLimitRefillCeil] bounds to
+// a server-supplied RefillIn duration. Returns the clamped value.
+func clampRefillIn(d time.Duration) time.Duration {
+	if d < rateLimitRefillFloor {
+		return rateLimitRefillFloor
+	}
+	if d > rateLimitRefillCeil {
+		return rateLimitRefillCeil
+	}
+	return d
+}
+
+// slotRateLimitedCooldownForTest is a test seam: production code calls
+// slotRateLimitedCooldown directly, but TestReconnectLoop_AppliesCooldownOnRateLimit
+// substitutes a 100ms shim so the integration test can complete in <1s.
+//
+// Defaults to slotRateLimitedCooldown so production behavior is unchanged
+// when no test stub is installed.
+var slotRateLimitedCooldownForTest = slotRateLimitedCooldown
+
+// slotBackoffDurationForTest is a test seam matching slotRateLimitedCooldownForTest.
+// Production reconnectLoop calls slotBackoffDuration(attempt) directly; tests
+// override this to return a fast backoff so reconnectLoop integration tests
+// finish in milliseconds instead of seconds.
+var slotBackoffDurationForTest = slotBackoffDuration
+
+// connectSlotForTest is a test seam for reconnectLoop integration tests —
+// production code uses (*WSPoolTransport).connectSlot directly. The stub
+// returns the desired error sequence (e.g. ErrRateLimited then nil) without
+// needing a live WS server.
+//
+// nil means "fall through to the real implementation" — production paths
+// must NOT see this hook and the build never references it.
+var connectSlotForTest func() error
+
+// sleepWithCancel sleeps for d, returning early if ctx is cancelled. Used
+// by reconnectLoop to pace the rate-limit cool-down without blocking
+// pool shutdown for the full 126-234s.
+func sleepWithCancel(ctx context.Context, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+}
+
+// newDiscardLogger returns a slog logger whose output is silently dropped.
+// Used by tests that exercise loops which would otherwise spam the test
+// output stream. NOT used in production code.
+func newDiscardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(discardWriter{}, nil))
+}
+
+type discardWriter struct{}
+
+func (discardWriter) Write(p []byte) (int, error) { return len(p), nil }
 
 type slotState int32
 
@@ -29,6 +142,26 @@ const (
 // Pass WSPoolConfig.MaxPendingPerSlot to override.
 const defaultMaxPendingPerSlot = 4
 
+// wsSlotTransport is the minimal interface that poolSlot.transport must satisfy.
+// Using an interface instead of *WebSocketTransport lets tests inject a fake
+// reader without spinning up a real gorilla WS connection, while keeping the
+// production code structurally identical — *WebSocketTransport satisfies all
+// five methods automatically (enforced by the compile-time assertion below).
+//
+// Phase 3 supervisor refactor will replace the loop body with a channel-based
+// pump, but this interface remains the seam point so regression tests continue
+// to drive the real reader path.
+type wsSlotTransport interface {
+	ReadMessage(timeout time.Duration) ([]byte, error)
+	LastWriteUnixNano() int64
+	WriteMessage(data []byte) error
+	WriteControlMessage(data []byte) error
+	Close() error
+}
+
+// Compile-time assertion: *WebSocketTransport must satisfy wsSlotTransport.
+var _ wsSlotTransport = (*WebSocketTransport)(nil)
+
 // poolSlot is a single WebSocket connection in the pool with its own crypto session.
 //
 // generation is incremented every time the slot is (re)connected. Each reader
@@ -38,7 +171,7 @@ const defaultMaxPendingPerSlot = 4
 // otherwise occur when an old reader and a new reader race on the same conn
 // after a fast reconnect.
 type poolSlot struct {
-	transport       *WebSocketTransport
+	transport       wsSlotTransport
 	session         *core.Session
 	token           []byte
 	state           atomic.Int32 // slotState
@@ -46,9 +179,15 @@ type poolSlot struct {
 	pendingConnects atomic.Int32 // in-flight CONNECTs (sent, awaiting CONNECT_OK)
 	generation      atomic.Uint64
 	index           int
+
+	// downBytes counts encrypted payload bytes received on this TCP since last
+	// (re)connect. Used for byte-based preemptive rotation: TSPU (Russia DPI,
+	// 2026) silently freezes TCP after ~15-20KB downstream from "suspicious" IPs
+	// with TLS 1.3 — we rotate before hitting the threshold to keep traffic moving.
+	downBytes atomic.Int64
 }
 
-func (s *poolSlot) getState() slotState { return slotState(s.state.Load()) }
+func (s *poolSlot) getState() slotState   { return slotState(s.state.Load()) }
 func (s *poolSlot) setState(st slotState) { s.state.Store(int32(st)) }
 
 // shouldExitReader returns true when the reader's captured generation no longer
@@ -58,6 +197,128 @@ func (p *WSPoolTransport) shouldExitReader(slot *poolSlot, capturedGen uint64) b
 	return slot.generation.Load() != capturedGen
 }
 
+// classifyWSReadError maps a terminal slot-reader error to one of the bounded
+// labels in frameAnomalyReasons. Used by R.3a diagnostic capture: dashboard
+// counters and a structured log line both consume the same classification so
+// "what failed?" is a single field across log, metric, and trace.
+//
+// Order matters — patterns are checked most-specific-first. Documented
+// precedence invariants (also asserted in TestClassifyWSReadError_OrderingInvariants):
+//   - `closed_local` before `eof` — a Close-then-read race produces both
+//     signals and the local-close attribution is more useful for forensics.
+//   - `tls` before `eof` — `tls: read EOF on record layer` is a TLS-layer
+//     teardown, not raw TCP EOF; misclassifying it as `eof` hides JA3/MAC
+//     drift signal.
+//   - `reset_by_peer` before `eof` — a hard TCP RST that the kernel surfaces
+//     as `connection reset by peer` is distinct from an orderly FIN read as
+//     EOF; conflating them would erase the throttle/RST-injection signal.
+//   - `io_timeout` before `eof` — a `i/o timeout` carries the same forensic
+//     weight as a write deadline expiry and must not be hidden in `other`.
+func classifyWSReadError(err error) string {
+	if err == nil {
+		return "other"
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "RSV"):
+		// gorilla returns "RSV1 set, RSV2 set, and RSV3 set, none of which is
+		// supported" or similar permutations. All collapse to one label —
+		// distinguishing 1 vs 2 vs 3 set bits adds cardinality without giving
+		// us actionable signal.
+		return "rsv"
+	case strings.Contains(msg, "bad opcode"):
+		return "opcode"
+	case strings.Contains(msg, "use of closed network connection"):
+		return "closed_local"
+	case strings.Contains(msg, "close 1011"):
+		return "close_1011"
+	case strings.Contains(msg, "message too big"):
+		// gorilla "websocket: read limit exceeded — ..." (ErrReadLimit), the
+		// canonical close-1009 CloseError (`"websocket: close 1009 (message
+		// too big)"`), and synthetic `"message too big"` middlebox responses.
+		// MUST come BEFORE "websocket: close" because the close-1009 message
+		// also contains the "websocket: close" prefix; otherwise close-1009
+		// silently collapses into close_other and we lose the size-violation
+		// signal entirely. Distinct from a corrupted-frame rsv/opcode signal
+		// — the wire bytes were syntactically valid, just too big.
+		return "message_too_big"
+	case strings.Contains(msg, "websocket: close"):
+		// Other WS close codes (1000/1001/1006/1008/...). 1011 is special
+		// above; 1009 (message too big) is special above too.
+		return "close_other"
+	case strings.Contains(msg, "connection reset by peer"):
+		// TCP RST surfaced through the kernel — explicit teardown, distinct
+		// from orderly FIN (EOF). Hoster throttle and CDN RST-injection both
+		// land here.
+		return "reset_by_peer"
+	case strings.Contains(msg, "i/o timeout"):
+		// Read or write deadline expired without data — distinct from EOF
+		// (peer never closed) and from `closed_local` (we didn't Close()).
+		// Surface it as its own bucket so dashboards can spot stalled-but-
+		// not-torn-down connections (CF/middlebox black-hole).
+		return "io_timeout"
+	case strings.Contains(msg, "tls:"):
+		return "tls"
+	case strings.Contains(msg, "EOF"):
+		// Covers io.EOF and "unexpected EOF" — both signal TCP teardown.
+		return "eof"
+	case looksLikeHTTPPrefix(msg):
+		// Middlebox (CF edge, hoster reverse proxy, captive portal) returned
+		// an HTTP error page on what should have been a WS frame stream.
+		// Common signature: gorilla parses leading "<HTML" / "HTTP/" bytes
+		// as a frame header and complains about RSV (already caught above)
+		// or unexpected payload — but the underlying cause is HTML/text on
+		// the wire. Some gorilla versions surface this as "invalid UTF-8"
+		// for text frames.
+		return "html"
+	default:
+		return "other"
+	}
+}
+
+// looksLikeHTTPPrefix returns true when the error message hints that the
+// underlying wire contained HTTP/HTML bytes instead of WS frames.
+func looksLikeHTTPPrefix(msg string) bool {
+	return strings.Contains(msg, "invalid UTF-8") ||
+		strings.Contains(msg, "HTTP") ||
+		strings.Contains(msg, "<!DOCTYPE") ||
+		strings.Contains(msg, "<html")
+}
+
+// slotBackoffDuration returns reconnect wait for a per-slot reconnect attempt.
+//
+// Behavior:
+//   - attempt 0: uniform [5s, 10s) — slow-start with broad spread.
+//   - attempt N>0: base = 5s × 2^N, jitter [1.0, 2.0), capped at 60s.
+//
+// Using a 5s base instead of the global 1s base (`backoffDuration`) prevents
+// the cascade documented in `docs/strategy/2026-04-30-current-state-and-improvements.md`
+// §2.2: 8 slots dying simultaneously and reconnecting at attempt=0 with the
+// 1s base would all fire within ~1.25s, blow through the per-IP handshake
+// rate limit, and cascade into a 70s backoff cliff. Wider [1.0, 2.0) jitter
+// (vs the global ±25%) decorrelates the 8 first-attempts across a 5-10s
+// window — comfortable spread under any reasonable handshake rate limit.
+//
+// Cap is applied AFTER jitter (not on the base) so the worst-case wait the
+// user can ever experience is bounded at exactly 60s. This trades a slightly
+// less aggressive curve at high attempts for predictable user-visible cap.
+//
+// Concurrency: math/rand/v2's package-level Float64 is concurrent-safe and
+// cheap. No need to manage our own seeded RNG here.
+//
+// Attempt clamp: pinned at 6 (5s × 2^6 = 320s pre-cap, post-cap 60s) to
+// prevent time.Duration overflow at attempt~37+ (May 2026 audit F1).
+func slotBackoffDuration(attempt int) time.Duration {
+	attempt = min(attempt, 6)
+	base := float64(5*time.Second) * math.Pow(2, float64(attempt))
+	jitter := 1.0 + rand.Float64() // [1.0, 2.0)
+	d := time.Duration(base * jitter)
+	if d > 60*time.Second {
+		return 60 * time.Second
+	}
+	return d
+}
+
 // WSPoolTransport manages a pool of WebSocket connections for fault tolerance and throughput.
 // Implements StreamTransport + PoolAware interfaces.
 // Server is unaware of the pool — each WS is an independent tunnel.
@@ -65,8 +326,9 @@ type WSPoolTransport struct {
 	slots    []*poolSlot
 	poolSize int
 
-	maxPendingPerSlot  int32 // cap on in-flight CONNECTs per slot
-	maxStreamsPerSlot   int32 // cap on active streams per slot (0 = unlimited)
+	maxPendingPerSlot int32 // cap on in-flight CONNECTs per slot
+	maxStreamsPerSlot int32 // cap on active streams per slot (0 = unlimited)
+	maxBytesPerSlot   int64 // rotate slot after N downstream bytes (0 = disabled)
 
 	streamMap sync.Map // map[uint16]int — streamID -> slot index
 
@@ -91,6 +353,14 @@ type WSPoolTransport struct {
 	recentDeaths      atomic.Int32
 	meltdownUntil     atomic.Int64 // unix nano; reconnects blocked until this time
 
+	// meltdownLimiter rate-limits WARN-level meltdown log emission so the
+	// emission cadence is not a deterministic side channel observable from
+	// the network. severeMeltdown() additionally suppresses transient drops
+	// from the WARN channel; transient events log at debug only.
+	meltdownLimiter *rate.Limiter
+	meltdownLogRNG  *mrand.Rand
+	meltdownLogMu   sync.Mutex // guards meltdownLogRNG (math/rand is not safe for concurrent use)
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	log    *slog.Logger
@@ -98,10 +368,11 @@ type WSPoolTransport struct {
 
 // Compile-time assertions.
 var (
-	_ StreamTransport   = (*WSPoolTransport)(nil)
-	_ PoolAware         = (*WSPoolTransport)(nil)
-	_ PendingTracker    = (*WSPoolTransport)(nil)
-	_ ControlPoolAware  = (*WSPoolTransport)(nil)
+	_ StreamTransport  = (*WSPoolTransport)(nil)
+	_ PoolAware        = (*WSPoolTransport)(nil)
+	_ PendingTracker   = (*WSPoolTransport)(nil)
+	_ ControlPoolAware = (*WSPoolTransport)(nil)
+	_ PoolReadiness    = (*WSPoolTransport)(nil)
 )
 
 // WSPoolConfig configures the WebSocket pool.
@@ -120,6 +391,12 @@ type WSPoolConfig struct {
 	// MaxStreamsPerSlot caps active streams per slot. 0 = unlimited.
 	// For CF CDN mode, set low (4-8) so each WS carries light traffic.
 	MaxStreamsPerSlot int
+
+	// MaxBytesPerSlot triggers preemptive rotation after N downstream bytes on
+	// a single slot's TCP. 0 = disabled. Critical for Russia TSPU DPI (2026)
+	// which silently freezes foreign-IP TCPs after ~15-20KB over TLS 1.3.
+	// Recommended 15 * 1024 for viaCF mode, 0 (disabled) for direct/SNI.
+	MaxBytesPerSlot int64
 
 	// WriteTimeout caps each WS frame's write deadline. 0 → WSAsyncWriter
 	// default (30s). For viaCF mode pass 5-8s: CF-side stalls propagate as
@@ -168,8 +445,9 @@ func NewWSPoolTransport(cl *Client, cfg WSPoolConfig) *WSPoolTransport {
 	return &WSPoolTransport{
 		slots:             make([]*poolSlot, cfg.Size),
 		poolSize:          cfg.Size,
-		maxPendingPerSlot:  int32(cfg.MaxPendingPerSlot),
-		maxStreamsPerSlot:  int32(cfg.MaxStreamsPerSlot),
+		maxPendingPerSlot: int32(cfg.MaxPendingPerSlot),
+		maxStreamsPerSlot: int32(cfg.MaxStreamsPerSlot),
+		maxBytesPerSlot:   cfg.MaxBytesPerSlot,
 		serverAddr:        cfg.ServerAddr,
 		sniHost:           cfg.SNIHost,
 		cfIP:              cfg.CFIP,
@@ -182,6 +460,8 @@ func NewWSPoolTransport(cl *Client, cfg WSPoolConfig) *WSPoolTransport {
 		meltdownWindow:    cfg.MeltdownWindow,
 		meltdownThreshold: cfg.MeltdownThreshold,
 		meltdownCooldown:  cfg.MeltdownCooldown,
+		meltdownLimiter:   newMeltdownLimiter(),
+		meltdownLogRNG:    mrand.New(mrand.NewSource(time.Now().UnixNano())),
 		ctx:               ctx,
 		cancel:            cancel,
 		log:               slog.Default(),
@@ -236,18 +516,19 @@ func (p *WSPoolTransport) Connect(ctx context.Context) error {
 	return nil
 }
 
-// keepaliveLoop sends FlagKeepalive to every healthy slot every 20s.
-// This prevents Cloudflare Proxy Write Timeout (30s) and Idle Timeout (900s)
-// from killing long-lived WebSocket connections.
+// keepaliveLoop sends FlagKeepalive to every healthy slot at a jittered
+// ~20s cadence. The base interval prevents Cloudflare Proxy Write Timeout
+// (30s) and Idle Timeout (900s) from killing long-lived WebSocket
+// connections; the log-normal jitter (final-audit-2026-05-03 P1-3,
+// upgraded from uniform ±30% NEW-1 fix) destroys the FFT-visible
+// periodic peak AND defeats ML classifiers that distinguish flat-band
+// uniform jitter from heavy-tailed real-world inter-frame jitter.
 func (p *WSPoolTransport) keepaliveLoop() {
-	ticker := time.NewTicker(20 * time.Second)
-	defer ticker.Stop()
-
 	for {
 		select {
 		case <-p.ctx.Done():
 			return
-		case <-ticker.C:
+		case <-time.After(JitteredIntervalLogNormal(20*time.Second, 0.5)):
 			p.sendKeepaliveToAllSlots()
 		}
 	}
@@ -302,11 +583,18 @@ func (p *WSPoolTransport) connectSlot(ctx context.Context, idx int) error {
 		return fmt.Errorf("slot %d: parse hello: %w", idx, err)
 	}
 
+	// `_v` MUST be threaded into core.ServerHello so CompleteHandshake picks the
+	// matching key schedule. Server's handleHandshakeNew derives keys with
+	// protoVersion=1; if we drop `_v` here, CompleteHandshake silently defaults
+	// to protoVersion=0 (legacy) and the resulting keys diverge byte-for-byte
+	// from the server's — every pool slot then fails with "cannot decrypt
+	// session token" (datacanvases.com data-plane drift, 2026-04-30).
 	var shData struct {
-		EphPub    []byte `json:"eph"`
-		Token     []byte `json:"tok"`
-		MaxConns  uint8  `json:"mc"`
-		ChunkSize uint16 `json:"cs"`
+		EphPub       []byte `json:"eph"`
+		Token        []byte `json:"tok"`
+		MaxConns     uint8  `json:"mc"`
+		ChunkSize    uint16 `json:"cs"`
+		ProtoVersion *uint8 `json:"_v,omitempty"`
 	}
 	if err := json.Unmarshal(respData, &shData); err != nil {
 		slot.setState(slotDead)
@@ -318,6 +606,7 @@ func (p *WSPoolTransport) connectSlot(ctx context.Context, idx int) error {
 		EncryptedSessionToken: shData.Token,
 		MaxConnsPerClient:     shData.MaxConns,
 		ChunkSize:             shData.ChunkSize,
+		ProtoVersion:          shData.ProtoVersion,
 	}
 
 	session, err := core.CompleteHandshake(clientState, serverHello)
@@ -339,12 +628,16 @@ func (p *WSPoolTransport) connectSlot(ctx context.Context, idx int) error {
 	if idx == 0 {
 		wst.WarmupRequests() // Only warmup for first slot (looks natural)
 	}
-	if err := wst.UpgradeToWS(slot.token); err != nil {
+	// D3: ws upgrade now authenticates via a post-upgrade first frame built
+	// from the slot's session — Bearer header is gone.
+	if err := wst.UpgradeToWS(slot.token, slot.session); err != nil {
 		slot.setState(slotDead)
 		return fmt.Errorf("slot %d: ws upgrade: %w", idx, err)
 	}
 
 	slot.transport = wst
+	// Reset downstream byte counter — fresh TCP starts the TSPU 15-20KB budget over.
+	slot.downBytes.Store(0)
 	// Bump generation BEFORE marking ready so any old reader checking
 	// generation after this point exits cleanly. The new reader (started by
 	// the caller) will capture the new generation at its first check.
@@ -358,6 +651,13 @@ func (p *WSPoolTransport) connectSlot(ctx context.Context, idx int) error {
 // the loop waits for it to elapse before attempting to reconnect. This
 // prevents a spiral where CF rejects replacement slots as fast as they are
 // created, keeping it under load and making recovery slower.
+//
+// Task A2 (May audit): if connectSlot surfaces ErrRateLimited (server
+// emitted X-SL-RL: 1 from its rate-limit branch), the loop applies a fixed
+// 180s ± 30% cool-down INSTEAD of exp backoff and resets the attempt counter
+// to 0 afterwards. Resetting the counter prevents the cool-down from being
+// stacked on top of an already-aged exp curve — after a rate-limit event
+// we want a clean slow-start, not "5s × 2^N + 180s".
 func (p *WSPoolTransport) reconnectLoop(idx int) {
 	for attempt := 0; ; attempt++ {
 		select {
@@ -378,8 +678,8 @@ func (p *WSPoolTransport) reconnectLoop(idx int) {
 			}
 		}
 
-		d := backoffDuration(attempt)
-		p.log.Info("WS pool reconnecting slot", "slot", idx, "backoff", d)
+		d := slotBackoffDurationForTest(attempt)
+		p.log.Info("WS pool reconnecting slot", "slot", idx, "backoff", d, "attempt", attempt)
 
 		timer := time.NewTimer(d)
 		select {
@@ -389,15 +689,107 @@ func (p *WSPoolTransport) reconnectLoop(idx int) {
 		case <-timer.C:
 		}
 
-		if err := p.connectSlot(p.ctx, idx); err != nil {
-			p.log.Warn("WS pool slot reconnect failed", "slot", idx, "err", err)
+		var connectErr error
+		if connectSlotForTest != nil {
+			// Test seam — see ws_pool.go::connectSlotForTest. Production
+			// builds never enter this branch because nothing assigns the var.
+			connectErr = connectSlotForTest()
+		} else {
+			connectErr = p.connectSlot(p.ctx, idx)
+		}
+
+		if connectErr == nil {
+			p.log.Info("WS pool slot reconnected", "slot", idx)
+			go p.slotReader(idx)
+			return
+		}
+
+		// Task A2: typed sentinel — server told us we're rate-limited.
+		// Honor Signal.RefillIn when present (Phase 2 fix); fall back to
+		// fixed 180s ± 30% otherwise. Reset attempt counter so the next
+		// iteration starts fresh from attempt=0 (slow-start). The counter
+		// reset is safe: slotBackoffDuration is already clamped at attempt=6
+		// (May audit F1, A1 fix), so over-counting can't overflow.
+		if errors.Is(connectErr, ErrRateLimited) {
+			Stats.RateLimitedFromServer.Add(1)
+			var cooldown time.Duration
+			var rlErr *RateLimitError
+			if errors.As(connectErr, &rlErr) && rlErr.Signal != nil && rlErr.Signal.RefillIn > 0 {
+				cooldown = clampRefillIn(rlErr.Signal.RefillIn)
+				cooldown = JitteredInterval(cooldown, 0.30)
+				p.log.Info("WS pool slot rate-limited by server (server-directed cooldown)",
+					"slot", idx,
+					"carrier", rlErr.Signal.Carrier,
+					"bucket", rlErr.Signal.Bucket,
+					"refill_in_server", rlErr.Signal.RefillIn,
+					"cooldown_applied", cooldown,
+				)
+			} else {
+				cooldown = slotRateLimitedCooldownForTest()
+				p.log.Info("WS pool slot rate-limited by server (fallback fixed cooldown)",
+					"slot", idx,
+					"cooldown_applied", cooldown,
+				)
+			}
+			sleepWithCancel(p.ctx, cooldown)
+			// Reset attempt counter — the for-loop's `attempt++` will run
+			// after `continue`, so we set it to -1 to land on 0 next iter.
+			attempt = -1
 			continue
 		}
 
-		p.log.Info("WS pool slot reconnected", "slot", idx)
-		go p.slotReader(idx)
-		return
+		p.log.Warn("WS pool slot reconnect failed", "slot", idx, "err", connectErr)
 	}
+}
+
+// newMeltdownLimiter returns a token-bucket limiter capping meltdown WARN
+// log emission at 1 per 10s with burst 3. Public-from-package for tests.
+//
+// Closes A2-MED-10: deterministic-cadence meltdown WARN emissions used to
+// be a passive timing side channel observable from the network (DPI could
+// correlate connection drops with predictable log timing). Token bucket +
+// jittered emit + severity gate together obscure the timing fingerprint.
+func newMeltdownLimiter() *rate.Limiter {
+	return rate.NewLimiter(rate.Every(10*time.Second), 3)
+}
+
+// severeMeltdown returns true when at least half the pool is dead. Below
+// this threshold, transient drops emit debug-only and are suppressed from
+// WARN-level log channels — preventing single-slot blips from triggering a
+// WARN that an attacker could correlate with their network probe.
+func severeMeltdown(dead, total int) bool {
+	if total <= 0 {
+		return false
+	}
+	return dead*2 >= total
+}
+
+// countDeadSlots returns the number of slots currently in slotDead state and
+// the pool size. Lock-free read of per-slot atomics.
+func (p *WSPoolTransport) countDeadSlots() (dead, total int) {
+	total = p.poolSize
+	for _, slot := range p.slots {
+		if slot == nil {
+			// Nil slot has not been initialized yet — treat as not-yet-alive,
+			// which for meltdown reporting purposes does not count as dead.
+			continue
+		}
+		if slot.getState() == slotDead {
+			dead++
+		}
+	}
+	return dead, total
+}
+
+// meltdownLogJitter returns a [0.5×base, 1.5×base) duration sampled from the
+// pool's RNG. Caller must NOT hold meltdownLogMu — this method takes it.
+func (p *WSPoolTransport) meltdownLogJitter(base time.Duration) time.Duration {
+	p.meltdownLogMu.Lock()
+	defer p.meltdownLogMu.Unlock()
+	if p.meltdownLogRNG == nil {
+		return base
+	}
+	return time.Duration(0.5*float64(base) + p.meltdownLogRNG.Float64()*float64(base))
 }
 
 // meltdownWaitDuration returns how long the reconnect must still wait before
@@ -435,13 +827,62 @@ func (p *WSPoolTransport) recordSlotDeath() {
 		// Only advance, never shorten, an already-active cooldown.
 		if prev := p.meltdownUntil.Load(); until > prev {
 			p.meltdownUntil.Store(until)
-			p.log.Warn("WS pool meltdown detected — entering cooldown",
-				"deaths_in_window", deaths,
-				"threshold", p.meltdownThreshold,
-				"window", p.meltdownWindow,
-				"cooldown", p.meltdownCooldown)
+			p.emitMeltdownLog(int(deaths))
 		}
 	}
+}
+
+// emitMeltdownLog dispatches the meltdown WARN log through a rate-limited,
+// severity-gated, jittered path. Closes A2-MED-10:
+//
+//   - Severity gate (severeMeltdown): single-slot or otherwise-transient
+//     pool drops never surface at WARN; they emit at debug only.
+//   - Token-bucket rate limit (meltdownLimiter): max 1 per 10s with burst 3,
+//     capping the rate at which any meltdown WARN can be observed from the
+//     network even under sustained churn.
+//   - Jitter (meltdownLogJitter): the WARN emit is delayed by a random
+//     [0.5×, 1.5×) × 5s draw, so the arrival timing is not a deterministic
+//     function of the underlying death event.
+func (p *WSPoolTransport) emitMeltdownLog(deathsInWindow int) {
+	dead, total := p.countDeadSlots()
+
+	if !severeMeltdown(dead, total) {
+		// Transient: never surface to WARN, debug only. Side-channel-quiet.
+		p.log.Debug("transient pool drop (suppressed from WARN)",
+			"dead", dead,
+			"total", total,
+			"deaths_in_window", deathsInWindow,
+			"threshold", p.meltdownThreshold)
+		return
+	}
+
+	if !p.meltdownLimiter.Allow() {
+		// Severity threshold met but emit budget exhausted — coalesce silently.
+		p.log.Debug("meltdown WARN rate-limited",
+			"dead", dead,
+			"total", total,
+			"deaths_in_window", deathsInWindow)
+		return
+	}
+
+	jitter := p.meltdownLogJitter(5 * time.Second)
+	go func(deathsInWindow, dead, total int, jitter time.Duration) {
+		timer := time.NewTimer(jitter)
+		defer timer.Stop()
+		select {
+		case <-p.ctx.Done():
+			return
+		case <-timer.C:
+		}
+		p.log.Warn("WS pool meltdown detected — entering cooldown",
+			"deaths_in_window", deathsInWindow,
+			"dead", dead,
+			"total", total,
+			"threshold", p.meltdownThreshold,
+			"window", p.meltdownWindow,
+			"cooldown", p.meltdownCooldown,
+			"emit_jitter", jitter)
+	}(deathsInWindow, dead, total, jitter)
 }
 
 // rotationLoop periodically rotates one slot for anti-fingerprinting.
@@ -760,9 +1201,24 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 	if slot == nil || slot.transport == nil {
 		return
 	}
+	// Capture transport pointer at reader start. The slot's transport field is
+	// reassigned on rotation and replaced wholesale on reconnect (which creates
+	// a new poolSlot at p.slots[idx]); reading slot.transport on every loop
+	// iteration races with these mutations and could deliver the new conn to a
+	// stale reader. Holding our own captured pointer means a stale reader keeps
+	// reading from the OLD conn (which is Close'd by handleSlotDeath /
+	// rotation), gets "use of closed network connection", and exits cleanly.
+	// The new reader started after reconnect uses its own freshly captured
+	// transport — no two readers ever share a *gorilla.Conn.
+	myTransport := slot.transport
 	myGen := slot.generation.Load()
+	slotStart := time.Now()
+	mode := "direct"
+	if p.cfIP != "" {
+		mode = "cf"
+	}
 
-	p.log.Info("WS pool slot reader started", "slot", idx, "gen", myGen)
+	p.log.Info("WS pool slot reader started", "slot", idx, "gen", myGen, "mode", mode)
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -793,7 +1249,7 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 			return
 		}
 
-		data, err := slot.transport.ReadMessage(30 * time.Second)
+		data, err := myTransport.ReadMessage(30 * time.Second)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -804,18 +1260,63 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 			if p.shouldExitReader(slot, myGen) {
 				return
 			}
-			if netErr, ok := err.(interface{ Timeout() bool }); ok && netErr.Timeout() {
-				continue
-			}
+			// Phase −1 hotfix (2026-05-14): any read error is terminal.
+			// Previously: `continue` on Timeout()==true created a tight loop
+			// because gorilla/websocket v1.5.3 caches readErr (sticky), so
+			// every subsequent ReadMessage() returns the same timeout without
+			// blocking. After ~1000 iterations gorilla triggers a defensive
+			// panic "repeated read on failed websocket connection".
+			// Treating timeout as terminal moves the slot to handleSlotDeath
+			// → reconnect, which is correct. Supervisor refactor (Phase 3)
+			// makes this structurally enforced.
 			// Terminal (non-timeout) reader error — attribute slot death.
 			// If this correlates with writer_exits in stats, CF-side stalls
 			// are the trigger (H6); if writer_exits stays low and
 			// reader_exits climbs, the server or CF edge is actively
 			// closing our TCP.
 			Stats.ReaderExits.Add(1)
-			p.log.Warn("WS pool slot reader error", "slot", idx, "err", err, "messages", msgCount)
+
+			// R.3a frame-anomaly diagnostic capture: classify the error and
+			// log a structured record that pairs human review (the WARN line)
+			// with a counter slice (`shadowlink_ws_frame_anomaly_total{type=}`).
+			// `last_write_age_ms` distinguishes "conn was idle" (writer
+			// exited or stalled) from "write was in flight" (suggests
+			// middlebox interfering with active traffic).
+			anomaly := classifyWSReadError(err)
+			Stats.IncFrameAnomaly(anomaly)
+			lastWriteAgeMs := int64(-1)
+			if lw := myTransport.LastWriteUnixNano(); lw > 0 {
+				lastWriteAgeMs = (time.Now().UnixNano() - lw) / int64(time.Millisecond)
+			}
+			p.log.Warn("WS pool slot reader error",
+				"slot", idx,
+				"err", err,
+				"anomaly", anomaly,
+				"messages", msgCount,
+				"slot_age_ms", time.Since(slotStart).Milliseconds(),
+				"down_bytes", slot.downBytes.Load(),
+				"last_write_age_ms", lastWriteAgeMs,
+				"writer_exits", Stats.WriterExits.Load(),
+				"mode", mode,
+			)
 			p.handleSlotDeath(cl, idx)
 			return
+		}
+
+		// Preemptive byte-based rotation (Russia TSPU 2026 mitigation).
+		// TSPU freezes foreign-IP TCP silently after ~15-20KB downstream over
+		// TLS 1.3. Rotate this slot BEFORE hitting that cliff — fresh TCP
+		// resets the censor's byte counter. maxBytesPerSlot=0 disables this
+		// (used for direct/SNI mode where there's no such limit).
+		if p.maxBytesPerSlot > 0 {
+			total := slot.downBytes.Add(int64(len(data)))
+			if total >= p.maxBytesPerSlot {
+				p.log.Info("WS pool slot preemptive rotation (TSPU byte budget)",
+					"slot", idx, "downBytes", total, "limit", p.maxBytesPerSlot,
+					"messages", msgCount)
+				p.handleSlotDeath(cl, idx)
+				return
+			}
 		}
 
 		session := slot.session
@@ -907,3 +1408,9 @@ func (p *WSPoolTransport) HealthySlots() int {
 	}
 	return count
 }
+
+// ReadyCount implements the PoolReadiness interface — same semantics as
+// HealthySlots, exposed under a name independent of the legacy "Healthy"
+// vocabulary so SOCKS5 UDP ASSOCIATE gating (C12 F6) reads naturally:
+// `if pool.ReadyCount() < udpMinReadySlots { fail }`.
+func (p *WSPoolTransport) ReadyCount() int { return p.HealthySlots() }

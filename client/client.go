@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nixavpn/shadowlink/core"
@@ -18,32 +19,118 @@ import (
 
 const maxClientStreams = 4096 // X-4 fix: bound client-side stream map (high for system VPN mode)
 
-// isValidUA validates that a UA string matches known browser patterns.
-// Prevents a malicious server from injecting arbitrary strings via the UA update mechanism.
-// MED-6 fix: added length bounds and printable ASCII check.
+// allowedUAKeys is the closed enum of profile keys the client will accept
+// in the ServerHello UA map. Any other key is dropped before the value is
+// even validated. Final-audit-2026-05-03 P2-2 (T1 §219): defensive
+// hygiene against a compromised server emitting binary-control-char keys
+// that propagate to UpdateUserAgents.
+//
+// 2026-05-05: non-Chrome fingerprints retired (TSPU блокирует Safari/Firefox/
+// Edge). Только chrome допускается; "safari"/"firefox" из ServerHello теперь
+// тихо отбрасываются isAllowedUAKey, server-side exportClientConfig также
+// отправляет только chrome-key.
+var allowedUAKeys = map[string]struct{}{
+	browser.ProfileChrome: {},
+}
+
+// uaForbiddenChars are bytes a real browser UA never contains. Listed
+// explicitly so the disallow set stays auditable even though every entry
+// here is also caught by the printable-ASCII range check below — having
+// the explicit deny-list documents intent and survives any future
+// loosening of the range check.
+var uaForbiddenChars = []byte{'<', '>', '\n', '\r', 0}
+
+// isValidUA validates that a UA string matches the locked-Chrome contract.
+// Prevents a malicious or compromised server from re-fingerprinting the
+// client fleet via the ServerHello UA update mechanism (T1 §154).
+//
+// Acceptance rules:
+//   - Length 80..200 bytes (Opus review M-5, final-audit-2026-05-05).
+//     Real Chrome UA на разных платформах: Win 117-130, Mac 125-135,
+//     Android 100-115. Старый bound 10..256 давал серверу 125 байт extra
+//     room для UA-padding атак — tighter window закрывает это без
+//     отказа легитимным браузерам.
+//   - All bytes are printable ASCII (0x20..0x7E).
+//   - No `<`, `>`, `\n`, `\r`, or NUL bytes (already covered by the
+//     printable-ASCII range; double-check kept as defense-in-depth).
+//   - Contains `"Mozilla/"` and `"Chrome/<LockedChromeMajor>."`.
+//   - Hard-reject UAs that contain `"Firefox/"` or `"Safari/"` BEZ `"Chrome/"`.
+//     Note: real Chrome UA содержит "Safari/537.36" в качестве AppleWebKit
+//     legacy-tag (наследие WebKit, который Chromium до сих пор forks-ает),
+//     поэтому проверка на standalone Safari условная — отвергаем только
+//     UAs, где есть "Safari/" но нет "Chrome/" (т.е. настоящий Apple Safari).
+//
+// 2026-05-05: non-Chrome fingerprints retired (TSPU блокирует Safari/Firefox/
+// Edge). Раньше функция принимала Firefox- и Safari-only UAs; теперь —
+// только Chrome-family с залоченным major.
+//
+// On reject, the caller leaves the per-profile UA unchanged — `browser`
+// retains its compile-time defaults sourced from LockedChromeUA(), so
+// failure-to-update does not break wire fingerprint consistency.
+//
+// Final-audit-2026-05-03 P2-2 (T1 §154 + §219).
 func isValidUA(ua string) bool {
-	if len(ua) < 10 || len(ua) > 256 {
+	if len(ua) < 80 || len(ua) > 200 {
 		return false
 	}
-	for _, c := range ua {
+	for i := 0; i < len(ua); i++ {
+		c := ua[i]
 		if c < 0x20 || c > 0x7E {
 			return false // non-printable or non-ASCII
 		}
 	}
-	return strings.Contains(ua, "Mozilla/") &&
-		(strings.Contains(ua, "Chrome/") || strings.Contains(ua, "Firefox/") || strings.Contains(ua, "Safari/"))
+	for _, bad := range uaForbiddenChars {
+		if strings.IndexByte(ua, bad) >= 0 {
+			return false
+		}
+	}
+	if !strings.Contains(ua, "Mozilla/") {
+		return false
+	}
+	hasChrome := strings.Contains(ua, "Chrome/")
+	if !hasChrome {
+		// 2026-05-05: только Chrome-family UAs принимаются. Firefox-only
+		// и standalone Safari (без Chrome/) отбрасываются.
+		return false
+	}
+	// Hard-reject Firefox/ — реальный Chrome UA не содержит этого токена.
+	if strings.Contains(ua, "Firefox/") {
+		return false
+	}
+	needle := "Chrome/" + browser.LockedChromeMajorString + "."
+	return strings.Contains(ua, needle)
+}
+
+// isAllowedUAKey reports whether the given map key is on the closed enum
+// of profile keys the client will accept from a ServerHello UA map.
+// Final-audit-2026-05-03 P2-2 (T1 §219).
+func isAllowedUAKey(k string) bool {
+	_, ok := allowedUAKeys[k]
+	return ok
 }
 
 // Client is the main ShadowLink client API.
 // Connect() performs handshake, then Send/Recv exchange data through the tunnel.
 type Client struct {
-	transport   Transport
-	session     *core.Session
-	token       []byte // encrypted session token for Authorization header
-	serverPub   []byte // server static public key
-	clientID    []byte
-	maxConns    int
-	chunkSize   int
+	transport Transport
+	session   *core.Session
+	token     []byte // encrypted session token for Authorization header
+	serverPub []byte // server static public key
+	clientID  []byte
+	maxConns  int
+	chunkSize int
+
+	// insecureSkipVerify is carried here so the D4 handshake probe can refuse
+	// to fall back to the legacy Bearer path when TLS is not actually verified.
+	// Without this guard, an on-path MITM could strip `_v` and force the client
+	// down the pre-migration path without detection.
+	insecureSkipVerify bool
+
+	// handshakeOnce ensures performHandshake runs at most once per Client —
+	// Connect() may be retried by callers, but the handshake is idempotent on
+	// success and we must not replay the ClientHello payload on a second call.
+	handshakeOnce sync.Once
+	handshakeErr  error
 
 	mu sync.Mutex
 
@@ -51,29 +138,96 @@ type Client struct {
 	streamCounter uint16
 	streamChans   map[uint16]chan []byte // StreamID → incoming data from server
 	streamMu      sync.Mutex
+
+	// Cold-start observability (Task D5, 2026-05-02 plan).
+	//
+	// connectStartUnixNano stores time.Now().UnixNano() at the start of
+	// Connect() — written before performHandshake runs, read by
+	// MarkFirstStream when the first SOCKS5 stream is attached so the
+	// gauge measures the user-perceived "tunnel ready" interval. Stored as
+	// atomic so the SOCKS5 dispatcher path can read without taking c.mu
+	// (which is already held by some callers higher in the stack).
+	//
+	// firstStreamOnce guarantees the FirstStreamMS gauge is stamped at most
+	// once per Connect() cycle — without it, every successful CONNECT
+	// would overwrite the gauge with later (irrelevant) latencies. Reset
+	// is wired into the ctx-error retry path in performHandshake so a
+	// fresh Connect after a cancelled one starts measuring from scratch.
+	connectStartUnixNano atomic.Int64
+	firstStreamOnce      sync.Once
+}
+
+// serverHelloJSON is the unmarshalled ServerHello envelope. `_v` is a pointer so
+// "absent" (legacy server) is distinguishable from "present but zero".
+type serverHelloJSON struct {
+	EphPub       []byte            `json:"eph"`
+	Token        []byte            `json:"tok"`
+	MaxConns     uint8             `json:"mc"`
+	ChunkSize    uint16            `json:"cs"`
+	ProtoVersion *uint8            `json:"_v,omitempty"`
+	Deprecated   bool              `json:"_deprecated,omitempty"`
+	UA           map[string]string `json:"ua,omitempty"`
+}
+
+// httpStatusError carries the HTTP status code from SendHandshakeRaw so the
+// D4 probe can decide whether to fall back to the legacy path.
+type httpStatusError struct {
+	Status int
+	Body   string
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("HTTP %d: %s", e.Status, e.Body)
+}
+
+// parseHandshakeError extracts an httpStatusError from a SendHandshakeRaw
+// error, walking the wrap chain via errors.As. Returns nil for network errors
+// and context cancellation — those should propagate without triggering the
+// legacy fallback.
+//
+// All transport implementations (DirectTransport, CDNTransport, the synthesized
+// error in handshakeNew when HandshakeRawSender is absent) emit *httpStatusError
+// directly, so string-prefix matching is unnecessary. errors.As also handles
+// `fmt.Errorf("foo: %w", statusErr)` wraps, keeping the classifier robust
+// against future transport refactors.
+func parseHandshakeError(err error) *httpStatusError {
+	if err == nil {
+		return nil
+	}
+	var he *httpStatusError
+	if errors.As(err, &he) {
+		return he
+	}
+	return nil
 }
 
 // ClientConfig holds configuration for the client.
 type ClientConfig struct {
 	ServerAddr   string // "host:port"
 	ServerPubKey []byte // 32 bytes X25519 public key
-	ClientID     []byte // client identifier
-	UseTLS       bool   // enable TLS (default true for production)
-	SkipVerify   bool   // skip TLS cert verification (testing only)
-	CDNDomain    string // if set, use CDN transport via this domain
-	ECHEnabled   bool   // enable ECH (Encrypted Client Hello) for CDN mode
-	SNIOverride  string // if set, TLS ServerName = SNIOverride (full-direct mode: IP host + domain SNI). Requires UseTLS=true.
-
-	// Phase 2: TURN relay for whitelist bypass
-	TURNServer    string // TURN server "host:port"
-	TURNUsername  string
-	TURNPassword  string
-	ServerUDPAddr  string // ShadowLink server UDP "host:port" (default :56000)
-	WBTurnEnabled  bool   // Enable WB TURN in auto-detect (feature flag)
+	// ClientID identifies the client. Phase B pins EncryptedClientIDSize=65
+	// bytes assuming a 16-byte UUID; non-UUID-sized IDs still work via the
+	// server's v0 legacy-fallback path but forfeit the new-format keys.
+	// Production SHOULD use UUID-sized (16 B) IDs.
+	ClientID    []byte
+	UseTLS      bool   // enable TLS (default true for production)
+	SkipVerify  bool   // skip TLS cert verification (testing only)
+	CDNDomain   string // if set, use CDN transport via this domain
+	ECHEnabled  bool   // enable ECH (Encrypted Client Hello) for CDN mode
+	SNIOverride string // if set, TLS ServerName = SNIOverride (full-direct mode: IP host + domain SNI). Requires UseTLS=true.
 }
 
 // NewClient creates a client with the given config.
+//
+// Warns (slog.Warn) when ClientID is not 16 bytes — prod callers should pass
+// UUIDs so the handshake lands on the new-format keys. We don't hard-fail
+// because short IDs still interoperate via the server's v0 fallback; the
+// warning is a migration-canary for admin panels still issuing short strings.
 func NewClient(config ClientConfig) *Client {
+	if len(config.ClientID) != 16 {
+		slog.Warn("shadowlink: non-UUID-sized ClientID — falling back to legacy v0 handshake path",
+			"size", len(config.ClientID), "recommended", 16)
+	}
 	var transport Transport
 	switch {
 	case config.SNIOverride != "":
@@ -88,9 +242,10 @@ func NewClient(config ClientConfig) *Client {
 	}
 
 	return &Client{
-		transport: transport,
-		serverPub: config.ServerPubKey,
-		clientID:  config.ClientID,
+		transport:          transport,
+		serverPub:          config.ServerPubKey,
+		clientID:           config.ClientID,
+		insecureSkipVerify: config.SkipVerify,
 	}
 }
 
@@ -104,79 +259,256 @@ func NewClientWithTransport(transport Transport, serverPubKey, clientID []byte) 
 }
 
 // Connect performs the ShadowLink handshake and establishes a session.
+// Internally idempotent via performHandshake's sync.Once — safe to call again
+// after a successful first connect (a second call is a no-op).
 func (c *Client) Connect(ctx context.Context) error {
+	// Task D5: stamp the cold-start origin so MarkFirstStream can compute
+	// the user-perceived "tunnel ready" interval. CompareAndSwap leaves the
+	// existing value untouched on the no-op second-Connect path (sync.Once
+	// already pinned the handshake outcome) so the gauge keeps measuring
+	// from the original Connect, not the retry.
+	c.connectStartUnixNano.CompareAndSwap(0, time.Now().UnixNano())
+	return c.performHandshake(ctx)
+}
+
+// MarkFirstStream stamps the FirstStreamMS gauge with the elapsed duration
+// since Connect() was called. The first SOCKS5 CONNECT to successfully send
+// CONNECT_OK back to its caller wires this up. sync.Once gates so only the
+// very first stream-attached event of the Connect cycle wins — subsequent
+// CONNECTs and reconnects do not overwrite the gauge.
+//
+// No-op when connectStartUnixNano is zero (Connect was never called) so
+// out-of-order callers do not write a meaningless "ms since Unix epoch".
+//
+// Snapshot of start+Once happens under c.mu so a concurrent ctx-error reset
+// in performHandshake (which clears both fields under the same mutex) cannot
+// race a stale start into a freshly-reset Once.Do — the gauge would otherwise
+// stamp with a very large elapsed (since the cancelled Connect) on the next
+// stream-attach event.
+func (c *Client) MarkFirstStream() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	start := c.connectStartUnixNano.Load()
+	if start == 0 {
+		return
+	}
+	c.firstStreamOnce.Do(func() {
+		SetFirstStreamMS(time.Since(time.Unix(0, start)))
+	})
+}
+
+// performHandshake is the one-shot guarded entry point around the probe
+// fallback. sync.Once pins the outcome so a retry after a successful connect
+// doesn't replay the ClientHello (which would mint a new session) and a retry
+// after a failed connect doesn't double-handshake either.
+//
+// Exception: context cancellation / deadline errors are transient — the caller
+// typically passes a fresh context to retry (ConnectWithRetry loops on this).
+// Caching those errors permanently would poison the Client forever after a
+// single early cancel. We reset the Once when the previous outcome was purely
+// a ctx error so the next caller gets a real handshake attempt.
+func (c *Client) performHandshake(ctx context.Context) error {
+	c.handshakeOnce.Do(func() {
+		c.handshakeErr = c.runHandshakeSequence(ctx)
+	})
+	err := c.handshakeErr
+	if err != nil && isContextError(err) {
+		// Clear the cached ctx error under the same lock the handshake runs
+		// under so a concurrent retry doesn't race with the reset.
+		c.mu.Lock()
+		c.handshakeOnce = sync.Once{}
+		c.handshakeErr = nil
+		// Task D5: cold-start gauge resets too, so the next Connect()
+		// timestamps a fresh start and the next stream-attach stamps a
+		// fresh interval (instead of measuring against a long-cancelled
+		// Connect that never completed).
+		c.connectStartUnixNano.Store(0)
+		c.firstStreamOnce = sync.Once{}
+		c.mu.Unlock()
+	}
+	return err
+}
+
+// isContextError reports whether the error is solely a context cancellation
+// or deadline, possibly wrapped. Network errors unrelated to ctx (dial refused,
+// TLS handshake failure, protocol parse failure) should NOT reset the Once —
+// they indicate a stable problem the caller can't fix by retrying with a new
+// context alone.
+func isContextError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// runHandshakeSequence implements the D4 probe flow:
+//
+//  1. Try the new body-prefix handshake (padded payload via BuildHandshakePayload,
+//     POST without Authorization).
+//  2. On network error or context cancellation — propagate, do not fall back.
+//  3. On HTTP 200 + body that isn't a valid ServerHello — hard-fail (MITM).
+//  4. On HTTP 4xx — fall back to the legacy handshake path, UNLESS
+//     InsecureSkipVerify is on (in which case a falling back would silently
+//     land on the pre-migration Bearer path without TLS guarantees).
+//  5. On success: require `_v` to be set; refuse `_v > 1` (server requires an
+//     update we don't yet ship) and refuse `_v == nil` unless falling back to
+//     legacy is permitted.
+//  6. Pin session.ProtoVersion = 1 on the new path, 0 on the legacy path.
+func (c *Client) runHandshakeSequence(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Create ClientHello
 	hello, clientState, err := core.NewClientHello(c.clientID, c.serverPub)
 	if err != nil {
 		return fmt.Errorf("create client hello: %w", err)
 	}
 
-	// Send via transport
-	respBody, err := c.transport.SendHandshake(ctx, hello)
-	if err != nil {
-		return fmt.Errorf("send handshake: %w", err)
+	// Non-UUID clientIDs produce a short EncryptedClientID that doesn't match
+	// Phase B's fixed EncryptedClientIDSize — a hybrid server fail-closes to
+	// decoy (HTML body) in that case, which would trip the 200-garbage MITM
+	// guard. Skip the new-format probe entirely for these clients and go
+	// straight to the legacy path (server still honors it via hybrid dispatch).
+	// Production callers SHOULD pass 16-byte UUIDs; legacy is only for back-
+	// compat with existing admin panels that still issue short IDs.
+	if len(c.clientID) != 16 {
+		return c.handshakeLegacy(ctx, hello, clientState)
 	}
 
-	// Parse ServerHello from response
+	// Attempt 1 — new format (padded, no Authorization).
+	respBody, newErr := c.handshakeNew(ctx, hello)
+	if newErr != nil {
+		// Network/context errors — don't retry under a different format.
+		if errors.Is(newErr, context.Canceled) || errors.Is(newErr, context.DeadlineExceeded) {
+			return newErr
+		}
+		statusErr := parseHandshakeError(newErr)
+		if statusErr == nil {
+			// Non-HTTP error (dial failure, TLS handshake, etc). Don't fall back.
+			return fmt.Errorf("handshake new: %w", newErr)
+		}
+		switch {
+		case statusErr.Status == 200:
+			// 200-garbage — likely MITM stripping the real body.
+			return fmt.Errorf("handshake: invalid ServerHello (possible MITM): %w", newErr)
+		case statusErr.Status >= 400 && statusErr.Status < 500:
+			if c.insecureSkipVerify {
+				return fmt.Errorf("handshake new failed and legacy fallback disabled (InsecureSkipVerify=true): %w", newErr)
+			}
+			return c.handshakeLegacy(ctx, hello, clientState)
+		default:
+			return fmt.Errorf("handshake new: %w", newErr)
+		}
+	}
+
+	// New-format success — parse and validate ServerHello before pinning session.
 	respData, _, err := browser.ParseDownloadResponse(respBody)
 	if err != nil {
-		return fmt.Errorf("parse server hello: %w", err)
+		return fmt.Errorf("handshake: invalid ServerHello (possible MITM): %w", err)
+	}
+	var sh serverHelloJSON
+	if err := json.Unmarshal(respData, &sh); err != nil {
+		return fmt.Errorf("handshake: invalid ServerHello (possible MITM): %w", err)
 	}
 
-	var shData struct {
-		EphPub    []byte            `json:"eph"`
-		Token     []byte            `json:"tok"`
-		MaxConns  uint8             `json:"mc"`
-		ChunkSize uint16            `json:"cs"`
-		UA        map[string]string `json:"ua,omitempty"` // server-provided UA updates
+	if sh.ProtoVersion == nil {
+		// Server advertised legacy from the new path — surprising but possible
+		// in the transitional window. Only fall back when TLS is verified.
+		if c.insecureSkipVerify {
+			return errors.New("handshake: legacy ServerHello received but fallback disabled (InsecureSkipVerify=true)")
+		}
+		return c.handshakeLegacy(ctx, hello, clientState)
 	}
-	if err := json.Unmarshal(respData, &shData); err != nil {
-		return fmt.Errorf("unmarshal server hello: %w", err)
+	if *sh.ProtoVersion > 1 {
+		return fmt.Errorf("handshake: server requires proto v=%d, client supports v=1 (update required)", *sh.ProtoVersion)
 	}
 
+	return c.applyServerHello(clientState, &sh, 1)
+}
+
+// handshakeNew posts a padded ClientHello payload through the transport's raw
+// handshake channel (D4). Returns the server body on 200 and a
+// "HTTP Nxx:" / "HTTP 200-garbage:" error from the transport otherwise.
+// Returns an error without side effects on Client state when the transport
+// doesn't implement HandshakeRawSender — callers treat that as an HTTP 4xx
+// and fall back to the legacy path.
+func (c *Client) handshakeNew(ctx context.Context, hello *core.ClientHello) ([]byte, error) {
+	raw, ok := c.transport.(HandshakeRawSender)
+	if !ok {
+		// Synthesize a 4xx so runHandshakeSequence triggers the fallback path.
+		return nil, &httpStatusError{Status: 404, Body: "transport does not support raw handshake"}
+	}
+	pd := browser.NewPayloadDistribution()
+	payload := browser.BuildHandshakePayload(hello.EphemeralPub, hello.EncryptedClientID, pd)
+	return raw.SendHandshakeRaw(ctx, payload)
+}
+
+// handshakeLegacy sends the pre-migration handshake (no padding) and applies
+// the resulting ServerHello with ProtoVersion pinned to 0.
+func (c *Client) handshakeLegacy(ctx context.Context, hello *core.ClientHello, clientState *core.HandshakeClientState) error {
+	respBody, err := c.transport.SendHandshake(ctx, hello)
+	if err != nil {
+		return fmt.Errorf("handshake legacy: %w", err)
+	}
+	respData, _, err := browser.ParseDownloadResponse(respBody)
+	if err != nil {
+		return fmt.Errorf("handshake legacy: invalid ServerHello (possible MITM): %w", err)
+	}
+	var sh serverHelloJSON
+	if err := json.Unmarshal(respData, &sh); err != nil {
+		return fmt.Errorf("handshake legacy: invalid ServerHello (possible MITM): %w", err)
+	}
+	// Legacy path ignores _v (may be absent or set by a hybrid server).
+	return c.applyServerHello(clientState, &sh, 0)
+}
+
+// applyServerHello completes the crypto handshake, stores session+token on the
+// Client, and pins ProtoVersion. protoVersion is the negotiated wire-format
+// version — 1 for the new body-prefix path, 0 for legacy.
+func (c *Client) applyServerHello(clientState *core.HandshakeClientState, sh *serverHelloJSON, protoVersion uint8) error {
 	serverHello := &core.ServerHello{
-		EphemeralPub:          shData.EphPub,
-		EncryptedSessionToken: shData.Token,
-		MaxConnsPerClient:     shData.MaxConns,
-		ChunkSize:             shData.ChunkSize,
+		EphemeralPub:          sh.EphPub,
+		EncryptedSessionToken: sh.Token,
+		MaxConnsPerClient:     sh.MaxConns,
+		ChunkSize:             sh.ChunkSize,
+		// Thread `_v` through so CompleteHandshake picks the matching key schedule
+		// (nil → v0, *v=1 → v1 body-prefix path).
+		ProtoVersion: sh.ProtoVersion,
 	}
 
-	// Complete handshake — derive session keys
 	session, err := core.CompleteHandshake(clientState, serverHello)
 	if err != nil {
 		return fmt.Errorf("complete handshake: %w", err)
 	}
 
+	// D5: pin the negotiated wire version on the session itself so write-path
+	// code can check Session.ProtoVersion without walking back to the client.
+	session.ProtoVersion = protoVersion
+
 	c.session = session
-	// Encode token with session_id hint for O(1) server-side lookup
-	c.token = browser.EncodeTokenWithHint(session.ID, shData.Token)
-	c.maxConns = int(shData.MaxConns)
-	c.chunkSize = int(shData.ChunkSize)
+	c.token = browser.EncodeTokenWithHint(session.ID, sh.Token)
+	c.maxConns = int(sh.MaxConns)
+	c.chunkSize = int(sh.ChunkSize)
 	if c.chunkSize == 0 {
 		c.chunkSize = 12288
 	}
 
-	// M-1 fix: pass session and token to transport so cover traffic can use them.
-	// Works for both DirectTransport and CDNTransport (both implement SessionAware).
 	if sa, ok := c.transport.(SessionAware); ok {
 		sa.SetSession(c.session)
 		sa.SetSessionToken(c.token)
 	}
 
-	// Apply server-provided UA updates (keeps client UAs fresh without code changes).
-	// SEC-H4 fix: validate UA strings against known browser patterns to prevent
-	// a compromised server from injecting arbitrary UA strings.
-	if len(shData.UA) > 0 {
-		validUAs := make(map[string]string, len(shData.UA))
-		for profile, ua := range shData.UA {
-			if isValidUA(ua) {
-				validUAs[profile] = ua
-			} else {
-				slog.Warn("rejected invalid UA from server", "profile", profile)
+	if len(sh.UA) > 0 {
+		validUAs := make(map[string]string, len(sh.UA))
+		for profile, ua := range sh.UA {
+			if !isAllowedUAKey(profile) {
+				// P2-2 T1 §219 — keys outside the closed enum are
+				// dropped before value validation so binary-control-char
+				// keys never reach UpdateUserAgents / log lines.
+				slog.Warn("rejected UA from server: unknown profile key")
+				continue
 			}
+			if !isValidUA(ua) {
+				slog.Warn("rejected invalid UA from server", "profile", profile)
+				continue
+			}
+			validUAs[profile] = ua
 		}
 		if len(validUAs) > 0 {
 			browser.UpdateUserAgents(validUAs)
@@ -186,7 +518,8 @@ func (c *Client) Connect(ctx context.Context) error {
 	slog.Info("connected to shadowlink server",
 		"transport", c.transport.Name(),
 		"max_conns", c.maxConns,
-		"chunk_size", c.chunkSize)
+		"chunk_size", c.chunkSize,
+		"proto_version", protoVersion)
 
 	return nil
 }
@@ -314,7 +647,13 @@ func (c *Client) UpgradeToWebSocket(serverAddr string, useTLS, skipVerify bool, 
 	// Without this, DPI sees instant TLS→WS upgrade (suspicious pattern).
 	wst.WarmupRequests()
 
-	if err := wst.UpgradeToWS(token); err != nil {
+	// D3 migration: UpgradeToWS now authenticates via a post-upgrade first
+	// frame and needs the active session for encryption of that frame.
+	session := c.Session()
+	if session == nil {
+		return nil, errors.New("not connected — call Connect() first")
+	}
+	if err := wst.UpgradeToWS(token, session); err != nil {
 		return nil, err
 	}
 	return wst, nil
@@ -592,6 +931,21 @@ func (c *Client) Token() []byte {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.token
+}
+
+// Snapshot atomically returns the current token and session under a single
+// c.mu acquisition. Use this when a caller needs both values consistent with
+// each other — consecutive Token() / Session() calls would admit a race where
+// Close() or the handshake reset nils one between the two loads, leaving the
+// caller with a token referring to an already-destroyed session (H4, D4 review).
+//
+// Either return value may be nil on its own if the handshake hasn't completed
+// yet; callers should check both. Callers MUST NOT retain the returned session
+// pointer across a Close() or Reset call without independently validating it.
+func (c *Client) Snapshot() (token []byte, session *core.Session) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.token, c.session
 }
 
 // Transport returns the underlying transport (for SplitHTTP to reuse for uploads).

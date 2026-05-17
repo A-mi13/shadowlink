@@ -39,19 +39,12 @@ func NewURLPool() *URLPool {
 	}
 }
 
-// NewURLPoolCustom creates a pool with server-provided paths.
-func NewURLPoolCustom(upload, download []string) *URLPool {
-	if len(upload) == 0 {
-		upload = defaultUploadPaths
-	}
-	if len(download) == 0 {
-		download = defaultDownloadPaths
-	}
-	return &URLPool{
-		uploadPaths:   upload,
-		downloadPaths: download,
-	}
-}
+// NewURLPoolCustom was removed in T4 P2-17 cleanup (final audit 2026-05-03):
+// the function was only called from one test (request_test.go::TestURLPoolCustom)
+// and the "server-provided paths" plumbing it implied was never wired into
+// the handshake. If a future feature needs server-pushed custom paths, add
+// the constructor back with documented call sites — until then the default
+// pool is the only source of paths.
 
 // NextUploadPath returns a random upload URL path.
 func (p *URLPool) NextUploadPath() string {

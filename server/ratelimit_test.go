@@ -1,6 +1,8 @@
 package server
 
 import (
+	"bytes"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/nixavpn/shadowlink/core"
@@ -16,8 +18,8 @@ func TestParseUserID(t *testing.T) {
 		{"u42:d1", "u42"},
 		{"u108:d2", "u108"},
 		{"nocolon", "nocolon"},
-		{"u1:d1:extra", "u1"},  // only first colon matters
-		{":leading", ""},       // edge case: empty userID
+		{"u1:d1:extra", "u1"}, // only first colon matters
+		{":leading", ""},      // edge case: empty userID
 		{"trailing:", "trailing"},
 	}
 
@@ -140,6 +142,8 @@ func TestClientAuthCheckDeviceLimitExistingSession(t *testing.T) {
 // rate limiter respects Config.HandshakeRateLimitPerMin so we can raise the
 // cap above the legacy 50/min hardcode that was breaking pool reconnect.
 func TestNewHandlerHandshakeRateLimitFromConfig(t *testing.T) {
+	// Force legacy path: test exercises h.rateLimiters.Handshake.Allow directly.
+	t.Setenv("SHADOWLINK_RL_TOKENBUCKET", "0")
 	serverKey, err := core.GenerateKeyPair()
 	require.NoError(t, err)
 
@@ -150,11 +154,11 @@ func TestNewHandlerHandshakeRateLimitFromConfig(t *testing.T) {
 
 	// First 100 attempts from one IP must be allowed.
 	for i := 0; i < 100; i++ {
-		require.True(t, h.rateLimiter.Allow("203.0.113.10"),
+		require.True(t, h.rateLimiters.Handshake.Allow("203.0.113.10"),
 			"attempt %d/100 must pass under configured limit", i+1)
 	}
 	// 101st must be blocked.
-	require.False(t, h.rateLimiter.Allow("203.0.113.10"),
+	require.False(t, h.rateLimiters.Handshake.Allow("203.0.113.10"),
 		"attempt 101 must be rate-limited")
 }
 
@@ -163,6 +167,8 @@ func TestNewHandlerHandshakeRateLimitFromConfig(t *testing.T) {
 // pool reconnect bursts. Pool of 4 slots × cascade reconnects can easily
 // generate 30+ handshakes/min from one IP — we must allow this.
 func TestNewHandlerHandshakeRateLimitDefaultRaised(t *testing.T) {
+	// Force legacy path: test exercises h.rateLimiters.Handshake.Allow directly.
+	t.Setenv("SHADOWLINK_RL_TOKENBUCKET", "0")
 	serverKey, err := core.GenerateKeyPair()
 	require.NoError(t, err)
 
@@ -172,10 +178,88 @@ func TestNewHandlerHandshakeRateLimitDefaultRaised(t *testing.T) {
 	// At least 100 attempts must pass under default — well above old 50.
 	allowed := 0
 	for i := 0; i < 100; i++ {
-		if h.rateLimiter.Allow("203.0.113.20") {
+		if h.rateLimiters.Handshake.Allow("203.0.113.20") {
 			allowed++
 		}
 	}
 	require.GreaterOrEqual(t, allowed, 100,
 		"default rate limit must allow >=100 handshakes/min for pool reconnect; got %d", allowed)
+}
+
+// TestRateLimitersSplit_IndependentBudgets confirms the Phase B split: a
+// handshake burst that exhausts the Handshake limiter must NOT affect the
+// Data limiter from the same IP. The isolation is the whole point — a DoSing
+// attacker flooding handshakes cannot starve an active session's data path.
+func TestRateLimitersSplit_IndependentBudgets(t *testing.T) {
+	// Force legacy path: test exercises the legacy .Allow() methods directly on
+	// individual limiter fields to verify budget isolation.
+	t.Setenv("SHADOWLINK_RL_TOKENBUCKET", "0")
+	serverKey, err := core.GenerateKeyPair()
+	require.NoError(t, err)
+
+	cfg := TestConfig()
+	cfg.HandshakeRateLimitPerMin = 10 // easy to exhaust
+	h := NewHandler(serverKey, cfg, "")
+
+	ip := "203.0.113.30"
+	// Exhaust handshake budget.
+	for range 10 {
+		require.True(t, h.rateLimiters.Handshake.Allow(ip))
+	}
+	require.False(t, h.rateLimiters.Handshake.Allow(ip), "handshake must be capped at 10")
+
+	// Data limiter must still accept traffic on the same IP.
+	require.True(t, h.rateLimiters.Data.Allow(ip), "data limiter must be independent of handshake")
+	require.True(t, h.rateLimiters.WSUpgrade.Allow(ip), "ws-upgrade limiter must be independent")
+}
+
+// TestHandshake_RateLimit_BucketPath verifies that when SHADOWLINK_RL_TOKENBUCKET
+// is active (default-on), draining the HandshakeBucket directly causes the HTTP
+// handleHandshakeNew path to return a decoy 200 (rate-limited). This exercises
+// the TokenBucket dispatch branch in AllowHandshake.
+func TestHandshake_RateLimit_BucketPath(t *testing.T) {
+	// Bucket path is the default; no env override needed. We ensure it explicitly.
+	t.Setenv("SHADOWLINK_RL_TOKENBUCKET", "1")
+
+	serverKey, err := core.GenerateKeyPair()
+	require.NoError(t, err)
+
+	cfg := TestConfig()
+	cfg.HandshakeRateLimitPerMin = 300
+	h := NewHandler(serverKey, cfg, "")
+
+	require.True(t, h.rateLimiters.UseBucket, "UseBucket must be true when token bucket path is on")
+	require.NotNil(t, h.rateLimiters.HandshakeBucket)
+
+	// Replace the production-sized bucket (burst=50) with a 1-token bucket so
+	// the test exhausts via the HTTP wire path itself. This proves the
+	// AllowHandshake → HandshakeBucket dispatch is wired AND that the IP key
+	// extracted by ClientIPFromRequest matches the bucket's key — without it,
+	// the test could pass while a future IP-extraction regression silently
+	// bypassed the bucket dispatch (review finding 2026-05-02).
+	h.rateLimiters.HandshakeBucket = NewTokenBucket(1, 0.0001, 10)
+
+	ip := "203.0.113.55"
+	// First HTTP request consumes the only token via AllowHandshake → bucket.
+	rec1 := httptest.NewRecorder()
+	req1 := httptest.NewRequest("POST", "/a", bytes.NewReader([]byte("{}")))
+	req1.RemoteAddr = ip + ":55555"
+	h.handleHandshakeNew(rec1, req1, []byte("eph"), []byte("enc"))
+	require.Empty(t, rec1.Header().Get("X-SL-RL"),
+		"first request must NOT be rate-limited (bucket has 1 token, no sentinel)")
+
+	// Second request hits an empty bucket and must take the rate-limit
+	// branch — proving the wire path consumes from the same bucket. C5 verbose
+	// format is "bucket=handshake,burst_left=...,refill_in=...s,exempt=0";
+	// burst_left/refill_in are bucket-state-dependent, so we substring-match
+	// the stable prefix instead of pinning the exact numeric values.
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest("POST", "/a", bytes.NewReader([]byte("{}")))
+	req2.RemoteAddr = ip + ":55555"
+	h.handleHandshakeNew(rec2, req2, []byte("eph"), []byte("enc"))
+	got := rec2.Header().Get("X-SL-RL")
+	require.Contains(t, got, "bucket=handshake",
+		"second request must emit verbose X-SL-RL sentinel (bucket exhausted via HTTP); got=%q", got)
+	require.Contains(t, got, "exempt=0",
+		"sentinel must include exempt field; got=%q", got)
 }

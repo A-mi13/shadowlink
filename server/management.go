@@ -9,36 +9,43 @@ import (
 )
 
 // ManagementHandler exposes an HTTP API for controlling client authorization
-// and device limits at runtime. Protected by X-Management-Key header.
+// and device limits at runtime. Protected by X-Management-Key header
+// (X-API-Key also accepted as alias for Prometheus scrapers that only support
+// the latter convention).
 //
 // Endpoints:
 //
-//	POST   /manage/clients     — add authorized client
-//	DELETE /manage/clients/{id} — remove client + destroy session
-//	POST   /manage/sync        — full replacement of clients + limits
-//	POST   /manage/set-limit   — set per-user device limit
-//	GET    /manage/status      — list all clients, sessions, limits
+//	POST   /manage/clients       — add authorized client
+//	DELETE /manage/clients/{id}  — remove client + destroy session
+//	POST   /manage/sync          — full replacement of clients + limits
+//	POST   /manage/set-limit     — set per-user device limit
+//	GET    /manage/status        — list all clients, sessions, limits
+//	GET    /metrics              — Prometheus / JSON metrics (migration counters)
 type ManagementHandler struct {
 	mux        *http.ServeMux
 	clientAuth *ClientAuth
+	metrics    *Metrics
 	apiKey     string
 }
 
 // StatusResponse is returned by GET /manage/status.
 type StatusResponse struct {
-	TotalClients   int                `json:"total_clients"`
-	ActiveSessions int                `json:"active_sessions"`
-	Clients        []string           `json:"clients"`
+	TotalClients   int                 `json:"total_clients"`
+	ActiveSessions int                 `json:"active_sessions"`
+	Clients        []string            `json:"clients"`
 	Sessions       map[string][]uint32 `json:"sessions"`
-	Limits         map[string]int     `json:"limits"`
-	DefaultMax     int                `json:"default_max"`
+	Limits         map[string]int      `json:"limits"`
+	DefaultMax     int                 `json:"default_max"`
 }
 
-// NewManagementHandler creates the management API handler.
-func NewManagementHandler(clientAuth *ClientAuth, apiKey string) *ManagementHandler {
+// NewManagementHandler creates the management API handler. `metrics` MAY be
+// nil — in which case the `/metrics` endpoint returns 503 but the rest of the
+// management API still works.
+func NewManagementHandler(clientAuth *ClientAuth, metrics *Metrics, apiKey string) *ManagementHandler {
 	mh := &ManagementHandler{
 		mux:        http.NewServeMux(),
 		clientAuth: clientAuth,
+		metrics:    metrics,
 		apiKey:     apiKey,
 	}
 	mh.mux.HandleFunc("POST /manage/clients", mh.handleAddClient)
@@ -46,17 +53,38 @@ func NewManagementHandler(clientAuth *ClientAuth, apiKey string) *ManagementHand
 	mh.mux.HandleFunc("POST /manage/sync", mh.handleSync)
 	mh.mux.HandleFunc("POST /manage/set-limit", mh.handleSetLimit)
 	mh.mux.HandleFunc("GET /manage/status", mh.handleStatus)
+	// H4 deploy fix 2026-04-20: delegate /metrics to the Metrics handler so
+	// Prometheus scrapers (and ops curl sessions) can pull migration counters.
+	// Accepts `?format=prom` or `Accept: text/plain` for Prometheus text format;
+	// JSON by default.
+	mh.mux.HandleFunc("GET /metrics", mh.handleMetrics)
 	return mh
 }
 
-// ServeHTTP checks the API key and delegates to the mux.
+// ServeHTTP checks the API key and delegates to the mux. Accepts the key on
+// either `X-Management-Key` (original) or `X-API-Key` (alias used by some
+// scraper tools). Both are checked in constant time.
 func (mh *ManagementHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// X-3 fix: constant-time comparison to prevent timing side-channel attacks on API key
-	if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Management-Key")), []byte(mh.apiKey)) != 1 {
+	key := []byte(mh.apiKey)
+	// X-3 fix: constant-time comparison prevents timing side-channel attacks.
+	// Run BOTH comparisons regardless of match, then OR results, so timing
+	// cannot distinguish "wrong management header" from "wrong api-key header".
+	mgmtOK := subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Management-Key")), key)
+	apiOK := subtle.ConstantTimeCompare([]byte(r.Header.Get("X-API-Key")), key)
+	if mgmtOK != 1 && apiOK != 1 {
 		http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
 		return
 	}
 	mh.mux.ServeHTTP(w, r)
+}
+
+// handleMetrics exposes the Metrics endpoint (Prometheus text or JSON).
+func (mh *ManagementHandler) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if mh.metrics == nil {
+		http.Error(w, `{"error":"metrics not wired"}`, http.StatusServiceUnavailable)
+		return
+	}
+	mh.metrics.ServeHTTP(w, r)
 }
 
 // handleAddClient adds a client to the authorized set.
@@ -122,7 +150,7 @@ func (mh *ManagementHandler) handleSync(w http.ResponseWriter, r *http.Request) 
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]any{
 		"status":  "ok",
 		"clients": len(req.Clients),
 		"limits":  len(req.Limits),
@@ -155,7 +183,7 @@ func (mh *ManagementHandler) handleSetLimit(w http.ResponseWriter, r *http.Reque
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]any{
 		"status":      "ok",
 		"user_id":     req.UserID,
 		"max_devices": req.MaxDevices,

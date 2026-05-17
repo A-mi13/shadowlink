@@ -4,12 +4,47 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/nixavpn/shadowlink/client"
 	"github.com/nixavpn/shadowlink/core"
+)
+
+// wsReadyPoolAdapter wraps *client.WSReadyPool so it satisfies PoolAcquirer
+// (which returns `any` to keep coalesce.go free of client/ imports). The
+// type assertion in the consumer recovers *client.WebSocketTransport.
+type wsReadyPoolAdapter struct {
+	pool *client.WSReadyPool
+}
+
+func (a wsReadyPoolAdapter) Acquire(ctx context.Context) (any, error) {
+	wst, err := a.pool.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return wst, nil
+}
+
+// socks5CoalesceEnabled returns true unless SHADOWLINK_SOCKS5_COALESCE is set
+// to one of the documented opt-out values. Default behavior is coalesce ON
+// (mirrors pqEnabled() / SHADOWLINK_DATAPATH_BODYPREFIX semantics).
+func socks5CoalesceEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SHADOWLINK_SOCKS5_COALESCE"))) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+// coalesceWindow / coalesceMaxParallel — D3-tuned defaults. Field-tuning
+// happens at deploy time via env (not yet exposed; keep literal until needed).
+const (
+	coalesceWindow      = 50 * time.Millisecond
+	coalesceMaxParallel = 2
 )
 
 // HandleTCPConnect handles a SOCKS5 CONNECT command in poll mode.
@@ -27,6 +62,9 @@ func HandleTCPConnect(ctx context.Context, conn net.Conn, cl *client.Client, rou
 		return
 	}
 
+	// Tunnel path — считаем CONNECT (только реальный VPN-трафик).
+	client.Stats.SocksConnects.Add(1)
+
 	// Multiplexed: allocate a stream within the shared session
 	streamID := cl.NextStreamID()
 	incomingCh, regErr := cl.RegisterStream(streamID)
@@ -43,6 +81,10 @@ func HandleTCPConnect(ctx context.Context, conn net.Conn, cl *client.Client, rou
 	}
 
 	conn.Write(ReplySuccess)
+	// Task D5 (cold-start metrics): poll-mode CONNECT_OK is the user-perceived
+	// "tunnel ready" event. sync.Once on Client gates this so only the first
+	// of all SOCKS5 paths (poll / per-stream WS / WS multiplex) wins the gauge.
+	cl.MarkFirstStream()
 
 	// Two goroutines: uplink (SOCKS->server) + downlink (server->SOCKS)
 	ctx2, cancel := context.WithCancel(ctx)
@@ -50,17 +92,24 @@ func HandleTCPConnect(ctx context.Context, conn net.Conn, cl *client.Client, rou
 
 	var wg sync.WaitGroup
 
-	// Uplink: read from SOCKS client -> send as stream data
+	// Uplink: read from SOCKS client -> send as stream data.
+	// V4: per-iteration randomized read cap spreads upload chunk sizes
+	// so TSPU can't fingerprint the VPN by POST body histogram.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		defer cancel()
 		buf := make([]byte, 16384)
 		for {
-			n, err := conn.Read(buf)
+			limit := core.NextReadSize()
+			if limit > len(buf) {
+				limit = len(buf)
+			}
+			n, err := conn.Read(buf[:limit])
 			if err != nil {
 				return
 			}
+			client.Stats.UplinkBytes.Add(int64(n))
 			if err := cl.SendStream(ctx2, streamID, buf[:n]); err != nil {
 				return
 			}
@@ -100,6 +149,7 @@ func HandleTCPConnect(ctx context.Context, conn net.Conn, cl *client.Client, rou
 				if _, err := conn.Write(data); err != nil {
 					return
 				}
+				client.Stats.DownlinkBytes.Add(int64(len(data)))
 				// Drain more data if available without blocking
 				draining := true
 				for draining {
@@ -111,6 +161,7 @@ func HandleTCPConnect(ctx context.Context, conn net.Conn, cl *client.Client, rou
 						if _, err := conn.Write(more); err != nil {
 							return
 						}
+						client.Stats.DownlinkBytes.Add(int64(len(more)))
 					default:
 						draining = false
 					}
@@ -160,10 +211,18 @@ func HandleTCPConnectWSPerStream(ctx context.Context, conn net.Conn, cl *client.
 	// Acquire a WS for this stream. When a pool is configured, pull a pre-
 	// warmed one (skips the ~250ms TCP+TLS+WS-upgrade cost that dominates CF
 	// CDN per-stream mode). Otherwise fall back to opening a fresh one.
+	//
+	// D4: Acquires routed through cfg.AcquireWS — under the hood a process-
+	// wide CoalescingDispatcher (50ms window, 2-in-flight) is shared across
+	// all CONNECTs that point at the same Pool. Under a SOCKS5 burst
+	// (system VPN — 50+ CONNECTs in seconds) this batches demand so the
+	// underlying WSReadyPool isn't hammered with concurrent acquires that
+	// all race to the same handful of ready slots.
+	// SHADOWLINK_SOCKS5_COALESCE=0|false|no|off bypasses the dispatcher.
 	var wst *client.WebSocketTransport
 	if cfg.Pool != nil {
 		acquireCtx, acquireCancel := context.WithTimeout(ctx, 5*time.Second)
-		acquired, acquireErr := cfg.Pool.Acquire(acquireCtx)
+		acquired, acquireErr := cfg.AcquireWS(acquireCtx)
 		acquireCancel()
 		if acquireErr != nil {
 			slog.Debug("per-stream WS pool acquire failed", "dest", destAddr, "err", acquireErr)
@@ -181,7 +240,9 @@ func HandleTCPConnectWSPerStream(ctx context.Context, conn net.Conn, cl *client.
 			wst.SetCFIP(cfg.CFIP)
 		}
 
-		if err := wst.UpgradeToWS(token); err != nil {
+		// D3: ws upgrade authenticates via a post-upgrade first frame built from
+		// the active session — Authorization header is gone.
+		if err := wst.UpgradeToWS(token, session); err != nil {
 			slog.Debug("per-stream WS upgrade failed", "dest", destAddr, "err", err)
 			conn.Write(ReplyConnRefused)
 			return
@@ -207,6 +268,11 @@ func HandleTCPConnectWSPerStream(ctx context.Context, conn net.Conn, cl *client.
 
 	slog.Debug("per-stream WS CONNECT sent", "dest", destAddr, "stream", streamID)
 	conn.Write(ReplySuccess)
+	// Task D5 (cold-start metrics): the first SOCKS5 stream to reach
+	// CONNECT_OK is the user-perceived "tunnel ready" event. sync.Once on
+	// the Client guarantees only the first such event per Connect cycle
+	// stamps the FirstStreamMS gauge — subsequent CONNECTs are no-ops.
+	cl.MarkFirstStream()
 
 	ctx2, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -214,15 +280,18 @@ func HandleTCPConnectWSPerStream(ctx context.Context, conn net.Conn, cl *client.
 	var wg sync.WaitGroup
 	relayStart := time.Now()
 
-	// Keepalive: prevent CF idle timeout (100s).
+	// Keepalive: prevent CF idle timeout (100s). Log-normal jitter
+	// (sigma=0.5, final-audit-2026-05-03 P1-3, upgraded from uniform ±30%
+	// NEW-1 fix) so the per-stream relay loop does not emit encrypted
+	// frames at a perfectly periodic 20s cadence AND the inter-frame
+	// histogram matches real-world heavy-tailed network jitter — uniform
+	// ±j leaves a flat-band signature an ML classifier can detect.
 	go func() {
-		ticker := time.NewTicker(20 * time.Second)
-		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx2.Done():
 				return
-			case <-ticker.C:
+			case <-time.After(client.JitteredIntervalLogNormal(20*time.Second, 0.5)):
 				ka := core.NewKeepaliveChunk(session.ID, session.NextSeqNum())
 				enc, _ := session.EncryptChunk(ka)
 				if enc != nil {
@@ -357,6 +426,10 @@ func HandleTCPConnectWS(ctx context.Context, conn net.Conn, cl *client.Client, w
 		return
 	}
 
+	// Tunnel path — считаем CONNECT. Block/Direct сюда не доходят (трафик
+	// не идёт через VPN), их в этот счётчик не включаем.
+	client.Stats.SocksConnects.Add(1)
+
 	// DNS priority: port 53 (DNS-over-TCP) bypasses throttling.
 	// Without DNS, nothing resolves → all CONNECTs fail in cascade.
 	isDNS := strings.HasSuffix(destAddr, ":53")
@@ -483,6 +556,10 @@ func HandleTCPConnectWS(ctx context.Context, conn net.Conn, cl *client.Client, w
 	// Reply SOCKS5 success immediately (optimistic for WS, confirmed for Split).
 	slog.Debug("WS CONNECT sent", "dest", destAddr, "stream", streamID)
 	conn.Write(ReplySuccess)
+	// Task D5 (cold-start metrics): WS-multiplex CONNECT_OK fires the gauge
+	// on the first stream of the Connect cycle. sync.Once on Client guarantees
+	// idempotency across retries and concurrent CONNECTs.
+	cl.MarkFirstStream()
 
 	// Session snapshot for data relay (pool-aware).
 	session := client.StreamSession(wst, cl, streamID)
@@ -519,6 +596,7 @@ func HandleTCPConnectWS(ctx context.Context, conn net.Conn, cl *client.Client, w
 			}
 			total += n
 			uploads++
+			client.Stats.UplinkBytes.Add(int64(n))
 			chunk := core.NewStreamDataChunk(session.ID, session.NextSeqNum(), streamID, buf[:n])
 			enc, encErr := session.EncryptChunk(chunk)
 			core.PutBuffer(chunk.Payload) // release pooled payload after encryption
@@ -588,6 +666,7 @@ func HandleTCPConnectWS(ctx context.Context, conn net.Conn, cl *client.Client, w
 				}
 				total += len(data)
 				chunks++
+				client.Stats.DownlinkBytes.Add(int64(len(data)))
 				if chunks <= 5 || chunks%100 == 0 {
 					slog.Info("downlink data", "dest", destAddr, "stream", streamID,
 						"chunk", chunks, "bytes", len(data), "totalBytes", total)

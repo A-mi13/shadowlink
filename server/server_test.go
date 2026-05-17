@@ -92,7 +92,7 @@ func TestServerFullCycle(t *testing.T) {
 	baseURL := "http://" + srv.Addr()
 
 	// === HANDSHAKE ===
-	clientHello, clientState, err := core.NewClientHello([]byte("full-cycle-test"), serverKey.Public)
+	clientHello, clientState, err := core.NewClientHello([]byte("full-cycle-test!"), serverKey.Public)
 	require.NoError(t, err)
 
 	helloPayload := append(clientHello.EphemeralPub, clientHello.EncryptedClientID...)
@@ -113,17 +113,18 @@ func TestServerFullCycle(t *testing.T) {
 	require.NoError(t, err)
 
 	var shData struct {
-		EphPub    []byte `json:"eph"`
-		Token     []byte `json:"tok"`
-		MaxConns  uint8  `json:"mc"`
-		ChunkSize uint16 `json:"cs"`
+		EphPub       []byte `json:"eph"`
+		Token        []byte `json:"tok"`
+		MaxConns     uint8  `json:"mc"`
+		ChunkSize    uint16 `json:"cs"`
+		ProtoVersion *uint8 `json:"_v"`
 	}
 	require.NoError(t, json.Unmarshal(respData, &shData))
 
 	serverHello := &core.ServerHello{
 		EphemeralPub:          shData.EphPub,
 		EncryptedSessionToken: shData.Token,
-		
+		ProtoVersion:          shData.ProtoVersion,
 		MaxConnsPerClient:     shData.MaxConns,
 		ChunkSize:             shData.ChunkSize,
 	}
@@ -145,14 +146,16 @@ func TestServerFullCycle(t *testing.T) {
 	encChunk, err := chunk.Encrypt(clientSession.SendKey)
 	require.NoError(t, err)
 
-	encB64 := base64.RawURLEncoding.EncodeToString(encChunk)
+	// Body-prefix wire format: pack token-with-hint + encrypted chunk into body.
+	tokenWithHint := browser.EncodeTokenWithHint(clientSession.ID, shData.Token)
+	dataPayload := browser.BuildDataPayload(tokenWithHint, encChunk)
+	encB64 := base64.RawURLEncoding.EncodeToString(dataPayload)
 	dataBody, _ := json.Marshal(map[string]any{
 		"events": []map[string]any{{"type": "data", "ts": 1234, "data": encB64}},
 	})
 
 	req, _ := http.NewRequest("POST", baseURL+"/api/v2/events", bytes.NewReader(dataBody))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+base64.RawURLEncoding.EncodeToString(shData.Token))
 	req.Header.Set("X-Request-ID", fmt.Sprintf("%08x", chunk.SeqNum))
 
 	resp2, err := http.DefaultClient.Do(req)
@@ -203,6 +206,30 @@ func TestServerGracefulShutdown(t *testing.T) {
 	assert.Error(t, err)
 }
 
+// TestServer_DefaultMaxDevices_AppliedWithoutMgmt covers A3-S-MED-4 closure:
+// when the operator sets DefaultMaxDevices but NOT ManagementPort, the value
+// must still propagate into clientAuth.defaultMax. Earlier the override was
+// gated behind the management API config, which silently dropped the limit.
+func TestServer_DefaultMaxDevices_AppliedWithoutMgmt(t *testing.T) {
+	serverKey, err := core.GenerateKeyPair()
+	require.NoError(t, err)
+
+	cfg := TestConfig()
+	cfg.ManagementPort = 0 // mgmt API disabled
+	cfg.ManagementKey = ""
+	cfg.DefaultMaxDevices = 5
+
+	srv, err := New(cfg, serverKey)
+	require.NoError(t, err)
+
+	_, err = srv.Start()
+	require.NoError(t, err)
+	t.Cleanup(func() { srv.Stop() })
+
+	assert.Equal(t, 5, srv.Handler().clientAuth.defaultMax,
+		"DefaultMaxDevices must apply regardless of management API state (A3-S-MED-4)")
+}
+
 func TestServerMaxClientsOverHTTP(t *testing.T) {
 	srv, serverKey := startTestServer(t)
 	srv.config.MaxClients = 1
@@ -212,7 +239,7 @@ func TestServerMaxClientsOverHTTP(t *testing.T) {
 	baseURL := "http://" + srv.Addr()
 
 	// First handshake — ok
-	ch1, _, _ := core.NewClientHello([]byte("c1"), serverKey.Public)
+	ch1, _, _ := core.NewClientHello([]byte("c1-uuid-padding!"), serverKey.Public)
 	p1 := append(ch1.EphemeralPub, ch1.EncryptedClientID...)
 	b1, _ := json.Marshal(map[string]any{
 		"events": []map[string]any{{"type": "init", "ts": 1, "data": base64.RawURLEncoding.EncodeToString(p1)}},
@@ -222,7 +249,7 @@ func TestServerMaxClientsOverHTTP(t *testing.T) {
 	assert.Equal(t, 200, resp1.StatusCode)
 
 	// Second handshake — should be 503
-	ch2, _, _ := core.NewClientHello([]byte("c2"), serverKey.Public)
+	ch2, _, _ := core.NewClientHello([]byte("c2-uuid-padding!"), serverKey.Public)
 	p2 := append(ch2.EphemeralPub, ch2.EncryptedClientID...)
 	b2, _ := json.Marshal(map[string]any{
 		"events": []map[string]any{{"type": "init", "ts": 1, "data": base64.RawURLEncoding.EncodeToString(p2)}},

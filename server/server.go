@@ -24,13 +24,12 @@ import (
 // A real nginx handles TLS and h2 with genuine nginx fingerprint, making the server
 // indistinguishable from any other nginx-hosted site. (Audit F1 fix)
 type Server struct {
-	config      Config
-	handler     *Handler
-	httpSrv     *http.Server
-	mgmtSrv     *http.Server // Management API server (optional)
-	udpListener *UDPListener // Phase 2: TURN-relayed UDP traffic
-	listener    net.Listener
-	stopCh      chan struct{}
+	config   Config
+	handler  *Handler
+	httpSrv  *http.Server
+	mgmtSrv  *http.Server // Management API server (optional)
+	listener net.Listener
+	stopCh   chan struct{}
 }
 
 // New creates a ShadowLink server from config.
@@ -72,26 +71,17 @@ func (s *Server) Start() (string, error) {
 	// Start session cleanup
 	s.handler.StartCleanup(s.stopCh)
 
-	// Start UDP listener for TURN relay (Phase 2)
-	if s.config.EnableUDP {
-		udpAddr := s.config.UDPListenAddr
-		if udpAddr == "" {
-			udpAddr = ":56000"
-		}
-		s.udpListener = NewUDPListener(s.handler, s.config)
-		udpActual, err := s.udpListener.Start(udpAddr)
-		if err != nil {
-			return "", fmt.Errorf("start UDP listener: %w", err)
-		}
-		slog.Info("UDP listener ready", "addr", udpActual)
+	// Apply DefaultMaxDevices unconditionally (A3-S-MED-4): the device-limit
+	// override must be honored regardless of whether the optional management
+	// API is enabled, because it shapes the per-user CheckDeviceLimit ceiling
+	// at handshake time.
+	if s.config.DefaultMaxDevices > 0 {
+		s.handler.clientAuth.defaultMax = s.config.DefaultMaxDevices
 	}
 
 	// Start Management API (optional — only if port and key are configured)
 	if s.config.ManagementPort > 0 && s.config.ManagementKey != "" {
-		mgmtHandler := NewManagementHandler(s.handler.clientAuth, s.config.ManagementKey)
-		if s.config.DefaultMaxDevices > 0 {
-			s.handler.clientAuth.defaultMax = s.config.DefaultMaxDevices
-		}
+		mgmtHandler := NewManagementHandler(s.handler.clientAuth, s.handler.metrics, s.config.ManagementKey)
 		bind := s.config.ManagementBind
 		if bind == "" {
 			bind = "127.0.0.1"
@@ -170,12 +160,19 @@ func (s *Server) startPlain() error {
 }
 
 // Stop gracefully shuts down the server.
+//
+// Order of operations (H1 graceful shutdown):
+//  1. Stop background workers via stopCh (cleanup loop etc.)
+//  2. Shut down the management HTTP server (2s drain).
+//  3. Disable HTTP keep-alives so in-flight responses close cleanly and new
+//     requests get Connection: close rather than being held open.
+//  4. Broadcast FlagFin to every active session's Outgoing channel so clients
+//     reconnect immediately — without this, an active WS/SplitHTTP client
+//     would sit on its read deadline (up to 60s) during a rolling deploy.
+//  5. Drain the main HTTP server with a 30s timeout (enough for the broadcast
+//     to flush + in-flight uploads to complete).
 func (s *Server) Stop() error {
 	close(s.stopCh)
-
-	if s.udpListener != nil {
-		s.udpListener.Stop()
-	}
 
 	if s.mgmtSrv != nil {
 		mgmtCtx, mgmtCancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -183,10 +180,29 @@ func (s *Server) Stop() error {
 		s.mgmtSrv.Shutdown(mgmtCtx)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	slog.Info("shutting down shadowlink server")
+
+	// Disable keep-alives on the main HTTP server — new requests get
+	// Connection: close, in-flight responses still complete.
+	s.httpSrv.SetKeepAlivesEnabled(false)
+
+	// Broadcast a FlagFin to every live session so clients reconnect on next
+	// tick instead of waiting out their read-deadline. Bounded-parallel via
+	// errgroup (T1.7, Phase 2): peak goroutines ≤ broadcastCloseConcurrency,
+	// total wall-clock < broadcastCloseTotalDeadline. Always logged so ops
+	// can confirm the drain happened at all on rolling deploys.
+	if s.handler != nil {
+		bStart := time.Now()
+		enqueued := s.handler.BroadcastStreamClose("server_maintenance")
+		slog.Info("graceful shutdown: broadcast complete",
+			"enqueued", enqueued,
+			"took", time.Since(bStart),
+		)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	slog.Info("shutting down shadowlink server")
 	return s.httpSrv.Shutdown(ctx)
 }
 
@@ -198,17 +214,32 @@ func (s *Server) Addr() string {
 	return s.listener.Addr().String()
 }
 
-// UDPAddr returns the UDP listener address (empty if not enabled).
-func (s *Server) UDPAddr() string {
-	if s.udpListener == nil || s.udpListener.conn == nil {
-		return ""
-	}
-	return s.udpListener.conn.LocalAddr().String()
-}
-
 // Handler returns the underlying handler (for testing).
 func (s *Server) Handler() *Handler {
 	return s.handler
+}
+
+// SetSentinelEmitter attaches a SentinelEmitter to the underlying handler.
+// No-op if handler not yet constructed (defensive guard — current New()
+// always constructs handler before this can be called, but explicit check
+// matches codebase style for nil safety).
+//
+// Must be called BEFORE Start() — the emitter is read by handler methods
+// with no synchronisation beyond the publication point (construction
+// happens-before serving begins). nil is safe: rate-limit branches degrade
+// to legacy header-only path.
+//
+// Phase 1 (2026-05-14): called from main.go after LoadDecoySnapshots succeeds.
+func (s *Server) SetSentinelEmitter(e *SentinelEmitter) {
+	if s.handler == nil {
+		return
+	}
+	s.handler.sentinelEmitter = e
+}
+
+// Metrics returns the server's metrics tracker (delegate to handler).
+func (s *Server) Metrics() *Metrics {
+	return s.handler.Metrics()
 }
 
 // SessionCount returns the number of active sessions.

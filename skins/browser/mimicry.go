@@ -4,6 +4,8 @@ import (
 	"math"
 	"math/rand/v2"
 	"sync/atomic"
+
+	"github.com/nixavpn/shadowlink/core"
 )
 
 // maxCoverBudget caps cover traffic generation at 64 KB/sec to avoid bandwidth waste.
@@ -165,27 +167,77 @@ func (rc *RatioController) Reset() {
 
 // SessionLifecycle controls transport rotation timing to match real analytics
 // SDK behavior (sessions have limited lifetime, gaps between reconnects).
+//
+// HIGH-3 (May 2026 audit follow-up, 2026-05-02): the active-interval
+// distribution switched from uniform [120, 480]s to a truncated log-normal
+// with median ≈ 300s and a heavy right tail (μ_log = ln(300) ≈ 5.7038,
+// σ_log = 1.5). This eliminates the flat-histogram fingerprint that a passive
+// observer could derive from session-duration clustering across many
+// connections — real browser SPA tabs show heavy-tailed lifetimes (most live
+// minutes, but a non-trivial fraction stretches into hours).
+//
+// minActive / maxActive carry the truncation bounds (60s floor, 86400s = 24h
+// ceiling), NOT the uniform endpoints — the field names are preserved for
+// backward-compat with the prior API but their meaning changed. The 60s floor
+// guarantees rotation forward progress on the unlucky-low draw; the 24h
+// ceiling caps the right tail to keep behavior bounded across device sleeps
+// and network changes.
 type SessionLifecycle struct {
-	minActive int // minimum active duration in seconds
-	maxActive int // maximum active duration in seconds
-	minGap    int // minimum gap between sessions in milliseconds
-	maxGap    int // maximum gap between sessions in milliseconds
+	// minActive / maxActive: log-normal truncation bounds (seconds).
+	// Were uniform [120, 480]s endpoints prior to HIGH-3 closure.
+	minActive int
+	maxActive int
+
+	// lifetimeMuLog / lifetimeSigmaLog: log-normal shape parameters.
+	// median = exp(lifetimeMuLog) = 300s ≈ 5min; σ_log=1.5 yields
+	// p99 ≈ 9818s ≈ 2.7h and p99.9 ≈ 31057s ≈ 8.6h pre-truncation.
+	lifetimeMuLog    float64
+	lifetimeSigmaLog float64
+
+	minGap int // minimum gap between sessions in milliseconds
+	maxGap int // maximum gap between sessions in milliseconds
 }
 
 // NewSessionLifecycle creates a lifecycle with production defaults:
-// active 120-480s, gap 500-3000ms.
+// active log-normal (median 300s, σ_log=1.5) truncated to [60, 86400]s,
+// gap 500-3000ms. See struct doc for the heavy-tail rationale.
 func NewSessionLifecycle() *SessionLifecycle {
 	return &SessionLifecycle{
-		minActive: 120,
-		maxActive: 480,
-		minGap:    500,
-		maxGap:    3000,
+		minActive:        60,
+		maxActive:        86400,
+		lifetimeMuLog:    math.Log(300), // ≈ 5.703782
+		lifetimeSigmaLog: 1.5,
+		minGap:           500,
+		maxGap:           3000,
 	}
 }
 
-// NextActiveInterval returns a random session duration in seconds.
+// NextActiveInterval returns a random session duration in seconds drawn from a
+// truncated log-normal: seconds = exp(μ + σ·N(0,1)), clamped to
+// [minActive, maxActive].
+//
+// Distribution properties at the production parameters (μ=ln(300), σ=1.5):
+//   - median ≈ 300s (5min) — matches the prior uniform center
+//   - p99 ≈ 9818s (2.7h)   — heavy enough to survive long browse sessions
+//   - p99.9 ≈ 31057s (8.6h) — matches occasional all-day-tab behavior
+//
+// Truncation rationale:
+//   - 60s floor (well below median, negligible probability mass) ensures the
+//     unlucky-low draw still rotates forward in finite time.
+//   - 86400s (24h) ceiling caps the unbounded log-normal tail so a single
+//     session can't outlive multiple network changes / device sleeps.
+//
+// Uses math/rand/v2 globals — safe for concurrent calls.
 func (sl *SessionLifecycle) NextActiveInterval() int {
-	return sl.minActive + rand.IntN(sl.maxActive-sl.minActive+1)
+	seconds := math.Exp(rand.NormFloat64()*sl.lifetimeSigmaLog + sl.lifetimeMuLog)
+	switch {
+	case seconds < float64(sl.minActive):
+		return sl.minActive
+	case seconds > float64(sl.maxActive):
+		return sl.maxActive
+	default:
+		return int(seconds)
+	}
 }
 
 // NextGapDuration returns a random gap in milliseconds.
@@ -218,3 +270,35 @@ func NewMimicryEngine() *MimicryEngine {
 		Ratio:   NewRatioController(2.5, 3.5),
 	}
 }
+
+// --- Sticky next_poll sampler (T2.4) ---
+
+// NewMimicrySession is a backward-compat shim over core.NewMimicrySession.
+// Plan §C11.3 (May 2026 audit) moved the constructor into core so that
+// SessionManager.Create can populate the field before publishing the
+// session — guaranteeing a happens-before edge to every concurrent
+// buildResponse reader. The browser-package wrapper is retained so external
+// callers (and existing tests under skins/browser) keep working unchanged.
+// T2.4 closure (Phase 3 Plan A); publish ordering tightened by §C11.3.
+func NewMimicrySession() *core.MimicrySession {
+	return core.NewMimicrySession()
+}
+
+// NextPollSeconds returns a per-event sample around the sticky lambda with
+// ±15% multiplicative jitter. Output truncated to [1, 3600] (real analytics
+// SDKs never emit next_poll above an hour). Safe for concurrent calls — uses
+// math/rand/v2 globals.
+func NextPollSeconds(s *core.MimicrySession) int {
+	jitter := 1.0 + (rand.Float64()-0.5)*0.30 // ±15%
+	v := s.NextPollLambda * jitter
+	switch {
+	case v < 1:
+		return 1
+	case v > 3600:
+		return 3600
+	default:
+		return int(v)
+	}
+}
+
+// (Pareto sampler relocated to core.NewMimicrySession — Plan §C11.3.)

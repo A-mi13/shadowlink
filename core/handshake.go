@@ -8,6 +8,13 @@ import (
 	"errors"
 )
 
+// EncryptedClientIDSize is the protocol-fixed size of EncryptClientID() output for a 16-byte UUID.
+// Composition: nonce(24) + ts(8) + len_prefix(1) + UUID(16) + NaCl Poly1305 MAC(16) = 65 bytes.
+// Wire format: ephemeralPub[32] || encClientID[EncryptedClientIDSize] || randomPadding.
+// Parser uses this constant to delimit the field — no length prefix in the frame per DPI-evasion design.
+// Changing this value requires a ServerHello._v bump and a per-version size map in parsers.
+const EncryptedClientIDSize = 65
+
 // ClientHello is the first message from client to server during handshake.
 type ClientHello struct {
 	EphemeralPub      []byte // 32 bytes X25519
@@ -21,6 +28,7 @@ type ServerHello struct {
 	SessionID             uint32
 	MaxConnsPerClient     uint8
 	ChunkSize             uint16
+	ProtoVersion          *uint8 // nil = legacy (Bearer header), non-nil = new body-prefix format version
 }
 
 // HandshakeClientState holds client-side state during handshake.
@@ -57,9 +65,20 @@ func NewClientHello(clientID, serverStaticPub []byte) (*ClientHello, *HandshakeC
 	return hello, state, nil
 }
 
-// HandleClientHello processes a ClientHello on the server side.
+// HandleClientHello processes a ClientHello on the server side (legacy path,
+// protoVersion=0). Preserved as a shim over HandleClientHelloWithVersion so
+// existing callers in the Bearer-header path keep v0 key derivation.
 // Returns ServerHello and a new Session with derived keys.
 func HandleClientHello(hello *ClientHello, serverStatic *KeyPair, maxConns uint8, chunkSize uint16, sm *SessionManager) (*ServerHello, *Session, []byte, error) {
+	return HandleClientHelloWithVersion(hello, serverStatic, maxConns, chunkSize, sm, 0)
+}
+
+// HandleClientHelloWithVersion is the protocol-version-aware server handshake.
+// protoVersion is threaded into DeriveSessionKeys so v0 (legacy Bearer header)
+// and v1 (body-prefix) sessions derive byte-different keys from the same X25519
+// share — a rollback attacker cannot downgrade a v1 client to v0 and reuse any
+// cryptographic material.
+func HandleClientHelloWithVersion(hello *ClientHello, serverStatic *KeyPair, maxConns uint8, chunkSize uint16, sm *SessionManager, protoVersion uint8) (*ServerHello, *Session, []byte, error) {
 	// Decrypt client_id
 	clientID, err := DecryptClientID(hello.EncryptedClientID, hello.EphemeralPub, serverStatic)
 	if err != nil {
@@ -78,8 +97,9 @@ func HandleClientHello(hello *ClientHello, serverStatic *KeyPair, maxConns uint8
 		return nil, nil, nil, err
 	}
 
-	// Derive keys — server sends with RecvKey, receives with SendKey (reversed from client)
-	keys, err := DeriveSessionKeys(shared, hello.EphemeralPub, serverEph.Public, clientID)
+	// Derive keys — server sends with RecvKey, receives with SendKey (reversed from client).
+	// protoVersion binds the key schedule to the wire format (downgrade defense).
+	keys, err := DeriveSessionKeys(shared, hello.EphemeralPub, serverEph.Public, clientID, protoVersion)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -107,17 +127,46 @@ func HandleClientHello(hello *ClientHello, serverStatic *KeyPair, maxConns uint8
 	return serverHello, session, clientID, nil
 }
 
-// CompleteHandshake finishes the handshake on the client side.
-// Returns a Session with derived keys.
+// CompleteHandshake finishes the handshake on the client side, mapping ServerHello.ProtoVersion
+// (`_v` JSON field) into the v0/v1 key schedule for DeriveSessionKeys.
+//
+// A1-L8 audit recommendation called for an explicit "reject nil" or "explicit default" instead
+// of silent-mapping nil → 0. Resolution: nil maps to **explicit default v0** (legacy Bearer-path
+// keys) with the rationale that:
+//
+//   - After Phase 0 Bearer retire (2026-04-26), the production server always emits `_v=1`, so a
+//     `nil` ProtoVersion only occurs in legacy unit tests exercising HandleClientHello (v0 wrapper).
+//   - The previous behaviour was correct: tests legitimately exercise the v0 path with nil _v.
+//     Rejecting nil here would break those tests without closing any production attack surface
+//     (the production server cannot emit nil _v).
+//
+// The comment below makes the default explicit (no longer silent). Callers that need to require
+// `_v` strictly should inspect `hello.ProtoVersion == nil` themselves before calling.
 func CompleteHandshake(state *HandshakeClientState, hello *ServerHello) (*Session, error) {
+	if hello == nil {
+		return nil, errors.New("ShadowLink: ServerHello = nil")
+	}
+	// Explicit-default semantics (A1-L8): nil → v0 (legacy). Documented, not silent.
+	pv := uint8(0)
+	if hello.ProtoVersion != nil {
+		pv = *hello.ProtoVersion
+	}
+	return CompleteHandshakeWithVersion(state, hello, pv)
+}
+
+// CompleteHandshakeWithVersion finishes the handshake with an explicit
+// protoVersion for DeriveSessionKeys — symmetric counterpart of
+// HandleClientHelloWithVersion on the server side. The client pins the version
+// based on `_v` in ServerHello: absent → 0 (legacy), 1 → new body-prefix path.
+func CompleteHandshakeWithVersion(state *HandshakeClientState, hello *ServerHello, protoVersion uint8) (*Session, error) {
 	// Compute shared secret
 	shared, err := ComputeSharedSecret(state.Ephemeral, hello.EphemeralPub)
 	if err != nil {
 		return nil, err
 	}
 
-	// Derive keys
-	keys, err := DeriveSessionKeys(shared, state.Ephemeral.Public, hello.EphemeralPub, state.ClientID)
+	// Derive keys — protoVersion binds the key schedule (downgrade defense).
+	keys, err := DeriveSessionKeys(shared, state.Ephemeral.Public, hello.EphemeralPub, state.ClientID, protoVersion)
 	if err != nil {
 		return nil, err
 	}

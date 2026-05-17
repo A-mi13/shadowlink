@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	stdhttp "net/http"
 	"sync"
 	"time"
 
@@ -35,10 +36,34 @@ type SessionAware interface {
 	SetSessionToken(token []byte)
 }
 
+// HandshakeRawSender is the optional capability used by the D4 probe flow:
+// it posts an arbitrary raw handshake payload (padded/BuildHandshakePayload)
+// through the transport's ConnManager and returns the server body. Transports
+// without this capability fall back to the legacy path only.
+type HandshakeRawSender interface {
+	// SendHandshakeRaw wraps the payload in the analytics envelope and POSTs it
+	// as the first request (no Authorization), returning the raw response body.
+	// Returns an error whose Error() starts with "HTTP 4xx: " / "HTTP 200-garbage: "
+	// so the D4 probe can classify fallback cases.
+	SendHandshakeRaw(ctx context.Context, payload []byte) ([]byte, error)
+}
+
 // Compile-time assertions: both transports must implement SessionAware.
 var (
 	_ SessionAware = (*DirectTransport)(nil)
 	_ SessionAware = (*CDNTransport)(nil)
+)
+
+// Phase 2.2 (2026-05-14) compile-time assertion: fhttp.Header (bogdanfinn/fhttp)
+// and stdhttp.Header (net/http) MUST both be `map[string][]string`.
+// SendHandshake / SendHandshakeRaw cast resp.Header via stdhttp.Header(resp.Header)
+// to feed the RateLimitDetector. The cast is zero-cost IFF both types share the
+// same underlying type. If bogdanfinn/fhttp ever changes its Header definition
+// (e.g., to a struct), this block will fail to compile rather than silently
+// corrupt response-header parsing.
+var (
+	_ = (stdhttp.Header)(http.Header{}) // fhttp.Header → stdhttp.Header
+	_ = (http.Header)(stdhttp.Header{}) // stdhttp.Header → fhttp.Header (symmetric)
 )
 
 // DirectTransport connects directly to the ShadowLink server.
@@ -49,6 +74,12 @@ type DirectTransport struct {
 	publicHost  string // VISIBLE_HOST used as HTTP Host header (== sniOverride when set, else dial host)
 	urlPool     *browser.URLPool
 	connManager *ConnManager
+
+	// rlDetector — Phase 2.2 (2026-05-14): dual-carrier rate-limit detector chain
+	// (body marker → header → lifeline fallback). Replaces the old header-only
+	// X-SL-RL detection that failed when CF stripped the header in production
+	// (log 2026-05-14, sticky reconnect loop).
+	rlDetector *RateLimitDetector
 
 	rc           *browser.RatioController
 	session      *core.Session
@@ -138,6 +169,7 @@ func newDirectTransportFull(serverAddr string, useTLS bool, skipVerify bool, ech
 		publicHost:  publicHost,
 		urlPool:     browser.NewURLPool(),
 		connManager: cm,
+		rlDetector:  DefaultDetector(&Stats),
 		rc:          browser.NewRatioController(2.5, 3.5),
 		stopCover:   make(chan struct{}),
 	}
@@ -170,23 +202,50 @@ func (t *DirectTransport) SetSessionToken(token []byte) {
 	t.sessionToken = token
 }
 
-// startCoverTraffic runs a background goroutine that checks CoverBudget every 5s
-// and sends encrypted FlagPadding chunks to balance the upload/download ratio.
+// startCoverTraffic runs a background goroutine that checks CoverBudget at a
+// jittered ~5s cadence and sends encrypted FlagPadding chunks to balance the
+// upload/download ratio. The ratio controller is reset at a jittered ~30s
+// cadence to prevent stale counters from accumulating after long idle
+// periods (M-3 fix).
+//
+// NEW-4 fix: both tickers are jittered. Final-audit-2026-05-03 P1-3:
+// switched to log-normal sampling (heavy-tailed) to defeat ML classifiers
+// that detect the flat power spectrum + sharp band edges of uniform
+// jitter via KS-test against a log-normal reference. Both tickers are
+// recurring/periodic so they qualify for the heavy-tailed sampler. Two
+// timers live alongside the main select to preserve the
+// independent-cadence semantics of the original ticker pair.
+//
+// Final-audit-2026-05-03 P2-5 (Periodic cover budget reset ~30s introduces
+// secondary FFT line) — closed by P1-3 above. The 30s `resetTimer` was
+// previously `JitteredInterval(30s, 0.2)` (uniform ±20%) which still left
+// a coherent first-moment around 30s in long captures. P1-3 swapped both
+// timers to JitteredIntervalLogNormal with sigma=0.5 (truncation rails
+// [base/2, base*2] = [15s, 60s]). Heavy-tailed log-normal eliminates the
+// boxy uniform histogram that the FFT secondary-line detector relied on.
+// Sigma=0.5 (moderate) was preferred over the milder sigma=0.3 because
+// the same value is used by the 5s coverTimer above — keeping both
+// timers on identical sampler shape removes a potential cross-period
+// correlation signal where the same client uses heavier jitter on cover
+// emit and lighter jitter on ratio reset.
 func (t *DirectTransport) startCoverTraffic() {
 	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-		// M-3 fix: periodically reset ratio controller to prevent stale counters
-		// from accumulating after long idle periods, which would cause a burst of cover traffic.
-		resetTicker := time.NewTicker(30 * time.Second)
-		defer resetTicker.Stop()
+		coverTimer := time.NewTimer(JitteredIntervalLogNormal(5*time.Second, 0.5))
+		defer coverTimer.Stop()
+		resetTimer := time.NewTimer(JitteredIntervalLogNormal(30*time.Second, 0.5))
+		defer resetTimer.Stop()
 		for {
 			select {
 			case <-t.stopCover:
 				return
-			case <-resetTicker.C:
+			case <-resetTimer.C:
 				t.rc.Reset()
-			case <-ticker.C:
+				resetTimer.Reset(JitteredIntervalLogNormal(30*time.Second, 0.5))
+			case <-coverTimer.C:
+				// Re-arm immediately so the body's continue/error paths
+				// don't leave the timer disarmed. Reset on a stopped
+				// timer is safe because we just consumed C.
+				coverTimer.Reset(JitteredIntervalLogNormal(5*time.Second, 0.5))
 				budget := t.rc.CoverBudget()
 				if budget <= 0 {
 					continue
@@ -212,22 +271,17 @@ func (t *DirectTransport) startCoverTraffic() {
 					continue
 				}
 
-				// Build fhttp cover request (same structure as SendChunk but with FlagPadding payload)
+				// Body-prefix wire format (D1/B2 migration, 2026-04): token
+				// is packed at the start of the envelope data field via
+				// buildDataEnvelope — no `Authorization: Bearer` header.
+				// Headers from buildDataPostHeaders MUST remain byte-identical
+				// across cover and real data POSTs (W4 invariant). Any edit
+				// to either helper is a wire-visible change.
 				ua := t.connManager.ActiveFingerprint().UserAgent()
-				coverPayload := base64.RawURLEncoding.EncodeToString(encrypted)
-				type evt struct {
-					Type string `json:"type"`
-					TS   int64  `json:"ts"`
-					Data string `json:"data"`
+				coverBody, err := buildDataEnvelope(token, encrypted)
+				if err != nil {
+					continue
 				}
-				type envelope struct {
-					Events []evt `json:"events"`
-				}
-				coverBody, _ := json.Marshal(envelope{Events: []evt{{
-					Type: browser.RandomEventType(),
-					TS:   time.Now().UnixMilli(),
-					Data: coverPayload,
-				}}})
 
 				coverURL := t.baseURL + t.urlPool.NextUploadPath()
 				req, err := http.NewRequest("POST", coverURL, bytes.NewReader(coverBody))
@@ -237,30 +291,7 @@ func (t *DirectTransport) startCoverTraffic() {
 				if t.publicHost != "" {
 					req.Host = t.publicHost
 				}
-				req.Header = http.Header{
-					"content-type":    {"application/json"},
-					"authorization":   {"Bearer " + base64.RawURLEncoding.EncodeToString(token)},
-					"x-request-id":    {fmt.Sprintf("%08x", browser.RandomUint32())},
-					"user-agent":      {ua},
-					"accept":          {"application/json"},
-					"accept-encoding": {"gzip, deflate, br"},
-					"accept-language": {"en-US,en;q=0.9"},
-					"origin":          {t.publicURL},
-					"referer":         {t.publicURL + "/"},
-					"cache-control":   {"no-cache"},
-					http.HeaderOrderKey: {
-						"content-type",
-						"authorization",
-						"x-request-id",
-						"user-agent",
-						"accept",
-						"accept-encoding",
-						"accept-language",
-						"origin",
-						"referer",
-						"cache-control",
-					},
-				}
+				req.Header = buildDataPostHeaders(ua, t.publicURL)
 
 				resp, err := t.connManager.Do(req)
 				if err != nil {
@@ -332,19 +363,36 @@ func (t *DirectTransport) SendHandshake(ctx context.Context, hello *core.ClientH
 	}
 	defer resp.Body.Close()
 
+	// Phase 2.2 (2026-05-14): read body first so BodyMarkerCarrier can inspect
+	// the Schema.org JSON-LD marker — needed when CF strips the X-SL-RL header.
 	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if err != nil {
 		return nil, err
+	}
+
+	// Run the dual-carrier detector chain: body marker → header → lifeline fallback.
+	// This replaces the old header-only check (X-SL-RL) and catches the P0 case
+	// where CF strips the header but the decoy body still carries the rl-state marker.
+	// Task D5 (cold-start metrics): IncHandshakeDecoyReceived is called at the
+	// detection site — independent from RateLimitedFromServer (per-cool-down).
+	// fhttp.Header is map[string][]string identical in layout to net/http.Header;
+	// the DetectionContext only reads the "X-SL-RL" header, so a shallow copy suffices.
+	stdResp := &stdhttp.Response{Header: stdhttp.Header(resp.Header)}
+	detCtx := &DetectionContext{Response: stdResp, BodyHead: respBytes, Path: "handshake"}
+	if sig := t.rlDetector.Detect(detCtx); sig != nil {
+		IncHandshakeDecoyReceived()
+		return nil, &RateLimitError{Signal: sig}
 	}
 
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("handshake failed: HTTP %d, body: %s", resp.StatusCode, string(respBytes[:min(200, len(respBytes))]))
 	}
 
-	// Debug: check if response looks like JSON
-	if len(respBytes) > 0 && respBytes[0] == '<' {
-		return nil, fmt.Errorf("server returned HTML instead of JSON (first 200 bytes): %s", string(respBytes[:min(200, len(respBytes))]))
-	}
+	// Note: the old `respBytes[0] == '<'` HTML guard has been removed.
+	// The detector's lifeline carrier (isHTMLBody + no X-SL-RL) handles all
+	// CF-strip scenarios where a decoy HTML body is returned without markers.
+	// If we somehow reach this point with an HTML body it means Detect returned
+	// nil — that's a detector bug to fix, not a defensive check here.
 
 	// Warmup delay after first handshake (mimics SDK init, not applied on reconnect)
 	t.connManager.WarmupDelay()
@@ -352,12 +400,20 @@ func (t *DirectTransport) SendHandshake(ctx context.Context, hello *core.ClientH
 	return respBytes, nil
 }
 
-// SendChunk sends an encrypted data chunk with session token.
-func (t *DirectTransport) SendChunk(ctx context.Context, encryptedChunk []byte, sessionToken []byte, seqNum uint32) ([]byte, error) {
-	ua := t.connManager.ActiveFingerprint().UserAgent()
-
-	// F4 fix: struct-based JSON for browser-like key ordering (type,ts,data)
-	payload := base64.RawURLEncoding.EncodeToString(encryptedChunk)
+// SendHandshakeRaw posts the given raw payload bytes as the first request
+// (no Authorization), returning the server body. Used by the D4 probe flow
+// to send a padded handshake via BuildHandshakePayload — transport here only
+// cares about wrapping it in the analytics envelope.
+//
+// Error shape: when the server answers with HTTP >= 400 or with HTTP 200 +
+// clearly non-JSON (e.g. an HTML decoy), SendHandshakeRaw returns a typed
+// `*httpStatusError` (Status >= 400 for HTTP errors, Status == 200 for
+// non-JSON bodies). The D4 probe uses `errors.As` on that type to decide
+// whether to fall back to the legacy path or hard-fail on suspected MITM.
+// Transports that wrap this error with `fmt.Errorf(..., %w, err)` stay
+// compatible — `errors.As` walks the wrap chain.
+func (t *DirectTransport) SendHandshakeRaw(ctx context.Context, payload []byte) ([]byte, error) {
+	encoded := base64.RawURLEncoding.EncodeToString(payload)
 	type evt struct {
 		Type string `json:"type"`
 		TS   int64  `json:"ts"`
@@ -366,14 +422,12 @@ func (t *DirectTransport) SendChunk(ctx context.Context, encryptedChunk []byte, 
 	type envelope struct {
 		Events []evt `json:"events"`
 	}
-	evtBody, _ := json.Marshal(envelope{Events: []evt{{
-		Type: browser.RandomEventType(),
-		TS:   time.Now().UnixMilli(),
-		Data: payload,
+	body, _ := json.Marshal(envelope{Events: []evt{{
+		Type: "init", TS: time.Now().UnixMilli(), Data: encoded,
 	}}})
 
 	url := t.baseURL + t.urlPool.NextUploadPath()
-	req, err := http.NewRequest("POST", url, bytes.NewReader(evtBody))
+	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -381,10 +435,9 @@ func (t *DirectTransport) SendChunk(ctx context.Context, encryptedChunk []byte, 
 		req.Host = t.publicHost
 	}
 
+	ua := t.connManager.ActiveFingerprint().UserAgent()
 	req.Header = http.Header{
 		"content-type":    {"application/json"},
-		"authorization":   {"Bearer " + base64.RawURLEncoding.EncodeToString(sessionToken)},
-		"x-request-id":    {fmt.Sprintf("%08x", browser.RandomUint32())},
 		"user-agent":      {ua},
 		"accept":          {"application/json"},
 		"accept-encoding": {"gzip, deflate, br"},
@@ -394,8 +447,6 @@ func (t *DirectTransport) SendChunk(ctx context.Context, encryptedChunk []byte, 
 		"cache-control":   {"no-cache"},
 		http.HeaderOrderKey: {
 			"content-type",
-			"authorization",
-			"x-request-id",
 			"user-agent",
 			"accept",
 			"accept-encoding",
@@ -412,6 +463,143 @@ func (t *DirectTransport) SendChunk(ctx context.Context, encryptedChunk []byte, 
 	}
 	defer resp.Body.Close()
 
+	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode >= 400 {
+		return nil, &httpStatusError{
+			Status: resp.StatusCode,
+			Body:   fmt.Sprintf("HTTP %d, body: %s", resp.StatusCode, string(respBytes[:min(200, len(respBytes))])),
+		}
+	}
+	if resp.StatusCode != 200 {
+		return nil, &httpStatusError{
+			Status: resp.StatusCode,
+			Body:   fmt.Sprintf("handshake unexpected status: HTTP %d", resp.StatusCode),
+		}
+	}
+
+	// Phase 2.2 (2026-05-14): check for rate-limit signal via detector chain
+	// before the HTML body guard, so a rl-state marker in the decoy body is
+	// surfaced as ErrRateLimited rather than a generic httpStatusError.
+	// SendHandshakeRaw is used by the D4 probe flow — rate-limit detection here
+	// prevents the probe from misclassifying a rate-limit decoy as a MITM page.
+	// fhttp.Header is map[string][]string; DetectionContext only reads "X-SL-RL".
+	stdRespRaw := &stdhttp.Response{Header: stdhttp.Header(resp.Header)}
+	detCtx := &DetectionContext{Response: stdRespRaw, BodyHead: respBytes, Path: "handshake"}
+	if sig := t.rlDetector.Detect(detCtx); sig != nil {
+		IncHandshakeDecoyReceived()
+		return nil, &RateLimitError{Signal: sig}
+	}
+
+	// HTML-ish body on 200 after detector passed — almost certainly a decoy-page
+	// response from a server that didn't recognize the payload (or an on-path
+	// adversary injecting a splash page). Flag with Status=200 so the probe
+	// classifier routes to the MITM hard-fail branch, not fallback.
+	if isHTMLBody(respBytes) {
+		return nil, &httpStatusError{
+			Status: 200,
+			Body:   fmt.Sprintf("server returned HTML instead of JSON (first 200 bytes): %s", string(respBytes[:min(200, len(respBytes))])),
+		}
+	}
+
+	t.connManager.WarmupDelay()
+	return respBytes, nil
+}
+
+// SendChunk sends an encrypted data chunk.
+//
+// Transport behavior is gated on dataPathBodyPrefixEnabled (env
+// SHADOWLINK_DATAPATH_BODYPREFIX):
+//   - on  → body-prefix wire format, no Authorization header (Phase T1.4)
+//   - off → legacy Authorization: Bearer header (pre-migration contract)
+//
+// The flag defaults ON since 2026-04-26 (Phase 0 T1.4 flip after canary soak).
+// Set SHADOWLINK_DATAPATH_BODYPREFIX=0 for emergency disable.
+//
+// seqNum is accepted for API compatibility but is not transmitted at the
+// transport layer — sequence numbering lives inside the encrypted core.Chunk
+// payload (see Spec §Open risks #3).
+func (t *DirectTransport) SendChunk(ctx context.Context, encryptedChunk []byte, sessionToken []byte, seqNum uint32) ([]byte, error) {
+	ua := t.connManager.ActiveFingerprint().UserAgent()
+
+	var evtBody []byte
+	var headers http.Header
+	if dataPathBodyPrefixEnabled {
+		var err error
+		evtBody, err = buildDataEnvelope(sessionToken, encryptedChunk)
+		if err != nil {
+			return nil, fmt.Errorf("build data envelope: %w", err)
+		}
+		headers = buildDataPostHeaders(ua, t.publicURL)
+	} else {
+		// Legacy Bearer contract. Preserved for flag=off clients during T1.4
+		// canary; retired in Phase 3 once new / total ≥ 0.99 for 7 days
+		// (see docs/superpowers/specs/2026-04-22-t14-direct-transport-v1-closure-design.md §Rollout plan and
+		// shadowlink/docs/protocols/body-prefix-v1.md §"Phase 3 Legacy Retirement").
+		payload := base64.RawURLEncoding.EncodeToString(encryptedChunk)
+		type evt struct {
+			Type string `json:"type"`
+			TS   int64  `json:"ts"`
+			Data string `json:"data"`
+		}
+		type envelope struct {
+			Events []evt `json:"events"`
+		}
+		var err error
+		evtBody, err = json.Marshal(envelope{Events: []evt{{
+			Type: browser.RandomEventType(),
+			TS:   time.Now().UnixMilli(),
+			Data: payload,
+		}}})
+		if err != nil {
+			return nil, fmt.Errorf("marshal legacy envelope: %w", err)
+		}
+		headers = http.Header{
+			"content-type":    {"application/json"},
+			"authorization":   {"Bearer " + base64.RawURLEncoding.EncodeToString(sessionToken)},
+			"x-request-id":    {fmt.Sprintf("%08x", browser.RandomUint32())},
+			"user-agent":      {ua},
+			"accept":          {"application/json"},
+			"accept-encoding": {"gzip, deflate, br"},
+			"accept-language": {"en-US,en;q=0.9"},
+			"origin":          {t.publicURL},
+			"referer":         {t.publicURL + "/"},
+			"cache-control":   {"no-cache"},
+			http.HeaderOrderKey: {
+				"content-type",
+				"authorization",
+				"x-request-id",
+				"user-agent",
+				"accept",
+				"accept-encoding",
+				"accept-language",
+				"origin",
+				"referer",
+				"cache-control",
+			},
+		}
+	}
+
+	url := t.baseURL + t.urlPool.NextUploadPath()
+	req, err := http.NewRequest("POST", url, bytes.NewReader(evtBody))
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if t.publicHost != "" {
+		req.Host = t.publicHost
+	}
+	req.Header = headers
+
+	resp, err := t.connManager.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
 	if t.rc != nil {
 		t.rc.RecordUpload(len(encryptedChunk))
 	}
@@ -420,7 +608,6 @@ func (t *DirectTransport) SendChunk(ctx context.Context, encryptedChunk []byte, 
 		return nil, fmt.Errorf("server returned HTTP %d", resp.StatusCode)
 	}
 
-	// H5 fix: limit response size
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if err != nil {
 		return nil, err
@@ -439,58 +626,84 @@ func (t *DirectTransport) SendChunk(ctx context.Context, encryptedChunk []byte, 
 }
 
 // SendChunkRawBody sends a chunk and returns the raw JSON response body (not parsed).
-// Used by PollVia to handle multi-chunk server responses.
+// Used by PollVia to handle multi-chunk server responses. Flag-gated identically
+// to SendChunk — see that function's docstring for the semantics of
+// dataPathBodyPrefixEnabled (env SHADOWLINK_DATAPATH_BODYPREFIX).
+//
+// seqNum is accepted for API compatibility but is not transmitted at the
+// transport layer — sequence numbering lives inside the encrypted core.Chunk
+// payload (see Spec §Open risks #3).
 func (t *DirectTransport) SendChunkRawBody(ctx context.Context, encryptedChunk []byte, sessionToken []byte, seqNum uint32) ([]byte, error) {
 	ua := t.connManager.ActiveFingerprint().UserAgent()
 
-	payload := base64.RawURLEncoding.EncodeToString(encryptedChunk)
-	type evt struct {
-		Type string `json:"type"`
-		TS   int64  `json:"ts"`
-		Data string `json:"data"`
+	var evtBody []byte
+	var headers http.Header
+	if dataPathBodyPrefixEnabled {
+		var err error
+		evtBody, err = buildDataEnvelope(sessionToken, encryptedChunk)
+		if err != nil {
+			return nil, fmt.Errorf("build data envelope: %w", err)
+		}
+		headers = buildDataPostHeaders(ua, t.publicURL)
+	} else {
+		// Legacy Bearer contract. Preserved for flag=off clients during T1.4
+		// canary; retired in Phase 3 once new / total ≥ 0.99 for 7 days
+		// (see docs/superpowers/specs/2026-04-22-t14-direct-transport-v1-closure-design.md §Rollout plan and
+		// shadowlink/docs/protocols/body-prefix-v1.md §"Phase 3 Legacy Retirement").
+		payload := base64.RawURLEncoding.EncodeToString(encryptedChunk)
+		type evt struct {
+			Type string `json:"type"`
+			TS   int64  `json:"ts"`
+			Data string `json:"data"`
+		}
+		type envelope struct {
+			Events []evt `json:"events"`
+		}
+		var err error
+		evtBody, err = json.Marshal(envelope{Events: []evt{{
+			Type: browser.RandomEventType(),
+			TS:   time.Now().UnixMilli(),
+			Data: payload,
+		}}})
+		if err != nil {
+			return nil, fmt.Errorf("marshal legacy envelope: %w", err)
+		}
+		headers = http.Header{
+			"content-type":    {"application/json"},
+			"authorization":   {"Bearer " + base64.RawURLEncoding.EncodeToString(sessionToken)},
+			"x-request-id":    {fmt.Sprintf("%08x", browser.RandomUint32())},
+			"user-agent":      {ua},
+			"accept":          {"application/json"},
+			"accept-encoding": {"gzip, deflate, br"},
+			"accept-language": {"en-US,en;q=0.9"},
+			"origin":          {t.publicURL},
+			"referer":         {t.publicURL + "/"},
+			"cache-control":   {"no-cache"},
+			http.HeaderOrderKey: {
+				"content-type",
+				"authorization",
+				"x-request-id",
+				"user-agent",
+				"accept",
+				"accept-encoding",
+				"accept-language",
+				"origin",
+				"referer",
+				"cache-control",
+			},
+		}
 	}
-	type envelope struct {
-		Events []evt `json:"events"`
-	}
-	evtBody, _ := json.Marshal(envelope{Events: []evt{{
-		Type: browser.RandomEventType(),
-		TS:   time.Now().UnixMilli(),
-		Data: payload,
-	}}})
 
 	url := t.baseURL + t.urlPool.NextUploadPath()
 	req, err := http.NewRequest("POST", url, bytes.NewReader(evtBody))
 	if err != nil {
 		return nil, err
 	}
+	req = req.WithContext(ctx)
 	if t.publicHost != "" {
 		req.Host = t.publicHost
 	}
-
-	req.Header = http.Header{
-		"content-type":    {"application/json"},
-		"authorization":   {"Bearer " + base64.RawURLEncoding.EncodeToString(sessionToken)},
-		"x-request-id":    {fmt.Sprintf("%08x", browser.RandomUint32())},
-		"user-agent":      {ua},
-		"accept":          {"application/json"},
-		"accept-encoding": {"gzip, deflate, br"},
-		"accept-language": {"en-US,en;q=0.9"},
-		"origin":          {t.publicURL},
-		"referer":         {t.publicURL + "/"},
-		"cache-control":   {"no-cache"},
-		http.HeaderOrderKey: {
-			"content-type",
-			"authorization",
-			"x-request-id",
-			"user-agent",
-			"accept",
-			"accept-encoding",
-			"accept-language",
-			"origin",
-			"referer",
-			"cache-control",
-		},
-	}
+	req.Header = headers
 
 	resp, err := t.connManager.Do(req)
 	if err != nil {
@@ -530,6 +743,10 @@ func (t *CDNTransport) Close() error { return t.direct.Close() }
 
 func (t *CDNTransport) SendHandshake(ctx context.Context, hello *core.ClientHello) ([]byte, error) {
 	return t.direct.SendHandshake(ctx, hello)
+}
+
+func (t *CDNTransport) SendHandshakeRaw(ctx context.Context, payload []byte) ([]byte, error) {
+	return t.direct.SendHandshakeRaw(ctx, payload)
 }
 
 func (t *CDNTransport) SendChunk(ctx context.Context, data []byte, token []byte, seq uint32) ([]byte, error) {

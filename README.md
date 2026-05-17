@@ -33,7 +33,6 @@ Built for scenarios where traditional VPN protocols may be unreliable due to net
 - **Smart transport selection** — auto-detects network conditions and picks the best path
 - **Domain-based routing** — configurable bypass rules (split tunneling by domain)
 - **Leak protection** — DNS/IPv6/kill-switch on Windows, macOS, Linux
-- **TURN relay** — fallback transport through third-party TURN servers for restricted networks
 - **Strong crypto** — X25519 ECDH + HKDF-SHA256 + AES-256-GCM, forward secrecy, replay protection
 
 ### Architecture
@@ -50,7 +49,6 @@ App → SOCKS5 → ShadowLink Client → TLS (browser fingerprint)
 | **Direct** | Server reachable | HTTPS |
 | **CDN** | Need extra layer | Via Cloudflare |
 | **WebSocket** | Full-duplex | WS upgrade over HTTPS |
-| **TURN relay** | Restricted network | KCP/yamux through TURN server |
 
 ### Quick Start
 
@@ -61,7 +59,7 @@ shadowlink-server --gen-key
 
 **Run server:**
 ```bash
-shadowlink-server --listen :8443 --server-key server.key --enable-udp --udp-listen :56000
+shadowlink-server --listen :8443 --server-key server.key
 ```
 
 **Run client:**
@@ -152,7 +150,6 @@ routing:
 |--------|--------|
 | Download | 196–548 Mbps |
 | Upload | 28–137 Mbps |
-| TURN relay | 86–145 Mbps |
 | Latency overhead | ~10–15 ms |
 
 ### Project Structure
@@ -160,10 +157,9 @@ routing:
 ```
 shadowlink/
   core/           — crypto, sessions, chunks
-  server/         — HTTP handler, WebSocket, UDP, decoy, management API
+  server/         — HTTP handler, WebSocket, decoy, management API
   client/         — transports, probe engine, leakguard, DNS router
   skins/browser/  — HTTP API masking (fingerprints, URL rotation)
-  skins/call/     — TURN relay transport
   cmd/            — server and client binaries
   testutil/       — DPI emulator, integration tests
 ```
@@ -200,7 +196,6 @@ ShadowLink — собственный VPN-протокол, разработан
 - **Авто-выбор транспорта** — определяет условия сети и выбирает лучший путь
 - **Маршрутизация по доменам** — настраиваемые bypass правила (split tunneling)
 - **Защита от утечек** — DNS/IPv6/kill-switch на Windows, macOS, Linux
-- **TURN relay** — запасной транспорт через сторонние TURN серверы для ограниченных сетей
 - **Надёжная криптография** — X25519 ECDH + HKDF-SHA256 + AES-256-GCM, forward secrecy
 
 ### Архитектура
@@ -217,7 +212,6 @@ ShadowLink — собственный VPN-протокол, разработан
 | **Direct** | Сервер доступен | HTTPS |
 | **CDN** | Нужен дополнительный слой | Через Cloudflare |
 | **WebSocket** | Full-duplex | WS поверх HTTPS |
-| **TURN relay** | Ограниченная сеть | KCP/yamux через TURN сервер |
 
 ### Быстрый старт
 
@@ -228,7 +222,7 @@ shadowlink-server --gen-key
 
 **Запуск сервера:**
 ```bash
-shadowlink-server --listen :8443 --server-key server.key --enable-udp --udp-listen :56000
+shadowlink-server --listen :8443 --server-key server.key
 ```
 
 **Запуск клиента:**
@@ -273,7 +267,6 @@ routing:
 |---------|-----------|
 | Download | 196–548 Мбит/с |
 | Upload | 28–137 Мбит/с |
-| TURN relay | 86–145 Мбит/с |
 | Задержка | ~10–15 мс |
 
 ### Структура проекта
@@ -281,10 +274,9 @@ routing:
 ```
 shadowlink/
   core/           — криптография, сессии, чанки
-  server/         — HTTP handler, WebSocket, UDP, decoy, management API
+  server/         — HTTP handler, WebSocket, decoy, management API
   client/         — транспорты, probe engine, leakguard, DNS router
   skins/browser/  — маскировка под HTTP API
-  skins/call/     — TURN relay транспорт
   cmd/            — бинарники сервера и клиента
   testutil/       — DPI эмулятор, интеграционные тесты
 ```
