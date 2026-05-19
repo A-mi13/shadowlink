@@ -28,6 +28,15 @@ type Tunnel struct {
 	proxyPass string
 	serverIPs []string // one or more IPs for escape routes
 
+	// narrowEscape: when true, setupRoutes skips the /16 CIDR sweep used to
+	// catch CF Anycast rotation. This is correct ONLY when the data path is
+	// pinned to a known origin IP (URL has ?origin=) — in that case the WS
+	// dial target never moves, so the broader /16 escape is unnecessary AND
+	// harmful (it lets ~65k unrelated IPs bypass the TUN, including any
+	// neighbour service on the same /16 the user might want routed through
+	// the VPN). For CDN-mode (no origin) we keep the /16 sweep.
+	narrowEscape bool
+
 	bypassEnabled  bool
 	bypassOverride *bypassroute.AdminOverride
 
@@ -38,6 +47,15 @@ type Tunnel struct {
 	// to exit. Closed by Stop. Nil when bypass is disabled or determination
 	// failed at Start.
 	nicWatcherStop chan struct{}
+}
+
+// WithNarrowEscape disables the /16 CIDR escape sweep, leaving only /32
+// host routes for each server IP. Call this when the data path is locked
+// to a specific origin IP (URL has ?origin=). Default (false) preserves
+// the CDN-friendly /16 sweep that catches CF Anycast rotation.
+func (t *Tunnel) WithNarrowEscape(narrow bool) *Tunnel {
+	t.narrowEscape = narrow
+	return t
 }
 
 // WithBypass настраивает bypass-маршрутизацию для Tunnel. Когда включено,
@@ -182,7 +200,7 @@ func (t *Tunnel) Start() error {
 
 	// W4: route setup failure is fatal — without routes, TUN is useless
 	// and LeakGuard kill switch would block all traffic.
-	if err := setupRoutes(device, t.serverIPs); err != nil {
+	if err := setupRoutes(device, t.serverIPs, t.narrowEscape); err != nil {
 		engine.Stop()
 		return fmt.Errorf("не удалось настроить маршруты: %w", err)
 	}
@@ -340,7 +358,7 @@ func createTUNLinux(device string) error {
 // setupRoutes настраивает split-routing для системного VPN.
 // Сначала добавляет escape-маршруты для каждого IP VPN-сервера через реальный шлюз,
 // затем один раз добавляет split-маршруты (0.0.0.0/1 + 128.0.0.0/1) через TUN.
-func setupRoutes(device string, serverIPs []string) error {
+func setupRoutes(device string, serverIPs []string, narrowEscape bool) error {
 	gw, err := getDefaultGateway()
 	if err != nil {
 		return fmt.Errorf("определение шлюза: %w", err)
@@ -354,23 +372,34 @@ func setupRoutes(device string, serverIPs []string) error {
 	}
 
 	// 1b. Broader escape routes for CF Anycast: add /16 for each resolved IP.
-	// CF CDN rotates Anycast IPs within the same datacenter. Without broader routes,
-	// ConnManager rotation may resolve to a new CF IP not covered by /32 escape routes,
-	// causing traffic to loop through TUN.
-	addedCIDR := make(map[string]bool)
-	for _, ip := range serverIPs {
-		parts := strings.SplitN(ip, ".", 4)
-		if len(parts) == 4 {
-			cidr := parts[0] + "." + parts[1] + ".0.0"
-			if !addedCIDR[cidr] {
-				addedCIDR[cidr] = true
-				if err := addEscapeRouteCIDR(cidr, "255.255.0.0", gw); err != nil {
-					slog.Warn("escape CIDR route не добавлен", "cidr", cidr+"/16", "err", err)
-				} else {
-					slog.Info("escape CIDR route добавлен", "cidr", cidr+"/16")
+	// CF CDN rotates Anycast IPs within the same datacenter. Without broader
+	// routes, ConnManager rotation may resolve to a new CF IP not covered by
+	// /32 escape routes, causing traffic to loop through TUN.
+	//
+	// SKIPPED in narrowEscape mode (URL has ?origin=). When the data path is
+	// pinned to a known origin IP, the WS dial target never rotates, so the
+	// /16 sweep adds no value AND is harmful: it covers ~65k unrelated IPs
+	// (every neighbour on the same /16) and exempts them from the TUN. In
+	// CDN mode (no origin pin) the /16 sweep is correct and kept.
+	if !narrowEscape {
+		addedCIDR := make(map[string]bool)
+		for _, ip := range serverIPs {
+			parts := strings.SplitN(ip, ".", 4)
+			if len(parts) == 4 {
+				cidr := parts[0] + "." + parts[1] + ".0.0"
+				if !addedCIDR[cidr] {
+					addedCIDR[cidr] = true
+					if err := addEscapeRouteCIDR(cidr, "255.255.0.0", gw); err != nil {
+						slog.Warn("escape CIDR route не добавлен", "cidr", cidr+"/16", "err", err)
+					} else {
+						slog.Info("escape CIDR route добавлен", "cidr", cidr+"/16")
+					}
 				}
 			}
 		}
+	} else {
+		slog.Info("narrow escape mode: /16 CIDR sweep skipped (origin pin)",
+			"escape_ips", serverIPs)
 	}
 
 	// 2. Split-routing через TUN — один раз.

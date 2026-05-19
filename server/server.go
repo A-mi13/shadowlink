@@ -121,14 +121,19 @@ func (s *Server) startTLS() error {
 		TLSConfig:         tlsConfig,
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    1 << 16, // 64 KB
+		// 300s (was 60s) — Wave 2.3 (2026-05-17), raised so idle WS connections
+		// survive TSPU mid-session ban transients (typically <60s). Memory cost
+		// tracked via Metrics.IdleConnections, populated by the ConnState hook
+		// installed below.
+		IdleTimeout:    300 * time.Second,
+		MaxHeaderBytes: 1 << 16, // 64 KB
 		// Disable HTTP/2: Go's h2 sends non-browser SETTINGS frames
 		// (INITIAL_WINDOW_SIZE=4194304 vs Chrome's 6291456).
 		// DPI matches TLS fingerprint (Chrome) + h2 SETTINGS (Go) = detection.
 		// HTTP/1.1 with keepalives is safer.
 		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
 	}
+	s.httpSrv.ConnState = s.connStateHook
 
 	ln, err := net.Listen("tcp", s.config.ListenAddr)
 	if err != nil {
@@ -145,9 +150,11 @@ func (s *Server) startPlain() error {
 		Handler:           s.handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    1 << 16,
+		// 300s (was 60s) — see startTLS for rationale (Wave 2.3, 2026-05-17).
+		IdleTimeout:    300 * time.Second,
+		MaxHeaderBytes: 1 << 16,
 	}
+	s.httpSrv.ConnState = s.connStateHook
 
 	ln, err := net.Listen("tcp", s.config.ListenAddr)
 	if err != nil {
@@ -157,6 +164,38 @@ func (s *Server) startPlain() error {
 
 	go s.httpSrv.Serve(ln)
 	return nil
+}
+
+// connStateHook tracks the count of idle keep-alive TCP connections held
+// by the HTTP server, exposed as Metrics.IdleConnections.
+//
+// Transitions emitted by net/http: New → Active → Idle → Active → Idle
+// → … → Closed (or Hijacked for WS upgrades). The hook receives only the
+// new state, not the previous one, so we use the simple approximation:
+//
+//	Idle                 → +1
+//	Active|Closed|Hijacked → -1
+//
+// Under steady state this stays accurate. During ramp, the gauge can
+// briefly dip below zero (e.g. Active fires for a New conn that never
+// went through Idle); atomic.Int64 is signed, so the negative spike is
+// recoverable. The strict variant would need a sync.Map[conn]state to
+// detect "was previously Idle", which is more correct but allocates a
+// map entry per connection — not worth the cost for a memory-pressure
+// gauge that ops alerts on as a smoothed average.
+//
+// Wave 2.3 (2026-05-17): introduced alongside IdleTimeout 60s→300s, so
+// ops can correlate idle pool size against the wider window's RAM cost.
+func (s *Server) connStateHook(_ net.Conn, st http.ConnState) {
+	if s.handler == nil || s.handler.metrics == nil {
+		return
+	}
+	switch st {
+	case http.StateIdle:
+		s.handler.metrics.IdleConnections.Add(1)
+	case http.StateActive, http.StateClosed, http.StateHijacked:
+		s.handler.metrics.IdleConnections.Add(-1)
+	}
 }
 
 // Stop gracefully shuts down the server.

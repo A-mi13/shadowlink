@@ -53,13 +53,16 @@ func TestDecoyHandler404ForMissingFiles(t *testing.T) {
 	assert.Equal(t, 404, w.Code)
 }
 
-func TestDecoyHandlerHasServerHeaders(t *testing.T) {
+func TestDecoyHandlerSecurityHeaders(t *testing.T) {
 	handler := NewDecoyHandler("", nil)
 
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
 
-	assert.Equal(t, "nginx/1.27.3", w.Header().Get("Server"))
+	// Server header must be absent — behind CF it becomes "cloudflare";
+	// in direct-IP fallback emitting "nginx/1.27.3" (Nov 2024) in May 2026
+	// is a version-anachronism fingerprint.
+	assert.Equal(t, "", w.Header().Get("Server"))
 	assert.Equal(t, "nosniff", w.Header().Get("X-Content-Type-Options"))
 	assert.Equal(t, "SAMEORIGIN", w.Header().Get("X-Frame-Options"))
 }
@@ -89,7 +92,7 @@ func TestDecoyHandlerGETAndHEAD(t *testing.T) {
 	assert.Equal(t, 200, w.Code)
 }
 
-func TestDecoyHandlerLooksLikeRealNginx(t *testing.T) {
+func TestDecoyHandlerServesPlausibleWebsite(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "index.html"),
 		[]byte("<html><head><title>Blog</title></head><body><h1>My Blog</h1></body></html>"), 0644)
@@ -102,7 +105,7 @@ func TestDecoyHandlerLooksLikeRealNginx(t *testing.T) {
 
 	// Response should look like a normal website
 	assert.Equal(t, 200, w.Code)
-	assert.Equal(t, "nginx/1.27.3", w.Header().Get("Server"))
+	assert.Equal(t, "", w.Header().Get("Server"), "Server header must be empty (CF sets its own)")
 	body := w.Body.String()
 	assert.Contains(t, body, "<html>")
 	assert.Contains(t, body, "Blog")
@@ -129,4 +132,18 @@ func TestDecoyHandlerPOSTReturns404(t *testing.T) {
 
 	// POST to unknown path = 404 (not 405) — looks like normal web server
 	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+// TestDecoy_NoServerHeader guards that the decoy handler emits no Server
+// header. Behind CF orange cloud CF replaces Server with "cloudflare"; in
+// direct-IP or leak scenarios, emitting "nginx/1.27.3" (Nov 2024) on
+// May 2026 is a version-anachronism fingerprint.
+func TestDecoy_NoServerHeader(t *testing.T) {
+	handler := NewDecoyHandler("", nil)
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
+
+	assert.Equal(t, "", w.Header().Get("Server"),
+		"Server header must be empty — CF sets its own; emitting nginx/1.27.3 is a fingerprint")
 }

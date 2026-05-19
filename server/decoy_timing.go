@@ -307,6 +307,23 @@ func decoyReasonForRLSentinel(info RLSentinel) DecoyReason {
 	}
 }
 
+// decoyWithTimingParity serves the decoy page with CPU+latency profile
+// matching failClosedToDecoy: runs runSyntheticDispatch (3× ScalarMult +
+// Poly1305 + AES-GCM) + ackJitter sleep, then forwards to decoy.
+//
+// Closes the passive-probe timing oracle where GET / direct-decoy responded
+// in <5ms while POST-JSON-invalid took ~10ms (full failClosedToDecoy path).
+//
+// Performance budget: ~5ms per request. At 1000 req/s ≈ 0.5 CPU core,
+// acceptable on pl1. DO NOT pre-compute or cache the synthetic result —
+// constant-time path reintroduces the very oracle this defends against.
+// Under extreme load, rely on IP-level RateLimiter, not on dispatch shortcut.
+func (h *Handler) decoyWithTimingParity(w http.ResponseWriter, r *http.Request) {
+	h.runSyntheticDispatch()
+	time.Sleep(ackJitter())
+	h.decoy.ServeHTTP(w, r)
+}
+
 // runSyntheticDispatch executes steps 1-3 of the failClosedToDecoy pipeline
 // (hint lookup + asymmetric ScalarMult parity + AES-GCM Open). Split out so
 // timing-variance tests can measure the CPU-work portion in isolation,

@@ -160,6 +160,20 @@ func TestExposer_IncludesPhase0Fields(t *testing.T) {
 	}
 }
 
+// TestMetrics_WSPathLegacyHits (Wave 2.1, 2026-05-17) verifies the new
+// atomic.Uint64 counter introduced for the legacy WS path observation:
+// every WS upgrade that lands on /_next/webpack-hmr or /track/realtime ticks
+// the counter. Used for data-driven cutoff decision on the IsAllowedWSPath
+// backward-compat accept set (MINOR-V2-6).
+func TestMetrics_WSPathLegacyHits(t *testing.T) {
+	m := &Metrics{}
+	m.WSPathLegacyHits.Add(1)
+	m.WSPathLegacyHits.Add(2)
+	if got := m.WSPathLegacyHits.Load(); got != 3 {
+		t.Errorf("WSPathLegacyHits = %d, want 3", got)
+	}
+}
+
 // TestRatelimitBurstCounters verifies that IncRatelimitBurstConsumed /
 // IncRatelimitBurstRejected route per-path increments correctly, that an
 // unknown path is a safe no-op, and that the JSON snapshot + Prom exposition

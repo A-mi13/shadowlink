@@ -67,15 +67,27 @@ type statsRegistry struct {
 	// default builds so a non-zero reading on the dashboard is itself a signal
 	// that the PQ path is enabled in the field.
 	//
+	// PQClientHelloSent — count of TLS ClientHellos sent with X25519MLKEM768
+	// in supported_groups + key_share where the subsequent TLS handshake also
+	// completed. Was named PQHandshakeSuccess until 2026-05-17 (Wave 3.3);
+	// renamed because CF edge may negotiate classical X25519 in ServerHello
+	// while we still record the ClientHello attempt — the metric tracks what
+	// we send, not what completes with PQ on the server side. See
+	// docs/superpowers/plans/2026-05-17-pq-wireshark-check.md for the
+	// one-time wire-level verification procedure.
+	//
 	// Three labels in the Prom exposition (shadowlink_tls_pq_handshake_total):
-	//   - success  : pqClientHelloSpec applied + Handshake completed
-	//   - fallback : pqClientHelloSpec returned an error so we used helloID
-	//                (Handshake itself succeeded on the fallback spec)
-	//   - error    : the dial errored on either ApplyPreset or Handshake while
-	//                in the PQ branch (regardless of whether the PQ spec or
-	//                the fallback spec was loaded — both count as "PQ branch
-	//                exposed an error to the caller")
-	PQHandshakeSuccess  atomic.Uint64
+	//   - clienthello_sent : pqClientHelloSpec applied + Handshake completed
+	//                        (was "success" prior to 2026-05-17 rename)
+	//   - fallback         : pqClientHelloSpec returned an error so we used
+	//                        helloID (Handshake itself succeeded on the
+	//                        fallback spec)
+	//   - error            : the dial errored on either ApplyPreset or
+	//                        Handshake while in the PQ branch (regardless of
+	//                        whether the PQ spec or the fallback spec was
+	//                        loaded — both count as "PQ branch exposed an
+	//                        error to the caller")
+	PQClientHelloSent   atomic.Uint64
 	PQHandshakeFallback atomic.Uint64
 	PQHandshakeError    atomic.Uint64
 
@@ -346,7 +358,7 @@ func (s *statsRegistry) IncFrameAnomaly(reason string) {
 func WritePromMetrics(w io.Writer) {
 	fmt.Fprintf(w, "# HELP shadowlink_tls_pq_handshake_total PQ ClientHello handshake outcomes (only ticks when SHADOWLINK_TLS_PQ=1)\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_tls_pq_handshake_total counter\n")
-	fmt.Fprintf(w, "shadowlink_tls_pq_handshake_total{result=\"success\"} %d\n", Stats.PQHandshakeSuccess.Load())
+	fmt.Fprintf(w, "shadowlink_tls_pq_handshake_total{result=\"clienthello_sent\"} %d\n", Stats.PQClientHelloSent.Load())
 	fmt.Fprintf(w, "shadowlink_tls_pq_handshake_total{result=\"fallback\"} %d\n", Stats.PQHandshakeFallback.Load())
 	fmt.Fprintf(w, "shadowlink_tls_pq_handshake_total{result=\"error\"} %d\n", Stats.PQHandshakeError.Load())
 

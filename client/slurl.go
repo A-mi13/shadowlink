@@ -11,7 +11,17 @@ import (
 // pubkeyRe matches exactly 64 lowercase hex characters.
 var pubkeyRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
+// hostnameRe matches a permissive DNS-name shape (letters, digits, dots, hyphens).
+// Strict RFC 1123 validation deferred — the pool is admin-configured server-side
+// via SQL, so input is trusted; this regex blocks shell/URL injection shapes only.
+var hostnameRe = regexp.MustCompile(`^[a-zA-Z0-9.\-]+$`)
+
 const defaultSocksAddr = "127.0.0.1:1080"
+
+// maxCDNs caps the SNI rotation pool size carried in `cdns=` query param.
+// Same limit applied in ParseSLURL (rejects oversized URLs) and BuildSLURL
+// (truncates programmatic callers to preserve roundtrip safety).
+const maxCDNs = 8
 
 // ParseSLURL parses an sl:// URL into a ClientFileConfig.
 //
@@ -101,6 +111,22 @@ func ParseSLURL(rawURL string) (*ClientFileConfig, error) {
 		}
 	}
 
+	if raw := q.Get("cdns"); raw != "" {
+		for _, p := range strings.Split(raw, ",") {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			if !hostnameRe.MatchString(p) {
+				return nil, fmt.Errorf("cdns: invalid hostname %q", p)
+			}
+			cfg.CDNs = append(cfg.CDNs, p)
+		}
+		if len(cfg.CDNs) > maxCDNs {
+			return nil, fmt.Errorf("cdns: max %d entries, got %d", maxCDNs, len(cfg.CDNs))
+		}
+	}
+
 	if cfg.Socks == "" {
 		cfg.Socks = defaultSocksAddr
 	}
@@ -158,6 +184,16 @@ func BuildSLURL(cfg *ClientFileConfig) string {
 	}
 	if len(cfg.BackupServers) > 0 {
 		params.Set("backup", strings.Join(cfg.BackupServers, ","))
+	}
+	if len(cfg.CDNs) > 0 {
+		// Truncate to maxCDNs so ParseSLURL(BuildSLURL(cfg)) round-trips even
+		// when programmatic callers exceed the limit. Validation lives in
+		// ParseSLURL — emit silently truncates rather than panicking here.
+		cdns := cfg.CDNs
+		if len(cdns) > maxCDNs {
+			cdns = cdns[:maxCDNs]
+		}
+		params.Set("cdns", strings.Join(cdns, ","))
 	}
 	if cfg.Socks != "" && cfg.Socks != defaultSocksAddr {
 		params.Set("socks", cfg.Socks)

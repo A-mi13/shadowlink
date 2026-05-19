@@ -87,7 +87,6 @@ func buildDirServer(dir string) (handler http.Handler, dirOK bool) {
 // Selects the directory via Host header → domainMap lookup; falls back to defaultDir.
 func (d *DecoyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Add headers that a real nginx/caddy would send
-	w.Header().Set("Server", "nginx/1.27.3")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "SAMEORIGIN")
 	w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")

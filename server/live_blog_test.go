@@ -273,8 +273,8 @@ func TestLiveBlog_ServeHTTP_CacheMissFetchesAndRewrites(t *testing.T) {
 	if rec.Header().Get("Set-Cookie") != "" {
 		t.Errorf("upstream cookie leaked")
 	}
-	if rec.Header().Get("Server") != "nginx/1.27.3" {
-		t.Errorf("our Server header not set: %q", rec.Header().Get("Server"))
+	if got := rec.Header().Get("Server"); got != "" {
+		t.Errorf("Server header must be empty (CF sets its own), got %q", got)
 	}
 	if rec.Header().Get("Cache-Control") == "" {
 		t.Errorf("Cache-Control missing")
@@ -640,4 +640,36 @@ func TestLiveBlogHandler_ServeHTTP_RecoversFromPanic(t *testing.T) {
 	if got := metrics.DecoyLiveBlogServeHTTPPanic.Load(); got != 1 {
 		t.Errorf("DecoyLiveBlogServeHTTPPanic: got %d, want 1", got)
 	}
+}
+
+// TestLiveBlog_NoServerHeader guards that writeCached, writeCachedCDN, and
+// writeNginxLike404 emit no Server header. Behind CF orange cloud CF replaces
+// Server with "cloudflare"; in direct-IP fallback, emitting "nginx/1.27.3"
+// (Nov 2024) on May 2026 is a version-anachronism fingerprint.
+func TestLiveBlog_NoServerHeader(t *testing.T) {
+	h := newTestLiveBlogHandlerWithJitter(t, nil)
+
+	t.Run("writeCached", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		h.writeCached(w, &cachedPage{body: []byte("ok"), contentType: "text/html", status: 200})
+		if got := w.Header().Get("Server"); got != "" {
+			t.Errorf("writeCached: Server header %q, want empty", got)
+		}
+	})
+
+	t.Run("writeCachedCDN", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		h.writeCachedCDN(w, &cachedPage{body: []byte("ok"), contentType: "text/css", status: 200})
+		if got := w.Header().Get("Server"); got != "" {
+			t.Errorf("writeCachedCDN: Server header %q, want empty", got)
+		}
+	})
+
+	t.Run("writeNginxLike404", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		h.writeNginxLike404(w)
+		if got := w.Header().Get("Server"); got != "" {
+			t.Errorf("writeNginxLike404: Server header %q, want empty", got)
+		}
+	})
 }

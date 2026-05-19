@@ -124,12 +124,14 @@ func (d *DecoyTraffic) loop() {
 	// Per-loop RNG: deterministic startup, runtime-seeded for unpredictable
 	// intervals. Not goroutine-shared so no mutex needed.
 	rng := stdrand.New(stdrand.NewSource(time.Now().UnixNano()))
+	// Bimodal Markov state (Task 3.2 — Opus MAJOR-2 fix). Real browser cadence
+	// alternates burst-phases (rapid asset fetches ~250ms apart) with quiet-
+	// phases (idle tab, ~60s background polls). Single-mode log-normal showed
+	// an FFT-detectable spectral peak; bimodal+Markov destroys that peak.
+	state := browser.DecoyStateBurst
 	for {
-		// Log-normal interval, median ~25s, truncated [5s, 90s] (T2.4 — replaces
-		// uniform [15s, 45s]). Real analytics SDK polling has heavy-tailed
-		// interval distribution; the prior uniform window was a detectable
-		// narrow-band pattern.
-		interval := browser.NextDecoyInterval(rng)
+		var interval time.Duration
+		interval, state = browser.NextDecoyIntervalBimodal(state, rng)
 		select {
 		case <-d.stopCh:
 			return

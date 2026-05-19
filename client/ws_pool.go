@@ -136,6 +136,45 @@ const (
 	slotDraining
 )
 
+// slotDeathCause classifies WHY a slot was torn down. The cause is plumbed
+// explicitly through handleSlotDeath because two semantically-different
+// events share the cleanup path:
+//
+//   - deathCauseNatural — the slot's TCP died for reasons outside our
+//     control: reader panic, ReadMessage error, middlebox close 1006, TCP
+//     RST. These are signals that something in the network path is angry;
+//     they MUST feed the meltdown detector so the reconnect loop pauses
+//     when CF / TSPU / origin are punishing us.
+//
+//   - deathCausePreemptiveRotation — WE decided to rotate the slot before
+//     a middlebox killed it (byte budget exceeded, age threshold reached,
+//     or watchdog-driven). The TCP teardown is a success of the rotation
+//     policy, not a failure. Counting these against the meltdown threshold
+//     was a regression introduced by the age-watchdog: 6 staggered
+//     rotations within ~15s tripped the 6-deaths/15s meltdown counter and
+//     paused reconnect for 10s on a perfectly healthy pool (observed in
+//     field log 2026-05-18 right after the watchdog landed).
+//
+// recordSlotDeath is only invoked for the Natural cause; the meltdown
+// detector therefore tracks ONLY real failures.
+type slotDeathCause int
+
+const (
+	deathCauseNatural slotDeathCause = iota
+	deathCausePreemptiveRotation
+)
+
+func (c slotDeathCause) String() string {
+	switch c {
+	case deathCauseNatural:
+		return "natural"
+	case deathCausePreemptiveRotation:
+		return "preemptive_rotation"
+	default:
+		return "unknown"
+	}
+}
+
 // defaultMaxPendingPerSlot is the default in-flight CONNECTs cap per slot.
 // 4 is suitable for direct-to-origin mode. For CF mode a lower value (2) is
 // preferred because CF Free plan throttles aggressive WS burst traffic.
@@ -185,10 +224,367 @@ type poolSlot struct {
 	// 2026) silently freezes TCP after ~15-20KB downstream from "suspicious" IPs
 	// with TLS 1.3 — we rotate before hitting the threshold to keep traffic moving.
 	downBytes atomic.Int64
+
+	// lastDeathNs holds the UnixNano timestamp of the most recent handleSlotDeath
+	// call. AssignStream uses it to deprioritize freshly-reconnected slots —
+	// without this penalty, a slot that just came back from meltdown immediately
+	// gets new TCP streams attached to it, and if it dies again (very likely
+	// because the underlying CF/TSPU condition hasn't cleared) the user's upload
+	// is killed mid-transfer. Zero means "never died" — fresh slots compete
+	// equally on score.
+	lastDeathNs atomic.Int64
+
+	// readerActive guards against two slotReader goroutines reading the same
+	// *gorilla.Conn concurrently. Two readers calling ReadMessage on one conn
+	// interleave their reads at the byte boundary and gorilla decodes the
+	// resulting stream as malformed frames — observed in production as
+	// `RSV1/RSV2/RSV3 set`, `bad opcode N`, `continuation after FIN`. The
+	// race opens when the outer engine restarts pool.StartReader after a
+	// "all readers exited" event WHILE pool.reconnectLoop has already
+	// scheduled a fresh slotReader for a slot it just brought back online
+	// (ws_pool.go::reconnectLoop, line near `go p.slotReader(idx)`).
+	//
+	// Reader lifecycle: slotReaderWithClient performs CAS(false→true) at
+	// entry and defers CAS(true→false) at exit. StartReader skips slots
+	// where readerActive is already true.
+	readerActive atomic.Bool
+
+	// rotationDeferredNs holds the first time maybeRotateSlot wanted to
+	// rotate this slot but found active streams on it. 0 means "rotation
+	// not currently deferred". When the slot finally drains its streams
+	// OR slotRotationGraceWithActiveStreams elapses (whichever happens
+	// first), the rotation fires. Reset to 0 in connectSlot on reconnect.
+	rotationDeferredNs atomic.Int64
+
+	// startedAtNs is the UnixNano timestamp at which the current TCP for
+	// this slot finished its handshake and became ready. Set by connectSlot
+	// right before setState(slotReady). Reader-side age checks AND the
+	// pool-level rotation watchdog goroutine both read this field to compute
+	// slot_age. Atomic so the watchdog can read it without taking any lock.
+	// Zero means "never connected" (initial state).
+	startedAtNs atomic.Int64
+
+	// byteBudget is the per-slot, per-session downlink-byte threshold that
+	// triggers preemptive rotation. Sampled ONCE in connectSlot from a wide
+	// jittered range based on WSPoolTransport.maxBytesPerSlot and the slot
+	// index, then stored here and read directly by slotReaderWithClient.
+	//
+	// Why per-session sample (not per-frame, not per-call): re-sampling on
+	// every ReadMessage would let a single frame trip rotation as soon as
+	// the resampled threshold dropped below the current down_bytes total,
+	// causing spurious instant rotations. Sampling once at connect freezes
+	// the threshold for the slot's lifetime, so a heavy upload sees one
+	// consistent budget all the way to rotation.
+	//
+	// Why per-slot random (not just idx-stagger): per-flow byte counters are
+	// a documented TSPU 2024 detection vector (Citizen Lab "Stranger DPI in
+	// Russia", Aug 2024; A*STAR anti-censorship workshop 2025). Our previous
+	// deterministic ladder 8/9/10/.../15 MB produced a clean bimodal
+	// distribution on the wire (our rotations vs middlebox kills around
+	// 200 MB), which is a fingerprint. Wide random sampling smears the
+	// "ours" cluster across a 4-30 MB band, much closer to organic decay.
+	//
+	// 0 = byte-budget rotation disabled for this slot (viaCF mode or
+	// MaxBytesPerSlot config = 0). Read with Load; written with Store
+	// exactly once per (re)connect by sampleByteBudget.
+	byteBudget atomic.Int64
+
+	// staggerOffsetNs is the per-slot, per-session additive grid jitter
+	// applied to the rotation timing threshold. Sampled ONCE in connectSlot
+	// via slotStaggerOffset(idx), stored here, and read by:
+	//   - rotationWatchdogSweep — adds to maxSlotAge to compute when this
+	//     slot is eligible for age-triggered rotation.
+	//   - maybeRotateSlot byte_budget defer — adds to nowNs when recording
+	//     rotationDeferredNs, so 8 simultaneously-deferred slots have
+	//     grace-expiry events spread by ~staggerStep × idx + jitter.
+	//
+	// Why per-session (not per-call): if the watchdog re-samples on every
+	// 5s tick, a slot near its threshold can repeatedly draw HIGH offsets
+	// and never rotate — or alternate "ready / not ready" decisions tick
+	// by tick. Freezing the offset at connect makes the rotation time a
+	// single random variable per session, which is the right contract for
+	// FFT-spectrum smearing.
+	//
+	// Range: idx=0 → always 0. idx≥1 → uniform on
+	// [idx*step - step/2, idx*step + step/2). Read with Load; written with
+	// Store exactly once per (re)connect.
+	staggerOffsetNs atomic.Int64
+}
+
+// slotFreshnessPenaltyWindow defines how long after a slot's last death
+// AssignStream's first pass excludes it from candidates. Tuned to outlast
+// the typical reconnect-handshake-warmup cycle (~3-8s in field data) so
+// the cooled-down slot has time to prove stability before long-lived TCP
+// uploads land on it. If every ready slot is inside this window (cascade
+// recovery), AssignStream falls through to a second pass that ignores
+// the window — see AssignStream's pickInPass closure.
+const slotFreshnessPenaltyWindow = 30 * time.Second
+
+// slotRotationStaggerStep is the per-slot GRID INTERVAL added to MaxSlotAge
+// so 8 slots created within milliseconds of each other don't all rotate at
+// the same instant. With a 2-min base and 15s grid step, the 8th slot
+// rotates ≈ 2m after the 1st — one rotation roughly every 15 seconds, no
+// reconnect storm.
+//
+// 2026-05-18 (A1 fix): the offset for a given slot is no longer
+// deterministic `idx × step` but `idx × step + uniform([-step/2, step/2))`
+// via slotStaggerOffset below. The deterministic ladder produced a
+// detectable arithmetic-progression signature in TCP-handshake-arrival
+// times (FFT peak at 1/step Hz). Additive grid jitter smears that peak
+// across a step-wide band while preserving slot ordering in expectation.
+const slotRotationStaggerStep = 15 * time.Second
+
+// slotStaggerOffset returns the per-slot rotation timing offset, computed
+// as additive grid noise around the deterministic ladder. For slot N:
+//
+//	offset(N) = N * slotRotationStaggerStep + uniform[-step/2, step/2)
+//
+// Properties:
+//   - offset(0) = 0 always. Slot 0 is the "first" rotation point — never
+//     delayed by jitter. This preserves the existing invariant that some
+//     tests rely on (e.g. TestRotationWatchdogSweep_RotatesAgedIdleSlot
+//     drives slot 0 specifically).
+//   - For N ≥ 1: offset is uniform on
+//     [N*step - step/2, N*step + step/2). Mean = N*step. Width = step.
+//   - Monotonicity in EXPECTATION across slots, NOT strictly per-call.
+//     For 8 slots × 15s grid, P(offset(N) > offset(N-1)) ≈ 0.71 per pair
+//     (window overlaps by step/2 on each side). Across the whole pool a
+//     full reversal is statistically negligible.
+//   - FFT effect: the additive grid noise spreads the ladder's spectral
+//     peak (was a delta at 1/step) into a band centered at 1/step with
+//     width ~1/step. A passive observer collecting ≥100 inter-arrival
+//     samples can no longer reject the "irregular" null hypothesis.
+//
+// Why additive (not multiplicative / not cumulative independent):
+//   - Multiplicative `idx × JitteredInterval(step, 0.5)` draws ONE sample
+//     and scales it — the inter-slot ratios are preserved deterministically
+//     per session, FFT peak survives. (Reviewed in
+//     docs/audit/2026-05-18-anti-tspu-debt-review.md as the "single-sample
+//     reused" anti-pattern.)
+//   - Cumulative independent jitter `Σ_{k=1..idx} JitteredInterval(step, 0.5)`
+//     breaks monotonicity outright — slot 7 can land before slot 3.
+//   - Additive grid `idx × step + uniform[-step/2, step/2)` keeps slots
+//     close to their grid points (monotonicity in expectation) AND breaks
+//     the spectral signature. This is the contract used here.
+//
+// Why NOT JitteredInterval(step/2, 1.0) directly: that helper clamps
+// output at base/2 (a sanity floor for the keepalive/backoff use case).
+// Here we WANT the full [-step/2, +step/2) range — clamping would skew
+// the distribution.
+//
+// Concurrency: `math/rand/v2`'s package-level Float64 is concurrent-safe
+// and allocation-free. Called from rotationWatchdogSweep (single goroutine,
+// 5s tick) and from maybeRotateSlot (single reader goroutine per slot
+// via readerActive CAS). No hot-path pressure.
+func slotStaggerOffset(idx int) time.Duration {
+	if idx <= 0 {
+		return 0
+	}
+	base := time.Duration(idx) * slotRotationStaggerStep
+	// Float64() ∈ [0, 1.0). Map to [-0.5, 0.5) then to half-open
+	// [-step/2, step/2).
+	jitter := time.Duration((rand.Float64() - 0.5) * float64(slotRotationStaggerStep))
+	return base + jitter
+}
+
+// reconnectJitterWindow defines how long after a meltdown event the
+// reconnect path applies per-slot handshake jitter. Beyond this window
+// (steady-state single-slot rotation), reconnects fire at their normal
+// cadence — no added latency.
+//
+// 5 seconds matches the typical meltdown cooldown (10s default) cut in
+// half, giving the post-meltdown reconnect burst a 5s spreading window
+// before the next eligible cooldown could fire.
+const reconnectJitterWindow = 5 * time.Second
+
+// reconnectJitterStaggerStep is the per-slot offset grid for post-meltdown
+// reconnect jitter. With 8 slots × 200ms step, the spread is roughly
+// 0 → 1.6s across the pool. The additive grid jitter (±step/2 around
+// each grid point) makes inter-slot timing fuzzy on the wire — see
+// slotStaggerOffset for the rationale on additive-grid over multiplicative
+// or cumulative-independent jitter.
+//
+// Tuning: 200ms is the smallest spread that visibly defuses a thunder-herd
+// of 8 TLS handshakes (typical TCP+TLS handshake completes in 50-150ms,
+// so 200ms ensures no two slots are mid-handshake simultaneously). Going
+// larger (e.g. 500ms) would extend post-meltdown recovery time linearly
+// in pool size — already 1.6s at 200ms, 4s at 500ms. 200ms is the sweet
+// spot.
+const reconnectJitterStaggerStep = 200 * time.Millisecond
+
+// reconnectJitterOffset returns the per-slot additive grid jitter for
+// post-meltdown reconnect spreading. Mirrors slotStaggerOffset but at a
+// much smaller scale (200ms step vs 15s step) — handshake spreading is
+// a sub-second concern, rotation timing is a multi-minute concern.
+//
+// Returns 0 for idx ≤ 0 (slot 0 is the "first reconnect" anchor).
+// For idx ≥ 1 returns uniform on
+//
+//	[idx * reconnectJitterStaggerStep - step/2,
+//	 idx * reconnectJitterStaggerStep + step/2).
+//
+// Concurrency: math/rand/v2 package-level Float64 is goroutine-safe.
+// Called from reconnectLoop (one goroutine per slot, never concurrent
+// for the same slot) so there's no contention even at the RNG level.
+func reconnectJitterOffset(idx int) time.Duration {
+	if idx <= 0 {
+		return 0
+	}
+	base := time.Duration(idx) * reconnectJitterStaggerStep
+	jitter := time.Duration((rand.Float64() - 0.5) * float64(reconnectJitterStaggerStep))
+	return base + jitter
+}
+
+// slotRotationGraceWithActiveStreams caps how long maybeRotateSlot will
+// defer a triggered rotation while active streams are still flowing on
+// the slot. Hard limit: after this window, we rotate anyway, because a
+// long-lived heavy upload would otherwise pin the slot past the
+// middlebox kill window we were trying to avoid.
+const slotRotationGraceWithActiveStreams = 30 * time.Second
+
+// rotationStormBrakeFraction is the fraction of the pool that must be
+// non-ready (dead, connecting, draining) before maybeRotateSlot pauses
+// new preemptive rotations. Computed as ceil(poolSize * fraction).
+//
+// Rationale (2026-05-18 field observation): under heavy upload load
+// (~60 Mbps sustained) every slot exceeds MaxBytesPerSlot within ~1s
+// of the speedtest start. All 8 slots enter byte_budget defer in a 6s
+// window; 30s later all 8 force-rotate. At the rotation peak, alive=4
+// dead=4 — half the pool is reconnecting and the upload writer has
+// nowhere to put bytes. Upload speed collapsed 55→16 Mbps observed.
+//
+// The brake: when ≥ ceil(poolSize * 0.25) slots are already non-ready,
+// new rotations defer instead of firing. We do NOT reset the defer
+// timestamp — the grace window keeps ticking in the background — so
+// the brake doesn't ALSO pin slots past their max-age forever. If the
+// brake stays engaged longer than grace, the deferred slot still hits
+// force-rotate eventually, but spread out as slots come back online.
+//
+// 0.25 is chosen so a healthy pool of 8 still permits 2 simultaneous
+// rotations (typical steady-state from age-stagger + byte-stagger),
+// while clamping at 2 means we never enter the "alive=4 dead=4"
+// state observed in the field.
+const rotationStormBrakeFraction = 0.25
+
+// effectiveMaxBytesForSlot returns the DETERMINISTIC center of the per-slot
+// byte-budget distribution. The actual budget used by the slot reader is
+// sampled with jitter around this center via sampleByteBudget below and
+// stored once per (re)connect in poolSlot.byteBudget.
+//
+// Center formula: base + (idx × base / poolSize). For 8 slots × 8 MiB base:
+//   slot 0 → 8.0 MiB center, slot 1 → 9.0, ..., slot 7 → 15.0 MiB.
+// Spread is exactly +base across the pool (slot N has 2× the budget center
+// of slot 0 at the high end), structurally identical to the 2× spread the
+// age stagger produces (slot 0 = 2m, slot 7 = 2m + 7×15s = 3m45s before
+// clamp).
+//
+// Returns 0 when base is 0 (feature disabled) — preserving the
+// "byte budget off" semantics callers rely on.
+func (p *WSPoolTransport) effectiveMaxBytesForSlot(idx int) int64 {
+	if p.maxBytesPerSlot <= 0 {
+		return 0
+	}
+	if p.poolSize <= 1 {
+		return p.maxBytesPerSlot
+	}
+	return p.maxBytesPerSlot + (int64(idx)*p.maxBytesPerSlot)/int64(p.poolSize)
+}
+
+// byteBudgetJitterLow / byteBudgetJitterHigh bound the multiplicative jitter
+// applied to each slot's byte-budget center at connect time. With center =
+// effectiveMaxBytesForSlot(idx), the actual budget is sampled uniformly
+// from the half-open interval [center * Low, center * High) — Float64
+// returns [0, 1), so the upper end is exclusive. The 1-byte gap at the
+// high end is irrelevant for byte-budget purposes.
+//
+// For slot 0 with 8 MiB center: budget ∈ [4 MiB, 16 MiB).
+// For slot 7 with 15 MiB center: budget ∈ [7.5 MiB, 30 MiB).
+// Aggregate across pool sessions: budget distribution spans ~4-30 MiB,
+// smearing the previous deterministic 8/9/.../15 MiB ladder into a wide
+// band that no longer reads as a clean bimodal cluster on the wire.
+//
+// Why uniform (not log-normal): the goal is to make the budget
+// distribution look uninformative to an observer counting per-flow bytes
+// at session teardown. Uniform on [0.5x, 2x] of the center is wider than
+// log-normal would be at sigma=0.5 and computationally cheaper. Real
+// browser flows have heavy-tail (Pareto-ish) byte distributions, so
+// matching that exactly would require a different sampler — uniform here
+// is the lower-effort first cut that already breaks the bimodal pattern
+// per Citizen Lab "Stranger DPI in Russia" detection vector.
+const (
+	byteBudgetJitterLow  = 0.5
+	byteBudgetJitterHigh = 2.0
+)
+
+// sampleByteBudget returns a freshly sampled byte budget for the given slot
+// index. Returns 0 when byte-budget rotation is disabled (maxBytesPerSlot
+// = 0, viaCF mode). Otherwise samples uniformly from
+// [center * byteBudgetJitterLow, center * byteBudgetJitterHigh] where
+// center = effectiveMaxBytesForSlot(idx).
+//
+// Concurrency: math/rand/v2's package-level Float64 is concurrent-safe and
+// allocation-free. No need for a seeded RNG here — this is called once per
+// connectSlot, not in any hot path.
+//
+// Caller contract: invoke ONCE per (re)connect after handshake completes,
+// before the slot becomes ready for the reader. Store result in
+// slot.byteBudget. Do NOT call from the read loop or watchdog.
+func (p *WSPoolTransport) sampleByteBudget(idx int) int64 {
+	center := p.effectiveMaxBytesForSlot(idx)
+	if center <= 0 {
+		return 0
+	}
+	span := byteBudgetJitterHigh - byteBudgetJitterLow
+	multiplier := byteBudgetJitterLow + rand.Float64()*span
+	return int64(float64(center) * multiplier)
+}
+
+// rotationStormBrakeThreshold returns the minimum count of non-ready
+// slots that engages the brake. Always at least 1 so the formula has
+// monotonic semantics; clamped to ≥ ceil(poolSize*fraction).
+func (p *WSPoolTransport) rotationStormBrakeThreshold() int {
+	t := int(float64(p.poolSize)*rotationStormBrakeFraction + 0.5)
+	if t < 1 {
+		t = 1
+	}
+	return t
+}
+
+// countNonReadySlots returns the count of slots NOT in slotReady. Used
+// by the rotation storm brake to decide whether a new preemptive
+// rotation would push the pool past the safety threshold. Lock-free
+// read of per-slot atomics; nil slots count as non-ready (they haven't
+// finished their first connect yet).
+func (p *WSPoolTransport) countNonReadySlots() int {
+	n := 0
+	for _, slot := range p.slots {
+		if slot == nil || slot.getState() != slotReady {
+			n++
+		}
+	}
+	return n
 }
 
 func (s *poolSlot) getState() slotState   { return slotState(s.state.Load()) }
 func (s *poolSlot) setState(st slotState) { s.state.Store(int32(st)) }
+
+// tryMarkDead atomically transitions the slot to slotDead from any non-dead
+// state. Returns true if THIS caller performed the transition (i.e., the slot
+// wasn't already dead). Used by handleSlotDeath to guarantee idempotency —
+// without it, a single slot failure can fan out into 2-3 handleSlotDeath calls
+// (reader panic + ReadMessage error + writer exit), each inflating the
+// meltdown death counter and tripping the threshold artificially.
+func (s *poolSlot) tryMarkDead() bool {
+	for {
+		cur := s.state.Load()
+		if slotState(cur) == slotDead {
+			return false
+		}
+		if s.state.CompareAndSwap(cur, int32(slotDead)) {
+			return true
+		}
+	}
+}
 
 // shouldExitReader returns true when the reader's captured generation no longer
 // matches the slot's current generation — meaning a reconnect happened and a
@@ -328,7 +724,8 @@ type WSPoolTransport struct {
 
 	maxPendingPerSlot int32 // cap on in-flight CONNECTs per slot
 	maxStreamsPerSlot int32 // cap on active streams per slot (0 = unlimited)
-	maxBytesPerSlot   int64 // rotate slot after N downstream bytes (0 = disabled)
+	maxBytesPerSlot   int64         // rotate slot after N downstream bytes (0 = disabled)
+	maxSlotAge        time.Duration // rotate slot after this much wallclock age (0 = disabled)
 
 	streamMap sync.Map // map[uint16]int — streamID -> slot index
 
@@ -364,6 +761,31 @@ type WSPoolTransport struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	log    *slog.Logger
+
+	// Diagnostics counters surfaced in the periodic "WS pool health" INFO
+	// summary. meltdowns1m: count of meltdown events in the last ~60s,
+	// updated by emitMeltdownLog (inc) and a tick goroutine (dec after
+	// 60s). rotations1m: count of preemptive rotations fired in the last
+	// ~60s — high values indicate aggressive middlebox interference and
+	// validate that the watchdog is doing useful work. startedAt is set
+	// in NewWSPoolTransport for uptime reporting.
+	meltdowns1m atomic.Int32
+	rotations1m atomic.Int32
+	startedAt   time.Time
+
+	// recentMeltdownNs is the UnixNano timestamp of the most recent
+	// meltdown event (set by emitMeltdownLog). Used by reconnectLoop's
+	// A2 jitter gate: post-meltdown, when 8 reconnects start nearly
+	// simultaneously after the cooldown window, we want to spread them
+	// across a few hundred ms so the origin doesn't see a thunder-herd
+	// of 8 identical-JA4 TLS handshakes. Routine single-slot rotation
+	// (which happens often under steady state) should NOT pay this
+	// latency — gating on "meltdown in last 5s" gives us spread when
+	// it matters and zero cost when it doesn't.
+	//
+	// Zero = no meltdown observed yet (initial state). Read with Load;
+	// written with Store from emitMeltdownLog only.
+	recentMeltdownNs atomic.Int64
 }
 
 // Compile-time assertions.
@@ -394,9 +816,31 @@ type WSPoolConfig struct {
 
 	// MaxBytesPerSlot triggers preemptive rotation after N downstream bytes on
 	// a single slot's TCP. 0 = disabled. Critical for Russia TSPU DPI (2026)
-	// which silently freezes foreign-IP TCPs after ~15-20KB over TLS 1.3.
-	// Recommended 15 * 1024 for viaCF mode, 0 (disabled) for direct/SNI.
+	// which silently freezes foreign-IP TCPs after ~15-20KB over TLS 1.3
+	// via CF. Direct-mode (origin IP) uses a much larger budget — TSPU's
+	// freeze threshold is far higher for direct flows than CF-mediated ones.
+	// Recommended: 15*1024 for viaCF mode, 8*1024*1024 (8 MiB) for direct/SNI.
 	MaxBytesPerSlot int64
+
+	// MaxSlotAge triggers preemptive rotation after a slot's TCP has been
+	// alive for this long, independent of how much data flowed. 0 = disabled.
+	//
+	// Rationale (2026-05-18 field analysis): direct-mode connections to
+	// foreign origin IPs see periodic `close 1006 unexpected EOF` events
+	// every 2-5 minutes. The byte-budget alone doesn't catch the case where
+	// a long-idle WS is killed by a middlebox per-flow timer (NAT entries,
+	// stateful firewalls, TSPU's age-based heuristics). Self-rotating just
+	// before the typical kill window keeps the kill signal out of the
+	// network path entirely.
+	//
+	// Recommended: 2 * time.Minute for direct/SNI mode (matches observed
+	// slot_age_ms ~3min at moment of close 1006). 0 for viaCF (byte budget
+	// alone handles the much shorter TSPU freeze).
+	//
+	// Per-slot stagger is automatic: slot N rotates at MaxSlotAge + N*15s,
+	// so 8 slots ageing simultaneously don't all rotate in the same instant
+	// and create a handshake storm.
+	MaxSlotAge time.Duration
 
 	// WriteTimeout caps each WS frame's write deadline. 0 → WSAsyncWriter
 	// default (30s). For viaCF mode pass 5-8s: CF-side stalls propagate as
@@ -448,6 +892,7 @@ func NewWSPoolTransport(cl *Client, cfg WSPoolConfig) *WSPoolTransport {
 		maxPendingPerSlot: int32(cfg.MaxPendingPerSlot),
 		maxStreamsPerSlot: int32(cfg.MaxStreamsPerSlot),
 		maxBytesPerSlot:   cfg.MaxBytesPerSlot,
+		maxSlotAge:        cfg.MaxSlotAge,
 		serverAddr:        cfg.ServerAddr,
 		sniHost:           cfg.SNIHost,
 		cfIP:              cfg.CFIP,
@@ -462,6 +907,7 @@ func NewWSPoolTransport(cl *Client, cfg WSPoolConfig) *WSPoolTransport {
 		meltdownCooldown:  cfg.MeltdownCooldown,
 		meltdownLimiter:   newMeltdownLimiter(),
 		meltdownLogRNG:    mrand.New(mrand.NewSource(time.Now().UnixNano())),
+		startedAt:         time.Now(),
 		ctx:               ctx,
 		cancel:            cancel,
 		log:               slog.Default(),
@@ -512,8 +958,144 @@ func (p *WSPoolTransport) Connect(ctx context.Context) error {
 
 	go p.rotationLoop()
 	go p.keepaliveLoop()
+	go p.healthSummaryLoop()
+	if p.maxSlotAge > 0 {
+		go p.rotationWatchdogLoop()
+	}
 
 	return nil
+}
+
+// rotationWatchdogLoop ticks at a fixed cadence (independent of downlink
+// data arrival) and checks every ready slot's age against its effective
+// max-age (MaxSlotAge + slot.staggerOffsetNs, sampled per-session via
+// slotStaggerOffset(idx) — see A1 fix 2026-05-18 for the additive-grid
+// jitter rationale). When the threshold is reached, the watchdog invokes
+// maybeRotateSlot, which respects the active-streams defer logic and the
+// grace window.
+//
+// Why a separate goroutine instead of doing it inline in slotReader:
+// slotReader's age check only runs after a successful ReadMessage. On a
+// slot that has gone idle (no downlink for tens of seconds) the reader
+// blocks until either data arrives OR the 60s read deadline fires. If
+// MaxSlotAge passes during that idle blockage, the in-reader check would
+// never run before the middlebox kills the TCP — defeating the purpose
+// of preemptive rotation. The watchdog ticks every 5s regardless of
+// reader activity.
+//
+// Concurrency: the watchdog reads slot.startedAtNs atomically, then calls
+// maybeRotateSlot. maybeRotateSlot writes rotationDeferredNs atomically.
+// handleSlotDeath (called from maybeRotateSlot when streams==0) flips
+// state atomically. There is no lock contention with slotReader because
+// every shared field is atomic.
+func (p *WSPoolTransport) rotationWatchdogLoop() {
+	const tickInterval = 5 * time.Second
+	ticker := time.NewTicker(tickInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.ctx.Done():
+			return
+		case <-ticker.C:
+			p.rotationWatchdogSweep()
+		}
+	}
+}
+
+// rotationWatchdogSweep performs one pass over all slots, rotating any
+// that have exceeded their effective max-age. Extracted from the loop
+// so unit tests can drive it deterministically without time.Sleep.
+func (p *WSPoolTransport) rotationWatchdogSweep() {
+	nowNs := time.Now().UnixNano()
+	for idx, slot := range p.slots {
+		if slot == nil || slot.getState() != slotReady {
+			continue
+		}
+		started := slot.startedAtNs.Load()
+		if started == 0 {
+			continue // not yet connected; connectSlot hasn't stamped it
+		}
+		// Per-slot age threshold = max-age + per-session frozen grid jitter.
+		// staggerOffsetNs is sampled ONCE in connectSlot via
+		// slotStaggerOffset(idx); re-sampling here every 5s tick would let a
+		// slot near its threshold oscillate between "ready" and "not ready"
+		// and never converge on a rotation decision.
+		effectiveMaxAge := p.maxSlotAge.Nanoseconds() + slot.staggerOffsetNs.Load()
+		if nowNs-started < effectiveMaxAge {
+			continue
+		}
+		// Synthesise a slotStart time.Time for the log fields (maybeRotateSlot
+		// expects one; we don't have anything but the atomic). This avoids
+		// changing maybeRotateSlot's signature for a single log field.
+		slotStart := time.Unix(0, started)
+		p.maybeRotateSlot(p.client, idx, slot, "age",
+			0, // msgCount unknown at watchdog level; the slot reader has the real value
+			slotStart,
+			slot.downBytes.Load(),
+		)
+	}
+}
+
+// healthSummaryLoop emits one INFO line every 30s with the live pool
+// state. Designed to be the one log line an operator needs to look at
+// to know if the pool is healthy — alive/dead/rate-limited slot counts,
+// total active streams, recent meltdown events, uptime. Independent of
+// the existing "shadowlink client stats (delta)" which reports per-
+// interval byte counters; this one is structural.
+func (p *WSPoolTransport) healthSummaryLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.ctx.Done():
+			return
+		case <-ticker.C:
+			p.emitHealthSummary()
+		}
+	}
+}
+
+func (p *WSPoolTransport) emitHealthSummary() {
+	alive, dead, connecting, draining := 0, 0, 0, 0
+	rateLimited := 0
+	var totalStreams int32
+	now := time.Now()
+	for _, slot := range p.slots {
+		if slot == nil {
+			continue
+		}
+		switch slot.getState() {
+		case slotReady:
+			alive++
+		case slotDead:
+			dead++
+		case slotConnecting:
+			connecting++
+		case slotDraining:
+			draining++
+		}
+		totalStreams += slot.streams.Load()
+		// Slot is "rate-limited" from this client's perspective if it died
+		// recently AND is still inside the freshness penalty window — that's
+		// our best proxy without plumbing X-SL-RL state per-slot.
+		if last := slot.lastDeathNs.Load(); last > 0 {
+			if now.Sub(time.Unix(0, last)) < slotFreshnessPenaltyWindow {
+				rateLimited++
+			}
+		}
+	}
+	uptime := time.Since(p.startedAt).Truncate(time.Second)
+	p.log.Info("WS pool health",
+		"alive", alive,
+		"dead", dead,
+		"connecting", connecting,
+		"draining", draining,
+		"rate_limited_recent", rateLimited,
+		"active_streams", totalStreams,
+		"meltdowns_1m", p.meltdowns1m.Load(),
+		"rotations_1m", p.rotations1m.Load(),
+		"uptime", uptime,
+	)
 }
 
 // keepaliveLoop sends FlagKeepalive to every healthy slot at a jittered
@@ -554,7 +1136,7 @@ func (p *WSPoolTransport) sendKeepaliveToAllSlots() {
 		}
 	}
 	if sent > 0 {
-		p.log.Debug("keepalive sent", "slots", sent)
+		Trace("keepalive sent", "slots", sent)
 	}
 }
 
@@ -638,6 +1220,40 @@ func (p *WSPoolTransport) connectSlot(ctx context.Context, idx int) error {
 	slot.transport = wst
 	// Reset downstream byte counter — fresh TCP starts the TSPU 15-20KB budget over.
 	slot.downBytes.Store(0)
+	// Reset rotation deferral — fresh TCP, no pending rotation to honour.
+	slot.rotationDeferredNs.Store(0)
+	// Sample THIS connection's byte budget once and freeze it for the slot
+	// lifetime. The reader compares down_bytes against this value, never
+	// against a recomputed-per-frame threshold (would cause spurious
+	// instant-rotation when a fresh sample lands below current total).
+	// Aggregate distribution across many sessions smears the previous
+	// deterministic 8/9/.../15 MiB ladder into a wide 4-30 MiB band —
+	// see byteBudgetJitterLow/High constants for rationale.
+	slot.byteBudget.Store(p.sampleByteBudget(idx))
+	// Sample additive grid jitter for rotation timing once per (re)connect.
+	// Re-sampling per watchdog tick would let a slot near its age threshold
+	// oscillate between "ready" and "not ready" — see slotStaggerOffset
+	// docstring. Stored as nanoseconds (int64) so the watchdog can do raw
+	// arithmetic with maxSlotAge.Nanoseconds().
+	slot.staggerOffsetNs.Store(int64(slotStaggerOffset(idx)))
+	// Stamp the slot's startup time — both the reader's local age check and
+	// the pool-level rotation watchdog goroutine read this. Set BEFORE
+	// setState(slotReady) so the watchdog never observes a ready slot with
+	// startedAtNs=0.
+	slot.startedAtNs.Store(time.Now().UnixNano())
+	// Reset reader-active flag so the next slotReader can CAS into ownership.
+	// At this point the previous reader either:
+	//   (a) was never running for this slot (initial connect), or
+	//   (b) had its conn Close()d by handleSlotDeath, observed the error in
+	//       ReadMessage, and is on its way out via the deferred CAS-to-false.
+	// We can't strictly wait for (b)'s defer to fire — that would require
+	// SUB ms-level synchronization between handleSlotDeath and the new reader
+	// startup. Forcing the flag false here is safe because the OLD transport
+	// pointer the old reader still holds is already torn down; even if a
+	// transient duplicate ran for a few iterations on the same `slot`, both
+	// would call myTransport.ReadMessage on different underlying conns. The
+	// generation check in the reader (shouldExitReader) handles the rest.
+	slot.readerActive.Store(false)
 	// Bump generation BEFORE marking ready so any old reader checking
 	// generation after this point exits cleanly. The new reader (started by
 	// the caller) will capture the new generation at its first check.
@@ -678,8 +1294,32 @@ func (p *WSPoolTransport) reconnectLoop(idx int) {
 			}
 		}
 
+		// A2 (2026-05-18): post-meltdown handshake spreading. When 8
+		// reconnect goroutines exit the cooldown together, without jitter
+		// they fire 8 identical-JA4 TLS handshakes to origin within
+		// milliseconds — a thunder-herd signature observable by any
+		// per-source-IP TLS counter at the origin (or on path). The
+		// per-slot offset spreads them across ~0-1.6s on a poolSize=8.
+		//
+		// Gate on attempt==0 && idx > 0 AND a recent meltdown timestamp:
+		//   - attempt > 0 retries already have exp backoff jitter.
+		//   - idx == 0 is the anchor reconnect, fires immediately.
+		//   - No recent meltdown (steady-state single-slot rotation) skips
+		//     the spread — it'd just add latency for no benefit.
+		if attempt == 0 && idx > 0 {
+			if last := p.recentMeltdownNs.Load(); last > 0 {
+				since := time.Since(time.Unix(0, last))
+				if since < reconnectJitterWindow {
+					jitter := reconnectJitterOffset(idx)
+					p.log.Debug("WS pool post-meltdown reconnect jitter",
+						"slot", idx, "jitter", jitter, "since_meltdown", since.Truncate(time.Millisecond))
+					sleepWithCancel(p.ctx, jitter)
+				}
+			}
+		}
+
 		d := slotBackoffDurationForTest(attempt)
-		p.log.Info("WS pool reconnecting slot", "slot", idx, "backoff", d, "attempt", attempt)
+		p.log.Debug("WS pool reconnecting slot", "slot", idx, "backoff", d, "attempt", attempt)
 
 		timer := time.NewTimer(d)
 		select {
@@ -706,10 +1346,16 @@ func (p *WSPoolTransport) reconnectLoop(idx int) {
 
 		// Task A2: typed sentinel — server told us we're rate-limited.
 		// Honor Signal.RefillIn when present (Phase 2 fix); fall back to
-		// fixed 180s ± 30% otherwise. Reset attempt counter so the next
-		// iteration starts fresh from attempt=0 (slow-start). The counter
-		// reset is safe: slotBackoffDuration is already clamped at attempt=6
-		// (May audit F1, A1 fix), so over-counting can't overflow.
+		// fixed 180s ± 30% otherwise.
+		//
+		// 2026-05-18 — DO NOT reset attempt counter after rate-limit. The
+		// old behavior (attempt = -1) made the next retry fire at attempt=0
+		// backoff (5-10s), which under sustained server-side TokenBucket
+		// pressure (other slots still consuming burst) walked straight back
+		// into another rate-limit response and looped indefinitely. Letting
+		// attempt keep growing means after a 180s server cooldown we add a
+		// slot-local backoff that grows exp until the slotBackoffDuration
+		// cap (60s, attempt=6 clamp). That gives the server time to refill.
 		if errors.Is(connectErr, ErrRateLimited) {
 			Stats.RateLimitedFromServer.Add(1)
 			var cooldown time.Duration
@@ -732,9 +1378,6 @@ func (p *WSPoolTransport) reconnectLoop(idx int) {
 				)
 			}
 			sleepWithCancel(p.ctx, cooldown)
-			// Reset attempt counter — the for-loop's `attempt++` will run
-			// after `continue`, so we set it to -1 to land on 0 next iter.
-			attempt = -1
 			continue
 		}
 
@@ -823,11 +1466,19 @@ func (p *WSPoolTransport) recordSlotDeath() {
 	}()
 
 	if int(deaths) >= p.meltdownThreshold {
-		until := time.Now().Add(p.meltdownCooldown).UnixNano()
-		// Only advance, never shorten, an already-active cooldown.
-		if prev := p.meltdownUntil.Load(); until > prev {
-			p.meltdownUntil.Store(until)
-			p.emitMeltdownLog(int(deaths))
+		// Flat cooldown: once a meltdown cooldown is set, additional deaths
+		// inside the active window only update the counter (already done
+		// above) — they do NOT extend the cooldown. Previously, every new
+		// death in the window pushed meltdownUntil forward by 10s from "now",
+		// which under sustained churn (≥6 deaths/15s — the exact rate seen
+		// in field logs 2026-05-18) kept reconnect paused indefinitely.
+		// We only set meltdownUntil when no prior cooldown is active.
+		nowNs := time.Now().UnixNano()
+		until := nowNs + p.meltdownCooldown.Nanoseconds()
+		if prev := p.meltdownUntil.Load(); prev == 0 || nowNs >= prev {
+			if p.meltdownUntil.CompareAndSwap(prev, until) {
+				p.emitMeltdownLog(int(deaths))
+			}
 		}
 	}
 }
@@ -844,6 +1495,26 @@ func (p *WSPoolTransport) recordSlotDeath() {
 //     [0.5×, 1.5×) × 5s draw, so the arrival timing is not a deterministic
 //     function of the underlying death event.
 func (p *WSPoolTransport) emitMeltdownLog(deathsInWindow int) {
+	// A2 (2026-05-18): stamp the meltdown timestamp before bumping the
+	// counter. reconnectLoop reads this via recentMeltdownNs.Load() and
+	// gates per-slot handshake jitter on it. Stamping FIRST means the
+	// jitter gate sees a fresh timestamp even if the 1m counter goroutine
+	// hasn't started yet.
+	p.recentMeltdownNs.Store(time.Now().UnixNano())
+	// Bump 1-minute counter for the periodic health summary. Decrement is
+	// scheduled in a separate goroutine after 60s — keeps the counter as a
+	// rolling window without needing a ring buffer or explicit timestamps.
+	p.meltdowns1m.Add(1)
+	go func() {
+		timer := time.NewTimer(60 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-p.ctx.Done():
+		case <-timer.C:
+			p.meltdowns1m.Add(-1)
+		}
+	}()
+
 	dead, total := p.countDeadSlots()
 
 	if !severeMeltdown(dead, total) {
@@ -959,37 +1630,66 @@ reconnect:
 }
 
 // AssignStream assigns a streamID to the least-loaded ready slot.
-// Prefers slots with fewer pending CONNECTs to distribute load evenly across CF CDN connections.
+// Prefers slots with fewer pending CONNECTs to distribute load evenly
+// across CF CDN connections.
+//
+// Selection algorithm (two-pass):
+//
+//  1. PASS-1 ("non-fresh preferred"): walk all slotReady slots, skip the
+//     ones inside slotFreshnessPenaltyWindow of their last death, pick
+//     the minimum score among the rest. If at least one non-fresh ready
+//     slot exists with spare capacity, the stream lands there.
+//
+//  2. PASS-2 ("fresh allowed"): if pass-1 found nothing, walk again but
+//     this time include freshly-reconnected slots. The penalty is dropped
+//     because there is no "non-fresh" alternative — applying it would
+//     either pick the same slot or fall through to the no-capacity branch
+//     unnecessarily. This avoids the failure mode where every slot just
+//     reconnected from a meltdown wave and AssignStream artificially
+//     refuses to use any of them.
+//
+//  3. CAPACITY OVERFLOW: if every slot is at maxStreamsPerSlot, soft-
+//     overflow onto the slot with fewest active streams. Last-resort
+//     fallback: any non-nil slot at all (typically slotConnecting), so a
+//     SOCKS5 CONNECT request never silently disappears.
 func (p *WSPoolTransport) AssignStream(streamID uint16) {
-	minIdx := -1
-	minScore := int32(1<<31 - 1)
+	pickInPass := func(allowFresh bool) (idx int, score int32) {
+		idx = -1
+		score = int32(1<<31 - 1)
+		nowNs := time.Now().UnixNano()
+		windowNs := slotFreshnessPenaltyWindow.Nanoseconds()
+		for i, slot := range p.slots {
+			if slot == nil || slot.getState() != slotReady {
+				continue
+			}
+			streams := slot.streams.Load()
+			if p.maxStreamsPerSlot > 0 && streams >= p.maxStreamsPerSlot {
+				continue
+			}
+			if !allowFresh {
+				if lastDeath := slot.lastDeathNs.Load(); lastDeath > 0 {
+					if nowNs-lastDeath < windowNs {
+						continue
+					}
+				}
+			}
+			pending := slot.pendingConnects.Load()
+			s := pending*4 + streams
+			if s < score {
+				score = s
+				idx = i
+			}
+		}
+		return idx, score
+	}
 
-	for i, slot := range p.slots {
-		if slot == nil {
-			continue
-		}
-		st := slot.getState()
-		if st != slotReady {
-			continue
-		}
-		streams := slot.streams.Load()
-		// Skip slots at stream capacity (CF mode: each WS should carry few streams)
-		if p.maxStreamsPerSlot > 0 && streams >= p.maxStreamsPerSlot {
-			continue
-		}
-		// Score: pending CONNECTs weighted 4x (bottleneck through CDN) + established streams.
-		// This spreads CONNECT load evenly and avoids piling onto one slot.
-		pending := slot.pendingConnects.Load()
-		score := pending*4 + streams
-		if score < minScore {
-			minScore = score
-			minIdx = i
-		}
+	minIdx, _ := pickInPass(false)
+	if minIdx < 0 {
+		minIdx, _ = pickInPass(true)
 	}
 
 	if minIdx < 0 {
 		// All slots at capacity — pick the slot with fewest streams (soft overflow).
-		// This is better than always picking slot 0 which creates a hotspot.
 		minStreams := int32(1<<31 - 1)
 		for i, slot := range p.slots {
 			if slot == nil || slot.getState() != slotReady {
@@ -1018,11 +1718,9 @@ func (p *WSPoolTransport) AssignStream(streamID uint16) {
 
 	p.streamMap.Store(streamID, minIdx)
 	p.slots[minIdx].streams.Add(1)
-	if p.log != nil {
-		p.log.Debug("stream assigned", "stream", streamID, "slot", minIdx,
-			"pending", p.slots[minIdx].pendingConnects.Load(),
-			"streams", p.slots[minIdx].streams.Load())
-	}
+	Trace("stream assigned", "stream", streamID, "slot", minIdx,
+		"pending", p.slots[minIdx].pendingConnects.Load(),
+		"streams", p.slots[minIdx].streams.Load())
 }
 
 // IncrPending increments the pending CONNECT counter for the stream's assigned slot.
@@ -1201,6 +1899,29 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 	if slot == nil || slot.transport == nil {
 		return
 	}
+
+	// CAS-gate against duplicate readers on the same slot. Two reader
+	// goroutines can be scheduled for one slot when:
+	//   1. reconnectLoop finishes connectSlot and calls `go p.slotReader(idx)`
+	//      (ws_pool.go ~line 802) to attach a reader to the new conn.
+	//   2. Concurrently, the outer engine's streamReaderLoop has observed
+	//      "all slot readers exited" on a *previous* generation and calls
+	//      pool.StartReader again, which walks all slotReady slots and
+	//      starts goroutines for each (ws_pool.go::StartReader).
+	// Both end up here for the same idx, with the same transport pointer
+	// and the same generation. Without this gate, two ReadMessage calls
+	// race on the same *gorilla.Conn — gorilla's frame parser observes the
+	// byte-interleaved stream and reports `RSV1/RSV2/RSV3 set`, `bad
+	// opcode N`, `continuation after FIN` — exactly the anomaly pattern
+	// captured in field logs 2026-05-18 right after a poll-fallback
+	// restart. Failing the CAS means another reader already owns the
+	// slot; we exit silently without touching the conn.
+	if !slot.readerActive.CompareAndSwap(false, true) {
+		Trace("WS pool slot reader skipped — already active", "slot", idx)
+		return
+	}
+	defer slot.readerActive.Store(false)
+
 	// Capture transport pointer at reader start. The slot's transport field is
 	// reassigned on rotation and replaced wholesale on reconnect (which creates
 	// a new poolSlot at p.slots[idx]); reading slot.transport on every loop
@@ -1209,7 +1930,8 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 	// reading from the OLD conn (which is Close'd by handleSlotDeath /
 	// rotation), gets "use of closed network connection", and exits cleanly.
 	// The new reader started after reconnect uses its own freshly captured
-	// transport — no two readers ever share a *gorilla.Conn.
+	// transport — paired with readerActive CAS, no two readers ever share
+	// a *gorilla.Conn.
 	myTransport := slot.transport
 	myGen := slot.generation.Load()
 	slotStart := time.Now()
@@ -1227,7 +1949,7 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 			// A panic on a stale generation means we lost a race with a
 			// reconnect; the new reader/transport must not be torn down.
 			if !p.shouldExitReader(slot, myGen) {
-				p.handleSlotDeath(cl, idx)
+				p.handleSlotDeath(cl, idx, deathCauseNatural)
 			}
 		}
 	}()
@@ -1244,12 +1966,18 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 		// owns the new transport — exit silently to avoid concurrent
 		// ReadMessage on the same conn.
 		if p.shouldExitReader(slot, myGen) {
-			p.log.Debug("WS pool slot reader exiting — slot reconnected",
+			Trace("WS pool slot reader exiting — slot reconnected",
 				"slot", idx, "captured_gen", myGen, "current_gen", slot.generation.Load())
 			return
 		}
 
-		data, err := myTransport.ReadMessage(30 * time.Second)
+		// Read deadline 60s: under heavy upload load the writer keeps the
+		// gorilla send buffer warm, but a downlink-quiet window can briefly
+		// exceed 30s if keepalive scheduling jitters into a slow writer.
+		// 60s gives slack while still tripping well before nginx's default
+		// proxy_read_timeout=60s on the origin (which itself should be raised
+		// to ~900s on the server side — orthogonal fix, see deploy docs).
+		data, err := myTransport.ReadMessage(60 * time.Second)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -1299,25 +2027,30 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 				"writer_exits", Stats.WriterExits.Load(),
 				"mode", mode,
 			)
-			p.handleSlotDeath(cl, idx)
+			p.handleSlotDeath(cl, idx, deathCauseNatural)
 			return
 		}
 
-		// Preemptive byte-based rotation (Russia TSPU 2026 mitigation).
-		// TSPU freezes foreign-IP TCP silently after ~15-20KB downstream over
-		// TLS 1.3. Rotate this slot BEFORE hitting that cliff — fresh TCP
-		// resets the censor's byte counter. maxBytesPerSlot=0 disables this
-		// (used for direct/SNI mode where there's no such limit).
-		if p.maxBytesPerSlot > 0 {
+		// Preemptive byte-based rotation. budget = 0 → feature disabled
+		// (viaCF mode). See poolSlot.byteBudget docstring for the jitter
+		// rationale and the "sample once per (re)connect" invariant.
+		budget := slot.byteBudget.Load()
+		if budget > 0 {
+			// Always advance the counter (even if we don't rotate here) so a
+			// future read sees the correct total.
 			total := slot.downBytes.Add(int64(len(data)))
-			if total >= p.maxBytesPerSlot {
-				p.log.Info("WS pool slot preemptive rotation (TSPU byte budget)",
-					"slot", idx, "downBytes", total, "limit", p.maxBytesPerSlot,
-					"messages", msgCount)
-				p.handleSlotDeath(cl, idx)
+			if total >= budget && p.maybeRotateSlot(cl, idx, slot, "byte_budget", msgCount, slotStart, total) {
 				return
 			}
 		}
+
+		// Age-based rotation lives in rotationWatchdog (pool-level
+		// goroutine), NOT here. The reader-side check would only fire when
+		// data arrives — on a slot that's gone idle just past the kill
+		// window threshold, ReadMessage would block until the 60s deadline,
+		// receive the close 1006 from the middlebox, and we'd handle it as
+		// a death instead of a preemptive rotation. The watchdog ticks
+		// independently of downlink traffic.
 
 		session := slot.session
 		if session == nil {
@@ -1344,10 +2077,161 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 	}
 }
 
+// maybeRotateSlot is the policy gate for preemptive rotation triggers
+// (byte budget, age budget). It performs the rotation immediately when
+// the slot has no active streams. When streams are still active, it
+// defers the rotation up to slotRotationGraceWithActiveStreams to let
+// the in-flight uploads finish — interrupting a long heavy upload
+// mid-flight wastes the upload's progress.
+//
+// Returns true iff rotation actually fired (caller must `return` to exit
+// the read loop). Returns false if rotation was deferred OR aborted; in
+// both cases the read loop continues and we'll re-evaluate on the next
+// data frame.
+//
+// Lifecycle of the defer:
+//   - First trigger with active streams → record rotationDeferredNs,
+//     log "preemptive rotation deferred", return false.
+//   - Subsequent triggers: if streams == 0 → rotate now. Else, check
+//     whether grace window has elapsed; if so, rotate anyway. Otherwise
+//     stay deferred (no log; the original log line carries the rationale).
+//
+// Storm brake: when ≥ rotationStormBrakeThreshold() slots are already
+// non-ready (dead/connecting/draining), a NEW rotation request defers
+// even if streams==0. Without this, byte-budget triggers under heavy
+// upload load fire on all 8 slots within seconds, and the simultaneous
+// teardowns leave the upload writer with nowhere to put bytes. The
+// brake only blocks NEW rotations — it never overrides the "grace
+// expired" force-rotate, because at that point we know the slot is
+// past its safe age and must be replaced.
+//
+// Concurrency: rotationDeferredNs is atomic; CAS not strictly needed
+// because the field is only written from the single slot reader goroutine
+// that owns this idx (readerActive gate guarantees one writer). The
+// brake reads countNonReadySlots which is a lock-free walk of per-slot
+// atomics — race-free, eventually-consistent (acceptable: false brake
+// just defers by one cycle, never wrong direction).
+func (p *WSPoolTransport) maybeRotateSlot(cl *Client, idx int, slot *poolSlot,
+	reason string, msgCount int, slotStart time.Time, downBytes int64) bool {
+
+	activeStreams := slot.streams.Load()
+	nowNs := time.Now().UnixNano()
+	deferredAt := slot.rotationDeferredNs.Load()
+	graceExpired := deferredAt != 0 && nowNs-deferredAt >= slotRotationGraceWithActiveStreams.Nanoseconds()
+
+	// Storm brake: skip NEW rotations when too many slots are already
+	// non-ready. Bypass when grace has expired — at that point the slot
+	// is past its safe age and the cost of NOT rotating (middlebox close
+	// 1006) exceeds the cost of a tight reconnect window. Recording the
+	// defer timestamp here means the grace clock starts ticking, so a
+	// stuck brake doesn't pin the slot indefinitely.
+	if !graceExpired {
+		nonReady := p.countNonReadySlots()
+		if nonReady >= p.rotationStormBrakeThreshold() {
+			if deferredAt == 0 {
+				slot.rotationDeferredNs.Store(nowNs)
+				p.log.Info("WS pool slot preemptive rotation deferred (storm brake)",
+					"slot", idx, "reason", reason,
+					"non_ready_slots", nonReady,
+					"brake_threshold", p.rotationStormBrakeThreshold(),
+					"active_streams", activeStreams,
+					"slot_age", time.Since(slotStart).Truncate(time.Second),
+					"grace_window", slotRotationGraceWithActiveStreams)
+			}
+			return false
+		}
+	}
+
+	if activeStreams == 0 {
+		p.log.Info("WS pool slot preemptive rotation",
+			"slot", idx, "reason", reason,
+			"slot_age", time.Since(slotStart).Truncate(time.Second),
+			"down_bytes", downBytes, "messages", msgCount)
+		p.fireRotation(cl, idx)
+		return true
+	}
+
+	if deferredAt == 0 {
+		// Per-slot defer stagger for byte_budget triggers. Without this,
+		// 8 slots under heavy upload load (≥100 Mbps total) all hit their
+		// byte budget within milliseconds (field log 2026-05-18: 8 slots
+		// deferred in a 4s window, 8 force-rotates 30s later in a 4s
+		// window → alive=2/8 during the storm).
+		//
+		// Offset = slot.staggerOffsetNs (sampled once in connectSlot via
+		// slotStaggerOffset(idx) — additive grid jitter, see 2026-05-18 A1).
+		// For idx=0 offset is always 0 so slot 0 defers at nowNs.
+		//
+		// Age-trigger does NOT need this offset — rotationWatchdogSweep
+		// already adds slot.staggerOffsetNs to maxSlotAge, so age defers
+		// arrive at maybeRotateSlot pre-spread. Applying the offset twice
+		// would double-delay the last slots past any reasonable kill window.
+		deferAt := nowNs
+		if reason == "byte_budget" && p.poolSize > 1 {
+			deferAt += slot.staggerOffsetNs.Load()
+		}
+		slot.rotationDeferredNs.Store(deferAt)
+		p.log.Info("WS pool slot preemptive rotation deferred (active streams)",
+			"slot", idx, "reason", reason, "active_streams", activeStreams,
+			"slot_age", time.Since(slotStart).Truncate(time.Second),
+			"grace_window", slotRotationGraceWithActiveStreams,
+			"stagger_offset", time.Duration(deferAt-nowNs).Truncate(time.Second))
+		return false
+	}
+
+	// Already deferred — check if grace window expired.
+	if graceExpired {
+		p.log.Info("WS pool slot preemptive rotation (grace expired, force rotate)",
+			"slot", idx, "reason", reason, "active_streams", activeStreams,
+			"slot_age", time.Since(slotStart).Truncate(time.Second),
+			"deferred_for", time.Duration(nowNs-deferredAt).Truncate(time.Second))
+		p.fireRotation(cl, idx)
+		return true
+	}
+
+	return false
+}
+
+// fireRotation executes the rotation: bumps the 1-minute counter and
+// triggers handleSlotDeath with the Preemptive cause so the meltdown
+// detector does NOT count this teardown as a network failure.
+// Extracted from maybeRotateSlot so both success branches (idle slot,
+// grace-expired) share counter accounting without duplication.
+// Decrement is scheduled in a separate goroutine after 60s — keeps the
+// counter as a rolling window without a ring buffer.
+func (p *WSPoolTransport) fireRotation(cl *Client, idx int) {
+	p.rotations1m.Add(1)
+	go func() {
+		timer := time.NewTimer(60 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-p.ctx.Done():
+		case <-timer.C:
+			p.rotations1m.Add(-1)
+		}
+	}()
+	p.handleSlotDeath(cl, idx, deathCausePreemptiveRotation)
+}
+
 // handleSlotDeath marks a slot as dead, closes its streams, and triggers reconnect.
-func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int) {
+//
+// Idempotent: if the slot is already dead, the function returns immediately
+// without re-running cleanup or recording another death. A single failing
+// slot can be observed by the reader (panic, timeout, terminal error) AND
+// the writer simultaneously; without CAS the death counter would be inflated
+// 2-3× per failure, tripping meltdown detection on what is really one event.
+//
+// cause distinguishes natural failures from preemptive rotations. ONLY
+// natural failures advance the meltdown counter — see slotDeathCause.
+func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int, cause slotDeathCause) {
 	slot := p.slots[idx]
-	slot.setState(slotDead)
+	if slot == nil {
+		return
+	}
+	if !slot.tryMarkDead() {
+		return
+	}
+	slot.lastDeathNs.Store(time.Now().UnixNano())
 
 	// Close all streams assigned to this slot
 	p.streamMap.Range(func(key, value any) bool {
@@ -1371,9 +2255,15 @@ func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int) {
 		slot.transport.Close()
 	}
 
-	// Record death for meltdown detection before kicking off reconnect so the
-	// reconnect loop can observe the cooldown if we just hit the threshold.
-	p.recordSlotDeath()
+	// Record death for meltdown detection ONLY for natural failures. A
+	// preemptive rotation is OUR action, not a network signal — counting it
+	// would falsely trip the meltdown threshold under steady-state rotation
+	// load (field log 2026-05-18: 6 staggered rotations in 15s window =
+	// false meltdown). The reconnect loop kicks off regardless, so the slot
+	// still comes back online via reconnectLoop.
+	if cause == deathCauseNatural {
+		p.recordSlotDeath()
+	}
 
 	go p.reconnectLoop(idx)
 }

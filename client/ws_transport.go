@@ -245,21 +245,34 @@ func (t *WebSocketTransport) WarmupRequests() {
 	client := t.buildColdPathClient(fp, 5*time.Second)
 	defer client.CloseIdleConnections()
 
-	// Shared cover/warmup pool — one definition lives in skins/browser.
-	paths := browser.DefaultCoverPaths()
+	// Shared cover/warmup pool — defaultCoverPaths (hand-curated SDK +
+	// static-asset shapes) combined with dynamicCoverPaths (extracted
+	// from a snapshot of the decoy origin via tools/extract_cover_paths).
+	// Wave 3, 2026-05-17 (Task 3.1): broaden the prefix space and bring
+	// it closer to NaiveProxy-style preambles where the warmup looks
+	// indistinguishable from a real browser cold-start on that origin.
+	paths := browser.CoverPathsPool()
 	rng := mrand.New(mrand.NewSource(time.Now().UnixNano()))
 	rng.Shuffle(len(paths), func(i, j int) { paths[i], paths[j] = paths[j], paths[i] })
 	count := chooseWarmupCount(rng, len(paths))
 
 	for i := 0; i < count; i++ {
-		url := t.baseURL + paths[i]
+		path := paths[i]
+		url := t.baseURL + path
 		req, err := http.NewRequest("GET", url, nil)
 		if err != nil {
 			continue
 		}
 		req.Header.Set("User-Agent", ua)
-		req.Header.Set("Accept", "application/json,text/javascript,image/*;q=0.9,*/*;q=0.8")
 		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+		// Per-subresource Accept + Sec-Fetch-* set based on the path
+		// extension (CSS/JS/image/fallback). MUST run before
+		// ApplyChromeCHUAForFingerprint — the latter adds sec-ch-ua-*
+		// but leaves Accept and Sec-Fetch-* untouched. Replaces the
+		// previous one-size-fits-all `Accept: application/json,...`
+		// which was a browser-class anomaly for the CSS/JS/image paths
+		// the warmup pool draws from.
+		applyChromeSubresourceHeaders(req, path)
 		browser.ApplyChromeCHUAForFingerprint(req.Header, fp)
 
 		resp, err := client.Do(req)
@@ -423,7 +436,7 @@ func (t *WebSocketTransport) UpgradeToWS(token []byte, session *core.Session) er
 			if usePQ {
 				switch {
 				case pqApplied:
-					Stats.PQHandshakeSuccess.Add(1)
+					Stats.PQClientHelloSent.Add(1)
 				case pqFellBack:
 					Stats.PQHandshakeFallback.Add(1)
 				}

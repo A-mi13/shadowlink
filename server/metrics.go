@@ -117,6 +117,16 @@ type Metrics struct {
 	RatelimitBucketWSUpgrade atomic.Int64
 	RatelimitBucketData      atomic.Int64
 
+	// IdleConnections — gauge of HTTP keep-alive connections currently in
+	// the Idle state. Populated by Server.connStateHook (Wave 2.3,
+	// 2026-05-17). Tracks memory pressure from the IdleTimeout=300s window
+	// — when the 60s→300s bump shipped, idle pool size becomes the proxy
+	// for "are we paying for the longer window?" Signed (atomic.Int64)
+	// because the simple Idle→+1 / Active|Closed|Hijacked→-1 approximation
+	// can briefly dip negative during ramp; absolute steady-state value is
+	// what ops alerts on, not transient sign.
+	IdleConnections atomic.Int64
+
 	// Plan §C7 (May audit, 2026-05-02) — per-bucket Consumed/Rejected counters
 	// for the three rate-limit gates. Consumed ticks once per AllowFoo() that
 	// returned true (token actually withdrawn from the bucket). Rejected ticks
@@ -137,6 +147,17 @@ type Metrics struct {
 	RatelimitBurstRejected_Handshake atomic.Uint64
 	RatelimitBurstRejected_Data      atomic.Uint64
 
+	// WSPathLegacyHits — count of WS upgrade accepts that landed on a
+	// retired path (currently /_next/webpack-hmr and /track/realtime; see
+	// legacyAcceptedWSPaths in urls.go). Ticked once per successful gorilla
+	// Upgrade so the counter reflects actually-attaching clients, not
+	// probe traffic stopped at IsAllowedWSPath. Used for the data-driven
+	// cutoff decision (Wave 2.1, 2026-05-17 — MINOR-V2-6): when the rate
+	// stays below 0.01/s for two weeks the entries in
+	// legacyAcceptedWSPaths can be removed and old clients that still hash
+	// to one of those paths will fall through to the decoy site.
+	WSPathLegacyHits atomic.Uint64
+
 	// OrphanSessionCleaned counts sessions evicted by the §C10 M2 (May audit)
 	// 30-second newborn-not-attached timeout — sessions whose handshake POST
 	// completed but whose client never landed the WS upgrade within the grace
@@ -144,6 +165,38 @@ type Metrics struct {
 	// handshake succeeds but the WS upgrade fails (CF edge degradation, MITM
 	// stripping the upgrade, NAT churn between two requests).
 	OrphanSessionCleaned atomic.Uint64
+
+	// WS reader-exit classification (2026-05-18 forensics, post-storm-brake).
+	// Field debug question we keep hitting: when the client logs `close 1006
+	// (abnormal closure): unexpected EOF`, who CLOSED the TCP first — the
+	// middlebox, the origin, or our own writer-side teardown? Each of these
+	// counters increments on EVERY server-side WS reader exit, classified
+	// by the gorilla error string. Comparing client `close_other`/`eof`
+	// counts against server `WSReaderExitPeerEOF`/`WSReaderExitReset` answers
+	// the question structurally instead of by speculation.
+	//
+	//   - PeerEOF: orderly FIN from the client side (gorilla "EOF" /
+	//     "unexpected EOF"). If client logged close 1006 AND this increments
+	//     → middlebox dropped the conn cleanly, client's gorilla synthesised
+	//     the 1006 because no WS close frame ever arrived. Confirms external
+	//     teardown.
+	//   - Reset: TCP RST from peer (gorilla "connection reset by peer" /
+	//     "wsarecv: An existing connection was forcibly closed"). Confirms
+	//     hard middlebox/origin intervention.
+	//   - IOTimeout: read deadline elapsed on a quiet conn — origin/middlebox
+	//     stopped forwarding bytes without tearing down the TCP. Classic
+	//     CF-edge black-hole signature.
+	//   - LocalClose: our own Close() raced ahead of the read — "use of
+	//     closed network connection". This is the only bucket that says
+	//     "WE closed it first". If this dominates close-1006 events, the
+	//     bug is in our preemptive rotation timing, not the network.
+	//   - Other: residual; should stay flat. Persistent non-zero indicates
+	//     an unclassified failure mode worth investigating.
+	WSReaderExitPeerEOF    atomic.Uint64
+	WSReaderExitReset      atomic.Uint64
+	WSReaderExitIOTimeout  atomic.Uint64
+	WSReaderExitLocalClose atomic.Uint64
+	WSReaderExitOther      atomic.Uint64
 
 	// Live decoy (T1.3) — /blog/* and /_cdn/* reverse-proxy instrumentation.
 	DecoyLiveBlogRequests              atomic.Uint64
@@ -327,6 +380,9 @@ type MetricsSnapshot struct {
 	RatelimitBucketHandshake      int64  `json:"ratelimit_bucket_handshake"`
 	RatelimitBucketWSUpgrade      int64  `json:"ratelimit_bucket_ws_upgrade"`
 	RatelimitBucketData           int64  `json:"ratelimit_bucket_data"`
+	// Wave 2.3 (2026-05-17) — idle connection gauge for IdleTimeout=300s
+	// memory-pressure observability.
+	IdleConnections int64 `json:"idle_connections"`
 	// Plan §C4 (May audit) — ClientID exemption telemetry.
 	RatelimitClientIDExempted          uint64 `json:"ratelimit_clientid_exempted"`
 	RatelimitClientIDSoftLimitRejected uint64 `json:"ratelimit_clientid_softlimit_rejected"`
@@ -342,6 +398,16 @@ type MetricsSnapshot struct {
 	RatelimitBurstRejectedData      uint64 `json:"ratelimit_burst_rejected_data"`
 	// Plan §C10 M2 (May audit) — newborn-not-attached evictions.
 	OrphanSessionCleaned uint64 `json:"orphan_session_cleaned"`
+	// 2026-05-18 forensics — server-side classification of WS reader exits.
+	// Cross-reference against client `close 1006` reports to attribute
+	// teardown source (peer EOF / TCP RST / read deadline / local Close).
+	WSReaderExitPeerEOF    uint64 `json:"ws_reader_exit_peer_eof"`
+	WSReaderExitReset      uint64 `json:"ws_reader_exit_reset"`
+	WSReaderExitIOTimeout  uint64 `json:"ws_reader_exit_io_timeout"`
+	WSReaderExitLocalClose uint64 `json:"ws_reader_exit_local_close"`
+	WSReaderExitOther      uint64 `json:"ws_reader_exit_other"`
+	// Wave 2.1 (2026-05-17) — WS upgrade accepts on retired legacy paths.
+	WSPathLegacyHits uint64 `json:"ws_path_legacy_hits"`
 	// Live decoy (T1.3) — /blog/* and /_cdn/* reverse-proxy instrumentation.
 	DecoyLiveBlogRequests              uint64 `json:"decoy_live_blog_requests"`
 	DecoyLiveBlogCacheHits             uint64 `json:"decoy_live_blog_cache_hits"`
@@ -403,6 +469,7 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		RatelimitBucketHandshake:           m.RatelimitBucketHandshake.Load(),
 		RatelimitBucketWSUpgrade:           m.RatelimitBucketWSUpgrade.Load(),
 		RatelimitBucketData:                m.RatelimitBucketData.Load(),
+		IdleConnections:                    m.IdleConnections.Load(),
 		RatelimitClientIDExempted:          m.RatelimitClientIDExempted.Load(),
 		RatelimitClientIDSoftLimitRejected: m.RatelimitClientIDSoftLimitRejected.Load(),
 		RatelimitBurstConsumedWSUpgrade:    m.RatelimitBurstConsumed_WSUpgrade.Load(),
@@ -412,6 +479,12 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		RatelimitBurstRejectedHandshake:    m.RatelimitBurstRejected_Handshake.Load(),
 		RatelimitBurstRejectedData:         m.RatelimitBurstRejected_Data.Load(),
 		OrphanSessionCleaned:               m.OrphanSessionCleaned.Load(),
+		WSReaderExitPeerEOF:                m.WSReaderExitPeerEOF.Load(),
+		WSReaderExitReset:                  m.WSReaderExitReset.Load(),
+		WSReaderExitIOTimeout:              m.WSReaderExitIOTimeout.Load(),
+		WSReaderExitLocalClose:             m.WSReaderExitLocalClose.Load(),
+		WSReaderExitOther:                  m.WSReaderExitOther.Load(),
+		WSPathLegacyHits:                   m.WSPathLegacyHits.Load(),
 		DecoyLiveBlogRequests:              m.DecoyLiveBlogRequests.Load(),
 		DecoyLiveBlogCacheHits:             m.DecoyLiveBlogCacheHits.Load(),
 		DecoyLiveBlogCacheMisses:           m.DecoyLiveBlogCacheMisses.Load(),
@@ -559,9 +632,34 @@ func writePromMetrics(w http.ResponseWriter, s *MetricsSnapshot) {
 	fmt.Fprintf(w, "# TYPE shadowlink_ratelimit_bucket_data gauge\n")
 	fmt.Fprintf(w, "shadowlink_ratelimit_bucket_data %d\n", s.RatelimitBucketData)
 
+	// Wave 2.3 (2026-05-17) — idle keep-alive gauge. Tracks memory pressure
+	// from IdleTimeout=300s; signed so a brief negative-spike during ramp
+	// (Idle→+1 / Active|Closed|Hijacked→-1 approximation) is observable
+	// rather than wrapping.
+	fmt.Fprintf(w, "# HELP shadowlink_idle_connections_count Estimated HTTP keep-alive connections currently in Idle state (gauge; tracks IdleTimeout=300s memory pressure)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_idle_connections_count gauge\n")
+	fmt.Fprintf(w, "shadowlink_idle_connections_count %d\n", s.IdleConnections)
+
 	fmt.Fprintf(w, "# HELP shadowlink_orphan_session_cleaned_total Newborn sessions evicted by the 30s §C10 M2 (May audit) fast-path timeout — handshake completed, transport never attached\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_orphan_session_cleaned_total counter\n")
 	fmt.Fprintf(w, "shadowlink_orphan_session_cleaned_total %d\n", s.OrphanSessionCleaned)
+
+	// 2026-05-18 forensics — WS reader-exit attribution. Cross-reference
+	// against client-side "WS pool slot reader error" lines to determine
+	// whether teardowns originate at the middlebox (peer_eof + reset
+	// dominate), in CF-edge black-hole stalls (io_timeout), or in our own
+	// rotation timing (local_close — should stay near zero).
+	fmt.Fprintf(w, "# HELP shadowlink_ws_reader_exit_total WS server-side reader exits classified by error kind (forensics for client close-1006 attribution)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_ws_reader_exit_total counter\n")
+	fmt.Fprintf(w, "shadowlink_ws_reader_exit_total{kind=\"peer_eof\"} %d\n", s.WSReaderExitPeerEOF)
+	fmt.Fprintf(w, "shadowlink_ws_reader_exit_total{kind=\"reset\"} %d\n", s.WSReaderExitReset)
+	fmt.Fprintf(w, "shadowlink_ws_reader_exit_total{kind=\"io_timeout\"} %d\n", s.WSReaderExitIOTimeout)
+	fmt.Fprintf(w, "shadowlink_ws_reader_exit_total{kind=\"local_close\"} %d\n", s.WSReaderExitLocalClose)
+	fmt.Fprintf(w, "shadowlink_ws_reader_exit_total{kind=\"other\"} %d\n", s.WSReaderExitOther)
+
+	fmt.Fprintf(w, "# HELP shadowlink_ws_path_legacy_hits_total WS upgrade accepts on retired paths (used for cutoff decision; Wave 2.1 MINOR-V2-6, 2026-05-17)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_ws_path_legacy_hits_total counter\n")
+	fmt.Fprintf(w, "shadowlink_ws_path_legacy_hits_total %d\n", s.WSPathLegacyHits)
 
 	fmt.Fprintf(w, "# HELP shadowlink_ratelimit_clientid_exempted_total Requests that bypassed the per-IP rate-limit bucket via §C4 (May audit) ClientID exemption — authenticated clients keep flowing under cold-start cascades\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_ratelimit_clientid_exempted_total counter\n")

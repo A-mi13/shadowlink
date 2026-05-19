@@ -62,19 +62,35 @@ func main() {
 	socksAddr := fs.String("socks", "", "SOCKS5 listen address (overrides config, default 127.0.0.1:1080)")
 	systemVPN := fs.Bool("system-vpn", false, "enable system VPN mode (TUN interface + LeakGuard)")
 	doCheckIP := fs.Bool("check-ip", false, "print exit IP after connecting")
-	verbose := fs.Bool("verbose", false, "verbose logging")
+	verbose := fs.Bool("verbose", false, "(deprecated) verbose logging — use -log=debug instead")
+	logFlag := fs.String("log", "info", "log level: quiet | info | debug | trace")
+	logFile := fs.String("log-file", "", "if set, also write logs to this file (appended)")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "ошибка разбора флагов: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Configure logging.
-	logLevel := slog.LevelInfo
-	if *verbose {
-		logLevel = slog.LevelDebug
+	// Configure logging. -verbose maps to debug for backwards compatibility
+	// with existing bat-scripts; -log takes precedence when both are passed.
+	levelStr := *logFlag
+	if *verbose && *logFlag == "info" {
+		levelStr = "debug"
 	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})))
+	parsedLevel, parseErr := parseLogLevel(levelStr)
+	if parseErr != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", parseErr)
+		os.Exit(1)
+	}
+	logCloser, logErr := configureLogging(logSpec{level: parsedLevel, file: *logFile})
+	if logErr != nil {
+		fmt.Fprintf(os.Stderr, "ошибка настройки логирования: %v\n", logErr)
+		os.Exit(1)
+	}
+	defer logCloser.Close()
+	if *verbose {
+		slog.Warn("-verbose флаг устарел — используйте -log=debug")
+	}
 
 	// Load config from one of the three sources.
 	cfg, err := loadConfig(*importURL, *configFile, *apiURL, *apiToken)
@@ -197,8 +213,13 @@ func main() {
 			}
 		}
 
+		// narrowEscape: enable /32-only escape when origin is pinned. resolveServerIPs
+		// already returns ONLY the origin IP in that case, so /16 sweep would have
+		// nothing legitimate to cover anyway.
+		narrowEscape := cfg.ShadowLink != nil && cfg.ShadowLink.Origin != ""
 		tun = NewTunnel(eng.SOCKSAddr(), cfg.ProxyUser, cfg.ProxyPass, serverIPs).
-			WithBypass(bypassOn, override)
+			WithBypass(bypassOn, override).
+			WithNarrowEscape(narrowEscape)
 		if err := tun.Start(); err != nil {
 			fmt.Fprintf(os.Stderr, "ошибка запуска TUN-туннеля: %v\n", err)
 			_ = eng.Close()
@@ -373,8 +394,27 @@ func resolveServerIPs(protocol string, cfg *Config) []string {
 		}
 	case "shadowlink":
 		if cfg.ShadowLink != nil {
-			// In CDN mode, the actual connection goes to the CDN domain (Cloudflare).
-			// We need an escape route for the CDN IP, not the origin server.
+			// Origin override has the highest priority. When ?origin=<IP> is set
+			// the data path is forced to dial that IP directly (see
+			// engine_shadowlink.go::full-direct activation). Returning ONLY the
+			// origin IP here ensures the TUN escape list does NOT include any
+			// CF edge IP — without this, a reconnect-handshake that for any
+			// reason resolved through DNS would still have a usable escape route
+			// and silently leak through CF. We make the leak path unroutable.
+			if cfg.ShadowLink.Origin != "" {
+				if parsed := net.ParseIP(cfg.ShadowLink.Origin); parsed != nil && parsed.To4() != nil {
+					slog.Info("сервер резолвлен для escape-маршрута (origin override)",
+						"origin", cfg.ShadowLink.Origin)
+					return []string{cfg.ShadowLink.Origin}
+				}
+				// Origin is set but not a valid IPv4 — fall through to normal
+				// resolution; log so the operator notices the config error.
+				slog.Warn("origin= задан, но не IPv4 — игнорируем, escape через DNS",
+					"origin", cfg.ShadowLink.Origin)
+			}
+
+			// In CDN mode (no origin override), the actual connection goes to
+			// the CDN domain (Cloudflare). We need an escape route for the CDN IP.
 			if cfg.ShadowLink.CDN != "" {
 				host = cfg.ShadowLink.CDN
 			} else {
@@ -386,10 +426,6 @@ func resolveServerIPs(protocol string, cfg *Config) []string {
 				}
 			}
 		}
-
-		// If origin IP is set (direct WS mode), we also need escape route for it.
-		// This is handled below after normal resolution — we append origin IP to the list.
-
 	}
 
 	if host == "" {
@@ -424,23 +460,22 @@ func resolveServerIPs(protocol string, cfg *Config) []string {
 		ipv4s = ipv4s[:8]
 	}
 
-	// If origin IP or CF edge IP is set, add to escape routes.
-	if protocol == "shadowlink" && cfg.ShadowLink != nil {
-		for _, extraIP := range []string{cfg.ShadowLink.Origin, cfg.ShadowLink.CFIP} {
-			if extraIP == "" {
-				continue
+	// If a specific CF edge IP is pinned via ?cfip=<IP>, add to escape routes.
+	// Origin override is NOT processed here — it short-circuits at the top of
+	// this function and returns [Origin] alone, so by construction we cannot
+	// reach this point with cfg.ShadowLink.Origin set.
+	if protocol == "shadowlink" && cfg.ShadowLink != nil && cfg.ShadowLink.CFIP != "" {
+		extraIP := cfg.ShadowLink.CFIP
+		if parsed := net.ParseIP(extraIP); parsed != nil && parsed.To4() != nil {
+			found := false
+			for _, ip := range ipv4s {
+				if ip == extraIP {
+					found = true
+					break
+				}
 			}
-			if parsed := net.ParseIP(extraIP); parsed != nil && parsed.To4() != nil {
-				found := false
-				for _, ip := range ipv4s {
-					if ip == extraIP {
-						found = true
-						break
-					}
-				}
-				if !found {
-					ipv4s = append(ipv4s, extraIP)
-				}
+			if !found {
+				ipv4s = append(ipv4s, extraIP)
 			}
 		}
 	}

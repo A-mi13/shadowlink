@@ -185,7 +185,7 @@ func HandleTCPConnectWSPerStream(ctx context.Context, conn net.Conn, cl *client.
 		}
 	}()
 
-	slog.Debug("SOCKS5 CONNECT (per-stream WS)", "dest", destAddr)
+	client.Trace("SOCKS5 CONNECT (per-stream WS)", "dest", destAddr)
 
 	switch router.Decide(destAddr) {
 	case client.ActionBlock:
@@ -266,7 +266,7 @@ func HandleTCPConnectWSPerStream(ctx context.Context, conn net.Conn, cl *client.
 		return
 	}
 
-	slog.Debug("per-stream WS CONNECT sent", "dest", destAddr, "stream", streamID)
+	client.Trace("per-stream WS CONNECT sent", "dest", destAddr, "stream", streamID)
 	conn.Write(ReplySuccess)
 	// Task D5 (cold-start metrics): the first SOCKS5 stream to reach
 	// CONNECT_OK is the user-perceived "tunnel ready" event. sync.Once on
@@ -378,7 +378,7 @@ func HandleTCPConnectWSPerStream(ctx context.Context, conn net.Conn, cl *client.
 				msg := string(payload)
 				if msg == "CONNECT_OK" {
 					connectConfirmed = true
-					slog.Debug("per-stream CONNECT_OK", "dest", destAddr, "stream", streamID)
+					client.Trace("per-stream CONNECT_OK", "dest", destAddr, "stream", streamID)
 					continue
 				}
 				if msg == "CONNECT_FAIL" {
@@ -392,7 +392,7 @@ func HandleTCPConnectWSPerStream(ctx context.Context, conn net.Conn, cl *client.
 			chunks++
 			client.Stats.DownlinkBytes.Add(int64(len(payload)))
 			if chunks <= 5 || chunks%100 == 0 {
-				slog.Info("per-stream downlink data", "dest", destAddr, "stream", streamID,
+				client.Trace("per-stream downlink data", "dest", destAddr, "stream", streamID,
 					"chunk", chunks, "bytes", len(payload), "totalBytes", total)
 			}
 			if _, err := conn.Write(payload); err != nil {
@@ -414,7 +414,7 @@ func HandleTCPConnectWS(ctx context.Context, conn net.Conn, cl *client.Client, w
 		}
 	}()
 
-	slog.Debug("SOCKS5 CONNECT (WS)", "dest", destAddr)
+	client.Trace("SOCKS5 CONNECT (WS)", "dest", destAddr)
 
 	// Apply routing rules: block / direct / tunnel
 	switch router.Decide(destAddr) {
@@ -554,7 +554,7 @@ func HandleTCPConnectWS(ctx context.Context, conn net.Conn, cl *client.Client, w
 	}
 
 	// Reply SOCKS5 success immediately (optimistic for WS, confirmed for Split).
-	slog.Debug("WS CONNECT sent", "dest", destAddr, "stream", streamID)
+	client.Trace("WS CONNECT sent", "dest", destAddr, "stream", streamID)
 	conn.Write(ReplySuccess)
 	// Task D5 (cold-start metrics): WS-multiplex CONNECT_OK fires the gauge
 	// on the first stream of the Connect cycle. sync.Once on Client guarantees
@@ -647,7 +647,7 @@ func HandleTCPConnectWS(ctx context.Context, conn net.Conn, cl *client.Client, w
 						if pt, ok := wst.(client.PendingTracker); ok {
 							pt.DecrPending(streamID)
 						}
-						slog.Debug("WS CONNECT_OK (optimistic)", "dest", destAddr, "stream", streamID)
+						client.Trace("WS CONNECT_OK (optimistic)", "dest", destAddr, "stream", streamID)
 						continue // don't relay this control message to SOCKS client
 					}
 					if msg == "CONNECT_FAIL" {
@@ -668,7 +668,7 @@ func HandleTCPConnectWS(ctx context.Context, conn net.Conn, cl *client.Client, w
 				chunks++
 				client.Stats.DownlinkBytes.Add(int64(len(data)))
 				if chunks <= 5 || chunks%100 == 0 {
-					slog.Info("downlink data", "dest", destAddr, "stream", streamID,
+					client.Trace("downlink data", "dest", destAddr, "stream", streamID,
 						"chunk", chunks, "bytes", len(data), "totalBytes", total)
 				}
 				if _, err := conn.Write(data); err != nil {

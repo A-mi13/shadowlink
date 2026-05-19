@@ -63,6 +63,45 @@ func TestAllWSPaths_ReturnsCopy(t *testing.T) {
 	}
 }
 
+// TestWSURLPool_NoDevEndpoints (Wave 2.1, 2026-05-17) guards the cleanup
+// of dev-only / vendor-specific endpoints from the active pool:
+//   - /_next/webpack-hmr — Next.js HMR is a development-time only WS endpoint,
+//     production deploys never serve it. Including it created a "developer
+//     preview deploy" tell.
+//   - /track/realtime — Mixpanel-specific public tracking endpoint shape; not
+//     a realtime SaaS pattern that mimics general analytics behavior.
+// Both paths remain accepted by IsAllowedWSPath via legacyAcceptedWSPaths
+// for backward-compat with already-installed clients (see TestIsAllowedWSPath_BackwardCompat).
+func TestWSURLPool_NoDevEndpoints(t *testing.T) {
+	for _, p := range wsURLPool {
+		if strings.Contains(p, "webpack-hmr") || strings.Contains(p, "/_next") || strings.Contains(p, "/__webpack") {
+			t.Errorf("WS pool contains dev-only endpoint: %s", p)
+		}
+		if strings.HasPrefix(p, "/track/") {
+			t.Errorf("WS pool contains Mixpanel-track endpoint: %s", p)
+		}
+	}
+	if len(wsURLPool) < 5 {
+		t.Errorf("WS pool too small: %d (need >= 5)", len(wsURLPool))
+	}
+}
+
+// TestIsAllowedWSPath_BackwardCompat (Wave 2.1, 2026-05-17) verifies that the
+// retired paths /_next/webpack-hmr and /track/realtime are still accepted by
+// the server-side whitelist even after their removal from the active pool.
+// Already-installed clients hashed a path at install time and continue to use
+// it across the upgrade — rejecting them would force a redeploy. Counter
+// Metrics.WSPathLegacyHits tracks how often these are hit, enabling a
+// data-driven cutoff decision (when rate < 0.01/s for 2 weeks → safe to drop).
+func TestIsAllowedWSPath_BackwardCompat(t *testing.T) {
+	if !IsAllowedWSPath("/_next/webpack-hmr") {
+		t.Error("legacy /_next/webpack-hmr must still be allowed during transition")
+	}
+	if !IsAllowedWSPath("/track/realtime") {
+		t.Error("legacy /track/realtime must still be allowed during transition")
+	}
+}
+
 // TestWSPool_NoFingerprintLeak guards CRIT-4: the pool must not contain any
 // path that gives away the project ("shadowlink", "vpn", "proxy", etc.). It
 // also ensures that "/ws" — the fingerprint we are removing — is not in the

@@ -7,6 +7,7 @@ import (
 	mathrand "math/rand/v2"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +19,86 @@ import (
 // maxStreamsPerSession limits concurrent multiplexed streams per WebSocket session
 // to prevent resource exhaustion attacks.
 const maxStreamsPerSession = 256
+
+// wsReaderExitKind is the bounded vocabulary classifyWSReaderExitErr emits.
+// Each value maps to a dedicated counter on server.Metrics. The set MUST
+// stay in sync with the kind= labels in the Prometheus exporter and the
+// shadowlink_ws_reader_exit_total {kind=...} histogram. Adding a new kind
+// requires: (1) a new const here, (2) a new Metrics counter field, (3) a
+// Snapshot field, (4) a Prometheus label. Five-prong update enforced so
+// dashboards stay coherent with the code.
+type wsReaderExitKind int
+
+const (
+	wsExitOther wsReaderExitKind = iota
+	wsExitPeerEOF
+	wsExitReset
+	wsExitIOTimeout
+	wsExitLocalClose
+)
+
+// String makes the kind self-describing in slog output. The labels match
+// the Prometheus kind= values 1:1 so operators can correlate a WARN line
+// with the histogram bucket without a translation table.
+func (k wsReaderExitKind) String() string {
+	switch k {
+	case wsExitPeerEOF:
+		return "peer_eof"
+	case wsExitReset:
+		return "reset"
+	case wsExitIOTimeout:
+		return "io_timeout"
+	case wsExitLocalClose:
+		return "local_close"
+	default:
+		return "other"
+	}
+}
+
+// classifyWSReaderExitErr maps a server-side gorilla read error to the
+// bounded label that feeds shadowlink_ws_reader_exit_total. Mirrors the
+// client-side classifyWSReadError pattern but trims the label set to the
+// four cases that answer the 2026-05-18 close-1006 forensics question:
+// when the client logged `close 1006`, what did the server actually see?
+//
+// Order matters — most-specific patterns first:
+//   - reset: hard TCP RST surfaced as "connection reset by peer" or
+//     Windows "wsarecv: An existing connection was forcibly closed". A
+//     middlebox hard-reset. Must come BEFORE peer_eof; the gorilla error
+//     string sometimes contains both fragments.
+//   - local_close: our own conn.Close() raced the read — "use of closed
+//     network connection". Only this label says WE closed first.
+//   - io_timeout: gorilla read deadline expired without any bytes from
+//     the peer. Conn still half-open from our side but the peer stopped
+//     forwarding — classic CF-edge / NAT black-hole signature.
+//   - peer_eof: orderly FIN from the peer-side (gorilla "EOF" /
+//     "unexpected EOF"). The peer (middlebox or CF or origin-side
+//     stack) closed cleanly without sending a WS Close frame, so the
+//     client's gorilla synthesises a close-1006 on the other side.
+//     Strong evidence the teardown is structural network behaviour, not
+//     a bug in either endpoint's WS framing.
+//   - other: residual; a persistent non-zero rate indicates an
+//     unclassified failure worth investigating.
+func classifyWSReaderExitErr(err error) wsReaderExitKind {
+	if err == nil {
+		return wsExitOther
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "connection reset by peer"),
+		strings.Contains(msg, "forcibly closed by the remote"),
+		strings.Contains(msg, "wsarecv"):
+		return wsExitReset
+	case strings.Contains(msg, "use of closed network connection"):
+		return wsExitLocalClose
+	case strings.Contains(msg, "i/o timeout"):
+		return wsExitIOTimeout
+	case strings.Contains(msg, "EOF"):
+		return wsExitPeerEOF
+	default:
+		return wsExitOther
+	}
+}
 
 // noopUpgradeError suppresses gorilla's default 400-with-text response on
 // failed WebSocket upgrade. We route the request through failClosedToDecoy
@@ -108,11 +189,14 @@ func (h *Handler) authenticateFirstFrame(conn *websocket.Conn) *core.Session {
 		return nil
 	}
 
-	// Plan §C10 M2 (May 2026 audit): record the attach time so the cleanup
-	// loop can distinguish "newborn orphan" sessions (handshake OK + WS
-	// upgrade never landed) from sessions that had a transport at some
-	// point. A non-zero AttachedAt removes the session from the 30s
-	// fast-path eviction policy — it falls under the regular idle timeout.
+	// Refresh AttachedAt to the WS-attach moment. As of the 2026-05-18
+	// revision (see core/session.go::AttachedAt history), AttachedAt is
+	// already set to a non-zero value at handshake response flush, so this
+	// store is not strictly necessary for orphan-cleanup correctness. We
+	// keep it because the WS-attach timestamp is a more useful liveness
+	// signal than the handshake timestamp — future telemetry that reports
+	// "how long a session has been actively WS-bound" will read this
+	// without needing a separate field.
 	session.AttachedAt.Store(time.Now().UnixNano())
 
 	return session
@@ -343,6 +427,15 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Wave 2.1 (2026-05-17, MINOR-V2-6): count WS upgrades that landed on a
+	// retired-but-still-accepted path. Ticked AFTER a successful gorilla
+	// Upgrade so probes that never complete the handshake do not skew the
+	// rate — the cutoff decision needs the count of actually-attaching
+	// clients still hashing to a legacy path.
+	if _, legacy := legacyAcceptedWSPaths[r.URL.Path]; legacy {
+		h.metrics.WSPathLegacyHits.Add(1)
+	}
+
 	session := h.authenticateFirstFrame(conn)
 	if session == nil {
 		h.fakeAckAndClose(conn)
@@ -412,19 +505,34 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 		return nil
 	})
 
-	// Server-side WS ping every ~20s with log-normal jitter (sigma=0.5) —
+	// Server-side WS ping every ~45s with log-normal jitter (sigma=0.6) —
 	// keeps CF proxy connection alive без FFT-visible periodic peak'а на
-	// 20s AND defeats ML classifiers, отличающие uniform jitter через
+	// 45s AND defeats ML classifiers, отличающие uniform jitter через
 	// KS-test против log-normal reference. Routed through the same async
 	// writer so it cannot stall behind a slow data write. Final audit
-	// 2026-05-03 P0-1 + P1-3.
+	// 2026-05-03 P0-1 + P1-3. Median bumped 20s→45s, sigma 0.5→0.6 в
+	// Wave 2.2 (2026-05-17) — снижение aggregate ping rate.
+	//
+	// CRITICAL — Wave 2.2 INFRASTRUCTURE PRECONDITION (2026-05-17 field
+	// incident): nginx `proxy_read_timeout` / `proxy_send_timeout` MUST
+	// be ≥180s before deploying this binary. Math: log-normal(45s, σ=0.6)
+	// has 95%-ile ≈ 145s. Если nginx clip'ит на 60s (default), 5-10%
+	// ping'ов «теряются» → reader EOF cascade → reconnect storm → ghost
+	// sessions упираются в MaxClients → весь трафик уходит в decoy.
+	// Validate via the post-deploy ops checklist in
+	// docs/superpowers/plans/2026-05-17-pl1-ops-instructions.md.
+	//
+	// Также MaxClients должен быть ≥500 и SessionTimeout ≤90s, иначе
+	// при любой сетевой деградации повторится тот же сценарий
+	// (ghost-сессии накапливаются за SessionTimeout, любой transient
+	// flap может пробить лимит).
 	//
 	// Opus review M-1 (2026-05-05): per-tick `time.After()` аллокировал
 	// *Timer + chan на каждой итерации (GC pressure под тысячами concurrent
 	// WS sessions). Замена на `time.NewTimer` + `Reset` — один Timer на
 	// весь loop. Reset безопасен после `<-t.C` без drain'а (Go-канон).
 	go func() {
-		t := time.NewTimer(core.JitteredIntervalLogNormal(20*time.Second, 0.5))
+		t := time.NewTimer(core.JitteredIntervalLogNormal(45*time.Second, 0.6))
 		defer t.Stop()
 		for {
 			select {
@@ -434,7 +542,7 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 				if err := writer.EnqueueControl(websocket.PingMessage, nil); err != nil {
 					return
 				}
-				t.Reset(core.JitteredIntervalLogNormal(20*time.Second, 0.5))
+				t.Reset(core.JitteredIntervalLogNormal(45*time.Second, 0.6))
 			}
 		}
 	}()
@@ -446,7 +554,25 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 		for {
 			msgType, data, err := conn.ReadMessage()
 			if err != nil {
-				slog.Warn("WS reader exit", "messages", wsMessages, "err", err)
+				// 2026-05-18 forensics: classify the exit and tick the
+				// matching counter. Cross-references against client-side
+				// `close 1006` log lines answer "who closed first?" — a
+				// peer_eof here confirms middlebox/origin tore down the
+				// TCP, not our writer-side rotation.
+				kind := classifyWSReaderExitErr(err)
+				switch kind {
+				case wsExitPeerEOF:
+					h.metrics.WSReaderExitPeerEOF.Add(1)
+				case wsExitReset:
+					h.metrics.WSReaderExitReset.Add(1)
+				case wsExitIOTimeout:
+					h.metrics.WSReaderExitIOTimeout.Add(1)
+				case wsExitLocalClose:
+					h.metrics.WSReaderExitLocalClose.Add(1)
+				default:
+					h.metrics.WSReaderExitOther.Add(1)
+				}
+				slog.Warn("WS reader exit", "messages", wsMessages, "err", err, "kind", kind)
 				return
 			}
 			wsMessages++

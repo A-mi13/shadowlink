@@ -1,11 +1,16 @@
 package client
 
 import (
+	"fmt"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+const testValidPubkey = "0000000000000000000000000000000000000000000000000000000000000001"
 
 func TestParseSLURL_BasicValid(t *testing.T) {
 	raw := "sl://aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233@example.com:8443?tls=1&ws=1&auto=1&cdn=cdn.example.com&socks=127.0.0.1:9050&ech=1&id=my-client-42"
@@ -223,6 +228,64 @@ func TestBuildSLURL_BackupRoundtrip(t *testing.T) {
 	roundtripped, err := ParseSLURL(built)
 	require.NoError(t, err)
 	assert.Equal(t, orig.BackupServers, roundtripped.BackupServers)
+}
+
+func TestParseSLURL_CDNsPool(t *testing.T) {
+	url := "sl://" + testValidPubkey + "@example.com:443?tls=1&ws=1&cdns=a.com,b.com,c.com"
+	cfg, err := ParseSLURL(url)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	want := []string{"a.com", "b.com", "c.com"}
+	if !reflect.DeepEqual(cfg.CDNs, want) {
+		t.Errorf("CDNs = %v, want %v", cfg.CDNs, want)
+	}
+}
+
+func TestParseSLURL_CDNsAbsent_Empty(t *testing.T) {
+	url := "sl://" + testValidPubkey + "@example.com:443?tls=1&ws=1"
+	cfg, _ := ParseSLURL(url)
+	if len(cfg.CDNs) != 0 {
+		t.Errorf("CDNs should be empty when absent, got %v", cfg.CDNs)
+	}
+}
+
+func TestParseSLURL_CDNs_TooMany(t *testing.T) {
+	parts := make([]string, 9)
+	for i := range parts {
+		parts[i] = fmt.Sprintf("x%d.com", i)
+	}
+	url := "sl://" + testValidPubkey + "@example.com:443?cdns=" + strings.Join(parts, ",")
+	_, err := ParseSLURL(url)
+	if err == nil {
+		t.Error("expected error for > 8 cdns entries")
+	}
+}
+
+func TestParseSLURL_CDNs_InvalidHostname(t *testing.T) {
+	url := "sl://" + testValidPubkey + "@example.com:443?cdns=ok.com,not%20a%20valid%20host"
+	_, err := ParseSLURL(url)
+	if err == nil {
+		t.Error("expected error for invalid hostname in cdns")
+	}
+}
+
+func TestBuildSLURL_RoundtripCDNs(t *testing.T) {
+	original := &ClientFileConfig{
+		Server:    "example.com:443",
+		PubKey:    testValidPubkey,
+		TLS:       true,
+		WebSocket: true,
+		CDNs:      []string{"a.com", "b.com"},
+	}
+	url := BuildSLURL(original)
+	parsed, err := ParseSLURL(url)
+	if err != nil {
+		t.Fatalf("roundtrip parse: %v", err)
+	}
+	if !reflect.DeepEqual(parsed.CDNs, original.CDNs) {
+		t.Errorf("roundtrip CDNs: got %v, want %v", parsed.CDNs, original.CDNs)
+	}
 }
 
 func TestBuildSLURL_HybridRoundtrip(t *testing.T) {

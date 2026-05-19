@@ -46,17 +46,31 @@ type Session struct {
 	recvBitmap  [WindowSize / 64]uint64
 	CreatedAt   time.Time
 
-	// AttachedAt is the unix nanosecond timestamp at which a transport
-	// successfully attached to this session (currently: WebSocket first-frame
-	// auth in server/websocket.go::authenticateFirstFrame). 0 means "newborn
-	// — handshake completed but no transport attached yet". Plan §C10 M2
-	// (May 2026 audit) introduced this field so the server-side cleanup loop
-	// can fast-path-evict newborn sessions whose client failed between the
-	// handshake POST and the WS upgrade — the legacy 5-minute idle timeout
-	// is too coarse for that case and lets orphan tunnels accumulate.
+	// AttachedAt is the unix nanosecond timestamp marking the session as
+	// "handshake-complete and ready for use by the owning client". 0 means
+	// "newborn — Create() returned but the handshake response was not yet
+	// flushed (panic-window, validation reject path, internal error)".
 	//
-	// Atomic so the cleanup loop can read it without taking s.mu (the WS
-	// upgrade path stores it under no lock either; pure CAS-style publish).
+	// History:
+	//   - Plan §C10 M2 (May 2026 audit) introduced this field tied to WS
+	//     first-frame attach. Cleanup at 30s let orphan tunnels from
+	//     client-side WS upgrade failures be reaped fast.
+	//   - 2026-05-18 revision: set at handshake response flush instead.
+	//     The old semantic raced with the WS-upgrade rate-limit gate: a
+	//     rejected upgrade left AttachedAt=0 even though the client had
+	//     received a valid handshake response and could legitimately retry
+	//     the WS upgrade. CleanupNewbornOrphans would then evict it after
+	//     30s, dropping the client mid-conversation. Production metrics
+	//     showed 351 orphan_session_cleaned events in a 5-min test, ~all
+	//     of which were this race rather than actual client abandons.
+	//
+	// CleanupNewbornOrphans now evicts only sessions that aborted between
+	// Create() and the handshake response flush. Sessions that successfully
+	// handshook but later went idle (legitimate client abandon, including
+	// failed WS upgrade) fall under SessionManager.Cleanup's idle timeout.
+	//
+	// Atomic so the cleanup loop can read it without taking s.mu (the
+	// handshake path stores it under no lock either; pure CAS-style publish).
 	AttachedAt atomic.Int64
 
 	// Cached AES-GCM ciphers (zero-alloc encrypt/decrypt).

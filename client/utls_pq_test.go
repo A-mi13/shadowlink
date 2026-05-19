@@ -178,11 +178,11 @@ func TestPQEnabled_DefaultOn(t *testing.T) {
 func TestPQHandshakeMetrics_PromExposition(t *testing.T) {
 	// Snapshot counters so this test is hermetic w.r.t. previous tests in
 	// the same run (counters are package-globals).
-	beforeSucc := Stats.PQHandshakeSuccess.Load()
+	beforeSucc := Stats.PQClientHelloSent.Load()
 	beforeFall := Stats.PQHandshakeFallback.Load()
 	beforeErr := Stats.PQHandshakeError.Load()
 
-	Stats.PQHandshakeSuccess.Add(2)
+	Stats.PQClientHelloSent.Add(2)
 	Stats.PQHandshakeFallback.Add(1)
 	Stats.PQHandshakeError.Add(3)
 
@@ -193,7 +193,7 @@ func TestPQHandshakeMetrics_PromExposition(t *testing.T) {
 	for _, want := range []string{
 		"# HELP shadowlink_tls_pq_handshake_total",
 		"# TYPE shadowlink_tls_pq_handshake_total counter",
-		`shadowlink_tls_pq_handshake_total{result="success"}`,
+		`shadowlink_tls_pq_handshake_total{result="clienthello_sent"}`,
 		`shadowlink_tls_pq_handshake_total{result="fallback"}`,
 		`shadowlink_tls_pq_handshake_total{result="error"}`,
 	} {
@@ -204,7 +204,7 @@ func TestPQHandshakeMetrics_PromExposition(t *testing.T) {
 
 	// Reset counters back to their prior values so other tests don't see drift.
 	// atomic.Uint64 has no Sub; do it via Store after a load.
-	Stats.PQHandshakeSuccess.Store(beforeSucc)
+	Stats.PQClientHelloSent.Store(beforeSucc)
 	Stats.PQHandshakeFallback.Store(beforeFall)
 	Stats.PQHandshakeError.Store(beforeErr)
 }

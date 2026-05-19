@@ -1,6 +1,7 @@
 package browser
 
 import (
+	"encoding/json"
 	"math/rand"
 	"testing"
 )
@@ -59,4 +60,28 @@ func TestSampleResponseSize_DominatesGaussianCore(t *testing.T) {
 		t.Fatalf("core fraction %.3f, want >0.55", frac)
 	}
 	t.Logf("Gaussian core fraction (μ±σ) = %.3f", frac)
+}
+
+// TestBuildInflatedDownloadResponse_VariesSize verifies that SampleResponseSize
+// is wired into BuildInflatedDownloadResponse — i.e. response bodies show
+// meaningful size variance rather than a fixed size (Wave 1.1 wire-up).
+func TestBuildInflatedDownloadResponse_VariesSize(t *testing.T) {
+	enc := []byte("encrypted-payload-mock-fixed-length-padding-test")
+	sizes := make(map[int]int)
+	for i := 0; i < 100; i++ {
+		body, err := BuildInflatedDownloadResponse(enc, uint32(i), nil)
+		if err != nil {
+			t.Fatalf("BuildInflatedDownloadResponse iteration %d: %v", i, err)
+		}
+		// Sanity: must still be valid JSON.
+		var envelope map[string]any
+		if err := json.Unmarshal(body, &envelope); err != nil {
+			t.Fatalf("response is not valid JSON at iteration %d: %v", i, err)
+		}
+		sizes[len(body)]++
+	}
+	t.Logf("distinct response sizes over 100 calls: %d", len(sizes))
+	if len(sizes) < 5 {
+		t.Errorf("expected >=5 distinct response sizes (SampleResponseSize wired), got %d", len(sizes))
+	}
 }

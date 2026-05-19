@@ -12,22 +12,24 @@ import (
 	"github.com/nixavpn/shadowlink/skins/browser"
 )
 
-// TestColdPath_PQ_OnWire_HandshakeIncrementsSuccess asserts that when
+// TestColdPath_PQ_OnWire_HandshakeIncrementsClientHelloSent asserts that when
 // SHADOWLINK_TLS_PQ=1 is set, the cold-path uTLS dialer used by
 // buildUTLSHTTPClient (SendHandshake POST, WarmupRequests, cover GET,
-// SplitTransport upload POST) honors the flag and ticks the PQ success
-// counter — matching the WS upgrade path. Without this, flipping the
-// flag default-on re-instates the JA3 mismatch CRIT-1/2/3 of the
-// 2026-04 audit (WS = MLKEM on wire, cold-path = stock HelloChrome).
-func TestColdPath_PQ_OnWire_HandshakeIncrementsSuccess(t *testing.T) {
+// SplitTransport upload POST) honors the flag and ticks the PQ
+// PQClientHelloSent counter — matching the WS upgrade path. Without this,
+// flipping the flag default-on re-instates the JA3 mismatch CRIT-1/2/3 of
+// the 2026-04 audit (WS = MLKEM on wire, cold-path = stock HelloChrome).
+// Renamed from TestColdPath_PQ_OnWire_HandshakeIncrementsSuccess 2026-05-17
+// (Wave 3.3) along with the underlying counter.
+func TestColdPath_PQ_OnWire_HandshakeIncrementsClientHelloSent(t *testing.T) {
 	t.Setenv("SHADOWLINK_TLS_PQ", "1")
 
 	// Snapshot counters so this test is hermetic w.r.t. earlier tests.
-	before := Stats.PQHandshakeSuccess.Load()
+	before := Stats.PQClientHelloSent.Load()
 	beforeFb := Stats.PQHandshakeFallback.Load()
 	beforeErr := Stats.PQHandshakeError.Load()
 	t.Cleanup(func() {
-		Stats.PQHandshakeSuccess.Store(before)
+		Stats.PQClientHelloSent.Store(before)
 		Stats.PQHandshakeFallback.Store(beforeFb)
 		Stats.PQHandshakeError.Store(beforeErr)
 	})
@@ -67,11 +69,11 @@ func TestColdPath_PQ_OnWire_HandshakeIncrementsSuccess(t *testing.T) {
 	// what this test verifies. Fallback MUST stay at 0 — the helper
 	// pqClientHelloSpec() does not error today; if it ever does, the
 	// fallback delta exposes that.
-	deltaSucc := Stats.PQHandshakeSuccess.Load() - before
+	deltaSent := Stats.PQClientHelloSent.Load() - before
 	deltaErr := Stats.PQHandshakeError.Load() - beforeErr
 	deltaFb := Stats.PQHandshakeFallback.Load() - beforeFb
-	if deltaSucc+deltaErr < 1 {
-		t.Errorf("expected at least one PQ counter tick (success OR error), got success=%d error=%d", deltaSucc, deltaErr)
+	if deltaSent+deltaErr < 1 {
+		t.Errorf("expected at least one PQ counter tick (clienthello_sent OR error), got clienthello_sent=%d error=%d", deltaSent, deltaErr)
 	}
 	if deltaFb != 0 {
 		t.Errorf("PQHandshakeFallback unexpectedly ticked: delta=%d (pqClientHelloSpec should not error today)", deltaFb)
@@ -82,9 +84,9 @@ func TestColdPath_PQ_OnWire_HandshakeIncrementsSuccess(t *testing.T) {
 	// cold-path clients. net/http.Transport only populates Response.TLS
 	// when the dial returns a *crypto/tls.Conn — buildUTLSDialTLS returns
 	// a *utls.UConn (the entire reason this helper exists), so resp.TLS
-	// is always nil even on a successful handshake. The Success counter
-	// delta plus deltaFb==0 already proves the wiring; the resp.TLS check
-	// is an environmental false-negative.
+	// is always nil even on a successful handshake. The PQClientHelloSent
+	// counter delta plus deltaFb==0 already proves the wiring; the
+	// resp.TLS check is an environmental false-negative.
 }
 
 // TestColdPath_PQ_OptOut_NoCounterTick asserts the cold-path counters stay
@@ -95,11 +97,11 @@ func TestColdPath_PQ_OptOut_NoCounterTick(t *testing.T) {
 	// Explicit opt-out: =0 routes through the legacy stock-helloID path.
 	t.Setenv("SHADOWLINK_TLS_PQ", "0")
 
-	before := Stats.PQHandshakeSuccess.Load()
+	before := Stats.PQClientHelloSent.Load()
 	beforeFb := Stats.PQHandshakeFallback.Load()
 	beforeErr := Stats.PQHandshakeError.Load()
 	t.Cleanup(func() {
-		Stats.PQHandshakeSuccess.Store(before)
+		Stats.PQClientHelloSent.Store(before)
 		Stats.PQHandshakeFallback.Store(beforeFb)
 		Stats.PQHandshakeError.Store(beforeErr)
 	})
@@ -120,8 +122,8 @@ func TestColdPath_PQ_OptOut_NoCounterTick(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	if d := Stats.PQHandshakeSuccess.Load() - before; d != 0 {
-		t.Errorf("PQHandshakeSuccess delta = %d, want 0 (env unset)", d)
+	if d := Stats.PQClientHelloSent.Load() - before; d != 0 {
+		t.Errorf("PQClientHelloSent delta = %d, want 0 (env unset)", d)
 	}
 	if d := Stats.PQHandshakeFallback.Load() - beforeFb; d != 0 {
 		t.Errorf("PQHandshakeFallback delta = %d, want 0 (env unset)", d)

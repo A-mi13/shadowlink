@@ -156,6 +156,18 @@ func (cm *ConnManager) SetDomainPool(p *DomainPool) {
 	cm.mu.Unlock()
 }
 
+// DomainPoolSize returns the number of domains in the rotation pool.
+// Returns 0 if no pool is installed. Read-only accessor for tests and
+// metrics — does not affect Pick state.
+func (cm *ConnManager) DomainPoolSize() int {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	if cm.domainPool == nil {
+		return 0
+	}
+	return cm.domainPool.Size()
+}
+
 // connect creates a new tls-client with the locked or rotated browser profile.
 func (cm *ConnManager) connect() {
 	// DomainPool integration: if pool is set, pick a fresh domain to use as SNI.

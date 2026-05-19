@@ -336,7 +336,6 @@ func isJSONContentType(ct string) bool {
 // headers as decoy to prevent oracle-based detection.
 func setStandardHeaders(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Server", "nginx/1.27.3")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "SAMEORIGIN")
@@ -398,7 +397,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// look like JSON (text/plain, html, urlencoded, missing) still routes
 	// to decoy without paying the failClosedToDecoy crypto cost.
 	if r.Method != "POST" || !isJSONContentType(r.Header.Get("Content-Type")) {
-		h.decoy.ServeHTTP(w, r)
+		h.decoyWithTimingParity(w, r)
 		return
 	}
 
@@ -547,11 +546,19 @@ proceed:
 		return
 	}
 
+	// A6 (2026-05-18): per-session chunk_size sampling. Pre-A6 every
+	// session got the same chunk_size (12288 default) — data frames on
+	// the wire formed a unimodal size distribution detectable as a
+	// circumvention-tool signature. sampleChunkSize draws from
+	// {6144, 8192, 10240, 12288} uniformly so the wire-shape histogram
+	// gains four discrete peaks. Pinned per session via the ServerHello
+	// response — client's connectSlot reads it into the slot transport.
+	sampledChunkSize := sampleChunkSize(h.config.ChunkSize)
 	serverHello, session, _, err := core.HandleClientHelloWithVersion(
 		clientHello,
 		h.serverKey,
 		uint8(h.config.MaxConnsPerClient),
-		uint16(h.config.ChunkSize),
+		sampledChunkSize,
 		h.sessions,
 		1, // protoVersion = 1 (new body-prefix format)
 	)
@@ -618,6 +625,26 @@ proceed:
 		h.failClosedToDecoyWithReason(w, r, DecoyReasonInternal)
 		return
 	}
+
+	// Mark the session as "handshake-attached" right before the response
+	// flushes. Plan §C10 M2 originally tied AttachedAt to the WS first-frame,
+	// but that semantic created a race: if the WS-upgrade rate-limit gate
+	// rejected the subsequent upgrade attempt, the session stayed in newborn
+	// state and got reaped by CleanupNewbornOrphans after 30s — producing
+	// `orphan_session_cleaned` storms (351 in one 5-min test, 2026-05-18)
+	// without any actual client-side abort. The new semantic is:
+	//
+	//   AttachedAt = "handshake completed successfully and the response is
+	//                 about to be flushed to the client"
+	//
+	// CleanupNewbornOrphans now evicts only sessions whose handshake aborted
+	// between Create() and this point (panic, validation reject, internal
+	// error path returns). Sessions whose owner client failed AFTER the
+	// handshake response was sent (incl. failed WS upgrade) fall under the
+	// regular idle timeout policy via SessionManager.Cleanup — which is the
+	// correct bucket: the session was reachable, the client just stopped
+	// using it.
+	session.AttachedAt.Store(time.Now().UnixNano())
 
 	setStandardHeaders(w)
 	w.WriteHeader(200)

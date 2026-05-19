@@ -112,7 +112,7 @@ func TestE2E_DecoyForUnauthenticated(t *testing.T) {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	assert.Contains(t, string(body), "under construction")
-	assert.Equal(t, "nginx/1.27.3", resp.Header.Get("Server"))
+	assert.Equal(t, "", resp.Header.Get("Server"), "Server header must be empty (CF sets its own)")
 }
 
 // T2.4

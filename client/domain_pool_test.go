@@ -170,3 +170,25 @@ func TestDomainPool_EmptyPool(t *testing.T) {
 		t.Errorf("expected empty string from empty pool, got %q", got)
 	}
 }
+
+// TestDomainPool_MarkFailedTriggersRotation — Task 1.2.F: цикл pick → MarkFailed
+// девять раз должен вовлечь все три домена. Гарантирует, что blacklist реально
+// убирает домен из rotation, а не sticky pick прилипает к одному.
+func TestDomainPool_MarkFailedTriggersRotation(t *testing.T) {
+	domains := []string{"a.com", "b.com", "c.com"}
+	pool := NewDomainPool(domains, time.Minute)
+
+	picked := map[string]int{}
+	for i := 0; i < 9; i++ {
+		d := pool.Pick()
+		if d != "" {
+			picked[d]++
+		}
+		pool.MarkFailed(d)
+	}
+
+	if len(picked) < 3 {
+		t.Errorf("expected all 3 domains used under MarkFailed-forced rotation, got %d distinct: %v",
+			len(picked), picked)
+	}
+}

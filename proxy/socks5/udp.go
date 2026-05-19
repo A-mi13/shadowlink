@@ -81,7 +81,7 @@ func HandleUDPAssociateWS(ctx context.Context, conn net.Conn, cl *client.Client,
 		byte(boundAddr.Port >> 8), byte(boundAddr.Port & 0xff)}
 	conn.Write(reply)
 
-	slog.Debug("SOCKS5 UDP ASSOCIATE (WS)", "udp_addr", boundAddr.String())
+	client.Trace("SOCKS5 UDP ASSOCIATE (WS)", "udp_addr", boundAddr.String())
 
 	// Allocate stream for this UDP association
 	streamID := cl.NextStreamID()

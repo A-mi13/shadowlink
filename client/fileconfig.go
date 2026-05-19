@@ -33,6 +33,10 @@ type ClientFileConfig struct {
 	// to the same underlying ShadowLink server (same X25519 pubkey) but via
 	// a different CF domain (or IP).
 	BackupServers []string `yaml:"backup_servers,omitempty"`
+	// CDNs is the SNI rotation pool. Distinct from BackupServers (alternative
+	// host:port endpoints). Max 8 entries. When non-empty, DomainPool rotates
+	// SNI per reconnect against this list.
+	CDNs []string `yaml:"cdns,omitempty"`
 }
 
 // RoutingConfig holds per-domain routing rules from the YAML file.

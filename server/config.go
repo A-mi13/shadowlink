@@ -64,9 +64,17 @@ type Config struct {
 	// BlockDomains is a list of domain suffixes/exact names the server refuses to dial.
 	BlockDomains []string
 
-	// UseInflatedResponses enables BuildInflatedDownloadResponse (extra JSON fields for DPI evasion).
-	// Disabled by default — adds overhead that reduces throughput ~2-3x.
-	// Enable via mimicry.inflation: true in YAML config.
+	// UseInflatedResponses enables BuildInflatedDownloadResponse (extra JSON
+	// fields + body-size variance for DPI evasion).
+	//
+	// Default: true (changed 2026-05-17 — audit found flag absent in pl1 config
+	// → all T2.4 mimicry distributions dead code in production).
+	//
+	// Throughput cost: ~2-3x per Phase 3 Plan A § 4.4 (T2.4 documentation).
+	// A/B perf-measure required before broad rollout (see plan Wave 1.1 Step 11).
+	// If regression > 30% in real traffic — consider "inflate small only" (<8KB).
+	//
+	// Override via `mimicry.inflation: false` in YAML.
 	UseInflatedResponses bool
 
 	// ReplayCacheMaxSize caps the LRU size of the handshake replay cache.
@@ -127,14 +135,23 @@ type RateLimitConfig struct {
 }
 
 // DefaultConfig returns production-ready defaults for a 2 vCPU / 2 GB RAM VPS.
+//
+// 2026-05-17 incident retrospective: prior defaults (MaxClients=100,
+// SessionTimeout=5m, CleanupInterval=30s) were too tight для современного
+// reconnect-storm pattern. При 8-slot WS pool и одном клиенте ghost-сессий
+// от EOF reader exit'ов накапливалось 50-100 за окно SessionTimeout — пробит
+// MaxClients → decoy lockout. Новые defaults дают 5× запас по слотам и 3×
+// быстрее освобождают idle сессии.
+//
+// Override: операционные ключи в /etc/shadowlink/config.yaml имеют приоритет.
 func DefaultConfig() Config {
 	return Config{
 		ListenAddr:        ":443",
-		MaxClients:        100,
+		MaxClients:        500,
 		MaxConnsPerClient: 8,
 		ChunkSize:         12288,
-		SessionTimeout:    5 * time.Minute,
-		CleanupInterval:   30 * time.Second,
+		SessionTimeout:    90 * time.Second,
+		CleanupInterval:   10 * time.Second,
 		ManagementBind:    "127.0.0.1",
 		DefaultMaxDevices: 3,
 	}

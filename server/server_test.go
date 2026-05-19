@@ -43,7 +43,7 @@ func TestServerStartsAndResponds(t *testing.T) {
 	assert.Equal(t, 200, resp.StatusCode)
 	body, _ := io.ReadAll(resp.Body)
 	assert.Contains(t, string(body), "under construction")
-	assert.Equal(t, "nginx/1.27.3", resp.Header.Get("Server"))
+	assert.Equal(t, "", resp.Header.Get("Server"), "Server header must be empty (CF sets its own)")
 }
 
 func TestServerDecoyForMultiplePaths(t *testing.T) {
@@ -228,6 +228,31 @@ func TestServer_DefaultMaxDevices_AppliedWithoutMgmt(t *testing.T) {
 
 	assert.Equal(t, 5, srv.Handler().clientAuth.defaultMax,
 		"DefaultMaxDevices must apply regardless of management API state (A3-S-MED-4)")
+}
+
+// TestServer_IdleTimeout_300s pins the IdleTimeout invariant introduced by
+// Wave 2.3 (2026-05-17): the HTTP server must hold idle keep-alive
+// connections for 300s, not the prior 60s. Rationale: TSPU mid-session
+// bans typically transient under a minute; a 300s idle window keeps WS
+// keep-alives alive across the disruption without forcing the client to
+// re-handshake. Memory pressure tracked via Metrics.IdleConnections.
+func TestServer_IdleTimeout_300s(t *testing.T) {
+	serverKey, err := core.GenerateKeyPair()
+	require.NoError(t, err)
+
+	cfg := TestConfig()
+	srv, err := New(cfg, serverKey)
+	require.NoError(t, err)
+
+	_, err = srv.Start()
+	require.NoError(t, err)
+	t.Cleanup(func() { srv.Stop() })
+
+	want := 300 * time.Second
+	require.NotNil(t, srv.httpSrv, "httpSrv must be initialized after Start()")
+	if got := srv.httpSrv.IdleTimeout; got != want {
+		t.Errorf("httpSrv.IdleTimeout = %v, want %v", got, want)
+	}
 }
 
 func TestServerMaxClientsOverHTTP(t *testing.T) {

@@ -1,9 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
+	"slices"
 	"testing"
+	"time"
 )
 
 // TestGorillaFailFallsThroughToDecoy verifies that malformed WS-upgrade attempts
@@ -81,4 +85,76 @@ func wsAllowedPathForTest(t *testing.T) string {
 		t.Fatalf("sentinel path %q no longer in wsURLPool — update test", sentinel)
 	}
 	return sentinel
+}
+
+// TestTimingParity_DecoyPaths — ensures decoy-routed requests have
+// indistinguishable response timing (closes passive prober oracle).
+// Skips on Windows (time.Now() resolution + goroutine scheduling
+// produce too much noise for this statistical smoke test).
+func TestTimingParity_DecoyPaths(t *testing.T) {
+	if runtime.GOOS == "windows" || testing.Short() {
+		t.Skip("requires Linux time resolution and non-short mode")
+	}
+	h := newTestHandler(t)
+	const N = 200 // samples per category: enough to stabilise median, fast enough for non-short CI
+
+	measure := func(method string, body []byte, ct string) []time.Duration {
+		durs := make([]time.Duration, 0, N)
+		for range N {
+			var rdr *bytes.Reader
+			if body != nil {
+				rdr = bytes.NewReader(body)
+			} else {
+				rdr = bytes.NewReader(nil)
+			}
+			req := httptest.NewRequest(method, "/api/v1/ws", rdr)
+			if ct != "" {
+				req.Header.Set("Content-Type", ct)
+			}
+			rr := httptest.NewRecorder()
+			start := time.Now()
+			h.ServeHTTP(rr, req)
+			durs = append(durs, time.Since(start))
+		}
+		return durs
+	}
+
+	cases := map[string][]time.Duration{
+		"GET":             measure("GET", nil, ""),
+		"POST-JSON-bad":   measure("POST", []byte("{bad-json"), "application/json"),
+		"POST-text":       measure("POST", []byte("hello"), "text/plain"),
+		"POST-empty-JSON": measure("POST", []byte("{}"), "application/json"),
+	}
+
+	medians := make(map[string]time.Duration, len(cases))
+	for k, v := range cases {
+		medians[k] = medianDuration(v)
+	}
+
+	var min, max time.Duration
+	first := true
+	for _, m := range medians {
+		if first || m < min {
+			min = m
+		}
+		if first || m > max {
+			max = m
+		}
+		first = false
+	}
+
+	// Smoke test bound: max-min median diff < 2ms.
+	// Full KS-test (gonum) is TODO follow-up for CI runner.
+	if max-min > 2*time.Millisecond {
+		t.Errorf("timing parity broken: max-min medians = %v (want < 2ms); medians: %v", max-min, medians)
+	}
+}
+
+func medianDuration(durs []time.Duration) time.Duration {
+	if len(durs) == 0 {
+		return 0
+	}
+	c := append([]time.Duration{}, durs...)
+	slices.Sort(c)
+	return c[len(c)/2]
 }

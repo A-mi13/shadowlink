@@ -29,6 +29,29 @@ var (
 	handshakePadRNGOnce sync.Once
 )
 
+// inflateRNG is a process-wide RNG used by BuildInflatedDownloadResponse for
+// body-size sampling via SampleResponseSize. Seeded once from crypto/rand
+// (same pattern as handshakePadRNG).
+var (
+	inflateRNGMu   sync.Mutex
+	inflateRNG     *mathrand.Rand
+	inflateRNGOnce sync.Once
+)
+
+func inflateRNGDraw() int {
+	inflateRNGOnce.Do(func() {
+		var seed [8]byte
+		if _, err := crand.Read(seed[:]); err != nil {
+			inflateRNG = mathrand.New(mathrand.NewSource(time.Now().UnixNano()))
+			return
+		}
+		inflateRNG = mathrand.New(mathrand.NewSource(int64(binary.LittleEndian.Uint64(seed[:]))))
+	})
+	inflateRNGMu.Lock()
+	defer inflateRNGMu.Unlock()
+	return SampleResponseSize(inflateRNG)
+}
+
 func handshakePadDraw() int {
 	handshakePadRNGOnce.Do(func() {
 		var seed [8]byte
@@ -94,6 +117,11 @@ type downloadEnvelope struct {
 	Status   string           `json:"status"`
 	Results  []downloadResult `json:"results"`
 	NextPoll int              `json:"next_poll,omitempty"`
+	// Pad carries random base64 padding so the total JSON body reaches the
+	// target size sampled by SampleResponseSize (Wave 1.1 wire-up).
+	// Omitted when empty — real analytics APIs occasionally include vendor-specific
+	// opaque fields; a base64 blob is indistinguishable at the JSON level.
+	Pad string `json:"_p,omitempty"`
 }
 
 type downloadResult struct {
@@ -304,7 +332,7 @@ func BuildDownloadResponseMulti(encryptedChunks [][]byte) ([]byte, error) {
 // uniform 30..89s fallback is preserved for nil-session callers (tests,
 // transitional code paths that don't carry session state).
 //
-// Server gate: Config.UseInflatedResponses (default false).
+// Server gate: Config.UseInflatedResponses (default true since Wave 1.1, 2026-05-17).
 func BuildInflatedDownloadResponse(encryptedChunk []byte, seqNum uint32, sess *core.MimicrySession) ([]byte, error) {
 	payload := base64.RawURLEncoding.EncodeToString(encryptedChunk)
 
@@ -323,6 +351,13 @@ func BuildInflatedDownloadResponse(encryptedChunk []byte, seqNum uint32, sess *c
 		}
 	}
 
+	// Wire SampleResponseSize (Wave 1.1) — body-size variance for DPI evasion.
+	// Phase 3 Plan A § 4.4 (T2.4) deferred this wire-up to Plan B Stage 1;
+	// we complete it here. Target size is sampled from the Gaussian+Pareto
+	// distribution; if the marshaled body is smaller, random bytes are
+	// base64-encoded into the _p field to reach the target.
+	target := inflateRNGDraw()
+
 	env := downloadEnvelope{
 		Status: "ok",
 		Results: []downloadResult{
@@ -332,6 +367,27 @@ func BuildInflatedDownloadResponse(encryptedChunk []byte, seqNum uint32, sess *c
 			},
 		},
 		NextPoll: nextPoll,
+	}
+
+	// Pre-estimate body size without padding to compute how many padding bytes
+	// are needed. Marshal once, measure, then add padding field and re-marshal.
+	preliminary, err := json.Marshal(env)
+	if err != nil {
+		return nil, err
+	}
+	if needed := target - len(preliminary); needed > 0 {
+		// Account for JSON key overhead when re-marshaling: `,"_p":""` is 8 chars.
+		// Subtract before computing raw bytes so final body lands closer to target.
+		const padKeyOverhead = 8
+		needed -= padKeyOverhead
+		if needed > 0 {
+			// base64 encodes 3 bytes → 4 chars; raw bytes needed ≈ needed * 3/4.
+			rawNeeded := (needed*3)/4 + 1
+			rawPad := make([]byte, rawNeeded)
+			if _, rerr := crand.Read(rawPad); rerr == nil {
+				env.Pad = base64.RawURLEncoding.EncodeToString(rawPad)
+			}
+		}
 	}
 
 	return json.Marshal(env)

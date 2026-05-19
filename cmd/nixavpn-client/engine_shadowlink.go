@@ -88,10 +88,41 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 		CDNDomain:    slCfg.CDN,
 		ECHEnabled:   slCfg.ECH,
 	}
-	// Full-direct mode: client dials to IP (slCfg.Server), TLS SNI = slCfg.SNI.
-	// In this mode we do NOT go through CF — both handshake and WS are direct.
-	// SNI override takes precedence over CDN: don't wrap in CDNTransport.
-	if slCfg.SNI != "" {
+	// Resolve full-direct mode parameters. Two URL inputs activate it:
+	//   1. Explicit ?sni=<domain> + Server=<IP:port> — caller knew enough to
+	//      hand-craft a direct-to-IP target with a domain-shaped TLS SNI.
+	//   2. ?origin=<IP> alongside ?cdn=<domain> — the URL gives us both
+	//      pieces (CDN-protected domain for SNI, origin IP for dial); the
+	//      intent is identical to (1) but the user didn't need to know the
+	//      "sni" knob existed.
+	//
+	// Without case (2), origin= used to take effect ONLY for the WS pool's
+	// dial target (engine sets wsTarget below) while handshake/reconnect-
+	// handshake POSTs went through the CDNTransport — meaning DNS on the
+	// CDN domain returned CF edge IPs and reconnect POSTs sometimes landed
+	// at CF instead of origin. Field log 2026-05-18 captured this leak:
+	//   Post "https://datacanvases.com/api/v2/batch" ... 51152->104.21.5.211:443
+	// where 104.21.5.211 is CF and 104.222.177.67 is origin.
+	//
+	// By forcing full-direct when origin is present, both the data path
+	// (handshake POST + reconnect POST + WS pool) dial origin IP with the
+	// CDN domain as TLS ServerName — there is no DNS for the data path.
+	if slCfg.SNI == "" && slCfg.Origin != "" && slCfg.CDN != "" {
+		host, port, splitErr := net.SplitHostPort(slCfg.Server)
+		if splitErr != nil {
+			host = slCfg.CDN
+			port = "443"
+		}
+		_ = host // currently unused; kept for symmetry if we later need it
+		clientCfg.ServerAddr = slCfg.Origin + ":" + port
+		clientCfg.SNIOverride = slCfg.CDN
+		clientCfg.CDNDomain = "" // force direct transport path (no CDNTransport wrap)
+		slog.Info("ShadowLink full-direct (auto from origin=)",
+			"dial", clientCfg.ServerAddr, "sni", slCfg.CDN)
+	} else if slCfg.SNI != "" {
+		// Full-direct mode: client dials to IP (slCfg.Server), TLS SNI = slCfg.SNI.
+		// In this mode we do NOT go through CF — both handshake and WS are direct.
+		// SNI override takes precedence over CDN: don't wrap in CDNTransport.
 		clientCfg.SNIOverride = slCfg.SNI
 		clientCfg.CDNDomain = "" // force direct transport path
 		slog.Info("ShadowLink full-direct", "dial", slCfg.Server, "sni", slCfg.SNI)
@@ -151,6 +182,25 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 	}
 
 	slog.Info("ShadowLink подключен", "transport", e.cl.TransportName())
+
+	// DomainPool wire-up: if the YAML/URL config supplied a CDN rotation pool
+	// (slCfg.CDNs), install it on the transport's ConnManager so each reconnect
+	// picks a fresh SNI from the pool. Gated on len > 0 so existing single-CDN
+	// configs keep the static SNI behavior. TTL=5min matches the DomainPool
+	// blacklist default — failed domains rest for 5min before reentering Pick.
+	if len(slCfg.CDNs) > 0 {
+		type cmAccessor interface {
+			ConnManager() *client.ConnManager
+		}
+		if acc, ok := e.cl.Transport().(cmAccessor); ok {
+			if cm := acc.ConnManager(); cm != nil {
+				pool := client.NewDomainPool(slCfg.CDNs, 5*time.Minute)
+				cm.SetDomainPool(pool)
+				slog.Info("ShadowLink DomainPool installed",
+					"size", cm.DomainPoolSize(), "cdns", slCfg.CDNs)
+			}
+		}
+	}
 
 	// Start periodic stats logger — prints counter deltas every 5s so we can
 	// see at a glance how much each subsystem (cover traffic, UDP poll,
@@ -282,8 +332,10 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 				maxPendingPerSlot := 0         // default 4 for direct
 				var writeTimeout time.Duration // 0 → 30s default for direct
 				var staggerDelay time.Duration // 0 → no stagger for direct
-				var maxBytesPerSlot int64      // 0 = disabled (direct has no TSPU limit)
+				var maxBytesPerSlot int64      // 0 = disabled
+				var maxSlotAge time.Duration   // 0 = disabled
 				viaCF := slCfg.CDN != "" && slCfg.Origin == "" && slCfg.SNI == ""
+				viaDirect := slCfg.Origin != "" || slCfg.SNI != ""
 				if viaCF {
 					maxStreamsPerSlot = 4
 					maxPendingPerSlot = 2
@@ -300,6 +352,7 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 					// the censor's counter triggers. See habr.com/990236
 					// ("Clumsy Hands or a New Level of DPI") for background.
 					maxBytesPerSlot = 15 * 1024
+					// CDN-mode: byte budget alone handles the short TSPU window.
 
 					// R4 reverted 2026-04-15 after field test: pinning all 8
 					// slots to a single pre-resolved CF edge turned out to
@@ -310,6 +363,53 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 					// some slots land on healthy edges and keep traffic
 					// flowing while writer_timeout kills slots on bad ones.
 					// Users can still pin manually via &cfip= in the URL.
+				} else if viaDirect {
+					// Direct-mode rotation (2026-05-18 field analysis).
+					// Field logs show foreign-origin TCP getting `close 1006`
+					// from middleboxes (NAT age timers, stateful firewalls,
+					// TSPU's age heuristic for long-lived flows) every 2-5
+					// minutes. Self-rotating BEFORE that window keeps the
+					// kill signal off the wire. 8 MiB byte budget + 2 min
+					// age budget cover both heavy-upload and long-idle cases.
+					// Per-slot stagger inside the pool (slotRotationStaggerStep
+					// = 15s × idx) keeps 8 rotations spread across 2 minutes
+					// — one every ~15s, never a handshake storm.
+					maxBytesPerSlot = 8 * 1024 * 1024
+					maxSlotAge = 2 * time.Minute
+					// A2 (2026-05-18): spread INITIAL connect handshakes
+					// by 300ms × idx so 8 TCP SYNs don't arrive at origin
+					// in the same millisecond. Same value as viaCF mode
+					// uses (line 348). The post-meltdown reconnect path
+					// has its own jitter (see reconnectJitterOffset in
+					// client/ws_pool.go) — these two cover initial connect
+					// and reconnect storm respectively.
+					staggerDelay = 300 * time.Millisecond
+					// A4 anti-TSPU debt (2026-05-18): rebalance hint for
+					// stream distribution across the pool. Pre-A4 saw
+					// active_streams peak at 85+ on a single slot under
+					// burst load — non-browser-like frame rate per conn,
+					// detectable signature. With this hint AssignStream
+					// PASS-1 routes streams to slots under the threshold;
+					// at saturation it soft-overflows (AssignStream "all
+					// slots at capacity" path picks the slot with fewest
+					// streams, NEVER refuses a stream). Net effect:
+					// smoother distribution (~10 streams/slot for 80
+					// concurrent), no hard stop on burst, no failed
+					// CONNECTs.
+					//
+					// CAP IS A HINT NOT A LIMIT. Soft band = 8 × poolSize
+					// streams (64 for poolSize=8) below which PASS-1
+					// honors the cap; streams ABOVE this overflow to the
+					// least-loaded slot via the soft-overflow path —
+					// never refused. Real speedtest sees 50-60 parallel
+					// CONNECTs, within the soft band; overflow only kicks
+					// in under heavier burst.
+					//
+					// If field test shows throughput drop >5%, revert to
+					// 0 (unlimited) and the score-min PASS-1 handles
+					// distribution implicitly. One-line code change +
+					// redeploy on pl1 — no env-flag needed.
+					maxStreamsPerSlot = 8
 				}
 
 				pool := client.NewWSPoolTransport(e.cl, client.WSPoolConfig{
@@ -322,6 +422,7 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 					MaxStreamsPerSlot: maxStreamsPerSlot,
 					MaxPendingPerSlot: maxPendingPerSlot,
 					MaxBytesPerSlot:   maxBytesPerSlot,
+					MaxSlotAge:        maxSlotAge,
 					WriteTimeout:      writeTimeout,
 					StaggerDelay:      staggerDelay,
 				})

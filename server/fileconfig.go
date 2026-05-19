@@ -30,6 +30,19 @@ type FileConfig struct {
 	BlockDomains      []string             `yaml:"block_domains"`
 	AuthorizedClients []string             `yaml:"authorized_clients"`
 	RateLimit         *FileRateLimitConfig `yaml:"rate_limit"`
+
+	// IdleTimeoutSec is the HTTP server IdleTimeout in seconds.
+	// Valid range: [60, 600]. Default (when nil): 300 (Wave 2.3 hardcoded).
+	// Task 5.1 (2026-05-17): exposed via YAML for ops tuning. Wiring through
+	// to httpSrv.IdleTimeout is deferred — for now Load() validates the value
+	// but startup keeps the 300s hardcode.
+	IdleTimeoutSec *int `yaml:"idle_timeout_sec"`
+
+	// ServerHeader overrides the HTTP `Server:` response header for masquerade
+	// (e.g. "nginx/1.24.0"). Default (nil): no override — Go's default is used
+	// (or omitted when responding from the embedded handler). Wiring deferred
+	// to Wave 2.4 — Load() accepts the value but it is not yet emitted.
+	ServerHeader *string `yaml:"server_header"`
 }
 
 // FileRateLimitConfig is the YAML representation of RateLimitConfig.
@@ -83,9 +96,37 @@ type MgmtConfig struct {
 }
 
 // MimicryConfig holds mimicry engine feature flags from the YAML file.
+//
+// Task 5.1 (2026-05-17): extended with tuning knobs for the WS pool size,
+// decoy GET cadence, and preamble count range. All new fields are pointers
+// so absent-in-YAML is distinguishable from explicit zero. Validation is
+// performed in LoadConfigFile; runtime wiring is deferred — only Inflation
+// is honored today. Logged at startup for ops verification.
 type MimicryConfig struct {
 	CoverTraffic *bool `yaml:"cover_traffic"`
 	Inflation    *bool `yaml:"inflation"`
+
+	// WSPoolSize is the target WebSocket pool size. Valid range: [1, 8].
+	// Default (when nil): 6 (current hardcode in ws_ready_pool). Wiring
+	// deferred until pool-size spike.
+	WSPoolSize *int `yaml:"ws_pool_size"`
+
+	// DecoyGetIntervalBurstMs is the decoy GET inter-arrival during burst
+	// phase, in milliseconds. Valid range: [100, 1000]. Default 250.
+	DecoyGetIntervalBurstMs *int `yaml:"decoy_get_interval_burst_ms"`
+
+	// DecoyGetIntervalQuietSec is the decoy GET inter-arrival during quiet
+	// phase, in seconds. Valid range: [15, 300]. Default 60.
+	DecoyGetIntervalQuietSec *int `yaml:"decoy_get_interval_quiet_sec"`
+
+	// PreambleCountMin is the lower bound of the WarmupRequests preamble
+	// count distribution. Valid range: [1, 5]. Default 3.
+	PreambleCountMin *int `yaml:"preamble_count_min"`
+
+	// PreambleCountMax is the upper bound of the WarmupRequests preamble
+	// count distribution. Valid range: [3, 15]. Default 7. Must be
+	// >= PreambleCountMin.
+	PreambleCountMax *int `yaml:"preamble_count_max"`
 }
 
 // LoadConfigFile reads and parses a YAML config file into FileConfig.
@@ -109,7 +150,69 @@ func LoadConfigFile(path string) (*FileConfig, error) {
 	}
 	fc.ServerKey = expandEnv(fc.ServerKey)
 
+	// Task 5.1 (2026-05-17): fail-fast range validation for mimicry tuning
+	// knobs + root idle_timeout_sec. Each field is independently optional —
+	// only validated when explicitly set in YAML. Out-of-range values abort
+	// startup with the field name + observed value in the error, so the
+	// operator can fix the config rather than silently shipping defaults.
+	if err := validateMimicryRanges(&fc); err != nil {
+		return nil, err
+	}
+
 	return &fc, nil
+}
+
+// validateMimicryRanges enforces the fail-fast invariants declared on
+// MimicryConfig pointer fields and FileConfig.IdleTimeoutSec. Returns nil
+// when every set field is in range; otherwise returns an error naming the
+// offending field. Cross-field constraint:
+// PreambleCountMin <= PreambleCountMax.
+func validateMimicryRanges(fc *FileConfig) error {
+	if fc.Mimicry != nil {
+		if fc.Mimicry.WSPoolSize != nil {
+			v := *fc.Mimicry.WSPoolSize
+			if v < 1 || v > 8 {
+				return fmt.Errorf("ws_pool_size must be in [1,8], got %d", v)
+			}
+		}
+		if fc.Mimicry.DecoyGetIntervalBurstMs != nil {
+			v := *fc.Mimicry.DecoyGetIntervalBurstMs
+			if v < 100 || v > 1000 {
+				return fmt.Errorf("decoy_get_interval_burst_ms must be in [100,1000], got %d", v)
+			}
+		}
+		if fc.Mimicry.DecoyGetIntervalQuietSec != nil {
+			v := *fc.Mimicry.DecoyGetIntervalQuietSec
+			if v < 15 || v > 300 {
+				return fmt.Errorf("decoy_get_interval_quiet_sec must be in [15,300], got %d", v)
+			}
+		}
+		if fc.Mimicry.PreambleCountMin != nil {
+			v := *fc.Mimicry.PreambleCountMin
+			if v < 1 || v > 5 {
+				return fmt.Errorf("preamble_count_min must be in [1,5], got %d", v)
+			}
+		}
+		if fc.Mimicry.PreambleCountMax != nil {
+			v := *fc.Mimicry.PreambleCountMax
+			if v < 3 || v > 15 {
+				return fmt.Errorf("preamble_count_max must be in [3,15], got %d", v)
+			}
+		}
+		if fc.Mimicry.PreambleCountMin != nil && fc.Mimicry.PreambleCountMax != nil {
+			lo, hi := *fc.Mimicry.PreambleCountMin, *fc.Mimicry.PreambleCountMax
+			if lo > hi {
+				return fmt.Errorf("preamble_count_min (%d) > preamble_count_max (%d)", lo, hi)
+			}
+		}
+	}
+	if fc.IdleTimeoutSec != nil {
+		v := *fc.IdleTimeoutSec
+		if v < 60 || v > 600 {
+			return fmt.Errorf("idle_timeout_sec must be in [60,600], got %d", v)
+		}
+	}
+	return nil
 }
 
 // warnInsecurePermissions logs a warning if the config file is readable by
@@ -197,10 +300,13 @@ func (fc *FileConfig) ApplyTo(cfg *Config) {
 	if len(fc.AuthorizedClients) > 0 {
 		cfg.AuthorizedClients = fc.AuthorizedClients
 	}
-	if fc.Mimicry != nil {
-		if fc.Mimicry.Inflation != nil {
-			cfg.UseInflatedResponses = *fc.Mimicry.Inflation
-		}
+	// Default-on per Wave 1.1 (audit 2026-05-17 found flag absent in pl1 config →
+	// all T2.4 mimicry distributions dead code in prod). A/B perf-measure on
+	// pl1-canary required before broad rollout — see
+	// docs/superpowers/plans/2026-05-17-pl1-ab-perf-measure.md
+	cfg.UseInflatedResponses = true
+	if fc.Mimicry != nil && fc.Mimicry.Inflation != nil {
+		cfg.UseInflatedResponses = *fc.Mimicry.Inflation
 	}
 	if fc.LiveBlog != nil {
 		lb := &cfg.LiveBlog

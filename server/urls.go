@@ -1,6 +1,9 @@
 package server
 
-import "slices"
+import (
+	"slices"
+	"strings"
+)
 
 // wsURLPool is the whitelist of URL paths on which WebSocket upgrade is
 // accepted. Requests to other paths fall through to the decoy site.
@@ -29,12 +32,26 @@ var wsURLPool = []string{
 	"/api/v1/socket",                        // v1 socket endpoint (PostHog-shape)
 	"/api/v2/collect/stream",                // analytics collect-stream (GA4-ish)
 	"/realtime/v1/connect",                  // realtime gateway connect
-	"/_next/webpack-hmr",                    // Next.js HMR endpoint shape (very common live WS in dev/preview SPAs)
-	"/track/realtime",                       // marketing-analytics realtime track
 	"/live/v1/events",                       // Pusher / Ably-shape live events stream
 	"/api/v2/notifications/stream",          // notifications stream (Slack/Linear-shape)
 	"/_ws/sync",                             // generic sync channel
 	"/cable",                                // ActionCable (Rails) default — extremely common across the web
+}
+
+// legacyAcceptedWSPaths — retired from the active wsURLPool (Wave 2.1,
+// 2026-05-17) but still accepted by IsAllowedWSPath for backward compatibility
+// with already-installed clients that hashed one of these paths at install
+// time. Every WS upgrade landing on a legacy path increments
+// Metrics.WSPathLegacyHits to inform a data-driven cutoff decision: when the
+// rate falls below 0.01/s sustained for two weeks the entries here can be
+// safely removed from the whitelist (MINOR-V2-6).
+//
+// Removed paths:
+//   - /_next/webpack-hmr — Next.js HMR endpoint, dev-only on real deployments.
+//   - /track/realtime    — Mixpanel-specific public tracking endpoint shape.
+var legacyAcceptedWSPaths = map[string]struct{}{
+	"/_next/webpack-hmr": {},
+	"/track/realtime":    {},
 }
 
 // IsAllowedWSPath reports whether path is in the WebSocket URL whitelist.
@@ -55,21 +72,19 @@ func IsAllowedWSPath(path string) bool {
 	// component. The pool stores both forms for symmetry with the client URL
 	// builder, but Go's r.URL.Path drops the query string before this check.
 	for _, p := range wsURLPool {
-		if i := indexByte(p, '?'); i > 0 && p[:i] == path {
+		if i := strings.IndexByte(p, '?'); i > 0 && p[:i] == path {
 			return true
 		}
 	}
-	return false
-}
-
-// indexByte is a local helper to avoid pulling in strings just for one call.
-func indexByte(s string, b byte) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == b {
-			return i
-		}
+	// Backward-compat: retired entries from the active pool (Wave 2.1,
+	// 2026-05-17) are still accepted here so already-installed clients keep
+	// connecting. The WS upgrade dispatcher ticks Metrics.WSPathLegacyHits
+	// on these hits — when the rate decays below the cutoff threshold the
+	// entries here can be dropped.
+	if _, ok := legacyAcceptedWSPaths[path]; ok {
+		return true
 	}
-	return -1
+	return false
 }
 
 // AllWSPaths returns a copy of the WebSocket URL pool. Test / client

@@ -49,6 +49,11 @@ type ShadowLinkConfig struct {
 	// the primary Server handshake fails (ТСПУ blocks the CF SNI, DNS
 	// poisoning, etc.). Must share the same X25519 pubkey.
 	BackupServers []string `yaml:"backup_servers,omitempty"`
+	// CDNs is the SNI rotation pool (DomainPool). Distinct from BackupServers
+	// (alternative host:port endpoints). When non-empty, the engine installs a
+	// DomainPool on the transport's ConnManager and rotates SNI per reconnect
+	// against this list. Max enforced by client.maxCDNs (=8) on URL parsing.
+	CDNs []string `yaml:"cdns,omitempty"`
 }
 
 // VLESSConfig holds VLESS+Reality connection settings.
@@ -153,6 +158,7 @@ func parseSLURL(rawURL string) (*ShadowLinkConfig, error) {
 		SNI:           cfc.SNI,
 		CFIP:          cfc.CFIP,
 		BackupServers: cfc.BackupServers,
+		CDNs:          cfc.CDNs,
 	}
 
 	// Map RoutingConfig only if non-empty (avoid allocating empty pointer).

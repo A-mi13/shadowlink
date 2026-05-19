@@ -3,6 +3,7 @@ package server
 import (
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +13,28 @@ import (
 
 	"github.com/nixavpn/shadowlink/core"
 )
+
+// TestWSPingInterval_MedianBumped — sanity check that JitteredIntervalLogNormal
+// with the Wave 2.2 (45s, 0.6) params produces median ≈ 45s. Pinned ahead of
+// the production change to catch param drift (Wave 2.2, 2026-05-17).
+//
+// DEPLOY GATE: do NOT ship this binary без выполнения infrastructure precondition
+// в websocket.go::handleWebSocket (nginx proxy_read_timeout ≥180s, MaxClients ≥500,
+// SessionTimeout ≤90s). 2026-05-17 field incident при дефолтном nginx 60s выдал
+// reader-EOF cascade → max_clients overrun → decoy lockout всех клиентов.
+func TestWSPingInterval_MedianBumped(t *testing.T) {
+	const N = 1000
+	const newMedianSec = 45.0
+	samples := make([]float64, N)
+	for i := 0; i < N; i++ {
+		samples[i] = core.JitteredIntervalLogNormal(45*time.Second, 0.6).Seconds()
+	}
+	sort.Float64s(samples)
+	gotMedian := samples[N/2]
+	if gotMedian < newMedianSec*0.8 || gotMedian > newMedianSec*1.2 {
+		t.Errorf("median = %.2fs, want ~%.2fs (±20%%)", gotMedian, newMedianSec)
+	}
+}
 
 // wsAuthHarness wires a single-shot httptest server that upgrades the request
 // and feeds authenticateFirstFrame with the resulting *websocket.Conn. The
@@ -497,3 +520,81 @@ func TestAuthenticateFirstFrame_MissingTunnelRejected(t *testing.T) {
 	require.True(t, ok)
 	require.Nil(t, got, "session without tunnel must not authenticate")
 }
+
+// TestClassifyWSReaderExitErr pins the 2026-05-18 forensics contract:
+// each error string the gorilla/websocket reader can surface must map to
+// exactly the bucket we attribute it to. Dashboards depend on this mapping
+// being stable — a regression here silently rewrites the "who closed the
+// TCP first?" story.
+func TestClassifyWSReaderExitErr(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want wsReaderExitKind
+	}{
+		// Hard TCP RST surfaced through the kernel. Linux/macOS:
+		// "read tcp ...: connection reset by peer". Windows: "wsarecv:
+		// An existing connection was forcibly closed by the remote host".
+		{"linux_rst", testErr("read tcp 10.0.0.1:443: connection reset by peer"), wsExitReset},
+		{"windows_rst", testErr("read tcp 10.0.0.1:443: wsarecv: An existing connection was forcibly closed by the remote host."), wsExitReset},
+
+		// Our own conn.Close() raced the read.
+		{"local_close", testErr("read tcp 10.0.0.1:443: use of closed network connection"), wsExitLocalClose},
+
+		// Read deadline expired without bytes — CF-edge black-hole.
+		{"deadline", testErr("read tcp 10.0.0.1:443: i/o timeout"), wsExitIOTimeout},
+
+		// Peer-side orderly FIN. This is the bucket that confirms the
+		// 2026-05-18 hypothesis: when client logs close-1006, server
+		// records peer_eof, meaning the middlebox tore down between us.
+		{"eof", testErr("EOF"), wsExitPeerEOF},
+		{"unexpected_eof", testErr("unexpected EOF"), wsExitPeerEOF},
+
+		// Residual.
+		{"unknown", testErr("some other transport error"), wsExitOther},
+		{"nil", nil, wsExitOther},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyWSReaderExitErr(tc.err)
+			require.Equal(t, tc.want, got,
+				"err=%v: kind classification regression — dashboards will silently mis-attribute teardowns", tc.err)
+		})
+	}
+}
+
+// TestClassifyWSReaderExitErr_OrderingInvariants documents the precedence
+// the switch relies on. If a Windows error message happens to contain
+// both "wsarecv" AND the substring "EOF" (rare but possible when gorilla
+// chains errors), reset MUST win — that's a hard teardown, not an
+// orderly close. Same for local_close before io_timeout: if the read
+// deadline fires AND our Close() also raced, attribute to local_close
+// because that's the bucket that flags our own bug.
+func TestClassifyWSReaderExitErr_OrderingInvariants(t *testing.T) {
+	// reset wins over EOF.
+	resetWithEOF := testErr("read tcp 10.0.0.1:443: wsarecv: An existing connection was forcibly closed by the remote host. (EOF)")
+	require.Equal(t, wsExitReset, classifyWSReaderExitErr(resetWithEOF),
+		"reset must take precedence over EOF — hard teardown is more informative than orderly close")
+
+	// local_close wins over io_timeout.
+	closeWithTimeout := testErr("read tcp 10.0.0.1:443: use of closed network connection (i/o timeout)")
+	require.Equal(t, wsExitLocalClose, classifyWSReaderExitErr(closeWithTimeout),
+		"local_close must take precedence over io_timeout — our own Close() bug must surface")
+}
+
+// TestWSReaderExitKind_String pins the label strings — they double as
+// Prometheus kind= values. A typo here would silently rename the
+// dashboard bucket and break alerting queries.
+func TestWSReaderExitKind_String(t *testing.T) {
+	require.Equal(t, "peer_eof", wsExitPeerEOF.String())
+	require.Equal(t, "reset", wsExitReset.String())
+	require.Equal(t, "io_timeout", wsExitIOTimeout.String())
+	require.Equal(t, "local_close", wsExitLocalClose.String())
+	require.Equal(t, "other", wsExitOther.String())
+}
+
+// testErr is a small helper for constructing error values from string
+// literals without pulling in errors.New everywhere in this file.
+type testErr string
+
+func (e testErr) Error() string { return string(e) }

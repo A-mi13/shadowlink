@@ -108,7 +108,7 @@ func TestUnauthenticatedGETReturnsDecoy(t *testing.T) {
 
 	assert.Equal(t, 200, w.Code)
 	assert.Contains(t, w.Body.String(), "under construction")
-	assert.Equal(t, "nginx/1.27.3", w.Header().Get("Server"))
+	assert.Equal(t, "", w.Header().Get("Server"), "Server header must be empty (CF sets its own)")
 }
 
 func TestUnauthenticatedPOSTNonJSONReturnsDecoy(t *testing.T) {
@@ -749,4 +749,61 @@ func TestFindSessionByHint_O1Lookup(t *testing.T) {
 	copy(corruptToken, tokenWithHint)
 	corruptToken[len(corruptToken)-1] ^= 0xFF
 	require.Nil(t, h.findSessionByHint(corruptToken), "bad token tag must not match")
+}
+
+// TestServeHTTP_NoServerHeader guards that the handler emits no Server header
+// on any response path. Behind CF orange cloud CF replaces Server with
+// "cloudflare"; in direct-IP fallback, emitting "nginx/1.27.3" (Nov 2024
+// release) on May 2026 is a version-anachronism fingerprint.
+func TestServeHTTP_NoServerHeader(t *testing.T) {
+	h, _ := setupTestHandler(t)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/", nil)
+	h.ServeHTTP(w, r)
+
+	assert.Equal(t, "", w.Header().Get("Server"),
+		"Server header must be empty — CF sets its own; emitting nginx/1.27.3 is a fingerprint")
+}
+
+// TestHandleHandshakeNew_SetsAttachedAt_PreventsOrphanCleanup verifies the
+// 2026-05-18 semantic revision: AttachedAt is set at handshake response
+// flush, not at WS first-frame. This means a session whose owner never
+// completes the subsequent WS upgrade (e.g. because the WS-upgrade rate-
+// limit gate rejected it) survives the orphan cleanup window — it falls
+// under the regular idle timeout instead. Pre-fix metric: 351 orphan
+// evictions in a 5-min field test, ~all races, no actual abandons.
+func TestHandleHandshakeNew_SetsAttachedAt_PreventsOrphanCleanup(t *testing.T) {
+	h, serverKey := setupTestHandler(t)
+	ch, _, err := core.NewClientHello([]byte("user-attached-uu"), serverKey.Public)
+	require.NoError(t, err)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/analytics", nil)
+	h.handleHandshakeNew(rec, req, ch.EphemeralPub, ch.EncryptedClientID)
+	require.Equal(t, 200, rec.Code, "handshake must succeed")
+
+	// Exactly one session must exist now.
+	require.Equal(t, 1, h.sessions.Count(), "one session created")
+
+	// Pull the session and verify AttachedAt is non-zero — the cleanup
+	// loop's Phase 1 filter (AttachedAt.Load() != 0 → skip) hinges on this.
+	var sess *core.Session
+	h.sessions.ForEach(func(s *core.Session) bool {
+		sess = s
+		return false
+	})
+	require.NotNil(t, sess, "session must be retrievable from manager")
+	require.NotZero(t, sess.AttachedAt.Load(),
+		"AttachedAt must be set at handshake response flush, "+
+			"so a subsequent WS-upgrade reject does not orphan the session")
+
+	// Drive orphan cleanup far past the grace window — the session must
+	// NOT be evicted because AttachedAt!=0.
+	evicted := h.sessions.CleanupNewbornOrphans(
+		time.Now().Add(1*time.Hour), 30*time.Second)
+	require.Empty(t, evicted,
+		"handshake-attached session must NOT be evicted by orphan cleanup, "+
+			"even an hour past the grace window")
+	require.Equal(t, 1, h.sessions.Count(), "session still present after cleanup")
 }

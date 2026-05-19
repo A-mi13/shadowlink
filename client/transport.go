@@ -179,6 +179,11 @@ func newDirectTransportFull(serverAddr string, useTLS bool, skipVerify bool, ech
 
 func (t *DirectTransport) Name() string { return "direct" }
 
+// ConnManager returns the underlying ConnManager (for DomainPool wire-up by
+// the engine and for testability). May be nil for transports constructed in
+// degenerate states; callers MUST nil-check.
+func (t *DirectTransport) ConnManager() *ConnManager { return t.connManager }
+
 func (t *DirectTransport) Close() error {
 	select {
 	case <-t.stopCover:
@@ -740,6 +745,10 @@ func NewCDNTransportWithECH(cdnDomain string, echEnabled bool) *CDNTransport {
 
 func (t *CDNTransport) Name() string { return "cdn" }
 func (t *CDNTransport) Close() error { return t.direct.Close() }
+
+// ConnManager proxies to the wrapped DirectTransport so callers can install a
+// DomainPool on the underlying ConnManager.
+func (t *CDNTransport) ConnManager() *ConnManager { return t.direct.ConnManager() }
 
 func (t *CDNTransport) SendHandshake(ctx context.Context, hello *core.ClientHello) ([]byte, error) {
 	return t.direct.SendHandshake(ctx, hello)

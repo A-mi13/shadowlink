@@ -127,7 +127,7 @@ func buildUTLSDialTLS(
 		if usePQ {
 			switch {
 			case pqApplied:
-				Stats.PQHandshakeSuccess.Add(1)
+				Stats.PQClientHelloSent.Add(1)
 			case pqFellBack:
 				Stats.PQHandshakeFallback.Add(1)
 			}

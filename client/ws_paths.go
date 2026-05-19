@@ -24,8 +24,12 @@ var wsURLPool = []string{
 	"/api/v1/socket",
 	"/api/v2/collect/stream",
 	"/realtime/v1/connect",
-	"/_next/webpack-hmr",
-	"/track/realtime",
+	// Wave 2.1 (2026-05-17): /_next/webpack-hmr and /track/realtime retired
+	// from the active client pool. They remain accepted by the server-side
+	// IsAllowedWSPath whitelist via legacyAcceptedWSPaths so already-installed
+	// clients that hashed to one of those paths keep working until the cutoff
+	// decision (Metrics.WSPathLegacyHits-driven). New clients never pick them
+	// from this pool.
 	"/live/v1/events",
 	"/api/v2/notifications/stream",
 	"/_ws/sync",

@@ -452,7 +452,6 @@ func (h *LiveBlogHandler) writeCached(w http.ResponseWriter, entry *cachedPage) 
 	hdr := w.Header()
 	hdr.Set("Content-Type", entry.contentType)
 	hdr.Set("Cache-Control", "public, max-age=300")
-	hdr.Set("Server", "nginx/1.27.3")
 	hdr.Set("X-Content-Type-Options", "nosniff")
 	hdr.Set("X-Frame-Options", "SAMEORIGIN")
 	hdr.Set("Referrer-Policy", "strict-origin-when-cross-origin")
@@ -544,7 +543,6 @@ func (h *LiveBlogHandler) writeCachedCDN(w http.ResponseWriter, entry *cachedPag
 		hdr.Set("Content-Type", entry.contentType)
 	}
 	hdr.Set("Cache-Control", "public, max-age=86400")
-	hdr.Set("Server", "nginx/1.27.3")
 	hdr.Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(entry.status)
 	w.Write(entry.body)
@@ -644,7 +642,6 @@ func (h *LiveBlogHandler) fetchUpstream(rawURL string, maxBody int) ([]byte, str
 // (body + headers). Used for /_cdn/* fail/limit paths to fix body-signature
 // oracle (C3 from T1.3 code review 2026-04-23).
 func (h *LiveBlogHandler) writeNginxLike404(w http.ResponseWriter) {
-	w.Header().Set("Server", "nginx/1.27.3")
 	w.Header().Set("Content-Type", "text/html")
 	w.Header().Set("Content-Length", strconv.Itoa(len(nginxLike404Body)))
 	w.WriteHeader(http.StatusNotFound)

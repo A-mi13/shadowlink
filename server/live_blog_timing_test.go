@@ -86,8 +86,9 @@ func TestServeFallback_PlaceholderRequest(t *testing.T) {
 
 // TestServeCDN_404BodyMatchesFixture verifies C3 fix: the 404 body matches
 // nginx's default 404 page byte-for-byte (146 bytes, CRLF-encoded, no
-// version string), and the Server header is "nginx/1.27.3" consistent with
-// writeCached/writeCachedCDN success paths.
+// version string). Server header must be absent — behind CF it becomes
+// "cloudflare"; in direct-IP fallback emitting "nginx/1.27.3" (Nov 2024)
+// on May 2026 is a version-anachronism fingerprint.
 func TestServeCDN_404BodyMatchesFixture(t *testing.T) {
 	h := newTestLiveBlogHandlerWithJitter(t, nil)
 	w := httptest.NewRecorder()
@@ -95,8 +96,8 @@ func TestServeCDN_404BodyMatchesFixture(t *testing.T) {
 	if w.Code != http.StatusNotFound {
 		t.Errorf("status %d, want 404", w.Code)
 	}
-	if got := w.Header().Get("Server"); got != "nginx/1.27.3" {
-		t.Errorf("Server header %q, want nginx/1.27.3", got)
+	if got := w.Header().Get("Server"); got != "" {
+		t.Errorf("Server header %q, want empty (CF sets its own)", got)
 	}
 	if !bytes.Equal(w.Body.Bytes(), nginxLike404Body) {
 		t.Errorf("body mismatch:\ngot:  %q\nwant: %q", w.Body.String(), string(nginxLike404Body))

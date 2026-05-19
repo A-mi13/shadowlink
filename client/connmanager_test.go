@@ -226,6 +226,43 @@ func TestConnManagerSetDomainPool_MarkFailedOnError(t *testing.T) {
 	assert.NotEqual(t, sni, next, "Pick after MarkFailed should return a different domain")
 }
 
+// TestConnManager_DomainPoolSize_Empty — accessor returns 0 when no pool
+// installed (covers the nil-pool branch in DomainPoolSize).
+func TestConnManager_DomainPoolSize_Empty(t *testing.T) {
+	fpPool := browser.NewFingerprintPool()
+	cm := NewConnManager(ConnManagerConfig{
+		ServerAddr:  "127.0.0.1:1234",
+		UseTLS:      false,
+		FPPool:      fpPool,
+		MinRotation: 0,
+	})
+	defer cm.Close()
+
+	if cm.DomainPoolSize() != 0 {
+		t.Errorf("empty cm should have DomainPoolSize 0, got %d", cm.DomainPoolSize())
+	}
+}
+
+// TestConnManager_DomainPoolSize_AfterSet — accessor reflects pool size after
+// SetDomainPool. Drives the engine wire-up assertion (engine installs a pool
+// from cfg.CDNs and downstream tests can verify length).
+func TestConnManager_DomainPoolSize_AfterSet(t *testing.T) {
+	fpPool := browser.NewFingerprintPool()
+	cm := NewConnManager(ConnManagerConfig{
+		ServerAddr:  "127.0.0.1:1234",
+		UseTLS:      false,
+		FPPool:      fpPool,
+		MinRotation: 0,
+	})
+	defer cm.Close()
+
+	pool := NewDomainPool([]string{"a.com", "b.com", "c.com"}, time.Minute)
+	cm.SetDomainPool(pool)
+	if cm.DomainPoolSize() != 3 {
+		t.Errorf("after SetDomainPool with 3 entries, got %d", cm.DomainPoolSize())
+	}
+}
+
 // TestProfileForFingerprint_AlwaysReturnsLockedChrome closes the 2026-05-02
 // wire-trigger followup F2 (Chrome major lockstep): the bogdanfinn hot-path
 // MUST return browser.LockedBogdanfinnChromeProfile() (Chrome_133) for the
