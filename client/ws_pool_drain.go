@@ -9,14 +9,30 @@ const (
 	drainRevertBackoff = 30 * time.Second
 )
 
-// findFreeReserveSlot returns the first nil cell in reserve range
-// [poolSize, 2*poolSize), or -1 if all reserve cells are occupied.
-// Lock-free read of the slice; reserve cells are written exclusively
-// by startDrain/connectReserveSlot under the implicit serialization
-// that only one drain can start per primary idx (tryMarkDraining CAS).
-func (p *WSPoolTransport) findFreeReserveSlot() int {
+// claimFreeReserveSlot atomically reserves the first nil cell in the
+// reserve range [poolSize, 2*poolSize) by installing a placeholder
+// poolSlot in slotConnecting state and returning its index. Returns
+// -1 if all reserve cells are occupied.
+//
+// Under p.reserveMu so concurrent startDrain calls on different
+// primary slots cannot pick the same newIdx. The critical section is
+// tiny (linear scan + 2 atomic-equivalent writes); contention is
+// bounded by the storm brake to at most 1-2 simultaneous drains per
+// poolSize.
+//
+// connectSlot (invoked later in connectReserveSlot) unconditionally
+// constructs a fresh *poolSlot and assigns to p.slots[idx], so the
+// placeholder installed here is replaced — its sole purpose is to
+// reserve the cell across the tiny concurrent window between two
+// concurrent startDrain invocations.
+func (p *WSPoolTransport) claimFreeReserveSlot() int {
+	p.reserveMu.Lock()
+	defer p.reserveMu.Unlock()
 	for i := p.poolSize; i < len(p.slots); i++ {
 		if p.slots[i] == nil {
+			slot := &poolSlot{}
+			slot.setState(slotConnecting)
+			p.slots[i] = slot
 			return i
 		}
 	}
@@ -35,8 +51,9 @@ func (p *WSPoolTransport) findFreeReserveSlot() int {
 //     about to transition doesn't inflate the non-ready count itself.
 //  5. tryMarkDraining CAS → false on race loss (another drain or natural
 //     failure beat us); no-op.
-//  6. findFreeReserveSlot → -1 means all reserve cells occupied; revert
-//     state + set backoff.
+//  6. claimFreeReserveSlot → -1 means all reserve cells occupied; revert
+//     state + set backoff. On success, the reserve cell is already
+//     atomically claimed with a placeholder *poolSlot in slotConnecting.
 //  7. Success: spawn connectReserveSlot + drainWatchdog goroutines.
 //
 // Reason: "age", "byte_budget", or "anti_fingerprint". Propagated to
@@ -69,7 +86,12 @@ func (p *WSPoolTransport) startDrain(cl *Client, oldIdx int, reason string) {
 		return
 	}
 
-	newIdx := p.findFreeReserveSlot()
+	// Atomic find-and-claim under p.reserveMu — a concurrent startDrain
+	// on another primary slot cannot pick the same newIdx because the
+	// placeholder is installed inside the critical section. connectSlot
+	// will overwrite this placeholder with its own freshly-constructed
+	// *poolSlot.
+	newIdx := p.claimFreeReserveSlot()
 	if newIdx < 0 {
 		p.log.Warn("WS pool drain skipped — no free reserve cell",
 			"slot", oldIdx, "reason", reason)
@@ -96,13 +118,6 @@ func (p *WSPoolTransport) startDrain(cl *Client, oldIdx int, reason string) {
 		"hard_cap", p.drainHardCap,
 	)
 
-	// Claim the reserve cell IMMEDIATELY (before goroutine spawn) so a
-	// concurrent startDrain on another primary slot cannot pick the
-	// same newIdx via findFreeReserveSlot. connectSlot will overwrite
-	// this placeholder with its own freshly-constructed *poolSlot.
-	p.slots[newIdx] = &poolSlot{}
-	p.slots[newIdx].setState(slotConnecting)
-
 	go p.connectReserveSlot(cl, newIdx, oldIdx)
 	go p.drainWatchdog(cl, oldIdx, oldSlot, drainStart, reason)
 }
@@ -113,10 +128,10 @@ func (p *WSPoolTransport) startDrain(cl *Client, oldIdx int, reason string) {
 // asynchronously; the drainWatchdog tears down oldIdx on its own
 // schedule regardless.
 //
-// Note: the reserve cell at newIdx has already been claimed with a
-// placeholder *poolSlot in slotConnecting state by startDrain (under
-// the synchronous portion of the call) — connectSlot will overwrite
-// that placeholder with its own freshly-constructed slot.
+// Note: the reserve cell at newIdx has already been atomically claimed
+// with a placeholder *poolSlot in slotConnecting state by
+// claimFreeReserveSlot — connectSlot will overwrite that placeholder
+// with its own freshly-constructed slot.
 func (p *WSPoolTransport) connectReserveSlot(cl *Client, newIdx, oldIdx int) {
 	if newIdx < 0 || newIdx >= len(p.slots) {
 		return

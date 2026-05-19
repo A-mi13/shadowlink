@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 )
@@ -371,29 +372,75 @@ func TestStartDrain_NoFreeReserveSlot(t *testing.T) {
 	t.Skip("Brake engages before no-free-reserve branch is reached in this layout; covered by Task 13 integration test")
 }
 
-// TestFindFreeReserveSlot_PrefersFirstNil returns the first nil cell
-// in the reserve range. With no reserve occupied, returns poolSize.
-// With first reserve filled, returns poolSize+1. Returns -1 only when
+// TestClaimFreeReserveSlot_PrefersFirstNil verifies the claim atomically
+// installs a placeholder in the first nil reserve cell. After claim,
+// the cell is non-nil and in slotConnecting state. Returns -1 only when
 // all reserve cells are non-nil.
-func TestFindFreeReserveSlot_PrefersFirstNil(t *testing.T) {
+func TestClaimFreeReserveSlot_PrefersFirstNil(t *testing.T) {
 	cl := &Client{}
 	p := NewWSPoolTransport(cl, WSPoolConfig{Size: 4, ServerAddr: "127.0.0.1:0"})
 	// p.slots has 8 cells; reserve range = [4, 8)
 
-	if got := p.findFreeReserveSlot(); got != 4 {
-		t.Errorf("with all reserve nil, findFreeReserveSlot = %d, want 4", got)
+	// First claim → idx 4 (first reserve cell)
+	if got := p.claimFreeReserveSlot(); got != 4 {
+		t.Errorf("first claim = %d, want 4", got)
+	}
+	if p.slots[4] == nil {
+		t.Error("claim did not install a placeholder at slots[4]")
+	}
+	if p.slots[4].getState() != slotConnecting {
+		t.Errorf("placeholder state = %v, want slotConnecting", p.slots[4].getState())
 	}
 
-	p.slots[4] = &poolSlot{}
-	if got := p.findFreeReserveSlot(); got != 5 {
-		t.Errorf("with reserve[4] filled, findFreeReserveSlot = %d, want 5", got)
+	// Second claim → idx 5 (next nil cell, since 4 is taken)
+	if got := p.claimFreeReserveSlot(); got != 5 {
+		t.Errorf("second claim = %d, want 5", got)
 	}
 
-	for i := 4; i < 8; i++ {
-		p.slots[i] = &poolSlot{}
+	// Fill remaining
+	if got := p.claimFreeReserveSlot(); got != 6 {
+		t.Errorf("third claim = %d, want 6", got)
 	}
-	if got := p.findFreeReserveSlot(); got != -1 {
-		t.Errorf("with all reserve filled, findFreeReserveSlot = %d, want -1", got)
+	if got := p.claimFreeReserveSlot(); got != 7 {
+		t.Errorf("fourth claim = %d, want 7", got)
+	}
+
+	// All reserve full → -1
+	if got := p.claimFreeReserveSlot(); got != -1 {
+		t.Errorf("claim with all reserve full = %d, want -1", got)
+	}
+}
+
+// TestClaimFreeReserveSlot_ConcurrentNoCollision exercises the mutex by
+// running many concurrent claims and verifying each gets a unique idx.
+// Without the mutex, two goroutines could pick the same idx.
+func TestClaimFreeReserveSlot_ConcurrentNoCollision(t *testing.T) {
+	cl := &Client{}
+	p := NewWSPoolTransport(cl, WSPoolConfig{Size: 8, ServerAddr: "127.0.0.1:0"})
+
+	const N = 8 // poolSize, so we expect 8 unique reserve indices
+	var wg sync.WaitGroup
+	results := make([]int, N)
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func(i int) {
+			defer wg.Done()
+			results[i] = p.claimFreeReserveSlot()
+		}(i)
+	}
+	wg.Wait()
+
+	// All results should be distinct and in range [8, 16) — the reserve
+	// range for poolSize=8.
+	seen := make(map[int]bool)
+	for _, idx := range results {
+		if idx < 8 || idx >= 16 {
+			t.Errorf("claim returned %d, want in [8, 16)", idx)
+		}
+		if seen[idx] {
+			t.Errorf("idx %d returned by two concurrent claims — race!", idx)
+		}
+		seen[idx] = true
 	}
 }
 

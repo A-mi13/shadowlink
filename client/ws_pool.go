@@ -168,7 +168,7 @@ const (
 	// counter (it is not a network failure) and MUST NOT spawn reconnectLoop
 	// on this idx (reserve slot owns the capacity in a different cell). The
 	// dispatcher additionally sets p.slots[idx] = nil to free the cell for
-	// future reserve reuse via findFreeReserveSlot.
+	// future reserve reuse via claimFreeReserveSlot.
 	deathCauseDrainTeardown
 )
 
@@ -817,6 +817,14 @@ type WSPoolTransport struct {
 	// forced teardown. Only consulted when gracefulDrain is true. Default
 	// 90s (Envoy Gateway recommendation). Tune via SHADOWLINK_DRAIN_HARD_CAP.
 	drainHardCap time.Duration
+
+	// reserveMu serializes the find-and-claim of reserve cells in
+	// startDrain. Without it, two concurrent startDrain calls on
+	// different primary slots can both call findFreeReserveSlot, both
+	// observe the same nil cell, and both write their placeholder,
+	// causing one to be silently clobbered. The critical section is
+	// just the (find ∩ claim) pair — atomic with respect to itself.
+	reserveMu sync.Mutex
 
 	streamMap sync.Map // map[uint16]int — streamID -> slot index
 
@@ -2435,7 +2443,7 @@ func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int, cause slotDeathCa
 		// already carries this capacity. Reconnecting THIS idx would be
 		// capacity duplication. Do NOT advance meltdown (not a failure)
 		// and do NOT spawn reconnectLoop. Free the cell so future
-		// reserve targets can pick it via findFreeReserveSlot.
+		// reserve targets can pick it via claimFreeReserveSlot.
 		p.slots[idx] = nil
 	}
 }
