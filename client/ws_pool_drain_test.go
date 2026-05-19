@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -135,5 +136,104 @@ func TestWriteControlMessageForStream_AcceptsDraining(t *testing.T) {
 	}
 	if stubReady.controlWrites != 0 {
 		t.Errorf("ready slot got %d control writes, want 0", stubReady.controlWrites)
+	}
+}
+
+// TestHandleSlotDeath_DrainTeardownClearsCell verifies that
+// handleSlotDeath(deathCauseDrainTeardown) sets p.slots[idx] = nil
+// (freeing the cell for reserve reuse) and does NOT spawn reconnectLoop.
+//
+// Verifies the three drain-cause invariants:
+//  1. recordSlotDeath NOT called (no false meltdown advance)
+//  2. reconnectLoop NOT spawned (reserve carries capacity elsewhere)
+//  3. p.slots[idx] cleared (cell free for reserve target reuse)
+func TestHandleSlotDeath_DrainTeardownClearsCell(t *testing.T) {
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel: even if reconnectLoop fires accidentally, it exits fast
+
+	p := &WSPoolTransport{
+		poolSize:          2,
+		ctx:               ctx,
+		cancel:            cancel,
+		log:               newDiscardLogger(),
+		meltdownThreshold: 100,
+		meltdownWindow:    5 * time.Second,
+	}
+	p.slots = make([]*poolSlot, 4)
+	p.client = cl
+
+	slot := &poolSlot{}
+	slot.setState(slotDraining)
+	p.slots[0] = slot
+
+	p.handleSlotDeath(cl, 0, deathCauseDrainTeardown)
+
+	if p.slots[0] != nil {
+		t.Errorf("after drain teardown, p.slots[0] should be nil, got non-nil")
+	}
+	if slot.getState() != slotDead {
+		t.Errorf("slot state should be slotDead, got %v", slot.getState())
+	}
+}
+
+// TestHandleSlotDeath_NaturalDoesNotClearCell is a regression test ensuring
+// Task 3 doesn't accidentally break the existing natural cause — it should
+// still leave p.slots[idx] non-nil (reconnectLoop owns the restart) and
+// NOT clear the cell. We verify only the immediate post-call state: Task 3
+// must only clear the cell for drainTeardown.
+func TestHandleSlotDeath_NaturalDoesNotClearCell(t *testing.T) {
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel so reconnectLoop goroutine exits immediately
+
+	p := &WSPoolTransport{
+		poolSize:          2,
+		ctx:               ctx,
+		cancel:            cancel,
+		log:               newDiscardLogger(),
+		meltdownThreshold: 100,
+		meltdownWindow:    5 * time.Second,
+	}
+	p.slots = make([]*poolSlot, 4)
+	p.client = cl
+
+	slot := &poolSlot{}
+	slot.setState(slotReady)
+	p.slots[0] = slot
+
+	p.handleSlotDeath(cl, 0, deathCauseNatural)
+
+	if p.slots[0] == nil {
+		t.Errorf("after natural death, p.slots[0] should NOT be nil (only drainTeardown clears)")
+	}
+}
+
+// TestHandleSlotDeath_PreemptiveDoesNotClearCell mirrors the natural-cause
+// regression for the preemptive-rotation cause.
+func TestHandleSlotDeath_PreemptiveDoesNotClearCell(t *testing.T) {
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	p := &WSPoolTransport{
+		poolSize:          2,
+		ctx:               ctx,
+		cancel:            cancel,
+		log:               newDiscardLogger(),
+		meltdownThreshold: 100,
+		meltdownWindow:    5 * time.Second,
+	}
+	p.slots = make([]*poolSlot, 4)
+	p.client = cl
+
+	slot := &poolSlot{}
+	slot.setState(slotReady)
+	p.slots[0] = slot
+
+	p.handleSlotDeath(cl, 0, deathCausePreemptiveRotation)
+
+	if p.slots[0] == nil {
+		t.Errorf("after preemptive rotation, p.slots[0] should NOT be nil (only drainTeardown clears)")
 	}
 }

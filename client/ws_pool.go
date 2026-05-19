@@ -162,6 +162,14 @@ type slotDeathCause int
 const (
 	deathCauseNatural slotDeathCause = iota
 	deathCausePreemptiveRotation
+	// deathCauseDrainTeardown — graceful drain finished (or hard cap fired)
+	// and the slot is being torn down by US after a reserve replacement
+	// already carried its capacity. This cause MUST NOT advance the meltdown
+	// counter (it is not a network failure) and MUST NOT spawn reconnectLoop
+	// on this idx (reserve slot owns the capacity in a different cell). The
+	// dispatcher additionally sets p.slots[idx] = nil to free the cell for
+	// future reserve reuse via findFreeReserveSlot.
+	deathCauseDrainTeardown
 )
 
 func (c slotDeathCause) String() string {
@@ -170,6 +178,8 @@ func (c slotDeathCause) String() string {
 		return "natural"
 	case deathCausePreemptiveRotation:
 		return "preemptive_rotation"
+	case deathCauseDrainTeardown:
+		return "drain_teardown"
 	default:
 		return "unknown"
 	}
@@ -2346,17 +2356,28 @@ func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int, cause slotDeathCa
 		slot.transport.Close()
 	}
 
-	// Record death for meltdown detection ONLY for natural failures. A
-	// preemptive rotation is OUR action, not a network signal — counting it
-	// would falsely trip the meltdown threshold under steady-state rotation
-	// load (field log 2026-05-18: 6 staggered rotations in 15s window =
-	// false meltdown). The reconnect loop kicks off regardless, so the slot
-	// still comes back online via reconnectLoop.
-	if cause == deathCauseNatural {
+	// Post-cleanup dispatch by cause. See slotDeathCause doc-comment for the
+	// rationale behind each branch.
+	switch cause {
+	case deathCauseNatural:
+		// Real network failure — feed meltdown detector and reconnect the
+		// same idx (reader observed the death, no replacement exists).
 		p.recordSlotDeath()
+		go p.reconnectLoop(idx)
+	case deathCausePreemptiveRotation:
+		// OUR rotation — do NOT advance meltdown (would falsely trip under
+		// steady-state rotation load, see field log 2026-05-18), but DO
+		// reconnect the same idx (legacy semantics: rotation tears one
+		// slot down and brings the same idx back up).
+		go p.reconnectLoop(idx)
+	case deathCauseDrainTeardown:
+		// Graceful drain finished — a reserve slot in a DIFFERENT cell
+		// already carries this capacity. Reconnecting THIS idx would be
+		// capacity duplication. Do NOT advance meltdown (not a failure)
+		// and do NOT spawn reconnectLoop. Free the cell so future
+		// reserve targets can pick it via findFreeReserveSlot.
+		p.slots[idx] = nil
 	}
-
-	go p.reconnectLoop(idx)
 }
 
 // Close shuts down all slots.
