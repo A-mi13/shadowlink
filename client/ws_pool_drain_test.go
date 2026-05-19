@@ -3,6 +3,8 @@ package client
 import (
 	"context"
 	"errors"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1042,5 +1044,48 @@ func TestStartDrain_StormBrakeTwoConcurrentEngages(t *testing.T) {
 	}
 	if p.slots[2].nextDrainAttemptNs.Load() == 0 {
 		t.Error("nextDrainAttemptNs not set after brake-deferred drain")
+	}
+}
+
+// TestByteBudgetDrain_ReaderContinues verifies the C1 fix: after
+// startDrain fires from the byte_budget branch in slotReaderWithClient,
+// the reader does NOT exit. It continues reading downlink frames so
+// active streams keep getting payload bytes until the drainWatchdog
+// bumps the slot generation and handleSlotDeath closes the transport.
+//
+// Without this fix, the reader exit caused up to 90s (drainHardCap) of
+// downlink starvation for any stream still alive on the draining slot
+// — exactly the regression Phase 1 graceful drain is meant to avoid.
+//
+// This is a source-inspection-grade test: it reads ws_pool.go and
+// verifies the byte_budget branch does NOT immediately `return` after
+// `startDrain(cl, idx, "byte_budget")`. Driving a real reader against
+// a mocked transport would require substantial scaffolding for what is
+// fundamentally a static control-flow invariant — Opus C1 review
+// targets a specific source pattern; we pin the pattern here.
+func TestByteBudgetDrain_ReaderContinues(t *testing.T) {
+	src, err := os.ReadFile("ws_pool.go")
+	if err != nil {
+		t.Fatalf("read ws_pool.go: %v", err)
+	}
+	srcStr := string(src)
+	idx := strings.Index(srcStr, `startDrain(cl, idx, "byte_budget")`)
+	if idx < 0 {
+		t.Fatal("byte_budget startDrain call not found in ws_pool.go — code shape changed")
+	}
+	// The bug pattern: a bare `return` on its own line shortly after
+	// the startDrain call. Inspect the next 200 chars.
+	tailEnd := idx + 200
+	if tailEnd > len(srcStr) {
+		tailEnd = len(srcStr)
+	}
+	tail := srcStr[idx:tailEnd]
+	if strings.Contains(tail, "\n\t\t\t\treturn\n") || strings.Contains(tail, "\n\t\t\t\t\treturn\n") {
+		t.Errorf("byte_budget startDrain branch contains immediate `return` — this causes downlink starvation (Opus review C1). tail=%q", tail)
+	}
+	// Positive assertion: the branch should continue (loop back to read)
+	// — either via `continue` or by falling through.
+	if !strings.Contains(tail, "continue") {
+		t.Errorf("byte_budget branch should `continue` after startDrain to keep reading downlink; tail=%q", tail)
 	}
 }

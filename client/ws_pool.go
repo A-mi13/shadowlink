@@ -2248,13 +2248,21 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 			if total >= budget {
 				if p.gracefulDrain {
 					// Graceful path: startDrain transitions the slot to
-					// slotDraining, spawns parallel reserve reconnect, and the
-					// drainWatchdog tears down on natural finish / hard cap.
-					// The reader must exit so the watchdog can manage the
-					// slot's lifecycle (legacy maybeRotateSlot would do the
-					// teardown inline; under graceful drain we hand it off).
+					// slotDraining and spawns parallel reserve reconnect.
+					// The reader MUST keep reading downlink frames — exiting
+					// here would starve active streams on this slot for up
+					// to drainHardCap (90s) until the drainWatchdog tears
+					// down the transport. The watchdog bumps the slot
+					// generation before handleSlotDeath; this reader then
+					// exits cleanly via shouldExitReader (gen mismatch) or
+					// a read error from the closed conn.
+					//
+					// startDrain is idempotent via tryMarkDraining CAS, but
+					// resetting downBytes to 0 avoids triggering startDrain
+					// on every subsequent read (log spam) until teardown.
 					p.startDrain(cl, idx, "byte_budget")
-					return
+					slot.downBytes.Store(0)
+					continue
 				}
 				if p.maybeRotateSlot(cl, idx, slot, "byte_budget", msgCount, slotStart, total) {
 					return
