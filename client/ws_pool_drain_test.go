@@ -898,3 +898,149 @@ func TestUnifiedRotation_AntiFPTickerUsesStartDrain(t *testing.T) {
 		t.Errorf("higher-loaded slot0 should be untouched, got %v", got)
 	}
 }
+
+// TestAssignStream_SkipsDraining is a regression test for the existing
+// invariant that AssignStream filters strictly on slotReady. After the
+// graceful drain refactor introduces slotDraining as a quasi-live
+// state, AssignStream must continue to exclude draining slots (new
+// streams go to slotReady slots only — primary or reserve).
+func TestAssignStream_SkipsDraining(t *testing.T) {
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size:              2,
+		ServerAddr:        "127.0.0.1:0",
+		MaxStreamsPerSlot: 100,
+		GracefulDrain:     true,
+		DrainHardCap:      5 * time.Second,
+	})
+	p.ctx = t.Context()
+
+	// slot 0 draining (must not receive new streams)
+	s0 := &poolSlot{}
+	s0.setState(slotDraining)
+	p.slots[0] = s0
+
+	// slot 1 ready (should receive all new streams)
+	s1 := &poolSlot{}
+	s1.setState(slotReady)
+	p.slots[1] = s1
+
+	for sid := uint16(100); sid < 110; sid++ {
+		p.AssignStream(sid)
+	}
+
+	if got := s0.streams.Load(); got != 0 {
+		t.Errorf("draining slot got %d streams, want 0", got)
+	}
+	if got := s1.streams.Load(); got != 10 {
+		t.Errorf("ready slot got %d streams, want 10", got)
+	}
+}
+
+// TestStartDrain_StormBrakeSingleDrain verifies that ONE drain in flight
+// does NOT engage the storm brake. The parallel reserve connecting cell
+// is exempted from non-ready count via the matching-slotDraining-primary
+// check in countNonReadySlots.
+//
+// Scenario: poolSize=8, primary[0] in slotDraining, reserve[8] in
+// slotConnecting (parallel replacement), primary[1..7] in slotReady,
+// reserve[9..15] nil.
+// countNonReadySlots = 1 (just the draining primary).
+// rotationStormBrakeThreshold = ceil(8 * 0.25) = 2.
+// 1 < 2 → brake disengaged.
+func TestStartDrain_StormBrakeSingleDrain(t *testing.T) {
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size:          8,
+		ServerAddr:    "127.0.0.1:0",
+		GracefulDrain: true,
+		DrainHardCap:  5 * time.Second,
+	})
+	p.ctx = t.Context()
+
+	primary0 := &poolSlot{}
+	primary0.setState(slotDraining)
+	p.slots[0] = primary0
+
+	reserve0 := &poolSlot{}
+	reserve0.setState(slotConnecting)
+	p.slots[8] = reserve0 // parallel replacement for primary[0]
+
+	for i := 1; i < 8; i++ {
+		s := &poolSlot{}
+		s.setState(slotReady)
+		p.slots[i] = s
+	}
+
+	got := p.countNonReadySlots()
+	if got != 1 {
+		t.Errorf("countNonReadySlots = %d, want 1 (reserve connecting is parallel replacement)", got)
+	}
+	threshold := p.rotationStormBrakeThreshold()
+	if threshold != 2 {
+		t.Errorf("threshold = %d, want 2", threshold)
+	}
+	if got >= threshold {
+		t.Error("brake engaged on single drain; should be disengaged")
+	}
+}
+
+// TestStartDrain_StormBrakeTwoConcurrentEngages verifies that 2 concurrent
+// drains DO engage the storm brake (count = 2 = threshold for poolSize=8),
+// and that a third drain attempt is deferred with backoff set.
+func TestStartDrain_StormBrakeTwoConcurrentEngages(t *testing.T) {
+	cl := &Client{
+		streamChans: make(map[uint16]chan []byte),
+		transport:   failingHandshakeTransport{},
+		serverPub:   make([]byte, 32),
+		clientID:    []byte("test-client-id"),
+	}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size:          8,
+		ServerAddr:    "127.0.0.1:1",
+		GracefulDrain: true,
+		DrainHardCap:  5 * time.Second,
+	})
+	p.ctx = t.Context()
+	p.client = cl
+
+	// 2 primary draining + 2 matching reserves connecting
+	for i := 0; i < 2; i++ {
+		ps := &poolSlot{}
+		ps.setState(slotDraining)
+		p.slots[i] = ps
+		rs := &poolSlot{}
+		rs.setState(slotConnecting)
+		p.slots[i+8] = rs
+	}
+	// 6 ready primary
+	for i := 2; i < 8; i++ {
+		s := &poolSlot{}
+		s.setState(slotReady)
+		p.slots[i] = s
+	}
+
+	got := p.countNonReadySlots()
+	if got != 2 {
+		t.Errorf("countNonReadySlots = %d, want 2", got)
+	}
+	threshold := p.rotationStormBrakeThreshold()
+	if got < threshold {
+		t.Errorf("brake should engage: got=%d, threshold=%d", got, threshold)
+	}
+
+	// Third drain attempt on a ready primary — brake should defer it
+	beforeStarted := Stats.DrainStartedTotal.Load()
+	p.startDrain(cl, 2, "test")
+	afterStarted := Stats.DrainStartedTotal.Load()
+
+	if afterStarted != beforeStarted {
+		t.Errorf("third drain started despite brake; DrainStartedTotal %d→%d", beforeStarted, afterStarted)
+	}
+	if p.slots[2].getState() != slotReady {
+		t.Errorf("primary[2] state = %v, want slotReady (brake should defer)", p.slots[2].getState())
+	}
+	if p.slots[2].nextDrainAttemptNs.Load() == 0 {
+		t.Error("nextDrainAttemptNs not set after brake-deferred drain")
+	}
+}
