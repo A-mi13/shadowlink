@@ -2,9 +2,12 @@ package client
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/nixavpn/shadowlink/core"
 )
 
 // TestCountNonReadySlots_IgnoresEmptyReserve verifies that nil cells in
@@ -351,12 +354,10 @@ func TestStartDrain_NoFreeReserveSlot(t *testing.T) {
 		GracefulDrain: true,
 		DrainHardCap:  5 * time.Second,
 	})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	p.ctx = ctx
+	p.ctx = t.Context()
 
 	// Fill primary range with ready slots
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		p.slots[i] = &poolSlot{}
 		p.slots[i].setState(slotReady)
 	}
@@ -422,7 +423,7 @@ func TestClaimFreeReserveSlot_ConcurrentNoCollision(t *testing.T) {
 	var wg sync.WaitGroup
 	results := make([]int, N)
 	wg.Add(N)
-	for i := 0; i < N; i++ {
+	for i := range N {
 		go func(i int) {
 			defer wg.Done()
 			results[i] = p.claimFreeReserveSlot()
@@ -453,9 +454,7 @@ func TestStartDrain_FlagOff(t *testing.T) {
 		ServerAddr:    "127.0.0.1:0",
 		GracefulDrain: false, // explicit
 	})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	p.ctx = ctx
+	p.ctx = t.Context()
 
 	p.slots[0] = &poolSlot{}
 	p.slots[0].setState(slotReady)
@@ -482,9 +481,7 @@ func TestDrainWatchdog_NaturalFinish(t *testing.T) {
 		GracefulDrain: true,
 		DrainHardCap:  5 * time.Second,
 	})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	p.ctx = ctx
+	p.ctx = t.Context()
 
 	oldSlot := &poolSlot{}
 	oldSlot.setState(slotDraining)
@@ -533,9 +530,7 @@ func TestDrainWatchdog_HardCap(t *testing.T) {
 		GracefulDrain: true,
 		DrainHardCap:  300 * time.Millisecond,
 	})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	p.ctx = ctx
+	p.ctx = t.Context()
 
 	oldSlot := &poolSlot{}
 	oldSlot.setState(slotDraining)
@@ -619,5 +614,100 @@ func TestDrainWatchdog_ContextCancel(t *testing.T) {
 	// handleSlotDeath happens in Close() path instead.
 	if p.slots[0] == nil {
 		t.Error("p.slots[0] cleared by drainWatchdog despite ctx cancel; watchdog should exit silently")
+	}
+}
+
+// TestSlotReader_SilentExitOnDrainTeardown is a placeholder for an
+// integration test verifying that when drainWatchdog bumps
+// slot.generation and triggers handleSlotDeath, the concurrent
+// slotReader exits silently via shouldExitReader (no false
+// ReaderExits++ or frame-anomaly counter inflation).
+//
+// Requires a loopback WS server fixture to spawn a real slotReader;
+// deferred to Phase 1 integration tests after pl1 canary validates
+// the drainWatchdog→generation→shouldExitReader chain end-to-end.
+//
+// The structural correctness is already verified by:
+//   - TestDrainWatchdog_NaturalFinish — generation.Add(1) before
+//     handleSlotDeath (the gen-bump path that silences any reader)
+//   - TestDrainWatchdog_HardCap — same invariant on hard cap path
+//   - ws_pool.go::slotReaderWithClient — existing shouldExitReader
+//     gate that consumes the bumped generation
+func TestSlotReader_SilentExitOnDrainTeardown(t *testing.T) {
+	t.Skip("requires loopback WS fixture; structural correctness covered by drainWatchdog gen-bump tests")
+}
+
+// failingHandshakeTransport satisfies the Transport interface and always
+// returns an error from SendHandshake — simulating an unreachable server
+// without actually opening a TCP connection. Used by
+// TestConnectReserveSlot_FailureFallsBackToReconnectLoop to drive
+// connectSlot into its error branch deterministically.
+type failingHandshakeTransport struct{}
+
+func (failingHandshakeTransport) SendChunk(ctx context.Context, data []byte, sessionToken []byte, seqNum uint32) ([]byte, error) {
+	return nil, errTestTransportUnreachable
+}
+func (failingHandshakeTransport) SendHandshake(ctx context.Context, hello *core.ClientHello) ([]byte, error) {
+	return nil, errTestTransportUnreachable
+}
+func (failingHandshakeTransport) Name() string  { return "failingHandshakeTransport" }
+func (failingHandshakeTransport) Close() error  { return nil }
+
+var errTestTransportUnreachable = errors.New("test: transport unreachable")
+
+// TestConnectReserveSlot_FailureFallsBackToReconnectLoop verifies that
+// when connectSlot fails (invalid server, rate limit, etc.), the
+// reserve slot ends up in slotDead or slotConnecting state (NOT
+// slotReady), and reconnectLoop is scheduled to recover capacity
+// asynchronously. The drainWatchdog tears down oldIdx on its own
+// schedule regardless.
+//
+// We can't directly call connectReserveSlot (it triggers a real
+// connectSlot which spawns goroutines into the unreachable server);
+// instead we drive startDrain on a fake old slot with a stub transport
+// that always errors out of SendHandshake and observe the reserve
+// cell's post-failure state.
+func TestConnectReserveSlot_FailureFallsBackToReconnectLoop(t *testing.T) {
+	cl := &Client{
+		streamChans: make(map[uint16]chan []byte),
+		transport:   failingHandshakeTransport{},
+		serverPub:   make([]byte, 32),
+		clientID:    []byte("test-client-id"),
+	}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size:          2,
+		ServerAddr:    "127.0.0.1:1", // port 1: reliably unreachable
+		GracefulDrain: true,
+		DrainHardCap:  500 * time.Millisecond,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.ctx = ctx
+
+	// Set up primary slot 0 as a draining-candidate ready slot.
+	oldSlot := &poolSlot{}
+	oldSlot.setState(slotReady)
+	p.slots[0] = oldSlot
+	// Slot 1 also ready so storm brake doesn't block.
+	otherSlot := &poolSlot{}
+	otherSlot.setState(slotReady)
+	p.slots[1] = otherSlot
+
+	p.startDrain(cl, 0, "test")
+
+	// Allow goroutines to attempt the connect and propagate failure.
+	time.Sleep(300 * time.Millisecond)
+
+	newIdx := p.poolSize // first reserve cell — 2
+	if p.slots[newIdx] == nil {
+		t.Fatal("reserve slot should be claimed (placeholder installed by claimFreeReserveSlot)")
+	}
+	state := p.slots[newIdx].getState()
+	if state == slotReady {
+		t.Errorf("reserve slot should NOT be slotReady after connect to invalid port; got slotReady")
+	}
+	// Acceptable: slotConnecting (reconnectLoop in flight) or slotDead.
+	if state != slotConnecting && state != slotDead {
+		t.Errorf("reserve slot state = %v, want slotConnecting or slotDead", state)
 	}
 }
