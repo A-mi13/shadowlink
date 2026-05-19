@@ -2459,11 +2459,26 @@ func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int, cause slotDeathCa
 	}
 	slot.lastDeathNs.Store(time.Now().UnixNano())
 
-	// Close all streams assigned to this slot
+	// Cause-dependent stream cleanup:
+	//
+	//   deathCauseNatural / deathCausePreemptiveRotation:
+	//     close(streamChans[id]) — upstream sees Go-channel EOF (legacy
+	//     abrupt-close semantics that callers expect).
+	//
+	//   deathCauseDrainTeardown:
+	//     Do NOT close streamChans. The transport.Close below causes any
+	//     in-flight stream reader on this slot to see a network-level EOF,
+	//     which propagates up to the SOCKS5 layer as a natural connection
+	//     close (HTTP/2 GOAWAY-style invariant from spec §3.4). We still
+	//     Delete from streamMap so the streamID can be reassigned to a
+	//     fresh stream on a different slot.
 	p.streamMap.Range(func(key, value any) bool {
-		if value.(int) == idx {
-			streamID := key.(uint16)
-			p.streamMap.Delete(streamID)
+		if value.(int) != idx {
+			return true
+		}
+		streamID := key.(uint16)
+		p.streamMap.Delete(streamID)
+		if cause != deathCauseDrainTeardown {
 			cl.streamMu.Lock()
 			if ch, ok := cl.streamChans[streamID]; ok {
 				close(ch)
@@ -2474,7 +2489,14 @@ func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int, cause slotDeathCa
 		return true
 	})
 
-	slot.streams.Store(0)
+	// streams.Store(0) is correct for natural + preemptive (we closed all
+	// streamChans above, so ReleaseStream from those streams becomes a
+	// no-op via the cancelled stream goroutines). For drainTeardown the
+	// active streams are still running and will call ReleaseStream as
+	// they finish — hard-zeroing here would underflow to -1.
+	if cause != deathCauseDrainTeardown {
+		slot.streams.Store(0)
+	}
 	slot.pendingConnects.Store(0) // Reset: pending CONNECTs from dead slot can't be decremented normally
 
 	if slot.transport != nil {

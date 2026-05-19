@@ -1089,3 +1089,136 @@ func TestByteBudgetDrain_ReaderContinues(t *testing.T) {
 		t.Errorf("byte_budget branch should `continue` after startDrain to keep reading downlink; tail=%q", tail)
 	}
 }
+
+// TestHandleSlotDeath_DrainTeardownDoesNotCloseStreamChans verifies the
+// C2 fix (spec §3.4 invariant): hard-cap drain teardown closes the
+// transport but leaves streamChans alive. The stream-reading goroutines
+// see a network-level EOF (from transport.Close), NOT a Go-channel
+// close. This is the HTTP/2 GOAWAY-style behavior we want for graceful
+// rotation.
+//
+// Without the fix, hard cap force-closed streamChans of active streams
+// — exactly the regression Phase 1 was supposed to prevent.
+func TestHandleSlotDeath_DrainTeardownDoesNotCloseStreamChans(t *testing.T) {
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	p := &WSPoolTransport{
+		poolSize:          2,
+		ctx:               ctx,
+		cancel:            cancel,
+		log:               newDiscardLogger(),
+		meltdownThreshold: 100,
+		meltdownWindow:    5 * time.Second,
+	}
+	p.slots = make([]*poolSlot, 4)
+	p.client = cl
+
+	slot := &poolSlot{}
+	slot.setState(slotDraining)
+	p.slots[0] = slot
+
+	// Wire two streams to slot 0
+	ch1 := make(chan []byte, 1)
+	ch2 := make(chan []byte, 1)
+	cl.streamChans[100] = ch1
+	cl.streamChans[101] = ch2
+	p.streamMap.Store(uint16(100), 0)
+	p.streamMap.Store(uint16(101), 0)
+	slot.streams.Store(2)
+
+	p.handleSlotDeath(cl, 0, deathCauseDrainTeardown)
+
+	// streamMap should be cleared (IDs are free for reassignment to a
+	// fresh stream on a different slot).
+	if _, ok := p.streamMap.Load(uint16(100)); ok {
+		t.Error("streamMap entry 100 not deleted after drain teardown")
+	}
+	if _, ok := p.streamMap.Load(uint16(101)); ok {
+		t.Error("streamMap entry 101 not deleted after drain teardown")
+	}
+
+	// But streamChans should still be open (NOT closed). A receive on
+	// an open empty channel would block; a receive on a closed channel
+	// returns (zero, false) immediately. We use a non-blocking select.
+	select {
+	case _, open := <-ch1:
+		if !open {
+			t.Error("ch1 was closed by drain teardown; spec §3.4 says hard cap should NOT close streamChans (C2)")
+		}
+	default:
+		// not closed, not ready — correct
+	}
+	select {
+	case _, open := <-ch2:
+		if !open {
+			t.Error("ch2 was closed by drain teardown (C2)")
+		}
+	default:
+		// not closed
+	}
+
+	// Cell should be cleared per Task 3 (existing invariant).
+	if p.slots[0] != nil {
+		t.Error("p.slots[0] should be nil after drain teardown")
+	}
+
+	// streams counter should NOT have been hard-zeroed for drainTeardown
+	// (active streams will decrement it naturally via ReleaseStream as
+	// they finish; hard-zero would underflow to -1).
+	if slot.streams.Load() != 2 {
+		t.Errorf("slot.streams should remain at 2 after drain teardown (will decrement via ReleaseStream); got %d", slot.streams.Load())
+	}
+}
+
+// TestHandleSlotDeath_NaturalClosesStreamChans is a regression guard
+// ensuring the legacy behavior is preserved for natural cause: the
+// streamChans of dead streams MUST be closed so upstream readers see
+// EOF promptly (no transport to send a network-level EOF in this case).
+func TestHandleSlotDeath_NaturalClosesStreamChans(t *testing.T) {
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel: prevent reconnectLoop from doing actual work
+
+	p := &WSPoolTransport{
+		poolSize:          2,
+		ctx:               ctx,
+		cancel:            cancel,
+		log:               newDiscardLogger(),
+		meltdownThreshold: 100,
+		meltdownWindow:    5 * time.Second,
+	}
+	p.slots = make([]*poolSlot, 4)
+	p.client = cl
+
+	slot := &poolSlot{}
+	slot.setState(slotReady)
+	p.slots[0] = slot
+
+	ch := make(chan []byte, 1)
+	cl.streamChans[200] = ch
+	p.streamMap.Store(uint16(200), 0)
+	slot.streams.Store(1)
+
+	p.handleSlotDeath(cl, 0, deathCauseNatural)
+
+	// streamMap deleted AND streamChans closed (legacy semantics)
+	if _, ok := p.streamMap.Load(uint16(200)); ok {
+		t.Error("streamMap entry 200 not deleted after natural death")
+	}
+	select {
+	case _, open := <-ch:
+		if open {
+			t.Error("ch should be closed after natural death (legacy semantics)")
+		}
+	default:
+		t.Error("ch should be closed after natural death — non-blocking receive on closed chan returns (zero, false) immediately")
+	}
+
+	// streams hard-zero IS expected for natural cause (no surviving
+	// streams to do natural decrement).
+	if slot.streams.Load() != 0 {
+		t.Errorf("slot.streams should be 0 after natural death; got %d", slot.streams.Load())
+	}
+}
