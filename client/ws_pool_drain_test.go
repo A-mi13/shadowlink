@@ -469,3 +469,155 @@ func TestStartDrain_FlagOff(t *testing.T) {
 		t.Errorf("slot state changed from slotReady to %v with flag off", p.slots[0].getState())
 	}
 }
+
+// TestDrainWatchdog_NaturalFinish runs the watchdog against a slot whose
+// streams counter is already 0; the watchdog should detect this within
+// drainPollInterval (500ms), increment DrainNaturalFinishTotal, and
+// invoke handleSlotDeath(deathCauseDrainTeardown) which clears the cell.
+func TestDrainWatchdog_NaturalFinish(t *testing.T) {
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size:          2,
+		ServerAddr:    "127.0.0.1:0",
+		GracefulDrain: true,
+		DrainHardCap:  5 * time.Second,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.ctx = ctx
+
+	oldSlot := &poolSlot{}
+	oldSlot.setState(slotDraining)
+	oldSlot.startedAtNs.Store(time.Now().Add(-2 * time.Minute).UnixNano())
+	// streams already 0 → first tick fires natural finish
+	p.slots[0] = oldSlot
+
+	before := Stats.DrainNaturalFinishTotal.Load()
+	beforeGen := oldSlot.generation.Load()
+
+	done := make(chan struct{})
+	go func() {
+		p.drainWatchdog(cl, 0, oldSlot, time.Now(), "test")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drainWatchdog did not return for streams==0 within 2s")
+	}
+
+	if got := Stats.DrainNaturalFinishTotal.Load(); got != before+1 {
+		t.Errorf("DrainNaturalFinishTotal = %d, want %d", got, before+1)
+	}
+	if got := oldSlot.generation.Load(); got <= beforeGen {
+		t.Errorf("generation should be bumped before handleSlotDeath; before=%d after=%d", beforeGen, got)
+	}
+	if p.slots[0] != nil {
+		t.Errorf("p.slots[0] should be nil after drain teardown (deathCauseDrainTeardown clears cell)")
+	}
+	if oldSlot.getState() != slotDead {
+		t.Errorf("slot state = %v, want slotDead", oldSlot.getState())
+	}
+}
+
+// TestDrainWatchdog_HardCap verifies that with streams stuck > 0, the
+// watchdog tears down the slot via the deadline timer (drainHardCap)
+// rather than natural finish. Uses a short DrainHardCap (300ms) for
+// test speed.
+func TestDrainWatchdog_HardCap(t *testing.T) {
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size:          2,
+		ServerAddr:    "127.0.0.1:0",
+		GracefulDrain: true,
+		DrainHardCap:  300 * time.Millisecond,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.ctx = ctx
+
+	oldSlot := &poolSlot{}
+	oldSlot.setState(slotDraining)
+	oldSlot.streams.Store(3) // never reaches zero → hard cap fires
+	oldSlot.startedAtNs.Store(time.Now().Add(-2 * time.Minute).UnixNano())
+	p.slots[0] = oldSlot
+
+	beforeHard := Stats.DrainHardCapTotal.Load()
+	beforeNat := Stats.DrainNaturalFinishTotal.Load()
+	beforeGen := oldSlot.generation.Load()
+
+	start := time.Now()
+	p.drainWatchdog(cl, 0, oldSlot, start, "test")
+	elapsed := time.Since(start)
+
+	if elapsed < 300*time.Millisecond {
+		t.Errorf("watchdog returned in %v, expected at least 300ms (hard cap)", elapsed)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("watchdog took %v, expected ~300ms hard cap", elapsed)
+	}
+	if got := Stats.DrainHardCapTotal.Load(); got != beforeHard+1 {
+		t.Errorf("DrainHardCapTotal = %d, want %d", got, beforeHard+1)
+	}
+	if got := Stats.DrainNaturalFinishTotal.Load(); got != beforeNat {
+		t.Errorf("DrainNaturalFinishTotal changed %d→%d on hard-cap path; should not", beforeNat, got)
+	}
+	if got := oldSlot.generation.Load(); got <= beforeGen {
+		t.Errorf("generation should be bumped before handleSlotDeath; before=%d after=%d", beforeGen, got)
+	}
+	if p.slots[0] != nil {
+		t.Errorf("p.slots[0] should be nil after hard-cap teardown")
+	}
+}
+
+// TestDrainWatchdog_ContextCancel verifies that cancelling the pool
+// context mid-drain causes the watchdog to exit cleanly without
+// incrementing metric counters (neither natural nor hard cap).
+func TestDrainWatchdog_ContextCancel(t *testing.T) {
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size:          2,
+		ServerAddr:    "127.0.0.1:0",
+		GracefulDrain: true,
+		DrainHardCap:  10 * time.Second, // long enough that ctx cancel wins
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	p.ctx = ctx
+
+	oldSlot := &poolSlot{}
+	oldSlot.setState(slotDraining)
+	oldSlot.streams.Store(2) // never reaches zero
+	p.slots[0] = oldSlot
+
+	beforeHard := Stats.DrainHardCapTotal.Load()
+	beforeNat := Stats.DrainNaturalFinishTotal.Load()
+
+	done := make(chan struct{})
+	go func() {
+		p.drainWatchdog(cl, 0, oldSlot, time.Now(), "test")
+		close(done)
+	}()
+
+	// Let the watchdog enter its loop, then cancel
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("drainWatchdog did not exit on ctx cancel within 1s")
+	}
+
+	if got := Stats.DrainHardCapTotal.Load(); got != beforeHard {
+		t.Error("ctx cancel must not count as hard cap")
+	}
+	if got := Stats.DrainNaturalFinishTotal.Load(); got != beforeNat {
+		t.Error("ctx cancel must not count as natural finish")
+	}
+	// Slot should NOT be torn down — ctx cancel is for pool shutdown,
+	// handleSlotDeath happens in Close() path instead.
+	if p.slots[0] == nil {
+		t.Error("p.slots[0] cleared by drainWatchdog despite ctx cancel; watchdog should exit silently")
+	}
+}
