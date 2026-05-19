@@ -238,27 +238,38 @@ func TestHandleSlotDeath_PreemptiveDoesNotClearCell(t *testing.T) {
 	}
 }
 
-// TestPoolSlice_DoubleCapacity verifies that allocSlots sizes the slot
-// slice at 2*poolSize, with primary range [0, poolSize) and reserve
-// range [poolSize, 2*poolSize) initialized to nil. Reserve cells are
-// populated lazily by startDrain → connectReserveSlot (Task 8).
+// TestPoolSlice_DoubleCapacity verifies that NewWSPoolTransport (via
+// allocSlots) sizes the slot slice at 2*poolSize, primary range
+// [0, poolSize) and reserve range [poolSize, 2*poolSize) initialized
+// to nil. Also verifies allocSlots is idempotent: calling it again
+// (e.g. on retry) re-initializes the slice cleanly.
 func TestPoolSlice_DoubleCapacity(t *testing.T) {
 	cl := &Client{}
 	p := NewWSPoolTransport(cl, WSPoolConfig{
 		Size:       4,
 		ServerAddr: "127.0.0.1:0",
 	})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	if err := p.allocSlots(ctx); err != nil {
-		t.Fatalf("allocSlots returned error: %v", err)
-	}
+
 	if got := len(p.slots); got != 8 {
-		t.Errorf("len(p.slots) = %d, want 8 (2*poolSize)", got)
+		t.Errorf("after NewWSPoolTransport, len(p.slots) = %d, want 8 (2*poolSize)", got)
 	}
 	for i := 4; i < 8; i++ {
 		if p.slots[i] != nil {
 			t.Errorf("reserve slot[%d] should be nil at init, got non-nil", i)
 		}
+	}
+
+	// Plant sentinels then call allocSlots — they must be wiped.
+	p.slots[0] = &poolSlot{}
+	p.slots[7] = &poolSlot{}
+	p.allocSlots()
+	if p.slots[0] != nil {
+		t.Error("allocSlots did not reset primary slot[0]")
+	}
+	if p.slots[7] != nil {
+		t.Error("allocSlots did not reset reserve slot[7]")
+	}
+	if got := len(p.slots); got != 8 {
+		t.Errorf("after re-allocSlots, len(p.slots) = %d, want 8", got)
 	}
 }
