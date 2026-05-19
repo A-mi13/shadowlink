@@ -1718,15 +1718,25 @@ func (p *WSPoolTransport) rotationLoop() {
 			return
 		case <-timer.C:
 		}
-		p.rotateOneSlot()
+		p.rotateMinLoadedSlot()
 	}
 }
 
-// rotateOneSlot soft-rotates the slot with fewer active streams.
-func (p *WSPoolTransport) rotateOneSlot() {
+// rotateMinLoadedSlot picks the slotReady cell with the fewest active
+// streams and rotates it. Used by rotationLoop for anti-fingerprinting
+// rotation cadence.
+//
+// When the gracefulDrain feature flag is on, the rotation goes through
+// startDrain (HTTP/2 GOAWAY-style: parallel reserve + drain watchdog).
+// When off, falls back to legacyRotateOneSlot (semi-graceful: polling
+// up to 30s then teardown via handleSlotDeath).
+//
+// To be removed in Phase 4 cleanup when the legacy path is retired.
+func (p *WSPoolTransport) rotateMinLoadedSlot() {
 	minIdx := -1
 	minStreams := int32(1<<31 - 1)
-	for i, slot := range p.slots {
+	for i := 0; i < p.poolSize; i++ {
+		slot := p.slots[i]
 		if slot == nil || slot.getState() != slotReady {
 			continue
 		}
@@ -1741,9 +1751,19 @@ func (p *WSPoolTransport) rotateOneSlot() {
 		return
 	}
 
+	// Commit 1: still calls legacyRotateOneSlot unconditionally.
+	// Commit 2 will branch on p.gracefulDrain.
+	p.legacyRotateOneSlot(minIdx)
+}
+
+// legacyRotateOneSlot is the pre-graceful-drain rotation path, kept
+// behind the gracefulDrain feature flag during Phase 1 rollout. Deleted
+// in Phase 4 cleanup along with maybeRotateSlot and fireRotation.
+func (p *WSPoolTransport) legacyRotateOneSlot(minIdx int) {
 	slot := p.slots[minIdx]
 	slot.setState(slotDraining)
-	p.log.Info("WS pool rotating slot", "slot", minIdx, "activeStreams", minStreams)
+	p.log.Info("WS pool rotating slot (legacy)", "slot", minIdx,
+		"activeStreams", slot.streams.Load())
 
 	// Wait for streams to drain (max 30s)
 	deadline := time.After(30 * time.Second)
@@ -1771,13 +1791,14 @@ reconnect:
 	}
 
 	if err := p.connectSlot(p.ctx, minIdx); err != nil {
-		p.log.Warn("WS pool rotation reconnect failed", "slot", minIdx, "err", err)
+		p.log.Warn("WS pool rotation reconnect failed (legacy)",
+			"slot", minIdx, "err", err)
 		go p.reconnectLoop(minIdx)
 		return
 	}
 
 	go p.slotReader(minIdx)
-	p.log.Info("WS pool slot rotated", "slot", minIdx)
+	p.log.Info("WS pool slot rotated (legacy)", "slot", minIdx)
 }
 
 // AssignStream assigns a streamID to the least-loaded ready slot.
