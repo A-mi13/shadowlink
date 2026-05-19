@@ -1864,14 +1864,32 @@ func (p *WSPoolTransport) SessionForStream(streamID uint16) *core.Session {
 	return nil
 }
 
-// WriteMessageForStream sends a data frame to the slot assigned to this stream.
+// WriteMessageForStream sends a data frame to the slot assigned to this
+// stream.
+//
+// A stream-bound write accepts both slotReady AND slotDraining as valid
+// targets: once a stream has been assigned to a slot, its crypto session
+// lives on THAT slot's transport. If the slot transitions to slotDraining
+// (preemptive rotation, byte-budget exhaustion, etc.), existing streams
+// MUST continue routing frames through it until they finish naturally or
+// the drain teardown unbinds them. Falling back to a random ready slot
+// here would route the frame through a different crypto session, and the
+// server would fail to decrypt (different per-slot session key) — see
+// spec C1 in docs/superpowers/specs/2026-05-19-ws-pool-graceful-drain-design.md.
+//
+// Only when the assigned slot is genuinely unusable (nil, no transport,
+// or in slotConnecting/slotDead) do we fall back to WriteMessage, which
+// scans for any ready slot and is reserved for non-stream traffic.
 func (p *WSPoolTransport) WriteMessageForStream(streamID uint16, data []byte) error {
 	if v, ok := p.streamMap.Load(streamID); ok {
 		idx := v.(int)
 		if idx < len(p.slots) {
 			slot := p.slots[idx]
-			if slot != nil && slot.getState() == slotReady && slot.transport != nil {
-				return slot.transport.WriteMessage(data)
+			if slot != nil && slot.transport != nil {
+				st := slot.getState()
+				if st == slotReady || st == slotDraining {
+					return slot.transport.WriteMessage(data)
+				}
 			}
 		}
 	}
@@ -1880,13 +1898,21 @@ func (p *WSPoolTransport) WriteMessageForStream(streamID uint16, data []byte) er
 
 // WriteControlMessageForStream sends a control frame (CONNECT, FIN) with
 // high priority to the slot assigned to this stream.
+//
+// Same draining-acceptance contract as WriteMessageForStream: a stream's
+// control frames must travel over the same crypto session as its data
+// frames. See WriteMessageForStream docstring for the full rationale and
+// spec reference.
 func (p *WSPoolTransport) WriteControlMessageForStream(streamID uint16, data []byte) error {
 	if v, ok := p.streamMap.Load(streamID); ok {
 		idx := v.(int)
 		if idx < len(p.slots) {
 			slot := p.slots[idx]
-			if slot != nil && slot.getState() == slotReady && slot.transport != nil {
-				return slot.transport.WriteControlMessage(data)
+			if slot != nil && slot.transport != nil {
+				st := slot.getState()
+				if st == slotReady || st == slotDraining {
+					return slot.transport.WriteControlMessage(data)
+				}
 			}
 		}
 	}
