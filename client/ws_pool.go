@@ -319,6 +319,14 @@ type poolSlot struct {
 	// [idx*step - step/2, idx*step + step/2). Read with Load; written with
 	// Store exactly once per (re)connect.
 	staggerOffsetNs atomic.Int64
+
+	// nextDrainAttemptNs is a UnixNano deadline before which the rotation
+	// watchdog must not attempt to drain this slot. Set when a drain is
+	// deferred via storm brake or no-reserve-cell revert — prevents a
+	// tight retry loop where the next 5s watchdog tick re-triggers the
+	// same deferred drain. Zero = no backoff (slot eligible for drain
+	// on next tick).
+	nextDrainAttemptNs atomic.Int64
 }
 
 // slotFreshnessPenaltyWindow defines how long after a slot's last death
@@ -648,6 +656,15 @@ func (s *poolSlot) tryMarkDead() bool {
 			return true
 		}
 	}
+}
+
+// tryMarkDraining CAS-transitions the slot from slotReady to slotDraining.
+// Returns true on success, false if the slot was not in slotReady (already
+// draining, connecting, or dead). Used by startDrain to guarantee a single
+// drain in progress per slot, regardless of which trigger fired (age,
+// byte_budget, anti-fingerprint timer, or a concurrent watchdog tick).
+func (s *poolSlot) tryMarkDraining() bool {
+	return s.state.CompareAndSwap(int32(slotReady), int32(slotDraining))
 }
 
 // shouldExitReader returns true when the reader's captured generation no longer

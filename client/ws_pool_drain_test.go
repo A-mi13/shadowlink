@@ -273,3 +273,46 @@ func TestPoolSlice_DoubleCapacity(t *testing.T) {
 		t.Errorf("after re-allocSlots, len(p.slots) = %d, want 8", got)
 	}
 }
+
+// TestPoolSlot_TryMarkDraining verifies the CAS transition slotReady →
+// slotDraining is exactly-once: first call returns true, subsequent
+// calls return false. Transitions from non-ready states must fail.
+func TestPoolSlot_TryMarkDraining(t *testing.T) {
+	s := &poolSlot{}
+	s.setState(slotReady)
+	if !s.tryMarkDraining() {
+		t.Fatal("first tryMarkDraining should return true")
+	}
+	if s.getState() != slotDraining {
+		t.Fatalf("state should be slotDraining, got %v", s.getState())
+	}
+	if s.tryMarkDraining() {
+		t.Fatal("second tryMarkDraining should return false (already draining)")
+	}
+
+	s2 := &poolSlot{}
+	s2.setState(slotConnecting)
+	if s2.tryMarkDraining() {
+		t.Fatal("tryMarkDraining from slotConnecting should fail")
+	}
+
+	s3 := &poolSlot{}
+	s3.setState(slotDead)
+	if s3.tryMarkDraining() {
+		t.Fatal("tryMarkDraining from slotDead should fail")
+	}
+}
+
+// TestPoolSlot_NextDrainAttemptNs verifies the backoff field exists and
+// behaves as a simple atomic int64 (zero = no backoff).
+func TestPoolSlot_NextDrainAttemptNs(t *testing.T) {
+	s := &poolSlot{}
+	if got := s.nextDrainAttemptNs.Load(); got != 0 {
+		t.Errorf("default nextDrainAttemptNs = %d, want 0", got)
+	}
+	future := time.Now().Add(30 * time.Second).UnixNano()
+	s.nextDrainAttemptNs.Store(future)
+	if got := s.nextDrainAttemptNs.Load(); got != future {
+		t.Errorf("nextDrainAttemptNs = %d, want %d", got, future)
+	}
+}
