@@ -492,6 +492,39 @@ func WritePromMetrics(w io.Writer) {
 	fmt.Fprintf(w, "# HELP shadowlink_socks5_coalesce_groups_total Distinct coalescing windows created in CoalescingDispatcher\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_socks5_coalesce_groups_total counter\n")
 	fmt.Fprintf(w, "shadowlink_socks5_coalesce_groups_total %d\n", SOCKS5CoalesceGroups.Load())
+
+	// === WS Pool Graceful Drain metrics (2026-05-19) ===
+	// See docs/superpowers/specs/2026-05-19-shadowlink-ws-pool-graceful-drain-design.md.
+	// Without these exposed in the metrics dump, pl1 canary cannot observe
+	// Phase 1 behavior (whether drains are dominated by natural finish or
+	// hard cap, and the duration distribution).
+	fmt.Fprintf(w, "# HELP shadowlink_slot_drain_started_total Total startDrain invocations (slot transitioned slotReady→slotDraining)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_slot_drain_started_total counter\n")
+	fmt.Fprintf(w, "shadowlink_slot_drain_started_total %d\n", Stats.DrainStartedTotal.Load())
+
+	fmt.Fprintf(w, "# HELP shadowlink_slot_drain_natural_finish_total Drains that completed because in-flight stream count reached zero before the hard cap\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_slot_drain_natural_finish_total counter\n")
+	fmt.Fprintf(w, "shadowlink_slot_drain_natural_finish_total %d\n", Stats.DrainNaturalFinishTotal.Load())
+
+	fmt.Fprintf(w, "# HELP shadowlink_slot_drain_hard_cap_total Drains force-torn-down by the hard-cap deadline (SHADOWLINK_DRAIN_HARD_CAP, default 90s)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_slot_drain_hard_cap_total counter\n")
+	fmt.Fprintf(w, "shadowlink_slot_drain_hard_cap_total %d\n", Stats.DrainHardCapTotal.Load())
+
+	// Histogram exposition: cumulative bucket counts with le-labels, plus
+	// _sum (seconds) and _count. Matches Prometheus histogram conventions.
+	if h := Stats.DrainDurationSeconds; h != nil {
+		fmt.Fprintf(w, "# HELP shadowlink_slot_drain_duration_seconds Drain duration from startDrain to teardown (natural or hard cap)\n")
+		fmt.Fprintf(w, "# TYPE shadowlink_slot_drain_duration_seconds histogram\n")
+		var cumulative uint64
+		for i, b := range h.buckets {
+			cumulative += h.counts[i].Load()
+			fmt.Fprintf(w, "shadowlink_slot_drain_duration_seconds_bucket{le=\"%g\"} %d\n", b, cumulative)
+		}
+		cumulative += h.counts[len(h.buckets)].Load()
+		fmt.Fprintf(w, "shadowlink_slot_drain_duration_seconds_bucket{le=\"+Inf\"} %d\n", cumulative)
+		fmt.Fprintf(w, "shadowlink_slot_drain_duration_seconds_sum %g\n", float64(h.sumMs.Load())/1000.0)
+		fmt.Fprintf(w, "shadowlink_slot_drain_duration_seconds_count %d\n", h.count.Load())
+	}
 }
 
 // StartStatsLogger launches a goroutine that logs counter deltas every
