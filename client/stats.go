@@ -254,18 +254,28 @@ func NewHistogram(buckets []float64) *Histogram {
 
 // Observe records a single observation in seconds. The observation
 // increments exactly one bucket counter (the first whose upper bound is
-// >= seconds, or the overflow bucket), plus the total count and the
-// running sum (in ms).
+// >= seconds, or the overflow bucket), plus the running sum (in ms),
+// and the total count LAST.
+//
+// Ordering matters: bucket → sum → count. A concurrent reader that
+// samples count first and then walks buckets will see the invariant
+// count >= sum(buckets) hold, because every count.Add is published
+// strictly after its corresponding bucket.Add. Reading in the opposite
+// order (bucket-sum-then-count) would briefly observe count == sum-1.
+// Observe itself is not snapshot-atomic across fields — that's
+// acceptable for monotonic event counters consumed eventually.
 func (h *Histogram) Observe(seconds float64) {
-	h.count.Add(1)
-	h.sumMs.Add(int64(seconds * 1000))
 	for i, b := range h.buckets {
 		if seconds <= b {
 			h.counts[i].Add(1)
+			h.sumMs.Add(int64(seconds * 1000))
+			h.count.Add(1)
 			return
 		}
 	}
 	h.counts[len(h.buckets)].Add(1)
+	h.sumMs.Add(int64(seconds * 1000))
+	h.count.Add(1)
 }
 
 // Cold-start observability counters (Task D5, 2026-05-02 plan).
