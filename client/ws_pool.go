@@ -2222,8 +2222,20 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 			// Always advance the counter (even if we don't rotate here) so a
 			// future read sees the correct total.
 			total := slot.downBytes.Add(int64(len(data)))
-			if total >= budget && p.maybeRotateSlot(cl, idx, slot, "byte_budget", msgCount, slotStart, total) {
-				return
+			if total >= budget {
+				if p.gracefulDrain {
+					// Graceful path: startDrain transitions the slot to
+					// slotDraining, spawns parallel reserve reconnect, and the
+					// drainWatchdog tears down on natural finish / hard cap.
+					// The reader must exit so the watchdog can manage the
+					// slot's lifecycle (legacy maybeRotateSlot would do the
+					// teardown inline; under graceful drain we hand it off).
+					p.startDrain(cl, idx, "byte_budget")
+					return
+				}
+				if p.maybeRotateSlot(cl, idx, slot, "byte_budget", msgCount, slotStart, total) {
+					return
+				}
 			}
 		}
 

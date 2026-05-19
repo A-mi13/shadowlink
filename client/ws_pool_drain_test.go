@@ -805,3 +805,51 @@ func TestRotationWatchdogSweep_RespectsNextDrainAttemptNs(t *testing.T) {
 		t.Errorf("slot state changed from slotReady to %v despite backoff", got)
 	}
 }
+
+// TestUnifiedRotation_ByteBudgetUsesStartDrain verifies that with
+// gracefulDrain on, the byte_budget trigger path calls startDrain
+// (slot transitions to slotDraining + DrainStartedTotal++), not the
+// legacy maybeRotateSlot path.
+//
+// Note: we don't drive a real slotReader (that requires a network
+// fixture). Instead we directly exercise startDrain with reason
+// "byte_budget" to assert the trigger semantics. The production
+// wire-up in slotReaderWithClient is verified by code inspection
+// + integration tests on pl1 canary.
+func TestUnifiedRotation_ByteBudgetUsesStartDrain(t *testing.T) {
+	cl := &Client{
+		streamChans: make(map[uint16]chan []byte),
+		transport:   failingHandshakeTransport{},
+		serverPub:   make([]byte, 32),
+		clientID:    []byte("test-client-id"),
+	}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size:          2,
+		ServerAddr:    "127.0.0.1:1",
+		GracefulDrain: true,
+		DrainHardCap:  5 * time.Second,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.ctx = ctx
+	p.client = cl
+
+	slot := &poolSlot{}
+	slot.setState(slotReady)
+	slot.startedAtNs.Store(time.Now().UnixNano())
+	p.slots[0] = slot
+	slot2 := &poolSlot{}
+	slot2.setState(slotReady)
+	p.slots[1] = slot2
+
+	before := Stats.DrainStartedTotal.Load()
+	p.startDrain(cl, 0, "byte_budget")
+	time.Sleep(50 * time.Millisecond)
+
+	if got := Stats.DrainStartedTotal.Load(); got != before+1 {
+		t.Errorf("DrainStartedTotal = %d, want %d", got, before+1)
+	}
+	if got := slot.getState(); got != slotDraining {
+		t.Errorf("slot state = %v, want slotDraining", got)
+	}
+}
