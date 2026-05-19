@@ -1139,8 +1139,17 @@ func (p *WSPoolTransport) rotationWatchdogLoop() {
 // so unit tests can drive it deterministically without time.Sleep.
 func (p *WSPoolTransport) rotationWatchdogSweep() {
 	nowNs := time.Now().UnixNano()
-	for idx, slot := range p.slots {
+	// Loop scope limited to primary range [0, poolSize) — reserve cells
+	// are not directly drained by the age trigger; they cycle into the
+	// primary range via the drain machinery first.
+	for idx := 0; idx < p.poolSize; idx++ {
+		slot := p.slots[idx]
 		if slot == nil || slot.getState() != slotReady {
+			continue
+		}
+		// Skip slots in drain backoff (storm brake / no-reserve revert in
+		// startDrain just deferred this one — don't immediately retry).
+		if slot.nextDrainAttemptNs.Load() > nowNs {
 			continue
 		}
 		started := slot.startedAtNs.Load()
@@ -1156,15 +1165,20 @@ func (p *WSPoolTransport) rotationWatchdogSweep() {
 		if nowNs-started < effectiveMaxAge {
 			continue
 		}
-		// Synthesise a slotStart time.Time for the log fields (maybeRotateSlot
-		// expects one; we don't have anything but the atomic). This avoids
-		// changing maybeRotateSlot's signature for a single log field.
-		slotStart := time.Unix(0, started)
-		p.maybeRotateSlot(p.client, idx, slot, "age",
-			0, // msgCount unknown at watchdog level; the slot reader has the real value
-			slotStart,
-			slot.downBytes.Load(),
-		)
+		if p.gracefulDrain {
+			p.startDrain(p.client, idx, "age")
+		} else {
+			// Synthesise a slotStart time.Time for the log fields
+			// (maybeRotateSlot expects one; we don't have anything but the
+			// atomic). This avoids changing maybeRotateSlot's signature for
+			// a single log field.
+			slotStart := time.Unix(0, started)
+			p.maybeRotateSlot(p.client, idx, slot, "age",
+				0, // msgCount unknown at watchdog level; the slot reader has the real value
+				slotStart,
+				slot.downBytes.Load(),
+			)
+		}
 	}
 }
 

@@ -711,3 +711,97 @@ func TestConnectReserveSlot_FailureFallsBackToReconnectLoop(t *testing.T) {
 		t.Errorf("reserve slot state = %v, want slotConnecting or slotDead", state)
 	}
 }
+
+// TestUnifiedRotation_AgeTriggerUsesStartDrain verifies that with
+// gracefulDrain on, watchdog sweep on an aged slot calls startDrain
+// (and the slot transitions to slotDraining), not the legacy
+// maybeRotateSlot/fireRotation path.
+func TestUnifiedRotation_AgeTriggerUsesStartDrain(t *testing.T) {
+	cl := &Client{
+		streamChans: make(map[uint16]chan []byte),
+		transport:   failingHandshakeTransport{},
+		serverPub:   make([]byte, 32),
+		clientID:    []byte("test-client-id"),
+	}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size:          2,
+		ServerAddr:    "127.0.0.1:1",
+		MaxSlotAge:    time.Minute,
+		GracefulDrain: true,
+		DrainHardCap:  5 * time.Second,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.ctx = ctx
+	p.client = cl
+
+	// Aged slot 0 (started 2 minutes ago, exceeds MaxSlotAge = 1 minute)
+	slot := &poolSlot{}
+	slot.setState(slotReady)
+	slot.startedAtNs.Store(time.Now().Add(-2 * time.Minute).UnixNano())
+	slot.streams.Store(5)
+	p.slots[0] = slot
+	// Second ready primary so storm brake threshold (2 of 8 non-ready)
+	// is NOT engaged. With 2 ready primaries + 6 nil reserves, count = 0
+	// per the parallel-replacement-aware logic.
+	slot2 := &poolSlot{}
+	slot2.setState(slotReady)
+	slot2.startedAtNs.Store(time.Now().UnixNano())
+	p.slots[1] = slot2
+
+	before := Stats.DrainStartedTotal.Load()
+	p.rotationWatchdogSweep()
+	// allow startDrain goroutines a moment to fully start, though state
+	// transition itself is synchronous inside startDrain
+	time.Sleep(50 * time.Millisecond)
+
+	if got := Stats.DrainStartedTotal.Load(); got != before+1 {
+		t.Errorf("DrainStartedTotal = %d, want %d (aged slot should drain)", got, before+1)
+	}
+	if got := slot.getState(); got != slotDraining {
+		t.Errorf("aged slot state = %v, want slotDraining", got)
+	}
+}
+
+// TestRotationWatchdogSweep_RespectsNextDrainAttemptNs verifies that a
+// slot with future nextDrainAttemptNs (backoff active after storm
+// brake revert) is skipped by the watchdog, preventing tight retry
+// loops on the 5s sweep cadence.
+func TestRotationWatchdogSweep_RespectsNextDrainAttemptNs(t *testing.T) {
+	cl := &Client{
+		streamChans: make(map[uint16]chan []byte),
+		transport:   failingHandshakeTransport{},
+		serverPub:   make([]byte, 32),
+		clientID:    []byte("test-client-id"),
+	}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size:          2,
+		ServerAddr:    "127.0.0.1:1",
+		MaxSlotAge:    time.Minute,
+		GracefulDrain: true,
+		DrainHardCap:  5 * time.Second,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.ctx = ctx
+	p.client = cl
+
+	slot := &poolSlot{}
+	slot.setState(slotReady)
+	slot.startedAtNs.Store(time.Now().Add(-2 * time.Minute).UnixNano())
+	slot.streams.Store(5)
+	// Set backoff: drain attempts blocked for next 30s
+	slot.nextDrainAttemptNs.Store(time.Now().Add(30 * time.Second).UnixNano())
+	p.slots[0] = slot
+
+	before := Stats.DrainStartedTotal.Load()
+	p.rotationWatchdogSweep()
+	time.Sleep(20 * time.Millisecond)
+
+	if got := Stats.DrainStartedTotal.Load(); got != before {
+		t.Errorf("DrainStartedTotal changed %d→%d; expected backoff to skip the aged slot", before, got)
+	}
+	if got := slot.getState(); got != slotReady {
+		t.Errorf("slot state changed from slotReady to %v despite backoff", got)
+	}
+}
