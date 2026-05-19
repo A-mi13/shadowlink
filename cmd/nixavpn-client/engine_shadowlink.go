@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -412,6 +413,13 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 					maxStreamsPerSlot = 8
 				}
 
+				// Phase 1 plumbing for WS pool graceful drain.
+				// Default off; flipped to on after pl1 canary.
+				// SHADOWLINK_DRAIN_HARD_CAP is field-tunable without
+				// redeploy (Envoy Gateway-recommended 90s default).
+				gracefulDrain := envBoolDefault("SHADOWLINK_GRACEFUL_DRAIN", false)
+				drainHardCap := envDurationDefault("SHADOWLINK_DRAIN_HARD_CAP", 90*time.Second)
+
 				pool := client.NewWSPoolTransport(e.cl, client.WSPoolConfig{
 					Size:              poolSize,
 					ServerAddr:        wsTarget,
@@ -425,6 +433,8 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 					MaxSlotAge:        maxSlotAge,
 					WriteTimeout:      writeTimeout,
 					StaggerDelay:      staggerDelay,
+					GracefulDrain:     gracefulDrain,
+					DrainHardCap:      drainHardCap,
 				})
 				if err := pool.Connect(ctx2); err != nil {
 					slog.Warn("WS Pool не удался, fallback на SplitHTTP", "err", err)
@@ -730,4 +740,37 @@ func (e *ShadowLinkEngine) Close() error {
 		e.cl.Close()
 	}
 	return nil
+}
+
+// envBoolDefault reads a boolean env var with the same lenient semantics
+// as bypassEnabledFromEnv / adminOverrideEnabled (case-insensitive,
+// whitespace-trimmed). Unset / empty / unrecognized values return def;
+// recognized truthy/falsy keywords ("0", "false", "no", "off" / "1",
+// "true", "yes", "on") map as expected.
+func envBoolDefault(name string, def bool) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "":
+		return def
+	case "0", "false", "no", "off":
+		return false
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return def
+	}
+}
+
+// envDurationDefault reads a time.Duration env var (any value
+// time.ParseDuration accepts: "90s", "2m", "1h30m", "500ms"). Unset,
+// empty, or unparseable values return def.
+func envDurationDefault(name string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return def
+	}
+	return d
 }

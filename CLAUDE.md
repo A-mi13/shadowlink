@@ -543,6 +543,8 @@ Requires CGO + gcc. Windows dev hosts without gcc fall back to plain `go test` (
 | `SHADOWLINK_PHASED_WARMUP` | on | not-set → linear stagger (legacy) |
 | `SHADOWLINK_SOCKS5_COALESCE` | on | `=0` direct Acquire (no debounce) |
 | `SHADOWLINK_ADMIN_OVERRIDE` | on (client) | `=0/false/no/off` skips network fetch (cached/baseline only) |
+| `SHADOWLINK_GRACEFUL_DRAIN` | off (Phase 1) | When `=1`/`true`/`yes`/`on` enables HTTP/2 GOAWAY-style slot draining: active streams survive rotation until natural finish or `DrainHardCap`. Off → legacy hard-rotation path. Phase 3 flips default to on. |
+| `SHADOWLINK_DRAIN_HARD_CAP` | 90s | `time.Duration` (e.g. `"90s"`, `"2m"`): max time a slot can stay in `slotDraining` before forced teardown. Only consulted when `SHADOWLINK_GRACEFUL_DRAIN` is on. Tune in field without redeploy. |
 
 ### Metrics added
 

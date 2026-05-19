@@ -808,6 +808,16 @@ type WSPoolTransport struct {
 	maxBytesPerSlot   int64         // rotate slot after N downstream bytes (0 = disabled)
 	maxSlotAge        time.Duration // rotate slot after this much wallclock age (0 = disabled)
 
+	// gracefulDrain — when true, slot rotation transitions through
+	// slotDraining + parallel reserve reconnect. When false, rotation
+	// goes directly through fireRotation → handleSlotDeath (legacy hard
+	// path). Wired via SHADOWLINK_GRACEFUL_DRAIN; default off in Phase 1.
+	gracefulDrain bool
+	// drainHardCap — max time a slot may stay in slotDraining before
+	// forced teardown. Only consulted when gracefulDrain is true. Default
+	// 90s (Envoy Gateway recommendation). Tune via SHADOWLINK_DRAIN_HARD_CAP.
+	drainHardCap time.Duration
+
 	streamMap sync.Map // map[uint16]int — streamID -> slot index
 
 	// For creating new slots
@@ -938,6 +948,22 @@ type WSPoolConfig struct {
 	MeltdownWindow    time.Duration // how long "recent death" lasts (default 5s)
 	MeltdownThreshold int           // N deaths in window triggers cooldown (default = ceil(size/2), min 2)
 	MeltdownCooldown  time.Duration // reconnect pause after trigger (default 10s)
+
+	// GracefulDrain enables the HTTP/2 GOAWAY-style draining path.
+	// When true, slot rotation transitions through slotDraining +
+	// parallel reserve reconnect; existing streams finish naturally
+	// (up to DrainHardCap) instead of being force-closed.
+	// When false, legacy behavior: rotation goes directly through
+	// fireRotation → handleSlotDeath (kills all active streams).
+	// Default false during Phase 1 rollout; flipped to true after
+	// pl1 canary observation.
+	GracefulDrain bool
+
+	// DrainHardCap is the maximum time a slot can stay in slotDraining
+	// before forced teardown. Only consulted when GracefulDrain is true.
+	// Zero defaults to 90s (Envoy Gateway recommendation for long-lived
+	// multiplexed streams). Field-tune via SHADOWLINK_DRAIN_HARD_CAP env.
+	DrainHardCap time.Duration
 }
 
 // NewWSPoolTransport creates a pool of WebSocket connections.
@@ -966,6 +992,12 @@ func NewWSPoolTransport(cl *Client, cfg WSPoolConfig) *WSPoolTransport {
 	if cfg.MeltdownCooldown <= 0 {
 		cfg.MeltdownCooldown = 10 * time.Second
 	}
+	drainHardCap := cfg.DrainHardCap
+	if drainHardCap <= 0 {
+		// 90s default per Envoy Gateway recommendation for long-lived
+		// multiplexed streams. Only consulted when GracefulDrain is true.
+		drainHardCap = 90 * time.Second
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &WSPoolTransport{
 		poolSize:          cfg.Size,
@@ -973,6 +1005,8 @@ func NewWSPoolTransport(cl *Client, cfg WSPoolConfig) *WSPoolTransport {
 		maxStreamsPerSlot: int32(cfg.MaxStreamsPerSlot),
 		maxBytesPerSlot:   cfg.MaxBytesPerSlot,
 		maxSlotAge:        cfg.MaxSlotAge,
+		gracefulDrain:     cfg.GracefulDrain,
+		drainHardCap:      drainHardCap,
 		serverAddr:        cfg.ServerAddr,
 		sniHost:           cfg.SNIHost,
 		cfIP:              cfg.CFIP,
