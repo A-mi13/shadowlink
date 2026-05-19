@@ -237,3 +237,28 @@ func TestHandleSlotDeath_PreemptiveDoesNotClearCell(t *testing.T) {
 		t.Errorf("after preemptive rotation, p.slots[0] should NOT be nil (only drainTeardown clears)")
 	}
 }
+
+// TestPoolSlice_DoubleCapacity verifies that allocSlots sizes the slot
+// slice at 2*poolSize, with primary range [0, poolSize) and reserve
+// range [poolSize, 2*poolSize) initialized to nil. Reserve cells are
+// populated lazily by startDrain → connectReserveSlot (Task 8).
+func TestPoolSlice_DoubleCapacity(t *testing.T) {
+	cl := &Client{}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size:       4,
+		ServerAddr: "127.0.0.1:0",
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := p.allocSlots(ctx); err != nil {
+		t.Fatalf("allocSlots returned error: %v", err)
+	}
+	if got := len(p.slots); got != 8 {
+		t.Errorf("len(p.slots) = %d, want 8 (2*poolSize)", got)
+	}
+	for i := 4; i < 8; i++ {
+		if p.slots[i] != nil {
+			t.Errorf("reserve slot[%d] should be nil at init, got non-nil", i)
+		}
+	}
+}

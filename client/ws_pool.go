@@ -951,7 +951,7 @@ func NewWSPoolTransport(cl *Client, cfg WSPoolConfig) *WSPoolTransport {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &WSPoolTransport{
-		slots:             make([]*poolSlot, cfg.Size),
+		slots:             make([]*poolSlot, cfg.Size*2),
 		poolSize:          cfg.Size,
 		maxPendingPerSlot: int32(cfg.MaxPendingPerSlot),
 		maxStreamsPerSlot: int32(cfg.MaxStreamsPerSlot),
@@ -978,9 +978,26 @@ func NewWSPoolTransport(cl *Client, cfg WSPoolConfig) *WSPoolTransport {
 	}
 }
 
+// allocSlots initializes p.slots as a slice of 2*poolSize cells.
+// Indices [0, poolSize) are primary cells, populated by Connect's slot
+// initialization loop. Indices [poolSize, 2*poolSize) are reserve cells,
+// nil until a drain reserves one via findFreeReserveSlot (Task 8).
+//
+// Returns error reserved for future failure modes (e.g. ulimit checks).
+// Currently never errors but the signature keeps Connect's "if err"
+// pattern uniform.
+func (p *WSPoolTransport) allocSlots(ctx context.Context) error {
+	_ = ctx // reserved for future use (e.g. ulimit / cgroup probe)
+	p.slots = make([]*poolSlot, p.poolSize*2)
+	return nil
+}
+
 // Connect establishes all WS connections in parallel.
 // Returns success when at least one slot is ready.
 func (p *WSPoolTransport) Connect(ctx context.Context) error {
+	if err := p.allocSlots(ctx); err != nil {
+		return err
+	}
 	var wg sync.WaitGroup
 	results := make([]error, p.poolSize)
 
