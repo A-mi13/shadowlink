@@ -853,3 +853,48 @@ func TestUnifiedRotation_ByteBudgetUsesStartDrain(t *testing.T) {
 		t.Errorf("slot state = %v, want slotDraining", got)
 	}
 }
+
+// TestUnifiedRotation_AntiFPTickerUsesStartDrain verifies that with
+// gracefulDrain on, rotateMinLoadedSlot delegates to startDrain
+// (reason "anti_fingerprint") instead of legacyRotateOneSlot. The
+// picker chooses the min-streams primary cell.
+func TestUnifiedRotation_AntiFPTickerUsesStartDrain(t *testing.T) {
+	cl := &Client{
+		streamChans: make(map[uint16]chan []byte),
+		transport:   failingHandshakeTransport{},
+		serverPub:   make([]byte, 32),
+		clientID:    []byte("test-client-id"),
+	}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size:          2,
+		ServerAddr:    "127.0.0.1:1",
+		GracefulDrain: true,
+		DrainHardCap:  5 * time.Second,
+	})
+	p.ctx = t.Context()
+	p.client = cl
+
+	// Two ready primaries; slot 1 has fewer streams (will be picked)
+	slot0 := &poolSlot{}
+	slot0.setState(slotReady)
+	slot0.streams.Store(5)
+	p.slots[0] = slot0
+	slot1 := &poolSlot{}
+	slot1.setState(slotReady)
+	slot1.streams.Store(1)
+	p.slots[1] = slot1
+
+	before := Stats.DrainStartedTotal.Load()
+	p.rotateMinLoadedSlot()
+	time.Sleep(50 * time.Millisecond)
+
+	if got := Stats.DrainStartedTotal.Load(); got != before+1 {
+		t.Errorf("DrainStartedTotal = %d, want %d (min-streams slot should drain)", got, before+1)
+	}
+	if got := slot1.getState(); got != slotDraining {
+		t.Errorf("min-streams slot1 state = %v, want slotDraining", got)
+	}
+	if got := slot0.getState(); got != slotReady {
+		t.Errorf("higher-loaded slot0 should be untouched, got %v", got)
+	}
+}

@@ -1751,8 +1751,10 @@ func (p *WSPoolTransport) rotateMinLoadedSlot() {
 		return
 	}
 
-	// Commit 1: still calls legacyRotateOneSlot unconditionally.
-	// Commit 2 will branch on p.gracefulDrain.
+	if p.gracefulDrain {
+		p.startDrain(p.client, minIdx, "anti_fingerprint")
+		return
+	}
 	p.legacyRotateOneSlot(minIdx)
 }
 
