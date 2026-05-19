@@ -193,6 +193,79 @@ type statsRegistry struct {
 	// remains as canary. Non-zero value = unrecognized bug.
 	WSReaderPanics atomic.Uint64
 	WSWriterExits  atomic.Uint64
+
+	// === WS Pool Graceful Drain metrics (2026-05-19) ===
+	// See docs/superpowers/specs/2026-05-19-shadowlink-ws-pool-graceful-drain-design.md.
+	// Populated by drainWatchdog (Task 8). Monotonic event counters →
+	// atomic.Uint64 per the Phase 0+ convention (not part of delta dump).
+	//
+	// DrainStartedTotal — every startDrain invocation (a slot transitioned
+	// from slotReady to slotDraining). Pairs with the sum of the two
+	// finish counters: in steady state Started == NaturalFinish + HardCap.
+	// A persistent gap is the signal that a watchdog goroutine leaked.
+	DrainStartedTotal atomic.Uint64
+	// DrainNaturalFinishTotal — drains that completed because in-flight
+	// stream count reached zero before the hard cap. Healthy field
+	// operation expects this to dominate DrainHardCapTotal (long-tail
+	// streams are uncommon).
+	DrainNaturalFinishTotal atomic.Uint64
+	// DrainHardCapTotal — drains that were force-torn-down by the hard
+	// cap deadline (SHADOWLINK_DRAIN_HARD_CAP, default 90s). A growing
+	// ratio of HardCap / Started indicates long-lived SOCKS5 streams
+	// (file downloads, persistent connections) that survive rotation
+	// — review whether to extend the cap or rotate less aggressively.
+	DrainHardCapTotal atomic.Uint64
+	// DrainDurationSeconds — distribution of drain durations from
+	// startDrain → terminal teardown (either natural finish or hard
+	// cap). Bucket boundaries 1/5/10/30/60/90/120s match the operational
+	// regimes: <5s = trivial, 5-30s = nominal, 30-90s = stretched, >90s
+	// only possible under future hard-cap raise. Initialized in init().
+	DrainDurationSeconds *Histogram
+}
+
+// Histogram is a fixed-bucket histogram for duration-style observations.
+// Buckets are inclusive upper bounds: an observation x lands in counts[i]
+// where i is the smallest index such that x <= buckets[i]. Observations
+// exceeding the largest bucket fall into the overflow bucket
+// (counts[len(buckets)]). Sum is stored as milliseconds (int64) so atomic
+// arithmetic stays exact on a 64-bit integer; convert back to seconds at
+// exposition time.
+//
+// Concurrency: Observe is lock-free (atomic ops on the bucket slice +
+// the sum/count); safe for use from any number of goroutines once the
+// histogram is published via NewHistogram.
+type Histogram struct {
+	buckets []float64
+	counts  []atomic.Uint64
+	sumMs   atomic.Int64
+	count   atomic.Uint64
+}
+
+// NewHistogram constructs a histogram with the given inclusive upper-bound
+// buckets. Buckets MUST be sorted ascending; this is a developer
+// invariant, not a runtime check. The slice is retained (not copied) but
+// is treated as immutable post-construction.
+func NewHistogram(buckets []float64) *Histogram {
+	return &Histogram{
+		buckets: buckets,
+		counts:  make([]atomic.Uint64, len(buckets)+1),
+	}
+}
+
+// Observe records a single observation in seconds. The observation
+// increments exactly one bucket counter (the first whose upper bound is
+// >= seconds, or the overflow bucket), plus the total count and the
+// running sum (in ms).
+func (h *Histogram) Observe(seconds float64) {
+	h.count.Add(1)
+	h.sumMs.Add(int64(seconds * 1000))
+	for i, b := range h.buckets {
+		if seconds <= b {
+			h.counts[i].Add(1)
+			return
+		}
+	}
+	h.counts[len(h.buckets)].Add(1)
 }
 
 // Cold-start observability counters (Task D5, 2026-05-02 plan).
@@ -311,6 +384,9 @@ func init() {
 	for _, r := range frameAnomalyReasons {
 		Stats.frameAnomalyCounter(r)
 	}
+	// Drain duration histogram — buckets in seconds, see field docstring
+	// on statsRegistry.DrainDurationSeconds for rationale.
+	Stats.DrainDurationSeconds = NewHistogram([]float64{1, 5, 10, 30, 60, 90, 120})
 }
 
 // frameAnomalyCounter returns (creating if needed) the counter for one of

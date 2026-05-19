@@ -316,3 +316,24 @@ func TestPoolSlot_NextDrainAttemptNs(t *testing.T) {
 		t.Errorf("nextDrainAttemptNs = %d, want %d", got, future)
 	}
 }
+
+// TestStats_DrainCounters verifies that Stats exposes the four drain
+// metrics required by the design spec: DrainStartedTotal,
+// DrainNaturalFinishTotal, DrainHardCapTotal, DrainDurationSeconds.
+//
+// Counter type must match the existing convention in stats.go (atomic.Int64
+// for delta-aware counters, atomic.Uint64 for monotonic).
+func TestStats_DrainCounters(t *testing.T) {
+	before := Stats.DrainStartedTotal.Load()
+	Stats.DrainStartedTotal.Add(1)
+	if got := Stats.DrainStartedTotal.Load(); got != before+1 {
+		t.Errorf("DrainStartedTotal.Add(1) → Load = %d, want %d", got, before+1)
+	}
+
+	Stats.DrainNaturalFinishTotal.Add(1)
+	Stats.DrainHardCapTotal.Add(1)
+	// Just verify they exist and accept Add.
+
+	// Histogram should accept Observe without panic.
+	Stats.DrainDurationSeconds.Observe(15.0)
+}
