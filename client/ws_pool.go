@@ -550,15 +550,69 @@ func (p *WSPoolTransport) rotationStormBrakeThreshold() int {
 	return t
 }
 
-// countNonReadySlots returns the count of slots NOT in slotReady. Used
-// by the rotation storm brake to decide whether a new preemptive
-// rotation would push the pool past the safety threshold. Lock-free
-// read of per-slot atomics; nil slots count as non-ready (they haven't
-// finished their first connect yet).
+// countNonReadySlots returns the count of slots NOT in slotReady that
+// contribute to the storm brake calculation. Logic for each cell:
+//
+//	Primary range [0, poolSize):
+//	  - nil cell: check if matching reserve cell[i+poolSize] is in
+//	    slotReady — if yes, capacity is provided by reserve, skip;
+//	    otherwise count (capacity gap).
+//	  - non-slotReady (connecting/draining/dead): count.
+//	  - slotReady: skip.
+//
+//	Reserve range [poolSize, 2*poolSize):
+//	  - nil cell: skip (empty space).
+//	  - slotConnecting: check if matching primary cell[i-poolSize] is
+//	    in slotDraining — if yes, this is the parallel drain replacement
+//	    and primary is still serving streams, skip (not a capacity gap);
+//	    otherwise count.
+//	  - slotDraining/slotDead: count.
+//	  - slotReady: skip.
+//
+// This handles the full drain lifecycle without false-positive non-ready:
+//   - Steady state: 8 primary ready, 8 reserve nil → count = 0
+//   - Drain start: 7 ready + 1 draining + 1 reserve connecting (parallel) → count = 1
+//   - Drain finish: 7 ready + 1 nil primary + 1 reserve ready → count = 0 (reserve covers)
+//   - Two concurrent drains: 6 ready + 2 draining + 2 reserve connecting (parallel) → count = 2
+//
+// Used by storm brake to bound concurrent drains. Lock-free read of
+// per-slot atomic state — snapshot-inconsistent reads of paired primary/
+// reserve cells are tolerated because the brake re-evaluates on the next
+// watchdog sweep (5s later); a single mis-counted tick has at most one
+// extra deferred/granted drain, self-correcting.
 func (p *WSPoolTransport) countNonReadySlots() int {
 	n := 0
-	for _, slot := range p.slots {
-		if slot == nil || slot.getState() != slotReady {
+	for i, slot := range p.slots {
+		if i < p.poolSize {
+			// Primary range
+			if slot == nil {
+				reserveIdx := i + p.poolSize
+				if reserveIdx < len(p.slots) && p.slots[reserveIdx] != nil &&
+					p.slots[reserveIdx].getState() == slotReady {
+					continue // capacity provided by reserve
+				}
+				n++
+				continue
+			}
+			if slot.getState() != slotReady {
+				n++
+			}
+		} else {
+			// Reserve range
+			if slot == nil {
+				continue
+			}
+			st := slot.getState()
+			if st == slotReady {
+				continue
+			}
+			if st == slotConnecting {
+				primaryIdx := i - p.poolSize
+				if primaryIdx < p.poolSize && p.slots[primaryIdx] != nil &&
+					p.slots[primaryIdx].getState() == slotDraining {
+					continue // parallel drain replacement, capacity preserved
+				}
+			}
 			n++
 		}
 	}
@@ -1060,8 +1114,13 @@ func (p *WSPoolTransport) emitHealthSummary() {
 	rateLimited := 0
 	var totalStreams int32
 	now := time.Now()
-	for _, slot := range p.slots {
+	for i, slot := range p.slots {
 		if slot == nil {
+			// nil primary cell = capacity gap (counts toward "dead"-like
+			// for ops visibility). nil reserve cell = empty space (skip).
+			if i < p.poolSize {
+				dead++
+			}
 			continue
 		}
 		switch slot.getState() {
@@ -1790,8 +1849,14 @@ func (p *WSPoolTransport) SessionForStream(streamID uint16) *core.Session {
 			return p.slots[idx].session
 		}
 	}
-	// Fallback: return first available session
-	for _, slot := range p.slots {
+	// Fallback: return first available session from primary range only.
+	// Reserve slots have their own sessions belonging to specific drain
+	// replacements; using a reserve session for a stream not assigned to
+	// that slot would yield decrypt mismatches at the server.
+	for i, slot := range p.slots {
+		if i >= p.poolSize {
+			break
+		}
 		if slot != nil && slot.session != nil && slot.getState() == slotReady {
 			return slot.session
 		}
@@ -2288,7 +2353,9 @@ func (p *WSPoolTransport) Close() error {
 	return nil
 }
 
-// HealthySlots returns the number of ready slots.
+// HealthySlots returns the number of ready slots in the entire pool
+// (primary + reserve). A reserve slot in slotReady is providing real
+// capacity (active drain replacement) so it counts toward health.
 func (p *WSPoolTransport) HealthySlots() int {
 	count := 0
 	for _, slot := range p.slots {
