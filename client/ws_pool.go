@@ -818,12 +818,16 @@ type WSPoolTransport struct {
 	// 90s (Envoy Gateway recommendation). Tune via SHADOWLINK_DRAIN_HARD_CAP.
 	drainHardCap time.Duration
 
-	// reserveMu serializes the find-and-claim of reserve cells in
-	// startDrain. Without it, two concurrent startDrain calls on
-	// different primary slots can both call findFreeReserveSlot, both
-	// observe the same nil cell, and both write their placeholder,
-	// causing one to be silently clobbered. The critical section is
-	// just the (find ∩ claim) pair — atomic with respect to itself.
+	// reserveMu serializes ALL writes to p.slots[idx] across drain
+	// teardown, claim, and reconnect — see graceful drain spec §C3 race
+	// fix. Originally introduced for the find-and-claim of reserve cells
+	// in startDrain (two concurrent startDrains on different primary
+	// slots could pick the same newIdx). The lock now also guards:
+	//   - connectSlot's `p.slots[idx] = slot` install (reconnect path),
+	//   - handleSlotDeath's `p.slots[idx] = nil` drain teardown,
+	//   - claimFreeReserveSlot's placeholder install.
+	// Linux -race detector flags any concurrent slice-cell read/write
+	// regardless of which range (primary/reserve) the index belongs to.
 	reserveMu sync.Mutex
 
 	streamMap sync.Map // map[uint16]int — streamID -> slot index
@@ -1295,7 +1299,13 @@ func (p *WSPoolTransport) sendKeepaliveToAllSlots() {
 func (p *WSPoolTransport) connectSlot(ctx context.Context, idx int) error {
 	slot := &poolSlot{index: idx}
 	slot.setState(slotConnecting)
+	// reserveMu serializes this write with the drain-teardown nil-write
+	// in handleSlotDeath and the placeholder write in claimFreeReserveSlot.
+	// Without it, a concurrent drain teardown could nil this cell after
+	// connectSlot installed the new *poolSlot — slot leak. See spec §C3.
+	p.reserveMu.Lock()
 	p.slots[idx] = slot
+	p.reserveMu.Unlock()
 
 	// Perform handshake to get a new session
 	hello, clientState, err := core.NewClientHello(p.client.clientID, p.client.serverPub)
@@ -2523,7 +2533,11 @@ func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int, cause slotDeathCa
 		// capacity duplication. Do NOT advance meltdown (not a failure)
 		// and do NOT spawn reconnectLoop. Free the cell so future
 		// reserve targets can pick it via claimFreeReserveSlot.
+		// reserveMu (Fix C3) serializes this write with connectSlot and
+		// claimFreeReserveSlot.
+		p.reserveMu.Lock()
 		p.slots[idx] = nil
+		p.reserveMu.Unlock()
 	}
 }
 
