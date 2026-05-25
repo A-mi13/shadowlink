@@ -119,7 +119,7 @@ func TestWriteMessageForStream_AcceptsDraining(t *testing.T) {
 	p.slots[1] = &poolSlot{transport: stubReady}
 	p.slots[1].setState(slotReady)
 
-	p.streamMap.Store(uint16(42), 0)
+	p.streamMap.Store(uint16(42), newStreamEntry(0))
 
 	if err := p.WriteMessageForStream(42, []byte("hello")); err != nil {
 		t.Fatalf("WriteMessageForStream returned err: %v", err)
@@ -144,7 +144,7 @@ func TestWriteControlMessageForStream_AcceptsDraining(t *testing.T) {
 	stubReady := &countingTransport{}
 	p.slots[1] = &poolSlot{transport: stubReady}
 	p.slots[1].setState(slotReady)
-	p.streamMap.Store(uint16(43), 0)
+	p.streamMap.Store(uint16(43), newStreamEntry(0))
 
 	if err := p.WriteControlMessageForStream(43, []byte("ctrl")); err != nil {
 		t.Fatalf("WriteControlMessageForStream returned err: %v", err)
@@ -1110,7 +1110,7 @@ func TestHandleSlotDeath_DrainTeardownClosesStreamChans(t *testing.T) {
 
 	ch := make(chan []byte, 1)
 	cl.streamChans[42] = ch
-	p.streamMap.Store(uint16(42), 3)
+	p.streamMap.Store(uint16(42), newStreamEntry(3))
 
 	p.handleSlotDeath(cl, 3, deathCauseDrainTeardown)
 
@@ -1150,7 +1150,7 @@ func TestHandleSlotDeath_NoUnderflowOnLateRelease(t *testing.T) {
 
 	for sid := uint16(100); sid < 105; sid++ {
 		cl.streamChans[sid] = make(chan []byte, 1)
-		p.streamMap.Store(sid, 0)
+		p.streamMap.Store(sid, newStreamEntry(0))
 	}
 
 	p.handleSlotDeath(cl, 0, deathCauseDrainTeardown)
@@ -1193,7 +1193,7 @@ func TestHandleSlotDeath_AllCausesCloseStreamChans(t *testing.T) {
 
 			ch := make(chan []byte, 1)
 			cl.streamChans[7] = ch
-			p.streamMap.Store(uint16(7), 0)
+			p.streamMap.Store(uint16(7), newStreamEntry(0))
 
 			p.handleSlotDeath(cl, 0, tc.cause)
 
@@ -1241,7 +1241,7 @@ func TestHandleSlotDeath_NaturalClosesStreamChans(t *testing.T) {
 
 	ch := make(chan []byte, 1)
 	cl.streamChans[200] = ch
-	p.streamMap.Store(uint16(200), 0)
+	p.streamMap.Store(uint16(200), newStreamEntry(0))
 	slot.streams.Store(1)
 
 	p.handleSlotDeath(cl, 0, deathCauseNatural)
@@ -1547,7 +1547,7 @@ func TestStreamIDReuse_RejectStaleFrames(t *testing.T) {
 	p.slots = make([]*poolSlot, 16)
 
 	// streamID 42 currently maps to slot 7 (newly assigned stream).
-	p.streamMap.Store(uint16(42), 7)
+	p.streamMap.Store(uint16(42), newStreamEntry(7))
 
 	// A reader on slot 5 receives a frame for streamID 42 (stale, slot 5
 	// was just torn down and streamMap.Delete'd; new stream took 42 on 7).
@@ -1555,7 +1555,7 @@ func TestStreamIDReuse_RejectStaleFrames(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected mapping present")
 	}
-	if mappedIdx.(int) == 5 {
+	if mappedIdx.(*streamEntry).slotIdx == 5 {
 		t.Fatalf("test setup broken — expected mismatch")
 	}
 
@@ -1563,7 +1563,7 @@ func TestStreamIDReuse_RejectStaleFrames(t *testing.T) {
 
 	// Simulate the validation predicate the reader uses.
 	myIdx := 5
-	if mappedIdx.(int) != myIdx {
+	if mappedIdx.(*streamEntry).slotIdx != myIdx {
 		Stats.StaleFrameDroppedTotal.Add(1)
 	}
 

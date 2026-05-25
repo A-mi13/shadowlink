@@ -22,7 +22,7 @@ func TestPoolAssignStream(t *testing.T) {
 
 	// First stream goes to slot 0 (both have 0 streams)
 	pool.AssignStream(1)
-	if v, ok := pool.streamMap.Load(uint16(1)); !ok || v.(int) != 0 {
+	if v, ok := pool.streamMap.Load(uint16(1)); !ok || v.(*streamEntry).slotIdx != 0 {
 		t.Fatalf("stream 1 should be on slot 0, got %v", v)
 	}
 	if pool.slots[0].streams.Load() != 1 {
@@ -31,7 +31,7 @@ func TestPoolAssignStream(t *testing.T) {
 
 	// Second stream goes to slot 1 (least loaded)
 	pool.AssignStream(2)
-	if v, ok := pool.streamMap.Load(uint16(2)); !ok || v.(int) != 1 {
+	if v, ok := pool.streamMap.Load(uint16(2)); !ok || v.(*streamEntry).slotIdx != 1 {
 		t.Fatalf("stream 2 should be on slot 1, got %v", v)
 	}
 
@@ -77,7 +77,7 @@ func TestPoolSkipsDeadSlots(t *testing.T) {
 	pool.slots[1].setState(slotReady)
 
 	pool.AssignStream(1)
-	if v, ok := pool.streamMap.Load(uint16(1)); !ok || v.(int) != 1 {
+	if v, ok := pool.streamMap.Load(uint16(1)); !ok || v.(*streamEntry).slotIdx != 1 {
 		t.Fatalf("stream should go to slot 1 (only ready slot)")
 	}
 }
@@ -93,7 +93,7 @@ func TestPoolSkipsDrainingSlots(t *testing.T) {
 	pool.slots[1].setState(slotReady)
 
 	pool.AssignStream(1)
-	if v, ok := pool.streamMap.Load(uint16(1)); !ok || v.(int) != 1 {
+	if v, ok := pool.streamMap.Load(uint16(1)); !ok || v.(*streamEntry).slotIdx != 1 {
 		t.Fatalf("stream should go to slot 1 (draining slots skipped)")
 	}
 }
