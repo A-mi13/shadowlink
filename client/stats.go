@@ -229,6 +229,14 @@ type statsRegistry struct {
 	// a bug.
 	StaleFrameDroppedTotal atomic.Uint64
 
+	// SnapshotNegativeAgeTotal — counts cases where drainStreamSnapshot
+	// observed lastWriteNs > now (clock went backwards under NTP adjust,
+	// or, worse, arbitrary value stored). Clamped to 0 in snapshot logic;
+	// counter exposes the underlying event for observability. Non-zero
+	// rate at >1/h indicates clock skew or a stamping bug worth investigating.
+	// Spec 2026-05-25 (drain-per-stream-diagnostics).
+	SnapshotNegativeAgeTotal atomic.Uint64
+
 	// InflightCapDeferredTotal — drain attempts deferred because
 	// inflightDrains already at maxConcurrentDrains. Indicates the
 	// rotation scheduler is healthy but at peak concurrency. High rate
