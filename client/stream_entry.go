@@ -36,8 +36,8 @@ type drainStreamSnapshot struct {
 	total           int
 	idleAge30sCount int
 	activeCount     int
-	maxIdleAgeMs    int64
-	minIdleAgeMs    int64
+	maxStreamAgeMs  int64 // max age (ms) среди ВСЕХ attached streams (regardless of active/idle classification). 0 if total==0.
+	minStreamAgeMs  int64 // min age (ms) среди ВСЕХ attached streams. 0 if total==0.
 }
 
 // snapshotDrainStreams scans the pool's streamMap once and aggregates
@@ -82,11 +82,11 @@ func snapshotDrainStreams(p *WSPoolTransport, slotIdx int, now time.Time) drainS
 		} else {
 			snap.activeCount++
 		}
-		if snap.total == 1 || ageMs > snap.maxIdleAgeMs {
-			snap.maxIdleAgeMs = ageMs
+		if snap.total == 1 || ageMs > snap.maxStreamAgeMs {
+			snap.maxStreamAgeMs = ageMs
 		}
-		if snap.total == 1 || ageMs < snap.minIdleAgeMs {
-			snap.minIdleAgeMs = ageMs
+		if snap.total == 1 || ageMs < snap.minStreamAgeMs {
+			snap.minStreamAgeMs = ageMs
 		}
 		return true
 	})

@@ -267,8 +267,8 @@ func TestSnapshotDrainStreams_SingleActive(t *testing.T) {
 	if snap.total != 1 || snap.activeCount != 1 || snap.idleAge30sCount != 0 {
 		t.Errorf("single-active snapshot = %+v, want total=1 active=1 idle=0", snap)
 	}
-	if snap.maxIdleAgeMs < 800 || snap.maxIdleAgeMs > 1200 {
-		t.Errorf("maxIdleAgeMs = %d, want ≈1000ms", snap.maxIdleAgeMs)
+	if snap.maxStreamAgeMs < 800 || snap.maxStreamAgeMs > 1200 {
+		t.Errorf("maxStreamAgeMs = %d, want ≈1000ms", snap.maxStreamAgeMs)
 	}
 }
 
@@ -292,7 +292,7 @@ func TestSnapshotDrainStreams_BimodalActivePlusIdle(t *testing.T) {
 	if snap.total != 2 || snap.activeCount != 1 || snap.idleAge30sCount != 1 {
 		t.Errorf("bimodal snapshot = %+v, want total=2 active=1 idle=1", snap)
 	}
-	delta := snap.maxIdleAgeMs - snap.minIdleAgeMs
+	delta := snap.maxStreamAgeMs - snap.minStreamAgeMs
 	if delta < 50000 {
 		t.Errorf("max-min delta = %d ms, want >50000 (bimodal shape)", delta)
 	}
@@ -332,8 +332,8 @@ type drainStreamSnapshot struct {
 	total           int
 	idleAge30sCount int
 	activeCount     int
-	maxIdleAgeMs    int64
-	minIdleAgeMs    int64
+	maxStreamAgeMs    int64
+	minStreamAgeMs    int64
 }
 
 // snapshotDrainStreams scans the pool's streamMap once and aggregates
@@ -378,11 +378,11 @@ func snapshotDrainStreams(p *WSPoolTransport, slotIdx int, now time.Time) drainS
 		} else {
 			snap.activeCount++
 		}
-		if snap.total == 1 || ageMs > snap.maxIdleAgeMs {
-			snap.maxIdleAgeMs = ageMs
+		if snap.total == 1 || ageMs > snap.maxStreamAgeMs {
+			snap.maxStreamAgeMs = ageMs
 		}
-		if snap.total == 1 || ageMs < snap.minIdleAgeMs {
-			snap.minIdleAgeMs = ageMs
+		if snap.total == 1 || ageMs < snap.minStreamAgeMs {
+			snap.minStreamAgeMs = ageMs
 		}
 		return true
 	})
@@ -1109,8 +1109,8 @@ func emitHardCapLog(p *WSPoolTransport, oldIdx int, slot *poolSlot, reason strin
 		"diag_total", snap.total,
 		"diag_idle_30s_count", snap.idleAge30sCount,
 		"diag_active_count", snap.activeCount,
-		"diag_max_idle_age_ms", snap.maxIdleAgeMs,
-		"diag_min_idle_age_ms", snap.minIdleAgeMs,
+		"diag_max_stream_age_ms", snap.maxStreamAgeMs,
+		"diag_min_stream_age_ms", snap.minStreamAgeMs,
 	)
 }
 ```
@@ -1157,8 +1157,8 @@ Replace with:
 				"diag_total", snap.total,
 				"diag_idle_30s_count", snap.idleAge30sCount,
 				"diag_active_count", snap.activeCount,
-				"diag_max_idle_age_ms", snap.maxIdleAgeMs,
-				"diag_min_idle_age_ms", snap.minIdleAgeMs,
+				"diag_max_stream_age_ms", snap.maxStreamAgeMs,
+				"diag_min_stream_age_ms", snap.minStreamAgeMs,
 			)
 ```
 
@@ -1207,7 +1207,7 @@ git commit -m "feat(ws_pool): emit diag snapshot in hard-cap and idle-finish log
 WS pool slot drain {hard cap reached, natural finish (idle)} now
 include five new fields:
   diag_total diag_idle_30s_count diag_active_count
-  diag_max_idle_age_ms diag_min_idle_age_ms
+  diag_max_stream_age_ms diag_min_stream_age_ms
 
 Computed once at teardown via snapshotDrainStreams (O(N) sync.Map
 scan, ~10µs typical). finishStreamsZero branch unchanged — empty

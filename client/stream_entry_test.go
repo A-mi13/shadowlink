@@ -75,8 +75,8 @@ func TestSnapshotDrainStreams_SingleActive(t *testing.T) {
 	if snap.total != 1 || snap.activeCount != 1 || snap.idleAge30sCount != 0 {
 		t.Errorf("single-active snapshot = %+v, want total=1 active=1 idle=0", snap)
 	}
-	if snap.maxIdleAgeMs < 800 || snap.maxIdleAgeMs > 1200 {
-		t.Errorf("maxIdleAgeMs = %d, want ≈1000ms", snap.maxIdleAgeMs)
+	if snap.maxStreamAgeMs < 800 || snap.maxStreamAgeMs > 1200 {
+		t.Errorf("maxStreamAgeMs = %d, want ≈1000ms", snap.maxStreamAgeMs)
 	}
 }
 
@@ -100,7 +100,7 @@ func TestSnapshotDrainStreams_BimodalActivePlusIdle(t *testing.T) {
 	if snap.total != 2 || snap.activeCount != 1 || snap.idleAge30sCount != 1 {
 		t.Errorf("bimodal snapshot = %+v, want total=2 active=1 idle=1", snap)
 	}
-	delta := snap.maxIdleAgeMs - snap.minIdleAgeMs
+	delta := snap.maxStreamAgeMs - snap.minStreamAgeMs
 	if delta < 50000 {
 		t.Errorf("max-min delta = %d ms, want >50000 (bimodal shape)", delta)
 	}

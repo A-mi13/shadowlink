@@ -242,8 +242,8 @@ type drainStreamSnapshot struct {
     total           int    // streams attached to target slot
     idleAge30sCount int    // entries с last_write_age >= 30s
     activeCount     int    // entries с last_write_age < 30s
-    maxIdleAgeMs    int64  // max age (ms) среди attached streams. 0 если total==0
-    minIdleAgeMs    int64  // min age (ms) среди attached streams. 0 если total==0
+    maxStreamAgeMs    int64  // max age (ms) среди attached streams. 0 если total==0
+    minStreamAgeMs    int64  // min age (ms) среди attached streams. 0 если total==0
 }
 
 // snapshotDrainStreams scans the pool's streamMap and computes a
@@ -285,11 +285,11 @@ func snapshotDrainStreams(p *WSPoolTransport, slotIdx int, now time.Time) drainS
         } else {
             snap.activeCount++
         }
-        if snap.total == 1 || ageMs > snap.maxIdleAgeMs {
-            snap.maxIdleAgeMs = ageMs
+        if snap.total == 1 || ageMs > snap.maxStreamAgeMs {
+            snap.maxStreamAgeMs = ageMs
         }
-        if snap.total == 1 || ageMs < snap.minIdleAgeMs {
-            snap.minIdleAgeMs = ageMs
+        if snap.total == 1 || ageMs < snap.minStreamAgeMs {
+            snap.minStreamAgeMs = ageMs
         }
         return true
     })
@@ -335,7 +335,7 @@ slot reason remaining_streams drain_duration
 
 Добавить:
 ```
-diag_total diag_idle_30s_count diag_active_count diag_max_idle_age_ms diag_min_idle_age_ms
+diag_total diag_idle_30s_count diag_active_count diag_max_stream_age_ms diag_min_stream_age_ms
 ```
 
 `diag_total` — даём отдельно от `remaining_streams` чтобы любой mini-race (см. §2.5 ReleaseStream) был виден напрямую, а не маскировался.
@@ -375,12 +375,12 @@ WS pool slot drain hard cap reached slot=5 reason=age remaining_streams=2 drain_
 
 **После patch'а — case "1 active + 1 idle" (доказательство H1):**
 ```
-WS pool slot drain hard cap reached slot=5 reason=age remaining_streams=2 drain_duration=1m30s diag_total=2 diag_idle_30s_count=1 diag_active_count=1 diag_max_idle_age_ms=87420 diag_min_idle_age_ms=1340
+WS pool slot drain hard cap reached slot=5 reason=age remaining_streams=2 drain_duration=1m30s diag_total=2 diag_idle_30s_count=1 diag_active_count=1 diag_max_stream_age_ms=87420 diag_min_stream_age_ms=1340
 ```
 
 **После patch'а — case "2 active" (NOT H1):**
 ```
-WS pool slot drain hard cap reached slot=5 reason=age remaining_streams=2 drain_duration=1m30s diag_total=2 diag_idle_30s_count=0 diag_active_count=2 diag_max_idle_age_ms=2100 diag_min_idle_age_ms=540
+WS pool slot drain hard cap reached slot=5 reason=age remaining_streams=2 drain_duration=1m30s diag_total=2 diag_idle_30s_count=0 diag_active_count=2 diag_max_stream_age_ms=2100 diag_min_stream_age_ms=540
 ```
 
 ### 3.2 Изменения для производительности (hot path)
@@ -446,7 +446,7 @@ WS pool slot drain hard cap reached slot=5 reason=age remaining_streams=2 drain_
 4. `p.slots[5].streams.Store(2)` чтобы согласовать с streamMap.
 5. Capture log output через testing slog handler (либо bytes.Buffer + slog.NewTextHandler — паттерн из `ws_pool_drain_logging_test.go`).
 6. Invoke `drainWatchdog` с short hard cap (10ms), wait teardown.
-7. Assert log contains: `WS pool slot drain hard cap reached`, `diag_total=2`, `diag_idle_30s_count=1`, `diag_active_count=1`, `diag_max_idle_age_ms` ≈ 60000±200, `diag_min_idle_age_ms` ≈ 1000±200.
+7. Assert log contains: `WS pool slot drain hard cap reached`, `diag_total=2`, `diag_idle_30s_count=1`, `diag_active_count=1`, `diag_max_stream_age_ms` ≈ 60000±200, `diag_min_stream_age_ms` ≈ 1000±200.
 
 **`TestDrainWatchdog_LogsDiagnostics_OnIdleFinish`**: тот же setup но оба stream'а с age=60s, hard cap 5s, idle threshold 30s → natural-finish (idle) ветка emit'ит diag поля.
 
@@ -470,8 +470,8 @@ WS pool slot drain hard cap reached slot=5 reason=age remaining_streams=2 drain_
 
 | Bucket | Что искать (H1 shape) |
 |---|---|
-| `remaining_streams == 1` | Single stream с `idle_30s_count == 1` AND `max_idle_age_ms > 30000` → этот stream полностью молчит, но heuristic не сработал. ВЕРОЯТНО H4 (stale stream, не H1). |
-| `remaining_streams == 2` | `idle_30s_count == 1` AND `(max_idle_age_ms - min_idle_age_ms) > 25000` → **bimodal shape "1 active + 1 idle"** — это smoking gun для H1. |
+| `remaining_streams == 1` | Single stream с `idle_30s_count == 1` AND `max_stream_age_ms > 30000` → этот stream полностью молчит, но heuristic не сработал. ВЕРОЯТНО H4 (stale stream, не H1). |
+| `remaining_streams == 2` | `idle_30s_count == 1` AND `(max_stream_age_ms - min_stream_age_ms) > 25000` → **bimodal shape "1 active + 1 idle"** — это smoking gun для H1. |
 | `remaining_streams >= 3` | `idle_30s_count >= remaining_streams - 1` AND bimodal `max-min > 25000ms` → все-кроме-одного молчат, один активен. H1. |
 
 **Step 2 — Compute confirmed_h1_fraction:**
@@ -494,7 +494,7 @@ fraction = confirmed_h1 / total_hard_caps
 
 **Дополнительный data collection (для понимания, не для decision):**
 
-- Гистограмма `(max_idle_age_ms - min_idle_age_ms)` — bimodal распределение с пиками на (~0, ~60000) = H1.
+- Гистограмма `(max_stream_age_ms - min_stream_age_ms)` — bimodal распределение с пиками на (~0, ~60000) = H1.
 - Conditional confirmed_h1 fraction по trigger reason (age vs anti_fingerprint vs byte_budget). Ожидание: H1 равномерна по reason'ам.
 - `diag.total != remaining_streams` events — если ≥10 events за 4h → есть систематический race не покрытый §2.5 анализом, нужен follow-up.
 
