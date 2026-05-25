@@ -92,3 +92,54 @@ func snapshotDrainStreams(p *WSPoolTransport, slotIdx int, now time.Time) drainS
 	})
 	return snap
 }
+
+// allStreamsIdle returns true iff every stream attached to slotIdx has
+// been silent for at least threshold. Returns false if there are no
+// streams attached to slotIdx (caller should have already handled the
+// streams.Load()==0 case via finishStreamsZero) — defensive against
+// edge case where streams counter and streamMap diverge.
+//
+// Early-exits on first active stream found (most ticks during a drain
+// have at least one active heartbeat-stream, so typical path is fast).
+//
+// Concurrency:
+//   - lastWriteNs read via atomic.Int64.Load — no torn reads.
+//   - sync.Map.Range visits each entry at most once; entries removed by
+//     concurrent ReleaseStream may or may not appear, per sync.Map
+//     contract. No partial state.
+//   - Race with new AssignStream: newStreamEntry stamps lastWriteNs=now,
+//     so fresh entries appear as active → conservative (no premature
+//     teardown). False negative for idle on at most one tick (500ms).
+//   - Race with ReleaseStream (spec §2.3.1 fix flips order: streams.Add(-1)
+//     BEFORE Delete): window where snapshot sees decremented counter
+//     but entry still present — entry's lastWriteNs is read, either
+//     correctly active (no premature teardown) or correctly idle
+//     (teardown safe).
+//
+// Cost: O(N) sync.Map scan, N = total active streams across pool.
+// Called only from drainWatchdog tick (500ms cadence). Typical N=50-100,
+// early-exit path <1µs, full-scan path ~5-10µs. Not a hot path.
+func allStreamsIdle(p *WSPoolTransport, slotIdx int, threshold time.Duration, now time.Time) bool {
+	nowNs := now.UnixNano()
+	thresholdNs := threshold.Nanoseconds()
+	found := false
+	allIdle := true
+	p.streamMap.Range(func(_, value any) bool {
+		e, ok := value.(*streamEntry)
+		if !ok || e.slotIdx != slotIdx {
+			return true
+		}
+		found = true
+		age := nowNs - e.lastWriteNs.Load()
+		// Clock-skew handling (spec §2.1 R2-L4): age < 0 means clock
+		// regressed. Conservative — treat as active. No telemetry
+		// bump here (decision path is silent; snapshot path handles
+		// telemetry for the same condition in Step 1).
+		if age < thresholdNs {
+			allIdle = false
+			return false // early exit
+		}
+		return true
+	})
+	return found && allIdle
+}
