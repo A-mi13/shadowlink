@@ -2098,20 +2098,29 @@ func (p *WSPoolTransport) AllSlotsAtMaxPending() bool {
 
 // ReleaseStream removes stream assignment.
 func (p *WSPoolTransport) ReleaseStream(streamID uint16) {
-	// LoadAndDelete remains atomic for the map entry. The minor race
-	// between Delete and streams.Add(-1) is documented in spec §2.5
-	// (ReleaseStream known minor): joint probability <<1 event per
-	// multi-hour canary. If observed in diag logs as diag_total <
-	// remaining_streams, treat as expected mid-Release race.
-	if v, ok := p.streamMap.LoadAndDelete(streamID); ok {
+	// R2-H2 fix: streams.Add(-1) MUST precede streamMap.Delete (symmetric
+	// to the AssignStream flip from Step 1 spec §2.5). Under per-stream
+	// idle decision (Step 2), the inverse ordering would let drainWatchdog
+	// observe streams.Load()>0 while the released entry is already gone
+	// from the map → allStreamsIdle could return true prematurely if the
+	// gone stream was the only active one → tearDown fires while Release
+	// hasn't completed counter decrement → silent drop or decrypt_fails.
+	//
+	// Read entry via Load first (need slotIdx), then decrement counter,
+	// then Delete from map. Trade: not atomic vs old LoadAndDelete, but
+	// SOCKS layer guarantees one owner per streamID so double-Release
+	// requires a future bug (defense-in-depth via inner type checks).
+	if v, ok := p.streamMap.Load(streamID); ok {
 		e, ok := v.(*streamEntry)
 		if !ok {
+			p.streamMap.Delete(streamID)
 			return
 		}
 		idx := e.slotIdx
 		if idx < len(p.slots) && p.slots[idx] != nil {
 			p.slots[idx].streams.Add(-1)
 		}
+		p.streamMap.Delete(streamID)
 	}
 }
 
