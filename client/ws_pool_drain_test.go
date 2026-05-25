@@ -2677,3 +2677,98 @@ func TestBumpRotations1m_FromDrainTearDown(t *testing.T) {
 		t.Errorf("rotations1m after drain tearDown = %d, want %d (Fix 3: drains count as rotations)", got, before+1)
 	}
 }
+
+// TestWriteMessageForStream_StampsBothPerSlotAndPerStream verifies that
+// a successful WriteMessageForStream call updates BOTH the existing
+// per-slot lastActivityNs AND the new per-stream lastWriteNs (Task 3
+// spec §2.3). The two timestamps must match (same time.Now().UnixNano()
+// value). Mirrors the fixture pattern from TestWriteMessageForStream_AcceptsDraining.
+func TestWriteMessageForStream_StampsBothPerSlotAndPerStream(t *testing.T) {
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size:       1,
+		ServerAddr: "127.0.0.1:0",
+	})
+
+	stub := &countingTransport{}
+	p.slots[0] = &poolSlot{transport: stub}
+	p.slots[0].setState(slotReady)
+
+	storeStreamForTest(p, uint16(42), 0)
+
+	before := time.Now().UnixNano()
+	if err := p.WriteMessageForStream(42, []byte("payload")); err != nil {
+		t.Fatalf("WriteMessageForStream returned err: %v", err)
+	}
+	after := time.Now().UnixNano()
+
+	// Per-slot stamp (existing behavior)
+	slotStamp := p.slots[0].lastActivityNs.Load()
+	if slotStamp < before || slotStamp > after {
+		t.Errorf("per-slot lastActivityNs = %d, want in [%d, %d]", slotStamp, before, after)
+	}
+
+	// Per-stream stamp (new behavior — Task 3)
+	v, ok := p.streamMap.Load(uint16(42))
+	if !ok {
+		t.Fatal("streamMap missing entry after write")
+	}
+	e, ok := v.(*streamEntry)
+	if !ok {
+		t.Fatalf("streamMap value is %T, want *streamEntry", v)
+	}
+	streamStamp := e.lastWriteNs.Load()
+	if streamStamp < before || streamStamp > after {
+		t.Errorf("per-stream lastWriteNs = %d, want in [%d, %d]", streamStamp, before, after)
+	}
+
+	// Both stamps should be the same value (same time.Now().UnixNano() call).
+	if slotStamp != streamStamp {
+		t.Errorf("per-slot stamp (%d) != per-stream stamp (%d); they must be derived from the same time.Now() call",
+			slotStamp, streamStamp)
+	}
+}
+
+// TestWriteControlMessageForStream_StampsBothPerSlotAndPerStream — control-frame counterpart.
+func TestWriteControlMessageForStream_StampsBothPerSlotAndPerStream(t *testing.T) {
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size:       1,
+		ServerAddr: "127.0.0.1:0",
+	})
+
+	stub := &countingTransport{}
+	p.slots[0] = &poolSlot{transport: stub}
+	p.slots[0].setState(slotReady)
+
+	storeStreamForTest(p, uint16(43), 0)
+
+	before := time.Now().UnixNano()
+	if err := p.WriteControlMessageForStream(43, []byte("ctrl")); err != nil {
+		t.Fatalf("WriteControlMessageForStream returned err: %v", err)
+	}
+	after := time.Now().UnixNano()
+
+	slotStamp := p.slots[0].lastActivityNs.Load()
+	if slotStamp < before || slotStamp > after {
+		t.Errorf("per-slot lastActivityNs = %d, want in [%d, %d]", slotStamp, before, after)
+	}
+
+	v, ok := p.streamMap.Load(uint16(43))
+	if !ok {
+		t.Fatal("streamMap missing entry after control write")
+	}
+	e, ok := v.(*streamEntry)
+	if !ok {
+		t.Fatalf("streamMap value is %T, want *streamEntry", v)
+	}
+	streamStamp := e.lastWriteNs.Load()
+	if streamStamp < before || streamStamp > after {
+		t.Errorf("per-stream lastWriteNs = %d, want in [%d, %d]", streamStamp, before, after)
+	}
+
+	if slotStamp != streamStamp {
+		t.Errorf("per-slot stamp (%d) != per-stream stamp (%d); must derive from same time.Now()",
+			slotStamp, streamStamp)
+	}
+}
