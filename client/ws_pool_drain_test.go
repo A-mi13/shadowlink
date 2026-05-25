@@ -2782,3 +2782,132 @@ func TestWriteControlMessageForStream_StampsPerStream(t *testing.T) {
 		t.Errorf("per-stream lastWriteNs = %d, want in [%d, %d]", streamStamp, before, after)
 	}
 }
+
+// TestDrainWatchdog_PerStreamIdle_TriggersWhenAllSilent verifies the
+// core Step 2 behavior: with 2 streams attached, both pre-aged past
+// threshold, drainWatchdog should fire finishIdle (not hard cap).
+// Asserts the spec §2.4 invariant on the emitted log line:
+// diag_min_stream_age_ms >= threshold at finishIdle.
+//
+// Spec 2026-05-25-drain-per-stream-idle-decision-design §4.2 #7.
+func TestDrainWatchdog_PerStreamIdle_TriggersWhenAllSilent(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size:               2,
+		ServerAddr:         "127.0.0.1:0",
+		GracefulDrain:      true,
+		DrainHardCap:       3 * time.Second,
+		DrainIdleThreshold: 100 * time.Millisecond,
+	})
+	p.ctx = t.Context()
+	p.log = logger
+
+	oldSlot := &poolSlot{}
+	oldSlot.setState(slotDraining)
+	oldSlot.streams.Store(2)
+	oldSlot.startedAtNs.Store(time.Now().Add(-2 * time.Minute).UnixNano())
+	p.slots[0] = oldSlot
+
+	// Both streams aged 500ms — well past 100ms threshold.
+	storeStreamForTestWithAge(p, 1, 0, 500*time.Millisecond)
+	storeStreamForTestWithAge(p, 2, 0, 500*time.Millisecond)
+
+	beforeIdle := Stats.DrainIdleFinishTotal.Load()
+
+	start := time.Now()
+	p.drainWatchdog(cl, 0, oldSlot, start, "test")
+	elapsed := time.Since(start)
+
+	// Should finishIdle on the first tick after threshold — well under
+	// the 3s hard cap.
+	if elapsed >= 1500*time.Millisecond {
+		t.Errorf("finishIdle took %v, expected ≤ ~1s", elapsed)
+	}
+	if got := Stats.DrainIdleFinishTotal.Load(); got != beforeIdle+1 {
+		t.Errorf("DrainIdleFinishTotal = %d, want %d", got, beforeIdle+1)
+	}
+
+	// Spec §2.4 invariant: at finishIdle, diag_min_stream_age_ms must be
+	// >= threshold (all streams silent at least that long).
+	out := logBuf.String()
+	if !strings.Contains(out, "natural finish (idle)") {
+		t.Errorf("log should contain 'natural finish (idle)':\n%s", out)
+	}
+	if !strings.Contains(out, "diag_min_stream_age_ms=") {
+		t.Errorf("log missing diag_min_stream_age_ms field:\n%s", out)
+	}
+}
+
+// TestDrainWatchdog_PerStreamIdle_HoldsOpenForActiveStream verifies
+// that a slot with one persistently-active stream does NOT trigger
+// finishIdle — it rides to hard cap. Active stream's lastWriteNs is
+// re-stamped every 50ms (well under the 100ms threshold), so
+// allStreamsIdle should always see at least one active stream.
+//
+// Spec 2026-05-25-drain-per-stream-idle-decision-design §4.2 #8.
+func TestDrainWatchdog_PerStreamIdle_HoldsOpenForActiveStream(t *testing.T) {
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size:               2,
+		ServerAddr:         "127.0.0.1:0",
+		GracefulDrain:      true,
+		DrainHardCap:       400 * time.Millisecond,
+		DrainIdleThreshold: 100 * time.Millisecond,
+	})
+	p.ctx = t.Context()
+
+	oldSlot := &poolSlot{}
+	oldSlot.setState(slotDraining)
+	oldSlot.streams.Store(2)
+	p.slots[0] = oldSlot
+
+	// Stream 1: idle (would-be candidate to trigger idle alone).
+	storeStreamForTestWithAge(p, 1, 0, 200*time.Millisecond)
+
+	// Stream 2: active — start fresh, re-stamp every 50ms.
+	storeStreamForTestWithAge(p, 2, 0, 0)
+
+	stopActive := make(chan struct{})
+	activeDone := make(chan struct{})
+	go func() {
+		defer close(activeDone)
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopActive:
+				return
+			case <-ticker.C:
+				if v, ok := p.streamMap.Load(uint16(2)); ok {
+					if e, ok := v.(*streamEntry); ok {
+						e.lastWriteNs.Store(time.Now().UnixNano())
+					}
+				}
+			}
+		}
+	}()
+
+	beforeIdle := Stats.DrainIdleFinishTotal.Load()
+	beforeHard := Stats.DrainHardCapTotal.Load()
+
+	start := time.Now()
+	p.drainWatchdog(cl, 0, oldSlot, start, "test")
+	elapsed := time.Since(start)
+
+	close(stopActive)
+	<-activeDone
+
+	// Should ride to hard cap (~400ms), NOT finishIdle.
+	if elapsed < 350*time.Millisecond {
+		t.Errorf("expected hard cap (~400ms), got %v (active stream did not hold slot open?)", elapsed)
+	}
+	if got := Stats.DrainIdleFinishTotal.Load(); got != beforeIdle {
+		t.Errorf("DrainIdleFinishTotal must not advance with active stream; before=%d after=%d", beforeIdle, got)
+	}
+	if got := Stats.DrainHardCapTotal.Load(); got != beforeHard+1 {
+		t.Errorf("DrainHardCapTotal = %d, want %d", got, beforeHard+1)
+	}
+}
