@@ -854,7 +854,7 @@ type WSPoolTransport struct {
 	// triggers (age/byte/anti-FP) read identical capacity and all proceed.
 	inflightDrains atomic.Int32
 
-	streamMap sync.Map // map[uint16]int — streamID -> slot index
+	streamMap sync.Map // map[uint16]*streamEntry — streamID -> entry (see stream_entry.go)
 
 	// For creating new slots
 	serverAddr   string
@@ -2011,8 +2011,25 @@ func (p *WSPoolTransport) AssignStream(streamID uint16) {
 		}
 	}
 
-	p.streamMap.Store(streamID, minIdx)
+	// R1-H3 fix: streams.Add MUST precede streamMap.Store so any
+	// concurrent snapshot that observes the new entry also sees
+	// the incremented counter. See spec §2.5.
+	//
+	// R2-M3 sanity-assert: log if streamID is already mapped (caller
+	// bug — production SOCKS guarantees single-owner). Not atomic
+	// protection; just observability for future regression.
+	if existing, dup := p.streamMap.Load(streamID); dup {
+		if e, ok := existing.(*streamEntry); ok {
+			p.log.Warn("AssignStream called twice for same streamID without ReleaseStream",
+				"stream", streamID, "old_slot", e.slotIdx, "new_slot", minIdx)
+		} else {
+			p.log.Warn("AssignStream duplicate with non-streamEntry value",
+				"stream", streamID, "new_slot", minIdx)
+		}
+		return
+	}
 	p.slots[minIdx].streams.Add(1)
+	p.streamMap.Store(streamID, newStreamEntry(minIdx))
 	Trace("stream assigned", "stream", streamID, "slot", minIdx,
 		"pending", p.slots[minIdx].pendingConnects.Load(),
 		"streams", p.slots[minIdx].streams.Load())
@@ -2021,7 +2038,11 @@ func (p *WSPoolTransport) AssignStream(streamID uint16) {
 // IncrPending increments the pending CONNECT counter for the stream's assigned slot.
 func (p *WSPoolTransport) IncrPending(streamID uint16) {
 	if v, ok := p.streamMap.Load(streamID); ok {
-		idx := v.(int)
+		e, ok := v.(*streamEntry)
+		if !ok {
+			return
+		}
+		idx := e.slotIdx
 		if idx < len(p.slots) && p.slots[idx] != nil {
 			p.slots[idx].pendingConnects.Add(1)
 		}
@@ -2031,7 +2052,11 @@ func (p *WSPoolTransport) IncrPending(streamID uint16) {
 // DecrPending decrements the pending CONNECT counter for the stream's assigned slot.
 func (p *WSPoolTransport) DecrPending(streamID uint16) {
 	if v, ok := p.streamMap.Load(streamID); ok {
-		idx := v.(int)
+		e, ok := v.(*streamEntry)
+		if !ok {
+			return
+		}
+		idx := e.slotIdx
 		if idx < len(p.slots) && p.slots[idx] != nil {
 			p.slots[idx].pendingConnects.Add(-1)
 		}
@@ -2041,7 +2066,11 @@ func (p *WSPoolTransport) DecrPending(streamID uint16) {
 // SlotPending returns pending CONNECT count for the stream's assigned slot.
 func (p *WSPoolTransport) SlotPending(streamID uint16) int32 {
 	if v, ok := p.streamMap.Load(streamID); ok {
-		idx := v.(int)
+		e, ok := v.(*streamEntry)
+		if !ok {
+			return 0
+		}
+		idx := e.slotIdx
 		if idx < len(p.slots) && p.slots[idx] != nil {
 			return p.slots[idx].pendingConnects.Load()
 		}
@@ -2069,8 +2098,17 @@ func (p *WSPoolTransport) AllSlotsAtMaxPending() bool {
 
 // ReleaseStream removes stream assignment.
 func (p *WSPoolTransport) ReleaseStream(streamID uint16) {
+	// LoadAndDelete remains atomic for the map entry. The minor race
+	// between Delete and streams.Add(-1) is documented in spec §2.5
+	// (ReleaseStream known minor): joint probability <<1 event per
+	// multi-hour canary. If observed in diag logs as diag_total <
+	// remaining_streams, treat as expected mid-Release race.
 	if v, ok := p.streamMap.LoadAndDelete(streamID); ok {
-		idx := v.(int)
+		e, ok := v.(*streamEntry)
+		if !ok {
+			return
+		}
+		idx := e.slotIdx
 		if idx < len(p.slots) && p.slots[idx] != nil {
 			p.slots[idx].streams.Add(-1)
 		}
@@ -2085,7 +2123,11 @@ func (p *WSPoolTransport) ReleaseStream(streamID uint16) {
 // (client.go:710, socks5/tcp.go:495/531/565) already nil-guard.
 func (p *WSPoolTransport) SessionForStream(streamID uint16) *core.Session {
 	if v, ok := p.streamMap.Load(streamID); ok {
-		idx := v.(int)
+		e, ok := v.(*streamEntry)
+		if !ok {
+			return nil
+		}
+		idx := e.slotIdx
 		if idx >= 0 && idx < len(p.slots) && p.slots[idx] != nil {
 			return p.slots[idx].session
 		}
@@ -2111,13 +2153,19 @@ func (p *WSPoolTransport) SessionForStream(streamID uint16) *core.Session {
 // scans for any ready slot and is reserved for non-stream traffic.
 func (p *WSPoolTransport) WriteMessageForStream(streamID uint16, data []byte) error {
 	if v, ok := p.streamMap.Load(streamID); ok {
-		idx := v.(int)
+		e, ok := v.(*streamEntry)
+		if !ok {
+			return p.WriteMessage(data)
+		}
+		idx := e.slotIdx
 		if idx < len(p.slots) {
 			slot := p.slots[idx]
 			if slot != nil && slot.transport != nil {
 				st := slot.getState()
 				if st == slotReady || st == slotDraining {
-					slot.lastActivityNs.Store(time.Now().UnixNano())
+					now := time.Now().UnixNano()
+					slot.lastActivityNs.Store(now) // existing per-slot stamp (out-of-scope to remove)
+					e.lastWriteNs.Store(now)       // NEW: per-stream stamp (Step 1 spec §2.3)
 					return slot.transport.WriteMessage(data)
 				}
 			}
@@ -2135,13 +2183,19 @@ func (p *WSPoolTransport) WriteMessageForStream(streamID uint16, data []byte) er
 // spec reference.
 func (p *WSPoolTransport) WriteControlMessageForStream(streamID uint16, data []byte) error {
 	if v, ok := p.streamMap.Load(streamID); ok {
-		idx := v.(int)
+		e, ok := v.(*streamEntry)
+		if !ok {
+			return p.WriteControlMessage(data)
+		}
+		idx := e.slotIdx
 		if idx < len(p.slots) {
 			slot := p.slots[idx]
 			if slot != nil && slot.transport != nil {
 				st := slot.getState()
 				if st == slotReady || st == slotDraining {
-					slot.lastActivityNs.Store(time.Now().UnixNano())
+					now := time.Now().UnixNano()
+					slot.lastActivityNs.Store(now)
+					e.lastWriteNs.Store(now) // NEW: per-stream stamp
 					return slot.transport.WriteControlMessage(data)
 				}
 			}
@@ -2444,11 +2498,20 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 		// W5 stale-frame validation: drop frames whose streamID has been
 		// reassigned to a different slot (post-drain-teardown streamID
 		// reuse race). Spec 2026-05-20 §2.4.1.
+		//
+		// Spec 2026-05-25 §2.4: per-stream lastWriteNs is stamped ONLY
+		// AFTER successful slotIdx == idx validation. Frames for
+		// reassigned streamIDs do NOT count as activity on the new owner.
 		if v, ok := p.streamMap.Load(streamID); ok {
-			if v.(int) != idx {
+			e, ok := v.(*streamEntry)
+			if !ok {
+				continue
+			}
+			if e.slotIdx != idx {
 				Stats.StaleFrameDroppedTotal.Add(1)
 				continue
 			}
+			e.lastWriteNs.Store(time.Now().UnixNano())
 		}
 
 		if chunk.Flags == core.FlagUDP {
@@ -2656,7 +2719,8 @@ func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int, cause slotDeathCa
 	// streamMap.Delete BEFORE close(ch) keeps the no-underflow invariant
 	// (see ReleaseStream's LoadAndDelete semantics).
 	p.streamMap.Range(func(key, value any) bool {
-		if value.(int) != idx {
+		e, ok := value.(*streamEntry)
+		if !ok || e.slotIdx != idx {
 			return true
 		}
 		streamID := key.(uint16)
