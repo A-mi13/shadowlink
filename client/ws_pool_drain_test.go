@@ -1,9 +1,11 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -2727,6 +2729,67 @@ func TestWriteMessageForStream_StampsBothPerSlotAndPerStream(t *testing.T) {
 		t.Errorf("per-slot stamp (%d) != per-stream stamp (%d); they must be derived from the same time.Now() call",
 			slotStamp, streamStamp)
 	}
+}
+
+// TestEmitHardCapLog_IncludesDiagSnapshot verifies that the hard-cap
+// log includes the new diag_* fields populated from snapshotDrainStreams.
+// Uses the same fixture pattern as TestDrainWatchdog_HardCapTimeout —
+// fakes a pool with two streams at controlled ages, then directly
+// invokes emitHardCapLog and inspects captured output.
+//
+// The "1 active + 1 idle" shape is the smoking gun for hypothesis H1:
+// if production hard-cap logs show this shape often, per-slot idle
+// measurement is masking real per-stream idle (spec §2.4 / canary §4.4).
+func TestEmitHardCapLog_IncludesDiagSnapshot(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	// Minimal harness: pool with two slots so slot index 0 references
+	// a real *poolSlot we can put streams on. We don't need transport
+	// or session — emitHardCapLog only reads slot.streams and the
+	// pool's streamMap.
+	p := &WSPoolTransport{
+		log: logger,
+	}
+	p.slots = []*poolSlot{
+		{streams: atomic.Int32{}},
+	}
+	p.slots[0].streams.Store(2)
+
+	storeStreamForTestWithAge(p, 1, 0, 1*time.Second)
+	storeStreamForTestWithAge(p, 2, 0, 60*time.Second)
+
+	emitHardCapLog(p, 0, p.slots[0], "age", 90*time.Second)
+
+	out := buf.String()
+	required := []string{
+		"drain hard cap reached",
+		"diag_total=2",
+		"diag_idle_30s_count=1",
+		"diag_active_count=1",
+		"diag_max_stream_age_ms=",
+		"diag_min_stream_age_ms=",
+	}
+	for _, want := range required {
+		if !strings.Contains(out, want) {
+			t.Errorf("log missing %q\nfull output:\n%s", want, out)
+		}
+	}
+}
+
+// TestTearDownIdle_IncludesDiagSnapshot — placeholder.
+//
+// The finishIdle branch sits inside drainWatchdog's tearDown closure and
+// is not directly callable from outside. Exercising it requires a real
+// watchdog run, which is well-covered by TestDrainWatchdog_* family.
+// The diag-field shape is identical to hard-cap (same snapshotDrainStreams
+// call, same field names), so TestEmitHardCapLog_IncludesDiagSnapshot
+// exercises the same logic.
+//
+// Skip is documented so anyone investigating canary regressions knows
+// where to start.
+func TestTearDownIdle_IncludesDiagSnapshot(t *testing.T) {
+	t.Skip("Requires drainWatchdog harness; integration coverage via canary logs.")
 }
 
 // TestWriteControlMessageForStream_StampsBothPerSlotAndPerStream — control-frame counterpart.

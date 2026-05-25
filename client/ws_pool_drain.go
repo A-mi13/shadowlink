@@ -585,11 +585,18 @@ func (p *WSPoolTransport) drainWatchdog(cl *Client, oldIdx int, oldSlot *poolSlo
 			Stats.DrainNaturalFinishTotal.Add(1)
 			Stats.DrainIdleFinishTotal.Add(1)
 			idleFor := time.Since(time.Unix(0, oldSlot.lastActivityNs.Load()))
+			snap := snapshotDrainStreams(p, oldIdx, time.Now())
 			p.log.Info("WS pool slot drain natural finish (idle)",
 				"slot", oldIdx, "reason", reason,
 				"remaining_streams", oldSlot.streams.Load(),
 				"idle_for", idleFor.Truncate(time.Second),
-				"drain_duration", duration.Truncate(time.Second))
+				"drain_duration", duration.Truncate(time.Second),
+				"diag_total", snap.total,
+				"diag_idle_30s_count", snap.idleAge30sCount,
+				"diag_active_count", snap.activeCount,
+				"diag_max_stream_age_ms", snap.maxStreamAgeMs,
+				"diag_min_stream_age_ms", snap.minStreamAgeMs,
+			)
 		default: // finishStreamsZero
 			Stats.DrainNaturalFinishTotal.Add(1)
 			p.log.Info("WS pool slot drain natural finish",
@@ -656,6 +663,8 @@ func (p *WSPoolTransport) drainWatchdog(cl *Client, oldIdx int, oldSlot *poolSlo
 func emitHardCapLog(p *WSPoolTransport, oldIdx int, slot *poolSlot, reason string, duration time.Duration) {
 	Stats.DrainHardCapTotal.Add(1)
 	remaining := slot.streams.Load()
+	snap := snapshotDrainStreams(p, oldIdx, time.Now())
+
 	logFn := p.log.Info
 	if remaining >= hardCapWarnThreshold {
 		logFn = p.log.Warn
@@ -663,5 +672,11 @@ func emitHardCapLog(p *WSPoolTransport, oldIdx int, slot *poolSlot, reason strin
 	logFn("WS pool slot drain hard cap reached",
 		"slot", oldIdx, "reason", reason,
 		"remaining_streams", remaining,
-		"drain_duration", duration.Truncate(time.Second))
+		"drain_duration", duration.Truncate(time.Second),
+		"diag_total", snap.total,
+		"diag_idle_30s_count", snap.idleAge30sCount,
+		"diag_active_count", snap.activeCount,
+		"diag_max_stream_age_ms", snap.maxStreamAgeMs,
+		"diag_min_stream_age_ms", snap.minStreamAgeMs,
+	)
 }
