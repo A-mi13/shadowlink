@@ -615,12 +615,13 @@ func (p *WSPoolTransport) drainWatchdog(cl *Client, oldIdx int, oldSlot *poolSlo
 		p.handleSlotDeath(cl, oldIdx, deathCauseDrainTeardown)
 	}
 
-	// Idle heuristic is active only when both knobs are >0 (DrainIdleStreamsMax
-	// is set to 0 to disable; DrainIdleThreshold <= 0 also disables). Read
-	// once at watchdog entry — these are write-once-at-init fields on the pool.
+	// Step 2: idle heuristic now uses per-stream measurement via
+	// allStreamsIdle (defined in stream_entry.go). The disable knob is
+	// SHADOWLINK_DRAIN_IDLE_THRESHOLD=0 — SHADOWLINK_DRAIN_IDLE_STREAMS_MAX
+	// is deprecated and ignored in the decision (BREAKING CHANGE doc'd
+	// in spec §2.5; startup WARN emitted in cmd-layer if env set).
 	idleThreshold := p.drainIdleThreshold
-	idleStreamsMax := p.drainIdleStreamsMax
-	idleEnabled := idleThreshold > 0 && idleStreamsMax > 0
+	idleEnabled := idleThreshold > 0
 
 	for {
 		select {
@@ -635,16 +636,9 @@ func (p *WSPoolTransport) drainWatchdog(cl *Client, oldIdx int, oldSlot *poolSlo
 				tearDown(finishStreamsZero)
 				return
 			}
-			if idleEnabled && streams <= idleStreamsMax {
-				last := oldSlot.lastActivityNs.Load()
-				// last==0 is the impossible-but-defensive case: connectSlot
-				// always stamps lastActivityNs alongside startedAtNs on
-				// (re)connect. Guard against it anyway so a corrupt slot
-				// state can't trip the idle path prematurely.
-				if last > 0 && time.Since(time.Unix(0, last)) >= idleThreshold {
-					tearDown(finishIdle)
-					return
-				}
+			if idleEnabled && allStreamsIdle(p, oldIdx, idleThreshold, time.Now()) {
+				tearDown(finishIdle)
+				return
 			}
 		}
 	}
