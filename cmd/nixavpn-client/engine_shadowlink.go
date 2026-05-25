@@ -432,6 +432,14 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 				// inside the window.
 				drainIdleThreshold := envDurationDefault("SHADOWLINK_DRAIN_IDLE_THRESHOLD", 30*time.Second)
 				drainIdleStreamsMax := int32(envIntDefault("SHADOWLINK_DRAIN_IDLE_STREAMS_MAX", 2))
+				// Deprecation notice (spec 2026-05-25-drain-per-stream-idle-decision-design §2.5):
+				// SHADOWLINK_DRAIN_IDLE_STREAMS_MAX is no longer consulted in the drain
+				// decision after Step 2. Emit a one-time WARN if operator set it
+				// explicitly so they know to migrate to SHADOWLINK_DRAIN_IDLE_THRESHOLD=0.
+				if _, set := os.LookupEnv("SHADOWLINK_DRAIN_IDLE_STREAMS_MAX"); set {
+					slog.Warn("SHADOWLINK_DRAIN_IDLE_STREAMS_MAX is deprecated and no longer affects drain behavior. " +
+						"Use SHADOWLINK_DRAIN_IDLE_THRESHOLD=0 to disable the idle gate.")
+				}
 
 				pool := client.NewWSPoolTransport(e.cl, client.WSPoolConfig{
 					Size:                poolSize,

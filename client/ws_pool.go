@@ -817,9 +817,10 @@ type WSPoolTransport struct {
 	// drainIdleStreamsMax — upper bound on streams.Load() at which the
 	// idle heuristic is allowed to fire. With many remaining streams the
 	// drain SHOULD wait for the hard cap; with 1-2 streams the risk of
-	// killing a real flow is small. Default 2 (matches the 2026-05-22
-	// 8h canary observation that 79.6% of hard-cap drains held ≤2
-	// streams). Zero disables idle-finish independently of threshold.
+	// drainIdleStreamsMax — Deprecated: kept readable for env-parsing
+	// backward compatibility. Step 2 (per-stream idle decision) ignores
+	// this value in decision logic. Use DrainIdleThreshold=0 to disable
+	// the idle gate. See spec 2026-05-25-drain-per-stream-idle-decision-design §2.5.
 	drainIdleStreamsMax int32
 
 	// reserveMu serializes ALL writes to p.slots[idx] across drain
@@ -1027,7 +1028,10 @@ type WSPoolConfig struct {
 	// DrainIdleStreamsMax is the upper bound on remaining streams under
 	// which the idle-finish heuristic is allowed to fire. Zero disables
 	// the heuristic (regardless of DrainIdleThreshold). Field-tune via
-	// SHADOWLINK_DRAIN_IDLE_STREAMS_MAX env.
+	// DrainIdleStreamsMax — Deprecated: no longer participates in the
+	// idle gate decision after Step 2 (per-stream idle decision).
+	// Kept on the struct for env-parsing backward compatibility. Use
+	// DrainIdleThreshold=0 to disable the idle gate.
 	DrainIdleStreamsMax int32
 }
 
