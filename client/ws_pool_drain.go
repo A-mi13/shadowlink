@@ -584,12 +584,10 @@ func (p *WSPoolTransport) drainWatchdog(cl *Client, oldIdx int, oldSlot *poolSlo
 		case finishIdle:
 			Stats.DrainNaturalFinishTotal.Add(1)
 			Stats.DrainIdleFinishTotal.Add(1)
-			idleFor := time.Since(time.Unix(0, oldSlot.lastActivityNs.Load()))
 			snap := snapshotDrainStreams(p, oldIdx, time.Now())
 			p.log.Info("WS pool slot drain natural finish (idle)",
 				"slot", oldIdx, "reason", reason,
 				"remaining_streams", oldSlot.streams.Load(),
-				"idle_for", idleFor.Truncate(time.Second),
 				"drain_duration", duration.Truncate(time.Second),
 				"diag_total", snap.total,
 				"diag_idle_30s_count", snap.idleAge30sCount,

@@ -274,19 +274,6 @@ type poolSlot struct {
 	// Zero means "never connected" (initial state).
 	startedAtNs atomic.Int64
 
-	// lastActivityNs is the UnixNano timestamp of the most recent data frame
-	// observed on this slot — either a successful DecryptChunkSafe in the
-	// reader or a WriteMessageForStream / WriteControlMessageForStream on
-	// the writer. drainWatchdog reads it to decide whether the remaining
-	// active streams are genuinely transferring or merely keepalive idle:
-	// in the 2026-05-22 8h canary, 79.6% of hard-cap drains held ≤2
-	// streams that were idle for the entire drain window. Treating those
-	// drains as natural finish (early teardown) lifts the natural-finish
-	// ratio from 60% toward 75-80% without changing the hard-cap budget.
-	// Set by connectSlot to "now" on reconnect so a freshly-bound slot
-	// isn't immediately classified idle. Atomic, no lock needed.
-	lastActivityNs atomic.Int64
-
 	// byteBudget is the per-slot, per-session downlink-byte threshold that
 	// triggers preemptive rotation. Sampled ONCE in connectSlot from a wide
 	// jittered range based on WSPoolTransport.maxBytesPerSlot and the slot
@@ -1496,10 +1483,6 @@ func (p *WSPoolTransport) connectSlot(ctx context.Context, idx int) error {
 	// startedAtNs=0.
 	now := time.Now().UnixNano()
 	slot.startedAtNs.Store(now)
-	// lastActivityNs primes to now() on (re)connect so drainWatchdog's
-	// idle-finish heuristic doesn't mis-classify a freshly-bound slot as
-	// idle. Real frames overwrite this in slotReader and the writer path.
-	slot.lastActivityNs.Store(now)
 	// Reset reader-active flag so the next slotReader can CAS into ownership.
 	// At this point the previous reader either:
 	//   (a) was never running for this slot (initial connect), or
@@ -2172,9 +2155,7 @@ func (p *WSPoolTransport) WriteMessageForStream(streamID uint16, data []byte) er
 			if slot != nil && slot.transport != nil {
 				st := slot.getState()
 				if st == slotReady || st == slotDraining {
-					now := time.Now().UnixNano()
-					slot.lastActivityNs.Store(now) // existing per-slot stamp (out-of-scope to remove)
-					e.lastWriteNs.Store(now)       // NEW: per-stream stamp (Step 1 spec §2.3)
+					e.lastWriteNs.Store(time.Now().UnixNano())
 					return slot.transport.WriteMessage(data)
 				}
 			}
@@ -2202,9 +2183,7 @@ func (p *WSPoolTransport) WriteControlMessageForStream(streamID uint16, data []b
 			if slot != nil && slot.transport != nil {
 				st := slot.getState()
 				if st == slotReady || st == slotDraining {
-					now := time.Now().UnixNano()
-					slot.lastActivityNs.Store(now)
-					e.lastWriteNs.Store(now) // NEW: per-stream stamp
+					e.lastWriteNs.Store(time.Now().UnixNano())
 					return slot.transport.WriteControlMessage(data)
 				}
 			}
@@ -2496,10 +2475,8 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 			continue
 		}
 
-		// Stamp activity for drainWatchdog's idle-finish gate. Any successful
-		// decrypt is a real downlink frame — keepalive cover frames take a
-		// different path. Cheap atomic store, no lock.
-		slot.lastActivityNs.Store(time.Now().UnixNano())
+		// Per-stream lastWriteNs is stamped below, after the stale-frame
+		// check (spec §2.4) — slot-level stamp was removed in Step 2.
 
 		msgCount++
 		streamID := uint16(chunk.Payload[0])<<8 | uint16(chunk.Payload[1])
