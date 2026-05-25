@@ -543,7 +543,7 @@ Requires CGO + gcc. Windows dev hosts without gcc fall back to plain `go test` (
 | `SHADOWLINK_PHASED_WARMUP` | on | not-set → linear stagger (legacy) |
 | `SHADOWLINK_SOCKS5_COALESCE` | on | `=0` direct Acquire (no debounce) |
 | `SHADOWLINK_ADMIN_OVERRIDE` | on (client) | `=0/false/no/off` skips network fetch (cached/baseline only) |
-| `SHADOWLINK_GRACEFUL_DRAIN` | off (Phase 1) | When `=1`/`true`/`yes`/`on` enables HTTP/2 GOAWAY-style slot draining: active streams survive rotation until natural finish or `DrainHardCap`. Off → legacy hard-rotation path. Phase 3 flips default to on. |
+| `SHADOWLINK_GRACEFUL_DRAIN` | **ON since 2026-05-20 (Phase 3)** | HTTP/2 GOAWAY-style slot draining with uniform-cells pool: active streams survive rotation, any free cell in the 2*poolSize slice serves as drain replacement, storm brake gates on readyCapacity. `=0`/`false`/`no`/`off` is the emergency opt-out → legacy hard-rotation path. Three canaries showed natural-finish ratio 53%, 0 capacity-floor defers, 0 reader-exit regressions. |
 | `SHADOWLINK_DRAIN_HARD_CAP` | 90s | `time.Duration` (e.g. `"90s"`, `"2m"`): max time a slot can stay in `slotDraining` before forced teardown. Only consulted when `SHADOWLINK_GRACEFUL_DRAIN` is on. Tune in field without redeploy. |
 
 ### Metrics added

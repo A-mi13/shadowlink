@@ -1,34 +1,163 @@
 package client
 
 import (
+	"math/rand/v2"
+	"sync/atomic"
 	"time"
 )
 
 const (
-	drainPollInterval  = 500 * time.Millisecond
+	// drainPollInterval — drainWatchdog tick rate when checking if active
+	// streams have drained naturally.
+	drainPollInterval = 500 * time.Millisecond
+
+	// drainRevertBackoff — backoff after startDrain failed because
+	// claimFreeSlot returned -1 (slice fully occupied). Genuine resource
+	// exhaustion, retry slowly.
 	drainRevertBackoff = 30 * time.Second
+
+	// drainStormBrakeBackoff — backoff after storm-brake deferral in
+	// non-catastrophic state (readyCapacity >= poolSize/2). Equal to one
+	// rotation watchdog tick (currently 5s — verified at T7) so the next
+	// sweep re-evaluates immediately. Cheap to retry: readyCapacity() is
+	// O(2*poolSize) integer compare. Spec 2026-05-20 §2.4.2 (W6 review
+	// fix). If the watchdog interval changes in the future, update this
+	// constant to match.
+	drainStormBrakeBackoff = 5 * time.Second
+
+	// drainCatastrophicBackoff — backoff when readyCapacity dropped below
+	// poolSize/2 (more than half the pool is dead/connecting). Long
+	// backoff to let reconnectLoop heal capacity without tight retry
+	// loops that would just spin against the storm brake. Spec 2026-05-20
+	// §2.1.1 (C2 review fix). 5x drainRevertBackoff is the spec-mandated
+	// multiplier — see §2.1.1.
+	drainCatastrophicBackoff = 150 * time.Second
+
+	// drainDeferredLogInterval — minimum wall-clock gap between two
+	// consecutive INFO emissions of "drain deferred" for the SAME gate.
+	// Counters always increment; only the human-readable log is
+	// rate-limited. 30s chosen to surface temporal trends (peaks/valleys)
+	// without log spam — the 2026-05-24 session (12326 deferrals over
+	// 4h52m) would have produced ~10 INFO lines per gate.
+	// Spec 2026-05-24 (drain-diagnostics-counter-split).
+	drainDeferredLogInterval = 30 * time.Second
+
+	// hardCapWarnThreshold — minimum remaining_streams for a hard-cap
+	// teardown to log at WARN level. Below this threshold the teardown
+	// logs INFO.
+	//
+	// Rationale: hard cap with remaining_streams=1-2 is expected
+	// steady-state behaviour under long-lived SOCKS sessions (uplinks
+	// of 4-10min seen regularly in real traffic). Session 2026-05-24
+	// distribution (272 hard-cap events, disjoint buckets):
+	//   remaining=1:   96 (35.3%)
+	//   remaining=2:   153 (56.3%)
+	//   remaining=3-4: 17 (6.3%)
+	//   remaining>=5:  6 (2.2%)
+	// Threshold=5 keeps ~98% at INFO, surfacing only outliers as WARN.
+	// Spec 2026-05-24 (drain-diagnostics-counter-split) §4.
+	hardCapWarnThreshold int32 = 5
+
+	// reserveConnectInitialBackoff — first delay after connectReserveSlot
+	// fails, before spawning reconnectLoop. Doubled on each consecutive
+	// failure up to reserveConnectMaxBackoff. Spec 2026-05-24
+	// (concurrency-lift-and-backoff) §2.
+	reserveConnectInitialBackoff = 500 * time.Millisecond
+
+	// reserveConnectMaxBackoff — ceiling for connectReserveSlot
+	// exponential backoff. Equal to drainRevertBackoff (30s) for symmetry
+	// with the existing "slice full" retry timeline. Spec 2026-05-24.
+	reserveConnectMaxBackoff = 30 * time.Second
+
+	// reserveConnectBackoffJitterFraction — ±20% jitter applied to the
+	// computed backoff to avoid thundering herd when multiple slots fail
+	// simultaneously (e.g. cascade TIME_WAIT exhaustion under upload
+	// load). Spec 2026-05-24.
+	reserveConnectBackoffJitterFraction = 0.2
 )
 
-// claimFreeReserveSlot atomically reserves the first nil cell in the
-// reserve range [poolSize, 2*poolSize) by installing a placeholder
-// poolSlot in slotConnecting state and returning its index. Returns
-// -1 if all reserve cells are occupied.
+// shouldLogDeferred returns true if at least drainDeferredLogInterval has
+// elapsed since the last INFO log for the gate represented by `last`.
+// Atomic CAS guarantees at-most-one-winner semantics under concurrent
+// calls — no mutex needed. The `now` parameter is passed explicitly so
+// tests can inject deterministic timestamps without monkey-patching
+// time.Now() globally.
 //
-// Under p.reserveMu so concurrent startDrain calls on different
-// primary slots cannot pick the same newIdx. The critical section is
-// tiny (linear scan + 2 atomic-equivalent writes); contention is
-// bounded by the storm brake to at most 1-2 simultaneous drains per
-// poolSize.
+// Returns true ≤1 time per drainDeferredLogInterval per `last`; counters
+// are NOT touched here and must increment unconditionally at the call
+// site (see spec §2). The returned bool gates ONLY the log call.
 //
-// connectSlot (invoked later in connectReserveSlot) unconditionally
-// constructs a fresh *poolSlot and assigns to p.slots[idx], so the
-// placeholder installed here is replaced — its sole purpose is to
-// reserve the cell across the tiny concurrent window between two
-// concurrent startDrain invocations.
-func (p *WSPoolTransport) claimFreeReserveSlot() int {
+// Spec 2026-05-24 (drain-diagnostics-counter-split).
+func shouldLogDeferred(last *atomic.Int64, now time.Time) bool {
+	prev := last.Load()
+	threshold := now.Add(-drainDeferredLogInterval).UnixNano()
+	if prev > threshold {
+		return false
+	}
+	return last.CompareAndSwap(prev, now.UnixNano())
+}
+
+// computeReserveBackoff returns an exponential backoff delay for the
+// connectReserveSlot retry path, capped at reserveConnectMaxBackoff and
+// jittered ±20% to break synchrony across cells.
+//
+// failures: consecutive failure count for this cell (1-based — 1 means
+// "first failure", 2 means "second failure", etc.). Caller passes the
+// value AFTER incrementing the counter, so failures=1 produces the
+// initial backoff (500ms ± jitter), failures=2 produces 1s ± jitter,
+// and so on, doubling until the 30s ceiling.
+//
+// The rng parameter returns float64 in [0.0, 1.0); production passes
+// rand.Float64 (math/rand/v2). Tests pass a deterministic function to
+// pin the jitter value.
+//
+// Spec 2026-05-24 (concurrency-lift-and-backoff) §2.
+func computeReserveBackoff(failures int32, rng func() float64) time.Duration {
+	if failures < 1 {
+		failures = 1
+	}
+	// Cap shift to avoid int64 overflow at very high failure counts.
+	// At failures=31 (shift=30) we have 500ms<<30 = 5.36e17ns, still
+	// well below MaxInt64 = 9.22e18, but the >max check kicks in earlier.
+	const maxShift = 30
+	shift := failures - 1
+	if shift > maxShift {
+		shift = maxShift
+	}
+	delay := reserveConnectInitialBackoff << shift
+	// `delay > reserveConnectMaxBackoff` is the hot path that caps the
+	// ladder. `delay <= 0` is currently unreachable: maxShift=30 gives at
+	// most 500ms<<30 = 5.36e17ns < MaxInt64. Kept as defence against
+	// future changes to maxShift, reserveConnectInitialBackoff, or the
+	// underlying time.Duration int64 width.
+	if delay > reserveConnectMaxBackoff || delay <= 0 {
+		delay = reserveConnectMaxBackoff
+	}
+	// Apply ±20% jitter. rng returns [0.0, 1.0); map to [-0.2, +0.2).
+	jitterFrac := (rng() - 0.5) * 2 * reserveConnectBackoffJitterFraction
+	jittered := time.Duration(float64(delay) * (1.0 + jitterFrac))
+	if jittered < 0 {
+		jittered = 0
+	}
+	return jittered
+}
+
+// claimFreeSlot atomically reserves the first nil cell anywhere in
+// p.slots (uniform-cells design — spec 2026-05-20 §2.2). Returns the
+// claimed index, or -1 if no nil cell exists.
+//
+// Under p.reserveMu so concurrent startDrain calls cannot pick the
+// same idx. The critical section is tiny (linear scan + 2 atomic
+// writes); contention is bounded by inflightDrains cap.
+//
+// connectReserveSlot's subsequent connectSlot call will overwrite the
+// placeholder *poolSlot installed here. Scan starts at index 0 so
+// post-teardown primary cells are recyclable as drain replacements
+// (replaces old [poolSize, 2*poolSize) reserve-range scan).
+func (p *WSPoolTransport) claimFreeSlot() int {
 	p.reserveMu.Lock()
 	defer p.reserveMu.Unlock()
-	for i := p.poolSize; i < len(p.slots); i++ {
+	for i := 0; i < len(p.slots); i++ {
 		if p.slots[i] == nil {
 			slot := &poolSlot{}
 			slot.setState(slotConnecting)
@@ -39,31 +168,192 @@ func (p *WSPoolTransport) claimFreeReserveSlot() int {
 	return -1
 }
 
+// emergencyEvictAgeMultiplier — the drain target's age threshold for
+// authorizing an emergency eviction of an active-stream cell. When the
+// drain target has been waiting through 2× its maxSlotAge (≈ 4 min
+// at default 2-min maxSlotAge), the anti-fingerprint cost of further
+// delay exceeds the UX cost of killing one stream's worth of SOCKS5
+// flows. Spec 2026-05-20 §2.2.3 (emergency eviction).
+const emergencyEvictAgeMultiplier = 2
+
+// tryForceEvictIdleSlot scans the slice for a slotReady cell with
+// streams.Load() == 0 and, if found, force-tears it down via
+// handleSlotDeath(deathCauseDrainTeardown) — freeing the cell for the
+// next claimFreeSlot call. Skips skipIdx (the drain target; usually
+// already slotDraining, defensive). Returns true if a cell was evicted.
+//
+// Rationale (spec 2026-05-20 §2.2.3): in long-running sessions with
+// stable network, all 2*poolSize cells stay alive past natural
+// rotation — claimFreeSlot starves indefinitely and anti-fingerprint
+// rotation freezes. Force-evicting an idle cell breaks the deadlock
+// without disturbing active streams.
+//
+// Idle-only policy: a slot with active streams hosts live SOCKS5
+// flows. Evicting it would close their streamChans uniformly,
+// terminating user-visible connections. Better to defer the drain
+// than to kill active streams.
+//
+// Race-vs-AssignStream: AssignStream does NOT take reserveMu — it
+// filters on slotReady state then calls streams.Add(1) unlocked. To
+// prevent killing a stream that arrived between our streams==0 read
+// and CAS, we (a) CAS to slotDraining first (so AssignStream's next
+// pass excludes the slot), then (b) re-load streams.Load() — if a
+// stream landed in the CAS window, revert the slot to slotReady and
+// bail. The recheck closes the race without taking AssignStream's
+// hot path under a lock.
+//
+// generation.Add(1) before handleSlotDeath: matches drainWatchdog's
+// tearDown contract — the victim's slotReader sees gen mismatch and
+// exits silently via shouldExitReader, avoiding false-positive
+// ReaderExits / FrameAnomaly counter inflation when handleSlotDeath
+// closes the transport (which would otherwise surface as a "natural"
+// read error).
+func (p *WSPoolTransport) tryForceEvictIdleSlot(cl *Client, skipIdx int) bool {
+	for i := 0; i < len(p.slots); i++ {
+		if i == skipIdx {
+			continue
+		}
+		s := p.slots[i]
+		if s == nil {
+			continue
+		}
+		if s.getState() != slotReady {
+			continue
+		}
+		if s.streams.Load() != 0 {
+			continue
+		}
+		// Try to claim this victim via CAS slotReady→slotDraining. Lost
+		// races (concurrent evictor or drain on this same cell) skip to
+		// the next candidate.
+		if !s.tryMarkDraining() {
+			continue
+		}
+		// Recheck streams under the post-CAS happens-before edge: any
+		// AssignStream that observed slotReady before our CAS would have
+		// completed streams.Add(1) by now if its picker chose this slot.
+		// If we see a non-zero count, revert and try another candidate
+		// (do NOT evict an active-stream slot).
+		if s.streams.Load() != 0 {
+			// Revert via CAS — drainWatchdog or another evictor may have
+			// raced us to slotDead; only revert if we still own slotDraining.
+			s.state.CompareAndSwap(int32(slotDraining), int32(slotReady))
+			continue
+		}
+
+		p.log.Info("WS pool drain force-evicted idle slot",
+			"evicted_slot", i,
+			"for_drain_of", skipIdx)
+
+		// Bump generation so the victim's slotReader exits silently
+		// via shouldExitReader when transport.Close in handleSlotDeath
+		// surfaces as a read error.
+		s.generation.Add(1)
+		// handleSlotDeath takes reserveMu internally to nil the cell.
+		p.handleSlotDeath(cl, i, deathCauseDrainTeardown)
+		return true
+	}
+	return false
+}
+
+// tryEmergencyEvictMinStreamsSlot is the second-tier eviction path
+// invoked when (a) tryForceEvictIdleSlot found no idle candidate AND
+// (b) the drain target's slot age exceeds emergencyEvictAgeMultiplier
+// × maxSlotAge. Under those two conditions, the pool has been stuck
+// long enough that further delay damages the anti-fingerprint goal
+// more than the UX cost of killing one cell's worth of streams.
+//
+// Selection: scan the slice for slotReady cells, pick the one with
+// the lowest streams.Load() (minimizes collateral damage). Skip
+// skipIdx. If multiple cells share the min, the first one wins
+// (deterministic, slice-order).
+//
+// CAS + generation bump + handleSlotDeath mirror the idle path;
+// the only difference is we do NOT recheck streams.Load() after CAS
+// because we explicitly accept evicting active streams here.
+//
+// Returns true if a cell was evicted. Returns false only if no
+// slotReady cell exists at all (rare; usually means pool is in
+// catastrophic state and capacity-floor gate should have fired
+// already).
+func (p *WSPoolTransport) tryEmergencyEvictMinStreamsSlot(cl *Client, skipIdx int) bool {
+	bestIdx := -1
+	bestStreams := int32(1<<31 - 1)
+	for i := 0; i < len(p.slots); i++ {
+		if i == skipIdx {
+			continue
+		}
+		s := p.slots[i]
+		if s == nil {
+			continue
+		}
+		if s.getState() != slotReady {
+			continue
+		}
+		st := s.streams.Load()
+		if st < bestStreams {
+			bestStreams = st
+			bestIdx = i
+		}
+	}
+	if bestIdx < 0 {
+		return false
+	}
+
+	victim := p.slots[bestIdx]
+	if !victim.tryMarkDraining() {
+		// Lost the race — pick may have been claimed by a concurrent
+		// startDrain. Caller will defer; the next watchdog tick re-tries.
+		return false
+	}
+
+	streamsAtEvict := victim.streams.Load()
+	p.log.Warn("WS pool drain emergency-evicted slot with active streams",
+		"evicted_slot", bestIdx,
+		"for_drain_of", skipIdx,
+		"killed_streams", streamsAtEvict)
+
+	victim.generation.Add(1)
+	p.handleSlotDeath(cl, bestIdx, deathCauseDrainTeardown)
+	return true
+}
+
+// drainTargetOverAged returns true when oldSlot's age exceeds
+// emergencyEvictAgeMultiplier × maxSlotAge. Used to gate the
+// emergency-eviction path.
+func (p *WSPoolTransport) drainTargetOverAged(oldSlot *poolSlot) bool {
+	if p.maxSlotAge <= 0 {
+		return false
+	}
+	started := oldSlot.startedAtNs.Load()
+	if started == 0 {
+		return false
+	}
+	age := time.Now().UnixNano() - started
+	threshold := int64(emergencyEvictAgeMultiplier) * p.maxSlotAge.Nanoseconds()
+	return age >= threshold
+}
+
 // startDrain transitions p.slots[oldIdx] from slotReady to slotDraining
-// and spawns parallel connect-reserve + drain-watchdog goroutines.
+// and spawns parallel connect-replacement + drain-watchdog goroutines.
 //
-// Sequence of checks (order matters):
+// Gate ordering (spec 2026-05-20 §2.1, §2.1.0):
 //  1. Feature flag off → no-op.
-//  2. oldIdx out of primary range → no-op.
+//  2. oldIdx out of range → no-op.
 //  3. oldSlot nil → no-op.
-//  4. Storm brake (countNonReadySlots >= threshold) → set backoff,
-//     no-op. This check runs BEFORE tryMarkDraining so the slot we're
-//     about to transition doesn't inflate the non-ready count itself.
-//  5. tryMarkDraining CAS → false on race loss (another drain or natural
-//     failure beat us); no-op.
-//  6. claimFreeReserveSlot → -1 means all reserve cells occupied; revert
-//     state + set backoff. On success, the reserve cell is already
-//     atomically claimed with a placeholder *poolSlot in slotConnecting.
-//  7. Success: spawn connectReserveSlot + drainWatchdog goroutines.
+//  4. Inflight cap gate (atomic): increment, check, hand off on success
+//     OR back out + defer on failure.
+//  5. Capacity floor gate (secondary, catches catastrophic state).
+//  6. tryMarkDraining CAS.
+//  7. claimFreeSlot.
+//  8. Spawn connectReserveSlot + drainWatchdog.
 //
-// Reason: "age", "byte_budget", or "anti_fingerprint". Propagated to
-// logs and (via handleSlotDeath cause) to the meltdown-counter
-// machinery.
+// `reason`: "age", "byte_budget", or "anti_fingerprint".
 func (p *WSPoolTransport) startDrain(cl *Client, oldIdx int, reason string) {
 	if !p.gracefulDrain {
 		return
 	}
-	if oldIdx < 0 || oldIdx >= p.poolSize {
+	if oldIdx < 0 || oldIdx >= len(p.slots) {
 		return
 	}
 	oldSlot := p.slots[oldIdx]
@@ -71,33 +361,104 @@ func (p *WSPoolTransport) startDrain(cl *Client, oldIdx int, reason string) {
 		return
 	}
 
-	// Storm brake check BEFORE tryMarkDraining — see func doc comment.
-	nonReady := p.countNonReadySlots()
-	threshold := p.rotationStormBrakeThreshold()
-	if nonReady >= threshold {
-		p.log.Info("WS pool slot drain deferred (storm brake)",
-			"slot", oldIdx, "reason", reason,
-			"non_ready_slots", nonReady, "brake_threshold", threshold)
-		oldSlot.nextDrainAttemptNs.Store(time.Now().Add(drainRevertBackoff).UnixNano())
+	// Gate 4: inflight cap (atomic — see spec §2.1.0). Increment FIRST so
+	// concurrent triggers cannot all observe the same low count.
+	inflight := p.inflightDrains.Add(1)
+	committed := false
+	defer func() {
+		if !committed {
+			p.inflightDrains.Add(-1)
+		}
+	}()
+	if int(inflight) > p.maxConcurrentDrains() {
+		Stats.InflightCapDeferredTotal.Add(1)
+		p.bumpDrainDeferrals1m()
+		// INFO with per-gate 30s rate-limit (spec 2026-05-24). Counters
+		// above always increment; only the log line is rate-limited so
+		// production logs stay readable. total_count in the log line
+		// gives readers the real rate via delta between successive INFOs.
+		if shouldLogDeferred(&p.lastInflightCapLogNs, time.Now()) {
+			p.log.Info("WS pool slot drain deferred (inflight cap)",
+				"slot", oldIdx, "reason", reason,
+				"inflight", inflight,
+				"max_concurrent", p.maxConcurrentDrains(),
+				"total_count", Stats.InflightCapDeferredTotal.Load(),
+				"deferred_1m", p.drainDeferrals1m.Load())
+		}
+		// Storm-brake-only deferral — fast retry.
+		oldSlot.nextDrainAttemptNs.Store(time.Now().Add(drainStormBrakeBackoff).UnixNano())
 		return
 	}
 
+	// Gate 5: capacity floor (catches natural-death depletion that
+	// inflightDrains doesn't track).
+	ready := p.readyCapacity()
+	floor := p.readyCapacityFloor()
+	if ready < floor {
+		Stats.CapacityFloorDeferredTotal.Add(1)
+		p.bumpDrainDeferrals1m()
+		// Catastrophic state (less than half pool ready) → longer backoff
+		// so reconnectLoop has time to heal capacity (spec §2.1.1).
+		backoff := drainStormBrakeBackoff
+		if ready < p.poolSize/2 {
+			backoff = drainCatastrophicBackoff
+		}
+		// INFO with per-gate 30s rate-limit (spec 2026-05-24). See
+		// inflight-cap branch above for rationale.
+		if shouldLogDeferred(&p.lastCapacityFloorLogNs, time.Now()) {
+			p.log.Info("WS pool slot drain deferred (capacity floor)",
+				"slot", oldIdx, "reason", reason,
+				"ready_capacity", ready,
+				"floor", floor,
+				"backoff", backoff,
+				"total_count", Stats.CapacityFloorDeferredTotal.Load(),
+				"deferred_1m", p.drainDeferrals1m.Load())
+		}
+		oldSlot.nextDrainAttemptNs.Store(time.Now().Add(backoff).UnixNano())
+		return
+	}
+
+	// Gate 6: CAS slotReady → slotDraining.
 	if !oldSlot.tryMarkDraining() {
 		return
 	}
 
-	// Atomic find-and-claim under p.reserveMu — a concurrent startDrain
-	// on another primary slot cannot pick the same newIdx because the
-	// placeholder is installed inside the critical section. connectSlot
-	// will overwrite this placeholder with its own freshly-constructed
-	// *poolSlot.
-	newIdx := p.claimFreeReserveSlot()
+	// Gate 7: claim a free cell ANYWHERE in the slice.
+	newIdx := p.claimFreeSlot()
 	if newIdx < 0 {
-		p.log.Warn("WS pool drain skipped — no free reserve cell",
+		// Slice fully occupied — under stable-network long-running
+		// sessions this is the deadlock state: no reader errors to
+		// trigger natural cell teardown, no free cell for the next
+		// drain. Spec 2026-05-20 §2.2.3 (slice-full eviction policy).
+		//
+		// Two-tier eviction policy:
+		//
+		// Tier 1 (always tried) — force-evict an idle slotReady cell
+		// (streams==0). Active streams on a slot would die uniformly
+		// via closed streamChans if we evict, so the idle path never
+		// disrupts user-visible flows.
+		//
+		// Tier 2 (only when drain target is over-aged) — emergency
+		// eviction of the cell with the LOWEST active stream count,
+		// even if non-zero. Triggered when oldSlot has been waiting
+		// through 2× maxSlotAge: at that point the anti-fingerprint
+		// cost of further delay (TSPU ML window) exceeds the UX cost
+		// of killing one cell's worth of streams. Field canary
+		// 2026-05-20 second run (174716): under dense load (5+ streams/
+		// slot avg) tier 1 finds no idle and tier 2 must bypass.
+		if evicted := p.tryForceEvictIdleSlot(cl, oldIdx); evicted {
+			Stats.DrainForceEvictedTotal.Add(1)
+			newIdx = p.claimFreeSlot()
+		} else if p.drainTargetOverAged(oldSlot) {
+			if evicted := p.tryEmergencyEvictMinStreamsSlot(cl, oldIdx); evicted {
+				Stats.DrainForceEvictedActiveTotal.Add(1)
+				newIdx = p.claimFreeSlot()
+			}
+		}
+	}
+	if newIdx < 0 {
+		p.log.Warn("WS pool drain skipped — no free cell",
 			"slot", oldIdx, "reason", reason)
-		// Revert state + set backoff. If CAS fails, slot was concurrently
-		// transitioned (e.g. handleSlotDeath raced us in) — log for
-		// visibility, then bail.
 		if !oldSlot.state.CompareAndSwap(int32(slotDraining), int32(slotReady)) {
 			p.log.Debug("WS pool revert CAS failed — slot died concurrently",
 				"slot", oldIdx)
@@ -106,16 +467,20 @@ func (p *WSPoolTransport) startDrain(cl *Client, oldIdx int, reason string) {
 		return
 	}
 
+	// All gates passed — hand off inflight ownership to drainWatchdog.
+	committed = true
+
 	Stats.DrainStartedTotal.Add(1)
 	drainStart := time.Now()
 	activeAtStart := oldSlot.streams.Load()
 
 	p.log.Info("WS pool slot drain started",
 		"slot", oldIdx,
-		"reserve_slot", newIdx,
+		"replacement_slot", newIdx,
 		"reason", reason,
 		"active_streams", activeAtStart,
 		"hard_cap", p.drainHardCap,
+		"inflight", inflight,
 	)
 
 	go p.connectReserveSlot(cl, newIdx, oldIdx)
@@ -124,25 +489,59 @@ func (p *WSPoolTransport) startDrain(cl *Client, oldIdx int, reason string) {
 
 // connectReserveSlot runs the standard connect path at newIdx. On
 // success, AssignStream picks it up via its slotReady filter. On
-// failure, schedules reconnectLoop at newIdx so capacity recovers
-// asynchronously; the drainWatchdog tears down oldIdx on its own
-// schedule regardless.
+// failure, drops the placeholder back to nil under reserveMu so a
+// fresh drain can immediately reuse the cell, then schedules
+// reconnectLoop (which short-circuits via §2.2.2 recycle guard if a
+// drain claimed the cell in the meantime).
 //
-// Note: the reserve cell at newIdx has already been atomically claimed
-// with a placeholder *poolSlot in slotConnecting state by
-// claimFreeReserveSlot — connectSlot will overwrite that placeholder
-// with its own freshly-constructed slot.
+// Spec 2026-05-20 §4.2 (S5 review).
 func (p *WSPoolTransport) connectReserveSlot(cl *Client, newIdx, oldIdx int) {
 	if newIdx < 0 || newIdx >= len(p.slots) {
 		return
 	}
 
-	if err := p.connectSlot(p.ctx, newIdx); err != nil {
-		p.log.Warn("WS pool reserve slot connect failed",
-			"slot", newIdx, "for_drain_of", oldIdx, "err", err)
-		go p.reconnectLoop(newIdx)
+	var err error
+	if connectSlotForTest != nil {
+		err = connectSlotForTest()
+	} else {
+		err = p.connectSlot(p.ctx, newIdx)
+	}
+
+	if err != nil {
+		// Pool-level counter (indexed by cell) survives slot recycle —
+		// see spec §2 and opus review H2. Atomic Add is race-safe
+		// under concurrent connectReserveSlot calls for the same cell
+		// (possible during cascade failures).
+		failures := p.reserveConnectFailures[newIdx].Add(1)
+		Stats.ReserveConnectFailuresTotal.Add(1)
+
+		p.reserveMu.Lock()
+		if p.slots[newIdx] != nil && p.slots[newIdx].getState() != slotReady {
+			p.slots[newIdx] = nil // free for next claim
+		}
+		p.reserveMu.Unlock()
+
+		backoff := computeReserveBackoff(failures, rand.Float64)
+		p.log.Warn("WS pool reserve slot connect failed — placeholder freed",
+			"slot", newIdx, "for_drain_of", oldIdx,
+			"err", err,
+			"consecutive_failures", failures,
+			"reconnect_backoff", backoff.Truncate(time.Millisecond))
+
+		go func() {
+			select {
+			case <-p.ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			p.reconnectLoop(newIdx)
+		}()
 		return
 	}
+
+	// Success — reset the failure counter for this cell. Pool-level
+	// storage means this reset persists across cell recycle.
+	p.reserveConnectFailures[newIdx].Store(0)
 	go p.slotReader(newIdx)
 }
 
@@ -158,20 +557,40 @@ func (p *WSPoolTransport) connectReserveSlot(cl *Client, newIdx, oldIdx int) {
 func (p *WSPoolTransport) drainWatchdog(cl *Client, oldIdx int, oldSlot *poolSlot,
 	drainStart time.Time, reason string) {
 
+	// Inflight ownership was transferred from startDrain via committed=true.
+	// Guarantee decrement on every exit path (natural finish, hard cap,
+	// ctx cancel, panic) — spec §2.1.0 NEW-1.
+	defer p.inflightDrains.Add(-1)
+
 	ticker := time.NewTicker(drainPollInterval)
 	defer ticker.Stop()
 	deadline := time.NewTimer(p.drainHardCap)
 	defer deadline.Stop()
 
-	tearDown := func(hardCap bool) {
+	// finishCause distinguishes the path that drove the natural-finish
+	// decision so the log line carries useful diagnostics.
+	type finishCause int
+	const (
+		finishStreamsZero finishCause = iota
+		finishIdle
+		finishHardCap
+	)
+
+	tearDown := func(cause finishCause) {
 		duration := time.Since(drainStart)
-		if hardCap {
-			Stats.DrainHardCapTotal.Add(1)
-			p.log.Warn("WS pool slot drain hard cap reached",
+		switch cause {
+		case finishHardCap:
+			emitHardCapLog(p, oldIdx, oldSlot, reason, duration)
+		case finishIdle:
+			Stats.DrainNaturalFinishTotal.Add(1)
+			Stats.DrainIdleFinishTotal.Add(1)
+			idleFor := time.Since(time.Unix(0, oldSlot.lastActivityNs.Load()))
+			p.log.Info("WS pool slot drain natural finish (idle)",
 				"slot", oldIdx, "reason", reason,
 				"remaining_streams", oldSlot.streams.Load(),
+				"idle_for", idleFor.Truncate(time.Second),
 				"drain_duration", duration.Truncate(time.Second))
-		} else {
+		default: // finishStreamsZero
 			Stats.DrainNaturalFinishTotal.Add(1)
 			p.log.Info("WS pool slot drain natural finish",
 				"slot", oldIdx, "reason", reason,
@@ -179,22 +598,70 @@ func (p *WSPoolTransport) drainWatchdog(cl *Client, oldIdx int, oldSlot *poolSlo
 		}
 		Stats.DrainDurationSeconds.Observe(duration.Seconds())
 
+		// Graceful drain is still a rotation we initiated — surface it in
+		// the rolling 1-minute counter that pool-health logs read. Before
+		// this change, drain-only sessions showed rotations_1m=0 even with
+		// hundreds of drains/hour (2026-05-22 canary).
+		p.bumpRotations1m()
+
 		oldSlot.generation.Add(1)
 		p.handleSlotDeath(cl, oldIdx, deathCauseDrainTeardown)
 	}
+
+	// Idle heuristic is active only when both knobs are >0 (DrainIdleStreamsMax
+	// is set to 0 to disable; DrainIdleThreshold <= 0 also disables). Read
+	// once at watchdog entry — these are write-once-at-init fields on the pool.
+	idleThreshold := p.drainIdleThreshold
+	idleStreamsMax := p.drainIdleStreamsMax
+	idleEnabled := idleThreshold > 0 && idleStreamsMax > 0
 
 	for {
 		select {
 		case <-p.ctx.Done():
 			return
 		case <-deadline.C:
-			tearDown(true)
+			tearDown(finishHardCap)
 			return
 		case <-ticker.C:
-			if oldSlot.streams.Load() == 0 {
-				tearDown(false)
+			streams := oldSlot.streams.Load()
+			if streams == 0 {
+				tearDown(finishStreamsZero)
 				return
+			}
+			if idleEnabled && streams <= idleStreamsMax {
+				last := oldSlot.lastActivityNs.Load()
+				// last==0 is the impossible-but-defensive case: connectSlot
+				// always stamps lastActivityNs alongside startedAtNs on
+				// (re)connect. Guard against it anyway so a corrupt slot
+				// state can't trip the idle path prematurely.
+				if last > 0 && time.Since(time.Unix(0, last)) >= idleThreshold {
+					tearDown(finishIdle)
+					return
+				}
 			}
 		}
 	}
+}
+
+// emitHardCapLog records a hard-cap teardown event: increments
+// Stats.DrainHardCapTotal and emits a structured log line at INFO or
+// WARN level depending on whether `slot.streams.Load() >=
+// hardCapWarnThreshold`. Below threshold (the expected steady-state
+// case for long-lived SOCKS sessions) logs INFO; outliers log WARN.
+//
+// Extracted from drainWatchdog.tearDown for testability — tests can
+// drive this directly without orchestrating a full drain.
+//
+// Spec 2026-05-24 (drain-diagnostics-counter-split) §4.
+func emitHardCapLog(p *WSPoolTransport, oldIdx int, slot *poolSlot, reason string, duration time.Duration) {
+	Stats.DrainHardCapTotal.Add(1)
+	remaining := slot.streams.Load()
+	logFn := p.log.Info
+	if remaining >= hardCapWarnThreshold {
+		logFn = p.log.Warn
+	}
+	logFn("WS pool slot drain hard cap reached",
+		"slot", oldIdx, "reason", reason,
+		"remaining_streams", remaining,
+		"drain_duration", duration.Truncate(time.Second))
 }

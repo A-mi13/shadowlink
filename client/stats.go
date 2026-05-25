@@ -221,6 +221,78 @@ type statsRegistry struct {
 	// regimes: <5s = trivial, 5-30s = nominal, 30-90s = stretched, >90s
 	// only possible under future hard-cap raise. Initialized in init().
 	DrainDurationSeconds *Histogram
+
+	// StaleFrameDroppedTotal — frames arriving on a slot whose
+	// streamMap lookup returns a different idx (post-teardown
+	// streamID reuse race). See spec 2026-05-20 §2.4.1. A non-zero
+	// rate is expected during heavy rotation; sustained high rate is
+	// a bug.
+	StaleFrameDroppedTotal atomic.Uint64
+
+	// InflightCapDeferredTotal — drain attempts deferred because
+	// inflightDrains already at maxConcurrentDrains. Indicates the
+	// rotation scheduler is healthy but at peak concurrency. High rate
+	// is OK if bounded; persistent saturation suggests poolSize is too
+	// small for the current rotation cadence. Counter increments on
+	// EVERY defer; log emission is rate-limited (drainDeferredLogInterval).
+	// Spec 2026-05-24 (drain-diagnostics-counter-split).
+	InflightCapDeferredTotal atomic.Uint64
+
+	// CapacityFloorDeferredTotal — drain attempts deferred because
+	// readyCapacity fell below readyCapacityFloor (poolSize *
+	// readyCapacityFloorFraction, see ws_pool.go). Catastrophic path —
+	// pool losing slots faster than reconnectLoop heals. Non-zero rate
+	// is a warning sign; persistent non-zero rate is cascading-slot-deaths
+	// failure mode. Counter increments on EVERY defer; log emission
+	// rate-limited. Spec 2026-05-24 (drain-diagnostics-counter-split,
+	// updated by concurrency-lift-and-backoff to use the decoupled
+	// fraction constant).
+	CapacityFloorDeferredTotal atomic.Uint64
+
+	// StreamBufferOverflowsTotal — cumulative count of frames dropped at
+	// client.RouteToStream when the per-stream buffered channel (cap 512)
+	// is full. Counter increments once per dropped frame, surfaced at
+	// stream UnregisterStream as an aggregated INFO log. Non-zero rate
+	// indicates SOCKS consumer death races (most often local app closing
+	// TCP early) — see spec 2026-05-23.
+	StreamBufferOverflowsTotal atomic.Uint64
+
+	// DrainForceEvictedTotal — every time startDrain force-evicted an
+	// idle slotReady cell (streams==0) because claimFreeSlot returned -1
+	// (slice fully occupied). Spec 2026-05-20 §2.2.3 (slice-full
+	// eviction policy). Non-zero rate is expected in long-running
+	// sessions where stable network keeps cells alive past natural
+	// rotation; required to keep anti-fingerprint rotation moving when
+	// no natural reader-error frees a cell.
+	DrainForceEvictedTotal atomic.Uint64
+
+	// DrainForceEvictedActiveTotal — emergency eviction of a slotReady
+	// cell that had ACTIVE streams (streams > 0) because (a) no idle
+	// cell was available AND (b) the drain target's slot age exceeded
+	// 2× maxSlotAge (over-aged threshold). Spec 2026-05-20 §2.2.3
+	// (emergency eviction policy). Each increment represents one or
+	// more user-visible SOCKS5 streams killed to break the deadlock —
+	// anti-fingerprint priority wins over UX after the over-aged
+	// threshold. Sustained non-zero rate means the pool is chronically
+	// saturated; consider raising slice size.
+	DrainForceEvictedActiveTotal atomic.Uint64
+
+	// ReserveConnectFailuresTotal — cumulative count of connectReserveSlot
+	// failures (across all cells). High rate suggests TIME_WAIT exhaustion
+	// or origin endpoint instability — investigate before raising
+	// maxConcurrentDrainsFraction further. Spec 2026-05-24
+	// (concurrency-lift-and-backoff).
+	ReserveConnectFailuresTotal atomic.Uint64
+
+	// DrainIdleFinishTotal — drains that completed because the slot showed
+	// no decrypt/write activity for SHADOWLINK_DRAIN_IDLE_THRESHOLD AND the
+	// remaining stream count was ≤ SHADOWLINK_DRAIN_IDLE_STREAMS_MAX. Logged
+	// as natural finish (keeps the existing dashboard meaning intact); this
+	// counter exposes WHY the natural finish fired so we can distinguish
+	// the streams-reached-zero path from the keepalive-idle path. Subset
+	// of DrainNaturalFinishTotal: in steady state, NaturalFinish ≥
+	// IdleFinish always.
+	DrainIdleFinishTotal atomic.Uint64
 }
 
 // Histogram is a fixed-bucket histogram for duration-style observations.
@@ -363,6 +435,17 @@ func IncSOCKS5CoalesceGroups() { SOCKS5CoalesceGroups.Add(1) }
 // Stats is the singleton stats registry. All increments across the codebase
 // use this variable directly.
 var Stats statsRegistry
+
+// globalPoolForStatsPtr publishes the running pool transport for the
+// shadowlink_drain_inflight gauge. atomic.Pointer keeps reads cheap
+// in the exporter hot path. nil if no pool is active.
+var globalPoolForStatsPtr atomic.Pointer[WSPoolTransport]
+
+// SetGlobalPoolForStats publishes the pool for gauge exposition.
+// Idempotent — last writer wins. Pass nil on Close to clear.
+func SetGlobalPoolForStats(p *WSPoolTransport) {
+	globalPoolForStatsPtr.Store(p)
+}
 
 // frameAnomalyReasons enumerates the labels emitted under
 // shadowlink_ws_frame_anomaly_total. Kept in sync with classifyWSReadError
@@ -524,6 +607,46 @@ func WritePromMetrics(w io.Writer) {
 		fmt.Fprintf(w, "shadowlink_slot_drain_duration_seconds_bucket{le=\"+Inf\"} %d\n", cumulative)
 		fmt.Fprintf(w, "shadowlink_slot_drain_duration_seconds_sum %g\n", float64(h.sumMs.Load())/1000.0)
 		fmt.Fprintf(w, "shadowlink_slot_drain_duration_seconds_count %d\n", h.count.Load())
+	}
+
+	fmt.Fprintf(w, "# HELP shadowlink_stale_frame_dropped_total Frames dropped due to streamID reuse race after drain teardown\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_stale_frame_dropped_total counter\n")
+	fmt.Fprintf(w, "shadowlink_stale_frame_dropped_total %d\n", Stats.StaleFrameDroppedTotal.Load())
+
+	fmt.Fprintf(w, "# HELP shadowlink_slot_drain_inflight_cap_deferred_total Drains deferred by storm-brake inflight-cap gate (concurrent drains >= maxConcurrentDrains)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_slot_drain_inflight_cap_deferred_total counter\n")
+	fmt.Fprintf(w, "shadowlink_slot_drain_inflight_cap_deferred_total %d\n", Stats.InflightCapDeferredTotal.Load())
+
+	fmt.Fprintf(w, "# HELP shadowlink_slot_drain_capacity_floor_deferred_total Drains deferred by storm-brake capacity-floor gate (readyCapacity < poolSize * readyCapacityFloorFraction)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_slot_drain_capacity_floor_deferred_total counter\n")
+	fmt.Fprintf(w, "shadowlink_slot_drain_capacity_floor_deferred_total %d\n", Stats.CapacityFloorDeferredTotal.Load())
+
+	fmt.Fprintf(w, "# HELP shadowlink_slot_drain_force_evicted_total Force-evictions of idle slotReady cells when claimFreeSlot would have returned -1 (slice full)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_slot_drain_force_evicted_total counter\n")
+	fmt.Fprintf(w, "shadowlink_slot_drain_force_evicted_total %d\n", Stats.DrainForceEvictedTotal.Load())
+
+	fmt.Fprintf(w, "# HELP shadowlink_stream_buffer_overflows_total Frames dropped at RouteToStream because the per-stream buffered channel was full (consumer dead/slow)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_stream_buffer_overflows_total counter\n")
+	fmt.Fprintf(w, "shadowlink_stream_buffer_overflows_total %d\n", Stats.StreamBufferOverflowsTotal.Load())
+
+	fmt.Fprintf(w, "# HELP shadowlink_slot_drain_force_evicted_active_total Emergency evictions of slotReady cells with active streams (over-aged drain target, no idle cell available)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_slot_drain_force_evicted_active_total counter\n")
+	fmt.Fprintf(w, "shadowlink_slot_drain_force_evicted_active_total %d\n", Stats.DrainForceEvictedActiveTotal.Load())
+
+	fmt.Fprintf(w, "# HELP shadowlink_reserve_connect_failures_total Cumulative count of connectReserveSlot failures across all cells. High sustained rate suggests TIME_WAIT exhaustion or origin endpoint instability — investigate before raising maxConcurrentDrainsFraction further.\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_reserve_connect_failures_total counter\n")
+	fmt.Fprintf(w, "shadowlink_reserve_connect_failures_total %d\n", Stats.ReserveConnectFailuresTotal.Load())
+
+	fmt.Fprintf(w, "# HELP shadowlink_slot_drain_idle_finish_total Drains classified as natural finish via the idle heuristic (no activity for SHADOWLINK_DRAIN_IDLE_THRESHOLD, ≤ SHADOWLINK_DRAIN_IDLE_STREAMS_MAX remaining streams). Subset of natural_finish_total.\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_slot_drain_idle_finish_total counter\n")
+	fmt.Fprintf(w, "shadowlink_slot_drain_idle_finish_total %d\n", Stats.DrainIdleFinishTotal.Load())
+
+	fmt.Fprintf(w, "# HELP shadowlink_drain_inflight Drains currently in progress (atomic snapshot)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_drain_inflight gauge\n")
+	if pool := globalPoolForStatsPtr.Load(); pool != nil {
+		fmt.Fprintf(w, "shadowlink_drain_inflight %d\n", pool.inflightDrains.Load())
+	} else {
+		fmt.Fprintf(w, "shadowlink_drain_inflight 0\n")
 	}
 }
 

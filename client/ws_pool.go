@@ -274,6 +274,19 @@ type poolSlot struct {
 	// Zero means "never connected" (initial state).
 	startedAtNs atomic.Int64
 
+	// lastActivityNs is the UnixNano timestamp of the most recent data frame
+	// observed on this slot — either a successful DecryptChunkSafe in the
+	// reader or a WriteMessageForStream / WriteControlMessageForStream on
+	// the writer. drainWatchdog reads it to decide whether the remaining
+	// active streams are genuinely transferring or merely keepalive idle:
+	// in the 2026-05-22 8h canary, 79.6% of hard-cap drains held ≤2
+	// streams that were idle for the entire drain window. Treating those
+	// drains as natural finish (early teardown) lifts the natural-finish
+	// ratio from 60% toward 75-80% without changing the hard-cap budget.
+	// Set by connectSlot to "now" on reconnect so a freshly-bound slot
+	// isn't immediately classified idle. Atomic, no lock needed.
+	lastActivityNs atomic.Int64
+
 	// byteBudget is the per-slot, per-session downlink-byte threshold that
 	// triggers preemptive rotation. Sampled ONCE in connectSlot from a wide
 	// jittered range based on WSPoolTransport.maxBytesPerSlot and the slot
@@ -460,29 +473,35 @@ func reconnectJitterOffset(idx int) time.Duration {
 // middlebox kill window we were trying to avoid.
 const slotRotationGraceWithActiveStreams = 30 * time.Second
 
-// rotationStormBrakeFraction is the fraction of the pool that must be
-// non-ready (dead, connecting, draining) before maybeRotateSlot pauses
-// new preemptive rotations. Computed as ceil(poolSize * fraction).
+// maxConcurrentDrainsFraction — fraction of poolSize that defines the
+// maximum number of concurrent in-flight drains. Inflight cap for the
+// drain scheduler's storm-brake. Raised 2026-05-24 from 0.25 (=2 drains
+// at poolSize=6) to 0.5 (=3 drains) because canary 2026-05-24-evening
+// showed 100% of storm-brake defers landing on the inflight gate and 0%
+// on the capacity-floor gate (12497 vs 0 over 4h3m). The pool spent 77%
+// of its time at inflight=2 saturation — drains queued behind the cap,
+// streams accumulated age, then hit the 90s hard-cap ceiling. Raising
+// the cap allows the scheduler to dispatch drains promptly.
 //
-// Rationale (2026-05-18 field observation): under heavy upload load
-// (~60 Mbps sustained) every slot exceeds MaxBytesPerSlot within ~1s
-// of the speedtest start. All 8 slots enter byte_budget defer in a 6s
-// window; 30s later all 8 force-rotate. At the rotation peak, alive=4
-// dead=4 — half the pool is reconnecting and the upload writer has
-// nowhere to put bytes. Upload speed collapsed 55→16 Mbps observed.
+// Spec 2026-05-24 (concurrency-lift-and-backoff).
+const maxConcurrentDrainsFraction = 0.5
+
+// readyCapacityFloorFraction — fraction of poolSize that must be in
+// slotReady state before storm-brake permits a new drain. Catastrophic-
+// state gate: when ready slots fall below this floor, the pool is losing
+// slots faster than reconnectLoop heals — defer drains so reconnects can
+// catch up.
 //
-// The brake: when ≥ ceil(poolSize * 0.25) slots are already non-ready,
-// new rotations defer instead of firing. We do NOT reset the defer
-// timestamp — the grace window keeps ticking in the background — so
-// the brake doesn't ALSO pin slots past their max-age forever. If the
-// brake stays engaged longer than grace, the deferred slot still hits
-// force-rotate eventually, but spread out as slots come back online.
+// Decoupled 2026-05-24 from maxConcurrentDrainsFraction (previously both
+// derived from a single rotationStormBrakeFraction=0.25 constant). The
+// canary 2026-05-24-evening proved this gate never triggers in steady
+// state (0 defers over 4h), so it's set independently of the inflight
+// cap. Value 0.75 preserves the prior floor at most poolSizes (the
+// floor stays unchanged for poolSize ∈ {2, 4, 6, 8, 16}) — purely
+// decoupling, no behavior change for the capacity-floor branch.
 //
-// 0.25 is chosen so a healthy pool of 8 still permits 2 simultaneous
-// rotations (typical steady-state from age-stagger + byte-stagger),
-// while clamping at 2 means we never enter the "alive=4 dead=4"
-// state observed in the field.
-const rotationStormBrakeFraction = 0.25
+// Spec 2026-05-24 (concurrency-lift-and-backoff).
+const readyCapacityFloorFraction = 0.75
 
 // effectiveMaxBytesForSlot returns the DETERMINISTIC center of the per-slot
 // byte-budget distribution. The actual budget used by the slot reader is
@@ -557,84 +576,67 @@ func (p *WSPoolTransport) sampleByteBudget(idx int) int64 {
 	return int64(float64(center) * multiplier)
 }
 
-// rotationStormBrakeThreshold returns the minimum count of non-ready
-// slots that engages the brake. Always at least 1 so the formula has
-// monotonic semantics; clamped to ≥ ceil(poolSize*fraction).
-func (p *WSPoolTransport) rotationStormBrakeThreshold() int {
-	t := int(float64(p.poolSize)*rotationStormBrakeFraction + 0.5)
-	if t < 1 {
-		t = 1
-	}
-	return t
-}
-
-// countNonReadySlots returns the count of slots NOT in slotReady that
-// contribute to the storm brake calculation. Logic for each cell:
+// readyCapacity returns the count of cells in slotReady across the
+// entire slice. Uniform-cells design (spec 2026-05-20 §2.1) — no
+// primary/reserve distinction. Used by startDrain storm brake to gate
+// new drains against a capacity floor.
 //
-//	Primary range [0, poolSize):
-//	  - nil cell: check if matching reserve cell[i+poolSize] is in
-//	    slotReady — if yes, capacity is provided by reserve, skip;
-//	    otherwise count (capacity gap).
-//	  - non-slotReady (connecting/draining/dead): count.
-//	  - slotReady: skip.
-//
-//	Reserve range [poolSize, 2*poolSize):
-//	  - nil cell: skip (empty space).
-//	  - slotConnecting: check if matching primary cell[i-poolSize] is
-//	    in slotDraining — if yes, this is the parallel drain replacement
-//	    and primary is still serving streams, skip (not a capacity gap);
-//	    otherwise count.
-//	  - slotDraining/slotDead: count.
-//	  - slotReady: skip.
-//
-// This handles the full drain lifecycle without false-positive non-ready:
-//   - Steady state: 8 primary ready, 8 reserve nil → count = 0
-//   - Drain start: 7 ready + 1 draining + 1 reserve connecting (parallel) → count = 1
-//   - Drain finish: 7 ready + 1 nil primary + 1 reserve ready → count = 0 (reserve covers)
-//   - Two concurrent drains: 6 ready + 2 draining + 2 reserve connecting (parallel) → count = 2
-//
-// Used by storm brake to bound concurrent drains. Lock-free read of
-// per-slot atomic state — snapshot-inconsistent reads of paired primary/
-// reserve cells are tolerated because the brake re-evaluates on the next
-// watchdog sweep (5s later); a single mis-counted tick has at most one
-// extra deferred/granted drain, self-correcting.
-func (p *WSPoolTransport) countNonReadySlots() int {
+// Lock-free read of per-slot atomic state. Snapshot-inconsistency
+// window is 2*poolSize cells; the brake is self-correcting on the next
+// watchdog tick (acceptance #9).
+func (p *WSPoolTransport) readyCapacity() int {
 	n := 0
-	for i, slot := range p.slots {
-		if i < p.poolSize {
-			// Primary range
-			if slot == nil {
-				reserveIdx := i + p.poolSize
-				if reserveIdx < len(p.slots) && p.slots[reserveIdx] != nil &&
-					p.slots[reserveIdx].getState() == slotReady {
-					continue // capacity provided by reserve
-				}
-				n++
-				continue
-			}
-			if slot.getState() != slotReady {
-				n++
-			}
-		} else {
-			// Reserve range
-			if slot == nil {
-				continue
-			}
-			st := slot.getState()
-			if st == slotReady {
-				continue
-			}
-			if st == slotConnecting {
-				primaryIdx := i - p.poolSize
-				if primaryIdx < p.poolSize && p.slots[primaryIdx] != nil &&
-					p.slots[primaryIdx].getState() == slotDraining {
-					continue // parallel drain replacement, capacity preserved
-				}
-			}
+	for _, slot := range p.slots {
+		if slot != nil && slot.getState() == slotReady {
 			n++
 		}
 	}
 	return n
+}
+
+// readyCapacityFloor returns the minimum readyCapacity the storm brake
+// will tolerate before deferring new drains. Independent of
+// maxConcurrentDrains after the 2026-05-24 knob decoupling — see spec
+// §1.
+//
+// Derivation: floor(poolSize * readyCapacityFloorFraction), clamped to
+// [1, poolSize-1]. The clamps preserve two invariants:
+//   - floor >= 1 (always require at least one ready slot)
+//   - floor <= poolSize-1 (never block all drains by setting floor at
+//     pool size — at minimum poolSize-1 ready slots is "acceptable")
+func (p *WSPoolTransport) readyCapacityFloor() int {
+	floor := int(math.Floor(float64(p.poolSize) * readyCapacityFloorFraction))
+	if floor < 1 {
+		floor = 1
+	}
+	if floor >= p.poolSize {
+		floor = p.poolSize - 1
+	}
+	return floor
+}
+
+// maxConcurrentDrains is the inflightDrains hard cap. Independent of
+// readyCapacityFloor after the 2026-05-24 knob decoupling — see spec
+// §1.
+//
+// Derivation: ceil(poolSize * maxConcurrentDrainsFraction), clamped to
+// [1, poolSize-1]. Clamps preserve invariants:
+//   - cap >= 1 (always permit at least one drain — never deadlock the
+//     scheduler by setting cap=0)
+//   - cap <= poolSize-1 (never let all slots drain simultaneously)
+//
+// Clamp order matters: upper clamp (poolSize-1) is applied first so that
+// the lower clamp (min=1) can rescue the degenerate poolSize=1 case
+// (ceil(0.5)=1 → upper→0 → lower→1). Result is always ≥ 1.
+func (p *WSPoolTransport) maxConcurrentDrains() int {
+	mcd := int(math.Ceil(float64(p.poolSize) * maxConcurrentDrainsFraction))
+	if mcd >= p.poolSize {
+		mcd = p.poolSize - 1
+	}
+	if mcd < 1 {
+		mcd = 1
+	}
+	return mcd
 }
 
 func (s *poolSlot) getState() slotState   { return slotState(s.state.Load()) }
@@ -817,6 +819,21 @@ type WSPoolTransport struct {
 	// forced teardown. Only consulted when gracefulDrain is true. Default
 	// 90s (Envoy Gateway recommendation). Tune via SHADOWLINK_DRAIN_HARD_CAP.
 	drainHardCap time.Duration
+	// drainIdleThreshold — once a slot has been in slotDraining and the
+	// remaining streams (≤ drainIdleStreamsMax) showed no decrypt/write
+	// activity for this long, drainWatchdog treats the drain as natural
+	// finish and tears the slot down early. Zero disables the heuristic
+	// (legacy hard-cap-only behavior). Default 30s — chosen so that a
+	// browser-tab keepalive (typical 25s interval) does ping the slot
+	// at least once within the window if the tab is genuinely live.
+	drainIdleThreshold time.Duration
+	// drainIdleStreamsMax — upper bound on streams.Load() at which the
+	// idle heuristic is allowed to fire. With many remaining streams the
+	// drain SHOULD wait for the hard cap; with 1-2 streams the risk of
+	// killing a real flow is small. Default 2 (matches the 2026-05-22
+	// 8h canary observation that 79.6% of hard-cap drains held ≤2
+	// streams). Zero disables idle-finish independently of threshold.
+	drainIdleStreamsMax int32
 
 	// reserveMu serializes ALL writes to p.slots[idx] across drain
 	// teardown, claim, and reconnect — see graceful drain spec §C3 race
@@ -829,6 +846,13 @@ type WSPoolTransport struct {
 	// Linux -race detector flags any concurrent slice-cell read/write
 	// regardless of which range (primary/reserve) the index belongs to.
 	reserveMu sync.Mutex
+
+	// inflightDrains caps concurrent drains atomically — see spec §2.1.0.
+	// startDrain increments before any state mutation, decrements via
+	// drainWatchdog defer (guaranteed on all exit paths). Cap consulted
+	// before readyCapacity check to close the TOCTOU window where multiple
+	// triggers (age/byte/anti-FP) read identical capacity and all proceed.
+	inflightDrains atomic.Int32
 
 	streamMap sync.Map // map[uint16]int — streamID -> slot index
 
@@ -874,7 +898,36 @@ type WSPoolTransport struct {
 	// in NewWSPoolTransport for uptime reporting.
 	meltdowns1m atomic.Int32
 	rotations1m atomic.Int32
-	startedAt   time.Time
+	// drainDeferrals1m — count of storm-brake drain deferrals in the
+	// last 60s (mirror of rotations1m). Surfaced in `WS pool health`
+	// snapshot. Aggregate across both gates (inflight cap + capacity
+	// floor) — its only consumer is the alert trigger threshold, so a
+	// per-gate split would add state without operational value.
+	// Spec 2026-05-23 (introduced) + 2026-05-24 (kept aggregate).
+	drainDeferrals1m atomic.Int32
+
+	// lastInflightCapLogNs / lastCapacityFloorLogNs — per-gate UnixNano
+	// timestamp of the most recent INFO emission of "drain deferred".
+	// Used by shouldLogDeferred to rate-limit the human-readable log
+	// without throttling the counters. Zero value (initial) means "never
+	// logged" — first call always logs. Spec 2026-05-24
+	// (drain-diagnostics-counter-split) §2.
+	lastInflightCapLogNs   atomic.Int64
+	lastCapacityFloorLogNs atomic.Int64
+
+	// reserveConnectFailures — per-cell consecutive-failure counter for
+	// connectReserveSlot. Indexed by cell index (0..2*poolSize-1). Reset
+	// to 0 on successful connect. Lives on the pool (not the poolSlot)
+	// because cells get recycled — placing the counter on poolSlot would
+	// reset it to zero each time a fresh slot replaces a failed one,
+	// defeating the backoff under cascade failures. Slice is
+	// pre-allocated in NewWSPoolTransport so connectReserveSlot can do
+	// lock-free atomic Add/Store/Load on a stable address.
+	//
+	// Spec 2026-05-24 (concurrency-lift-and-backoff) §2.
+	reserveConnectFailures []atomic.Int32
+
+	startedAt        time.Time
 
 	// recentMeltdownNs is the UnixNano timestamp of the most recent
 	// meltdown event (set by emitMeltdownLog). Used by reconnectLoop's
@@ -976,6 +1029,19 @@ type WSPoolConfig struct {
 	// Zero defaults to 90s (Envoy Gateway recommendation for long-lived
 	// multiplexed streams). Field-tune via SHADOWLINK_DRAIN_HARD_CAP env.
 	DrainHardCap time.Duration
+
+	// DrainIdleThreshold enables drainWatchdog's idle-finish path: when a
+	// draining slot has no decrypt/write activity for this long AND its
+	// remaining stream count is ≤ DrainIdleStreamsMax, the drain is
+	// treated as natural finish early. Zero disables the heuristic.
+	// Field-tune via SHADOWLINK_DRAIN_IDLE_THRESHOLD env.
+	DrainIdleThreshold time.Duration
+
+	// DrainIdleStreamsMax is the upper bound on remaining streams under
+	// which the idle-finish heuristic is allowed to fire. Zero disables
+	// the heuristic (regardless of DrainIdleThreshold). Field-tune via
+	// SHADOWLINK_DRAIN_IDLE_STREAMS_MAX env.
+	DrainIdleStreamsMax int32
 }
 
 // NewWSPoolTransport creates a pool of WebSocket connections.
@@ -1010,6 +1076,14 @@ func NewWSPoolTransport(cl *Client, cfg WSPoolConfig) *WSPoolTransport {
 		// multiplexed streams. Only consulted when GracefulDrain is true.
 		drainHardCap = 90 * time.Second
 	}
+	drainIdleThreshold := cfg.DrainIdleThreshold
+	if drainIdleThreshold < 0 {
+		drainIdleThreshold = 0
+	}
+	drainIdleStreamsMax := cfg.DrainIdleStreamsMax
+	if drainIdleStreamsMax < 0 {
+		drainIdleStreamsMax = 0
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &WSPoolTransport{
 		poolSize:          cfg.Size,
@@ -1017,8 +1091,10 @@ func NewWSPoolTransport(cl *Client, cfg WSPoolConfig) *WSPoolTransport {
 		maxStreamsPerSlot: int32(cfg.MaxStreamsPerSlot),
 		maxBytesPerSlot:   cfg.MaxBytesPerSlot,
 		maxSlotAge:        cfg.MaxSlotAge,
-		gracefulDrain:     cfg.GracefulDrain,
-		drainHardCap:      drainHardCap,
+		gracefulDrain:       cfg.GracefulDrain,
+		drainHardCap:        drainHardCap,
+		drainIdleThreshold:  drainIdleThreshold,
+		drainIdleStreamsMax: drainIdleStreamsMax,
 		serverAddr:        cfg.ServerAddr,
 		sniHost:           cfg.SNIHost,
 		cfIP:              cfg.CFIP,
@@ -1046,8 +1122,19 @@ func NewWSPoolTransport(cl *Client, cfg WSPoolConfig) *WSPoolTransport {
 // Indices [0, poolSize) are primary cells, populated by Connect's slot
 // initialization loop. Indices [poolSize, 2*poolSize) are reserve cells,
 // nil until populated by the drain machinery.
+//
+// Also (re)initializes p.reserveConnectFailures (spec 2026-05-24 §2)
+// to a fresh zero-filled slice. This is correct for a fresh pool but
+// would WIPE per-cell backoff state if called on a live pool mid-flight.
+// Callers other than NewWSPoolTransport must understand this side
+// effect before invoking allocSlots a second time.
 func (p *WSPoolTransport) allocSlots() {
 	p.slots = make([]*poolSlot, p.poolSize*2)
+	// Pool-level per-cell counter for connectReserveSlot exponential
+	// backoff (spec 2026-05-24 §2). Size matches slots — counter index
+	// follows cell index. Zero-init is semantically correct (no prior
+	// failures on a fresh pool).
+	p.reserveConnectFailures = make([]atomic.Int32, p.poolSize*2)
 }
 
 // Connect establishes all WS connections in parallel.
@@ -1099,6 +1186,7 @@ func (p *WSPoolTransport) Connect(ctx context.Context) error {
 		go p.rotationWatchdogLoop()
 	}
 
+	SetGlobalPoolForStats(p)
 	return nil
 }
 
@@ -1143,10 +1231,10 @@ func (p *WSPoolTransport) rotationWatchdogLoop() {
 // so unit tests can drive it deterministically without time.Sleep.
 func (p *WSPoolTransport) rotationWatchdogSweep() {
 	nowNs := time.Now().UnixNano()
-	// Loop scope limited to primary range [0, poolSize) — reserve cells
-	// are not directly drained by the age trigger; they cycle into the
-	// primary range via the drain machinery first.
-	for idx := 0; idx < p.poolSize; idx++ {
+	// Uniform-cells: iterate the entire slice. Cells that drifted from
+	// primary to reserve range still need age-driven drain — see spec
+	// 2026-05-20 §2.3.
+	for idx := range p.slots {
 		slot := p.slots[idx]
 		if slot == nil || slot.getState() != slotReady {
 			continue
@@ -1161,10 +1249,6 @@ func (p *WSPoolTransport) rotationWatchdogSweep() {
 			continue // not yet connected; connectSlot hasn't stamped it
 		}
 		// Per-slot age threshold = max-age + per-session frozen grid jitter.
-		// staggerOffsetNs is sampled ONCE in connectSlot via
-		// slotStaggerOffset(idx); re-sampling here every 5s tick would let a
-		// slot near its threshold oscillate between "ready" and "not ready"
-		// and never converge on a rotation decision.
 		effectiveMaxAge := p.maxSlotAge.Nanoseconds() + slot.staggerOffsetNs.Load()
 		if nowNs-started < effectiveMaxAge {
 			continue
@@ -1172,13 +1256,9 @@ func (p *WSPoolTransport) rotationWatchdogSweep() {
 		if p.gracefulDrain {
 			p.startDrain(p.client, idx, "age")
 		} else {
-			// Synthesise a slotStart time.Time for the log fields
-			// (maybeRotateSlot expects one; we don't have anything but the
-			// atomic). This avoids changing maybeRotateSlot's signature for
-			// a single log field.
 			slotStart := time.Unix(0, started)
 			p.maybeRotateSlot(p.client, idx, slot, "age",
-				0, // msgCount unknown at watchdog level; the slot reader has the real value
+				0,
 				slotStart,
 				slot.downBytes.Load(),
 			)
@@ -1205,18 +1285,16 @@ func (p *WSPoolTransport) healthSummaryLoop() {
 	}
 }
 
-func (p *WSPoolTransport) emitHealthSummary() {
-	alive, dead, connecting, draining := 0, 0, 0, 0
-	rateLimited := 0
-	var totalStreams int32
-	now := time.Now()
-	for i, slot := range p.slots {
+// poolStateCounts returns the breakdown of cell states across the
+// whole slice. Uniform-cells schema (spec 2026-05-20 §2.4):
+//   - alive: slotReady cells
+//   - dead: slotDead cells (literal, NOT nil)
+//   - empty: nil cells (new field — replaces the old "nil primary = dead++" semantics)
+//   - sum invariant: alive + dead + connecting + draining + empty == 2*poolSize
+func (p *WSPoolTransport) poolStateCounts() (alive, dead, connecting, draining, empty int) {
+	for _, slot := range p.slots {
 		if slot == nil {
-			// nil primary cell = capacity gap (counts toward "dead"-like
-			// for ops visibility). nil reserve cell = empty space (skip).
-			if i < p.poolSize {
-				dead++
-			}
+			empty++
 			continue
 		}
 		switch slot.getState() {
@@ -1229,10 +1307,20 @@ func (p *WSPoolTransport) emitHealthSummary() {
 		case slotDraining:
 			draining++
 		}
+	}
+	return
+}
+
+func (p *WSPoolTransport) emitHealthSummary() {
+	alive, dead, connecting, draining, empty := p.poolStateCounts()
+	rateLimited := 0
+	var totalStreams int32
+	now := time.Now()
+	for _, slot := range p.slots {
+		if slot == nil {
+			continue
+		}
 		totalStreams += slot.streams.Load()
-		// Slot is "rate-limited" from this client's perspective if it died
-		// recently AND is still inside the freshness penalty window — that's
-		// our best proxy without plumbing X-SL-RL state per-slot.
 		if last := slot.lastDeathNs.Load(); last > 0 {
 			if now.Sub(time.Unix(0, last)) < slotFreshnessPenaltyWindow {
 				rateLimited++
@@ -1243,12 +1331,17 @@ func (p *WSPoolTransport) emitHealthSummary() {
 	p.log.Info("WS pool health",
 		"alive", alive,
 		"dead", dead,
+		"empty", empty,
 		"connecting", connecting,
 		"draining", draining,
 		"rate_limited_recent", rateLimited,
 		"active_streams", totalStreams,
 		"meltdowns_1m", p.meltdowns1m.Load(),
 		"rotations_1m", p.rotations1m.Load(),
+		"inflight_drains", p.inflightDrains.Load(),
+		"inflight_cap_deferred_total", Stats.InflightCapDeferredTotal.Load(),
+		"capacity_floor_deferred_total", Stats.CapacityFloorDeferredTotal.Load(),
+		"deferred_drains_1m", p.drainDeferrals1m.Load(),
 		"uptime", uptime,
 	)
 }
@@ -1273,7 +1366,7 @@ func (p *WSPoolTransport) keepaliveLoop() {
 
 func (p *WSPoolTransport) sendKeepaliveToAllSlots() {
 	sent := 0
-	for i := 0; i < p.poolSize; i++ {
+	for i := range p.slots {
 		slot := p.slots[i]
 		if slot == nil || slot.getState() != slotReady || slot.transport == nil || slot.session == nil {
 			continue
@@ -1401,7 +1494,12 @@ func (p *WSPoolTransport) connectSlot(ctx context.Context, idx int) error {
 	// the pool-level rotation watchdog goroutine read this. Set BEFORE
 	// setState(slotReady) so the watchdog never observes a ready slot with
 	// startedAtNs=0.
-	slot.startedAtNs.Store(time.Now().UnixNano())
+	now := time.Now().UnixNano()
+	slot.startedAtNs.Store(now)
+	// lastActivityNs primes to now() on (re)connect so drainWatchdog's
+	// idle-finish heuristic doesn't mis-classify a freshly-bound slot as
+	// idle. Real frames overwrite this in slotReader and the writer path.
+	slot.lastActivityNs.Store(now)
 	// Reset reader-active flag so the next slotReader can CAS into ownership.
 	// At this point the previous reader either:
 	//   (a) was never running for this slot (initial connect), or
@@ -1488,6 +1586,19 @@ func (p *WSPoolTransport) reconnectLoop(idx int) {
 			timer.Stop()
 			return
 		case <-timer.C:
+		}
+
+		// Recycle guard (spec §2.2.2): if a drain has recycled this cell
+		// while we were waiting, abandon this stale reconnect. claimFreeSlot
+		// + drainWatchdog teardown both write p.slots[idx] under
+		// reserveMu, so observing non-nil here is conclusive.
+		p.reserveMu.Lock()
+		recycled := p.slots[idx] != nil && p.slots[idx].getState() != slotDead
+		p.reserveMu.Unlock()
+		if recycled {
+			p.log.Info("WS pool reconnect short-circuited — cell recycled by drain",
+				"slot", idx)
+			return
 		}
 
 		var connectErr error
@@ -1745,7 +1856,7 @@ func (p *WSPoolTransport) rotationLoop() {
 func (p *WSPoolTransport) rotateMinLoadedSlot() {
 	minIdx := -1
 	minStreams := int32(1<<31 - 1)
-	for i := 0; i < p.poolSize; i++ {
+	for i := range p.slots {
 		slot := p.slots[i]
 		if slot == nil || slot.getState() != slotReady {
 			continue
@@ -1966,24 +2077,17 @@ func (p *WSPoolTransport) ReleaseStream(streamID uint16) {
 	}
 }
 
-// SessionForStream returns the crypto session for the stream's assigned slot.
+// SessionForStream returns the crypto session for the stream's assigned
+// slot, or nil if the stream is not mapped or the mapped cell is
+// nil/non-Ready. The old "fallback to first primary's session" path
+// was removed (spec 2026-05-20 §2.5, C4 review) — it produced silent
+// decrypt failures (server keys sessions per-slot) and all callers
+// (client.go:710, socks5/tcp.go:495/531/565) already nil-guard.
 func (p *WSPoolTransport) SessionForStream(streamID uint16) *core.Session {
 	if v, ok := p.streamMap.Load(streamID); ok {
 		idx := v.(int)
-		if idx < len(p.slots) && p.slots[idx] != nil {
+		if idx >= 0 && idx < len(p.slots) && p.slots[idx] != nil {
 			return p.slots[idx].session
-		}
-	}
-	// Fallback: return first available session from primary range only.
-	// Reserve slots have their own sessions belonging to specific drain
-	// replacements; using a reserve session for a stream not assigned to
-	// that slot would yield decrypt mismatches at the server.
-	for i, slot := range p.slots {
-		if i >= p.poolSize {
-			break
-		}
-		if slot != nil && slot.session != nil && slot.getState() == slotReady {
-			return slot.session
 		}
 	}
 	return nil
@@ -2013,6 +2117,7 @@ func (p *WSPoolTransport) WriteMessageForStream(streamID uint16, data []byte) er
 			if slot != nil && slot.transport != nil {
 				st := slot.getState()
 				if st == slotReady || st == slotDraining {
+					slot.lastActivityNs.Store(time.Now().UnixNano())
 					return slot.transport.WriteMessage(data)
 				}
 			}
@@ -2036,6 +2141,7 @@ func (p *WSPoolTransport) WriteControlMessageForStream(streamID uint16, data []b
 			if slot != nil && slot.transport != nil {
 				st := slot.getState()
 				if st == slotReady || st == slotDraining {
+					slot.lastActivityNs.Store(time.Now().UnixNano())
 					return slot.transport.WriteControlMessage(data)
 				}
 			}
@@ -2064,36 +2170,60 @@ func (p *WSPoolTransport) WriteControlMessage(data []byte) error {
 	return fmt.Errorf("ws pool: no ready slots")
 }
 
-// StartReader starts background readers for all connected slots.
-// Returns when ALL readers die or context is cancelled.
+// StartReader spawns and supervises slot readers for the pool's
+// lifetime. Polls every readerSupervisorInterval to find ready slots
+// without an active reader and spawn a goroutine for each. The
+// slot.readerActive CAS gate inside slotReaderWithClient prevents
+// duplicate spawns when reconnectLoop / connectReserveSlot ALSO spawn
+// readers concurrently.
+//
+// Returns ONLY on ctx.Done() — pool manages its own reader lifecycle
+// via reconnectLoop and connectReserveSlot, so engine resets are
+// counterproductive. (Previous WaitGroup-based implementation reflected
+// only the snapshot of readers at StartReader call time, returning
+// "all readers exited" when those original goroutines drained — even
+// while replacement readers spawned on reserve cells were alive. F1
+// architectural fix, 2026-05-20.)
 func (p *WSPoolTransport) StartReader(ctx context.Context, cl *Client) error {
-	var wg sync.WaitGroup
-	errCh := make(chan error, p.poolSize)
+	const readerSupervisorInterval = 1 * time.Second
 
-	for i := 0; i < p.poolSize; i++ {
-		if p.slots[i] == nil || p.slots[i].getState() != slotReady {
+	// Initial fan-out: spawn readers for all currently-ready cells.
+	p.spawnMissingReaders(ctx, cl)
+
+	ticker := time.NewTicker(readerSupervisorInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			p.spawnMissingReaders(ctx, cl)
+		}
+	}
+}
+
+// spawnMissingReaders iterates the slice and spawns slotReaderWithClient
+// for any slotReady cell that doesn't already have an active reader.
+// The readerActive CAS inside slotReaderWithClient is the authoritative
+// duplicate-prevention gate — this function just primes the spawn.
+func (p *WSPoolTransport) spawnMissingReaders(ctx context.Context, cl *Client) {
+	for i := range p.slots {
+		slot := p.slots[i]
+		if slot == nil {
 			continue
 		}
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			p.slotReaderWithClient(ctx, cl, idx)
-		}(i)
-	}
-
-	go func() {
-		wg.Wait()
-		select {
-		case errCh <- fmt.Errorf("all slot readers exited"):
-		default:
+		if slot.getState() != slotReady {
+			continue
 		}
-	}()
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-errCh:
-		return err
+		if slot.readerActive.Load() {
+			continue
+		}
+		// Best-effort spawn — readerActive CAS inside slotReaderWithClient
+		// is the authoritative gate. If we lose the race to another
+		// caller (reconnectLoop / connectReserveSlot), the CAS-fail
+		// branch in slotReaderWithClient exits cleanly with no work done.
+		go p.slotReaderWithClient(ctx, cl, i)
 	}
 }
 
@@ -2120,10 +2250,11 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 	// goroutines can be scheduled for one slot when:
 	//   1. reconnectLoop finishes connectSlot and calls `go p.slotReader(idx)`
 	//      (ws_pool.go ~line 802) to attach a reader to the new conn.
-	//   2. Concurrently, the outer engine's streamReaderLoop has observed
-	//      "all slot readers exited" on a *previous* generation and calls
-	//      pool.StartReader again, which walks all slotReady slots and
-	//      starts goroutines for each (ws_pool.go::StartReader).
+	//   2. Concurrently, spawnMissingReaders (called by StartReader polling
+	//      supervisor) sees a slotReady cell with readerActive=false and
+	//      spawns a goroutine for it.
+	//   3. connectReserveSlot (ws_pool_drain.go) calls `go p.slotReader(newIdx)`
+	//      for a freshly connected reserve cell.
 	// Both end up here for the same idx, with the same transport pointer
 	// and the same generation. Without this gate, two ReadMessage calls
 	// race on the same *gorilla.Conn — gorilla's frame parser observes the
@@ -2302,8 +2433,23 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 			continue
 		}
 
+		// Stamp activity for drainWatchdog's idle-finish gate. Any successful
+		// decrypt is a real downlink frame — keepalive cover frames take a
+		// different path. Cheap atomic store, no lock.
+		slot.lastActivityNs.Store(time.Now().UnixNano())
+
 		msgCount++
 		streamID := uint16(chunk.Payload[0])<<8 | uint16(chunk.Payload[1])
+
+		// W5 stale-frame validation: drop frames whose streamID has been
+		// reassigned to a different slot (post-drain-teardown streamID
+		// reuse race). Spec 2026-05-20 §2.4.1.
+		if v, ok := p.streamMap.Load(streamID); ok {
+			if v.(int) != idx {
+				Stats.StaleFrameDroppedTotal.Add(1)
+				continue
+			}
+		}
 
 		if chunk.Flags == core.FlagUDP {
 			cl.RouteToStream(streamID, chunk.Payload)
@@ -2332,19 +2478,19 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 //     whether grace window has elapsed; if so, rotate anyway. Otherwise
 //     stay deferred (no log; the original log line carries the rationale).
 //
-// Storm brake: when ≥ rotationStormBrakeThreshold() slots are already
-// non-ready (dead/connecting/draining), a NEW rotation request defers
-// even if streams==0. Without this, byte-budget triggers under heavy
-// upload load fire on all 8 slots within seconds, and the simultaneous
-// teardowns leave the upload writer with nowhere to put bytes. The
-// brake only blocks NEW rotations — it never overrides the "grace
-// expired" force-rotate, because at that point we know the slot is
-// past its safe age and must be replaced.
+// Storm brake: when readyCapacity() drops below readyCapacityFloor(), a
+// NEW rotation request defers even if streams==0. Without this,
+// byte-budget triggers under heavy upload load fire on all 8 slots
+// within seconds, and the simultaneous teardowns leave the upload
+// writer with nowhere to put bytes. The brake only blocks NEW
+// rotations — it never overrides the "grace expired" force-rotate,
+// because at that point we know the slot is past its safe age and must
+// be replaced.
 //
 // Concurrency: rotationDeferredNs is atomic; CAS not strictly needed
 // because the field is only written from the single slot reader goroutine
 // that owns this idx (readerActive gate guarantees one writer). The
-// brake reads countNonReadySlots which is a lock-free walk of per-slot
+// brake reads readyCapacity which is a lock-free walk of per-slot
 // atomics — race-free, eventually-consistent (acceptable: false brake
 // just defers by one cycle, never wrong direction).
 func (p *WSPoolTransport) maybeRotateSlot(cl *Client, idx int, slot *poolSlot,
@@ -2362,14 +2508,15 @@ func (p *WSPoolTransport) maybeRotateSlot(cl *Client, idx int, slot *poolSlot,
 	// defer timestamp here means the grace clock starts ticking, so a
 	// stuck brake doesn't pin the slot indefinitely.
 	if !graceExpired {
-		nonReady := p.countNonReadySlots()
-		if nonReady >= p.rotationStormBrakeThreshold() {
+		ready := p.readyCapacity()
+		floor := p.readyCapacityFloor()
+		if ready < floor {
 			if deferredAt == 0 {
 				slot.rotationDeferredNs.Store(nowNs)
 				p.log.Info("WS pool slot preemptive rotation deferred (storm brake)",
 					"slot", idx, "reason", reason,
-					"non_ready_slots", nonReady,
-					"brake_threshold", p.rotationStormBrakeThreshold(),
+					"ready_capacity", ready,
+					"floor", floor,
 					"active_streams", activeStreams,
 					"slot_age", time.Since(slotStart).Truncate(time.Second),
 					"grace_window", slotRotationGraceWithActiveStreams)
@@ -2428,14 +2575,21 @@ func (p *WSPoolTransport) maybeRotateSlot(cl *Client, idx int, slot *poolSlot,
 	return false
 }
 
-// fireRotation executes the rotation: bumps the 1-minute counter and
-// triggers handleSlotDeath with the Preemptive cause so the meltdown
-// detector does NOT count this teardown as a network failure.
-// Extracted from maybeRotateSlot so both success branches (idle slot,
-// grace-expired) share counter accounting without duplication.
-// Decrement is scheduled in a separate goroutine after 60s — keeps the
-// counter as a rolling window without a ring buffer.
-func (p *WSPoolTransport) fireRotation(cl *Client, idx int) {
+// bumpRotations1m increments the 1-minute rolling rotation counter and
+// schedules a decrement after 60s. Called by every code path that retires
+// a slot under our control:
+//   - fireRotation (legacy hard-rotation path)
+//   - drainWatchdog tearDown (graceful drain path: natural, idle, hard cap)
+//
+// The counter's semantic is "slot teardowns we initiated in the last
+// minute" — graceful drains are still our-initiated rotations, only the
+// teardown mechanism differs. Previously this counter showed 0 on
+// graceful-drain-only sessions even with hundreds of drains (2026-05-22
+// 8h canary: 895 drains, rotations_1m always 0 in pool-health log).
+//
+// Lock-free: atomic.Int32 Add. Decrement goroutine exits cleanly on ctx
+// cancel so pool shutdown doesn't leak timers.
+func (p *WSPoolTransport) bumpRotations1m() {
 	p.rotations1m.Add(1)
 	go func() {
 		timer := time.NewTimer(60 * time.Second)
@@ -2446,6 +2600,31 @@ func (p *WSPoolTransport) fireRotation(cl *Client, idx int) {
 			p.rotations1m.Add(-1)
 		}
 	}()
+}
+
+// bumpDrainDeferrals1m mirrors bumpRotations1m for storm-brake drain
+// deferrals. Lock-free Int32 Add with a 60s decay goroutine that
+// exits cleanly on pool ctx cancel. Spec 2026-05-23.
+func (p *WSPoolTransport) bumpDrainDeferrals1m() {
+	p.drainDeferrals1m.Add(1)
+	go func() {
+		timer := time.NewTimer(60 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-p.ctx.Done():
+		case <-timer.C:
+			p.drainDeferrals1m.Add(-1)
+		}
+	}()
+}
+
+// fireRotation executes the rotation: bumps the 1-minute counter and
+// triggers handleSlotDeath with the Preemptive cause so the meltdown
+// detector does NOT count this teardown as a network failure.
+// Extracted from maybeRotateSlot so both success branches (idle slot,
+// grace-expired) share counter accounting without duplication.
+func (p *WSPoolTransport) fireRotation(cl *Client, idx int) {
+	p.bumpRotations1m()
 	p.handleSlotDeath(cl, idx, deathCausePreemptiveRotation)
 }
 
@@ -2469,44 +2648,29 @@ func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int, cause slotDeathCa
 	}
 	slot.lastDeathNs.Store(time.Now().UnixNano())
 
-	// Cause-dependent stream cleanup:
-	//
-	//   deathCauseNatural / deathCausePreemptiveRotation:
-	//     close(streamChans[id]) — upstream sees Go-channel EOF (legacy
-	//     abrupt-close semantics that callers expect).
-	//
-	//   deathCauseDrainTeardown:
-	//     Do NOT close streamChans. The transport.Close below causes any
-	//     in-flight stream reader on this slot to see a network-level EOF,
-	//     which propagates up to the SOCKS5 layer as a natural connection
-	//     close (HTTP/2 GOAWAY-style invariant from spec §3.4). We still
-	//     Delete from streamMap so the streamID can be reassigned to a
-	//     fresh stream on a different slot.
+	// Uniform stream cleanup (spec 2026-05-20 §3): close(streamChans[id])
+	// for every cause (natural, preemptive, drainTeardown). The earlier
+	// design had drainTeardown skip the close in favor of network EOF
+	// from transport.Close — but that was non-deterministic. Closing the
+	// chan gives SOCKS5 readers an immediate, synchronous signal.
+	// streamMap.Delete BEFORE close(ch) keeps the no-underflow invariant
+	// (see ReleaseStream's LoadAndDelete semantics).
 	p.streamMap.Range(func(key, value any) bool {
 		if value.(int) != idx {
 			return true
 		}
 		streamID := key.(uint16)
 		p.streamMap.Delete(streamID)
-		if cause != deathCauseDrainTeardown {
-			cl.streamMu.Lock()
-			if ch, ok := cl.streamChans[streamID]; ok {
-				close(ch)
-				delete(cl.streamChans, streamID)
-			}
-			cl.streamMu.Unlock()
+		cl.streamMu.Lock()
+		if ch, ok := cl.streamChans[streamID]; ok {
+			close(ch)
+			delete(cl.streamChans, streamID)
 		}
+		cl.streamMu.Unlock()
 		return true
 	})
 
-	// streams.Store(0) is correct for natural + preemptive (we closed all
-	// streamChans above, so ReleaseStream from those streams becomes a
-	// no-op via the cancelled stream goroutines). For drainTeardown the
-	// active streams are still running and will call ReleaseStream as
-	// they finish — hard-zeroing here would underflow to -1.
-	if cause != deathCauseDrainTeardown {
-		slot.streams.Store(0)
-	}
+	slot.streams.Store(0)
 	slot.pendingConnects.Store(0) // Reset: pending CONNECTs from dead slot can't be decremented normally
 
 	if slot.transport != nil {
@@ -2544,6 +2708,7 @@ func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int, cause slotDeathCa
 // Close shuts down all slots.
 func (p *WSPoolTransport) Close() error {
 	p.cancel()
+	SetGlobalPoolForStats(nil)
 	for _, slot := range p.slots {
 		if slot == nil {
 			continue

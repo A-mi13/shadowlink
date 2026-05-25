@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -413,28 +414,42 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 					maxStreamsPerSlot = 8
 				}
 
-				// Phase 1 plumbing for WS pool graceful drain.
-				// Default off; flipped to on after pl1 canary.
-				// SHADOWLINK_DRAIN_HARD_CAP is field-tunable without
-				// redeploy (Envoy Gateway-recommended 90s default).
-				gracefulDrain := envBoolDefault("SHADOWLINK_GRACEFUL_DRAIN", false)
+				// Phase 3 (2026-05-20): WS pool graceful drain — DEFAULT ON
+				// after three canaries on uniform-cells architecture (2026-05-19
+				// 14:54 baseline, 17:19 uniform-cells, 18:01 + F1 fix). Metrics:
+				// natural finish ratio 53%, storm-brake capacity-floor defers 0,
+				// "all readers exited" regressions 0, decrypt_fails 0, downlink
+				// write errors 0. SHADOWLINK_GRACEFUL_DRAIN=0 (or false/no/off)
+				// is the emergency opt-out — restores legacy hard-rotation path.
+				// SHADOWLINK_DRAIN_HARD_CAP is field-tunable without redeploy
+				// (Envoy Gateway-recommended 90s default).
+				gracefulDrain := envBoolDefault("SHADOWLINK_GRACEFUL_DRAIN", true)
 				drainHardCap := envDurationDefault("SHADOWLINK_DRAIN_HARD_CAP", 90*time.Second)
+				// Drain idle-finish heuristic — defaults derived from 2026-05-22
+				// 8h canary: 79.6% of hard-cap drains held ≤2 streams that were
+				// keepalive-idle for the entire 90s window. 30s idle threshold
+				// leaves room for a real 25s browser keepalive ping to land
+				// inside the window.
+				drainIdleThreshold := envDurationDefault("SHADOWLINK_DRAIN_IDLE_THRESHOLD", 30*time.Second)
+				drainIdleStreamsMax := int32(envIntDefault("SHADOWLINK_DRAIN_IDLE_STREAMS_MAX", 2))
 
 				pool := client.NewWSPoolTransport(e.cl, client.WSPoolConfig{
-					Size:              poolSize,
-					ServerAddr:        wsTarget,
-					UseTLS:            slCfg.TLS,
-					SkipVerify:        false,
-					SNIHost:           sniHost,
-					CFIP:              slCfg.CFIP,
-					MaxStreamsPerSlot: maxStreamsPerSlot,
-					MaxPendingPerSlot: maxPendingPerSlot,
-					MaxBytesPerSlot:   maxBytesPerSlot,
-					MaxSlotAge:        maxSlotAge,
-					WriteTimeout:      writeTimeout,
-					StaggerDelay:      staggerDelay,
-					GracefulDrain:     gracefulDrain,
-					DrainHardCap:      drainHardCap,
+					Size:                poolSize,
+					ServerAddr:          wsTarget,
+					UseTLS:              slCfg.TLS,
+					SkipVerify:          false,
+					SNIHost:             sniHost,
+					CFIP:                slCfg.CFIP,
+					MaxStreamsPerSlot:   maxStreamsPerSlot,
+					MaxPendingPerSlot:   maxPendingPerSlot,
+					MaxBytesPerSlot:     maxBytesPerSlot,
+					MaxSlotAge:          maxSlotAge,
+					WriteTimeout:        writeTimeout,
+					StaggerDelay:        staggerDelay,
+					GracefulDrain:       gracefulDrain,
+					DrainHardCap:        drainHardCap,
+					DrainIdleThreshold:  drainIdleThreshold,
+					DrainIdleStreamsMax: drainIdleStreamsMax,
 				})
 				if err := pool.Connect(ctx2); err != nil {
 					slog.Warn("WS Pool не удался, fallback на SplitHTTP", "err", err)
@@ -628,21 +643,13 @@ func (e *ShadowLinkEngine) streamReaderLoop(ctx context.Context) {
 			continue
 		}
 
-		// WSPoolTransport: all slot readers exited. DON'T destroy the pool —
-		// it has its own internal recovery via handleSlotDeath → reconnectLoop
-		// for each slot. Just restart StartReader so it picks up the slots
-		// as they come back online. Creating a new pool (and especially
-		// Close()ing the old one) kills the recovery goroutines and makes
-		// things worse: the new pool connects into the same CF edge that
-		// just RST'd us, dies immediately, and we loop forever.
+		// WSPoolTransport: F1 architectural fix (2026-05-20) — StartReader
+		// now polls and supervises readers for the pool's lifetime, returning
+		// ONLY on ctx.Done. Any non-nil return here means VPN shutdown.
 		if _, isPool := e.stream.(*client.WSPoolTransport); isPool {
-			slog.Info("WS Pool: все reader'ы вышли, перезапуск StartReader",
-				"backoff", backoff)
-			// Pool's reconnectLoops are already running for dead slots.
-			// Just let backoff pass and re-enter the for loop to call
-			// StartReader again on the same pool.
-			backoff = min(backoff*2, maxBackoff)
-			continue
+			slog.Info("WS Pool: StartReader вернулся (ctx.Done)",
+				"err", err)
+			return // exit streamReaderLoop — context is cancelled
 		}
 
 		// Single WebSocket: need full reconnect.
@@ -773,4 +780,19 @@ func envDurationDefault(name string, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+// envIntDefault reads a base-10 int env var. Unset, empty, or
+// unparseable values return def. Negative values are returned verbatim
+// — the caller is responsible for any non-negative validation.
+func envIntDefault(name string, def int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
 }

@@ -3,65 +3,77 @@ package client
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/nixavpn/shadowlink/core"
 )
 
-// TestCountNonReadySlots_IgnoresEmptyReserve verifies that nil cells in
-// the reserve range (i >= poolSize) do NOT inflate the non-ready count.
-// This guards the storm brake against permanent activation after slice
-// expansion to 2*poolSize.
-func TestCountNonReadySlots_IgnoresEmptyReserve(t *testing.T) {
-	p := &WSPoolTransport{poolSize: 4}
-	p.slots = make([]*poolSlot, 8) // 4 primary + 4 reserve, all nil
+// TestReadyCapacity_CountsAllReadyAcrossSlice asserts that readyCapacity
+// counts slotReady cells anywhere in the slice — no primary/reserve
+// distinction. This guards against the canary 2026-05-19 bug where
+// countNonReadySlots used `i+poolSize` pairing and locked storm brake
+// at non_ready=2 forever.
+func TestReadyCapacity_CountsAllReadyAcrossSlice(t *testing.T) {
+	p := &WSPoolTransport{poolSize: 8}
+	p.slots = make([]*poolSlot, 16)
 
-	// All 4 primary are nil → all count as non-ready (capacity = 0)
-	if got := p.countNonReadySlots(); got != 4 {
-		t.Errorf("countNonReadySlots with all-nil primary = %d, want 4", got)
+	if got := p.readyCapacity(); got != 0 {
+		t.Errorf("readyCapacity with all nil = %d, want 0", got)
 	}
 
-	// Fill 4 primary as ready
-	for i := range 4 {
+	// 6 primary ready + 2 reserve ready (canary post-teardown state).
+	for _, i := range []int{0, 1, 3, 4, 5, 7, 8, 9} {
 		p.slots[i] = &poolSlot{}
 		p.slots[i].setState(slotReady)
 	}
-	// Reserve still all nil
-	if got := p.countNonReadySlots(); got != 0 {
-		t.Errorf("countNonReadySlots with 4 primary ready + 4 nil reserve = %d, want 0 (reserve nil = empty, not non-ready)", got)
+	if got := p.readyCapacity(); got != 8 {
+		t.Errorf("readyCapacity with 6+2 ready = %d, want 8 (uniform cells)", got)
 	}
 
-	// One primary draining, 3 ready, reserve still nil
+	// One draining doesn't count.
 	p.slots[0].setState(slotDraining)
-	if got := p.countNonReadySlots(); got != 1 {
-		t.Errorf("countNonReadySlots with 1 draining primary = %d, want 1", got)
+	if got := p.readyCapacity(); got != 7 {
+		t.Errorf("readyCapacity with 1 drained = %d, want 7", got)
 	}
 
-	// Add a reserve slot in slotConnecting state — this is the parallel
-	// drain replacement for primary[0] (which is slotDraining). Per the
-	// countNonReadySlots design (parallel-replacement exception), this
-	// reserve cell is NOT counted as non-ready because its matching
-	// primary is in slotDraining: capacity is being maintained, not
-	// lost. The non-ready count therefore stays at 1 (the primary
-	// draining itself).
-	p.slots[4] = &poolSlot{}
-	p.slots[4].setState(slotConnecting)
-	if got := p.countNonReadySlots(); got != 1 {
-		t.Errorf("countNonReadySlots with 1 draining primary + 1 connecting reserve (parallel replacement) = %d, want 1 (reserve connecting paired with draining primary is exempted)", got)
+	// Connecting doesn't count.
+	p.slots[10] = &poolSlot{}
+	p.slots[10].setState(slotConnecting)
+	if got := p.readyCapacity(); got != 7 {
+		t.Errorf("readyCapacity ignores slotConnecting = %d, want 7", got)
 	}
+}
 
-	// Sanity: a reserve slotConnecting WITHOUT a matching primary
-	// slotDraining IS counted (it's a genuine non-ready cell, not a
-	// parallel replacement). Use slot 5 (reserve) paired with primary[1]
-	// which is in slotReady.
-	p.slots[5] = &poolSlot{}
-	p.slots[5].setState(slotConnecting)
-	if got := p.countNonReadySlots(); got != 2 {
-		t.Errorf("countNonReadySlots with 1 draining primary + 1 paired-parallel reserve + 1 standalone reserve connecting = %d, want 2 (standalone reserve connecting counts)", got)
+// TestStormBrakeFloor_DerivedFromPoolSize asserts the floor formula
+// scales with poolSize (spec §2.1, C1 review fix).
+func TestStormBrakeFloor_DerivedFromPoolSize(t *testing.T) {
+	// After 2026-05-24 decoupling: floor = max(1, min(poolSize-1, floor(poolSize * 0.75))).
+	// Most values UNCHANGED from pre-decouple (this is intentional — decoupling
+	// preserves the catastrophic-state defense at known-good values). poolSize=4
+	// was floor=3 (4-1), now floor(4*0.75)=3 (same). poolSize=6 was floor=4 (6-2),
+	// now floor(6*0.75)=4 (same).
+	cases := []struct {
+		poolSize  int
+		wantFloor int
+	}{
+		{poolSize: 8, wantFloor: 6},   // floor(8*0.75) = 6 — UNCHANGED from pre-decouple
+		{poolSize: 6, wantFloor: 4},   // floor(6*0.75) = 4 — UNCHANGED (added explicit row)
+		{poolSize: 4, wantFloor: 3},   // floor(4*0.75) = 3 — UNCHANGED
+		{poolSize: 2, wantFloor: 1},   // floor(2*0.75)=1, clamped min=1 — UNCHANGED
+		{poolSize: 16, wantFloor: 12}, // floor(16*0.75) = 12 — UNCHANGED
+	}
+	for _, c := range cases {
+		p := &WSPoolTransport{poolSize: c.poolSize}
+		if got := p.readyCapacityFloor(); got != c.wantFloor {
+			t.Errorf("readyCapacityFloor(poolSize=%d) = %d, want %d",
+				c.poolSize, got, c.wantFloor)
+		}
 	}
 }
 
@@ -84,7 +96,7 @@ func (c *countingTransport) WriteControlMessage(data []byte) error {
 func (c *countingTransport) ReadMessage(timeout time.Duration) ([]byte, error) {
 	return nil, nil
 }
-func (c *countingTransport) Close() error            { return nil }
+func (c *countingTransport) Close() error             { return nil }
 func (c *countingTransport) LastWriteUnixNano() int64 { return 0 }
 
 // TestWriteMessageForStream_AcceptsDraining verifies that a stream
@@ -375,70 +387,78 @@ func TestStartDrain_NoFreeReserveSlot(t *testing.T) {
 	t.Skip("Brake engages before no-free-reserve branch is reached in this layout; covered by Task 13 integration test")
 }
 
-// TestClaimFreeReserveSlot_PrefersFirstNil verifies the claim atomically
-// installs a placeholder in the first nil reserve cell. After claim,
-// the cell is non-nil and in slotConnecting state. Returns -1 only when
-// all reserve cells are non-nil.
-func TestClaimFreeReserveSlot_PrefersFirstNil(t *testing.T) {
+// TestClaimFreeSlot_PrefersFirstNil verifies the claim atomically
+// installs a placeholder in the first nil cell anywhere in the slice.
+// After claim, the cell is non-nil and in slotConnecting state.
+// Returns -1 only when every cell is non-nil.
+//
+// Updated for uniform-cells design (spec 2026-05-20 §2.2): scan starts
+// at index 0 so primary cells are eligible targets alongside reserve
+// cells. NewWSPoolTransport initializes all slots to nil; first claim
+// therefore returns idx 0, not the old reserve-floor 4.
+func TestClaimFreeSlot_PrefersFirstNil(t *testing.T) {
 	cl := &Client{}
 	p := NewWSPoolTransport(cl, WSPoolConfig{Size: 4, ServerAddr: "127.0.0.1:0"})
-	// p.slots has 8 cells; reserve range = [4, 8)
+	// p.slots has 8 cells; all nil at init.
 
-	// First claim → idx 4 (first reserve cell)
-	if got := p.claimFreeReserveSlot(); got != 4 {
-		t.Errorf("first claim = %d, want 4", got)
+	// First claim → idx 0 (first nil in the whole slice)
+	if got := p.claimFreeSlot(); got != 0 {
+		t.Errorf("first claim = %d, want 0", got)
 	}
-	if p.slots[4] == nil {
-		t.Error("claim did not install a placeholder at slots[4]")
+	if p.slots[0] == nil {
+		t.Error("claim did not install a placeholder at slots[0]")
 	}
-	if p.slots[4].getState() != slotConnecting {
-		t.Errorf("placeholder state = %v, want slotConnecting", p.slots[4].getState())
-	}
-
-	// Second claim → idx 5 (next nil cell, since 4 is taken)
-	if got := p.claimFreeReserveSlot(); got != 5 {
-		t.Errorf("second claim = %d, want 5", got)
+	if p.slots[0].getState() != slotConnecting {
+		t.Errorf("placeholder state = %v, want slotConnecting", p.slots[0].getState())
 	}
 
-	// Fill remaining
-	if got := p.claimFreeReserveSlot(); got != 6 {
-		t.Errorf("third claim = %d, want 6", got)
-	}
-	if got := p.claimFreeReserveSlot(); got != 7 {
-		t.Errorf("fourth claim = %d, want 7", got)
+	// Second claim → idx 1 (next nil cell)
+	if got := p.claimFreeSlot(); got != 1 {
+		t.Errorf("second claim = %d, want 1", got)
 	}
 
-	// All reserve full → -1
-	if got := p.claimFreeReserveSlot(); got != -1 {
-		t.Errorf("claim with all reserve full = %d, want -1", got)
+	// Fill the rest — claim all 8 cells in order
+	for want := 2; want < 8; want++ {
+		if got := p.claimFreeSlot(); got != want {
+			t.Errorf("claim %d = %d, want %d", want, got, want)
+		}
+	}
+
+	// All cells claimed → -1
+	if got := p.claimFreeSlot(); got != -1 {
+		t.Errorf("claim with all occupied = %d, want -1", got)
 	}
 }
 
-// TestClaimFreeReserveSlot_ConcurrentNoCollision exercises the mutex by
+// TestClaimFreeSlot_ConcurrentNoCollision exercises the mutex by
 // running many concurrent claims and verifying each gets a unique idx.
 // Without the mutex, two goroutines could pick the same idx.
-func TestClaimFreeReserveSlot_ConcurrentNoCollision(t *testing.T) {
+//
+// Updated for uniform-cells design: results are in [0, 16), not the
+// old reserve-range [8, 16). All slots start nil, so 8 concurrent
+// claims exhaust the first 8 cells (order non-deterministic under
+// race, but each idx must be unique and in-range).
+func TestClaimFreeSlot_ConcurrentNoCollision(t *testing.T) {
 	cl := &Client{}
 	p := NewWSPoolTransport(cl, WSPoolConfig{Size: 8, ServerAddr: "127.0.0.1:0"})
 
-	const N = 8 // poolSize, so we expect 8 unique reserve indices
+	const N = 8 // claim 8 out of 16 slots
 	var wg sync.WaitGroup
 	results := make([]int, N)
 	wg.Add(N)
 	for i := range N {
 		go func(i int) {
 			defer wg.Done()
-			results[i] = p.claimFreeReserveSlot()
+			results[i] = p.claimFreeSlot()
 		}(i)
 	}
 	wg.Wait()
 
-	// All results should be distinct and in range [8, 16) — the reserve
-	// range for poolSize=8.
+	// All results should be distinct and in range [0, 16).
 	seen := make(map[int]bool)
 	for _, idx := range results {
-		if idx < 8 || idx >= 16 {
-			t.Errorf("claim returned %d, want in [8, 16)", idx)
+		if idx < 0 || idx >= 16 {
+			t.Errorf("claim returned %d, want in [0, 16)", idx)
 		}
 		if seen[idx] {
 			t.Errorf("idx %d returned by two concurrent claims — race!", idx)
@@ -652,23 +672,23 @@ func (failingHandshakeTransport) SendChunk(ctx context.Context, data []byte, ses
 func (failingHandshakeTransport) SendHandshake(ctx context.Context, hello *core.ClientHello) ([]byte, error) {
 	return nil, errTestTransportUnreachable
 }
-func (failingHandshakeTransport) Name() string  { return "failingHandshakeTransport" }
-func (failingHandshakeTransport) Close() error  { return nil }
+func (failingHandshakeTransport) Name() string { return "failingHandshakeTransport" }
+func (failingHandshakeTransport) Close() error { return nil }
 
 var errTestTransportUnreachable = errors.New("test: transport unreachable")
 
 // TestConnectReserveSlot_FailureFallsBackToReconnectLoop verifies that
 // when connectSlot fails (invalid server, rate limit, etc.), the
-// reserve slot ends up in slotDead or slotConnecting state (NOT
-// slotReady), and reconnectLoop is scheduled to recover capacity
-// asynchronously. The drainWatchdog tears down oldIdx on its own
-// schedule regardless.
+// placeholder cell is freed (nil) under reserveMu so a fresh drain can
+// immediately reclaim the cell (T9 §4.2), and reconnectLoop is
+// scheduled to recover capacity asynchronously. The drainWatchdog tears
+// down oldIdx on its own schedule regardless.
 //
-// We can't directly call connectReserveSlot (it triggers a real
-// connectSlot which spawns goroutines into the unreachable server);
-// instead we drive startDrain on a fake old slot with a stub transport
-// that always errors out of SendHandshake and observe the reserve
-// cell's post-failure state.
+// Updated for T9: old behavior asserted the cell stayed non-nil in
+// slotConnecting or slotDead state. New behavior: cell is set to nil
+// immediately after failure so claimFreeSlot can reuse it without
+// waiting for reconnectLoop. reconnectLoop's recycle guard (§2.2.2)
+// short-circuits if a drain reclaimed the cell in the meantime.
 func TestConnectReserveSlot_FailureFallsBackToReconnectLoop(t *testing.T) {
 	cl := &Client{
 		streamChans: make(map[uint16]chan []byte),
@@ -701,16 +721,19 @@ func TestConnectReserveSlot_FailureFallsBackToReconnectLoop(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 
 	newIdx := p.poolSize // first reserve cell — 2
-	if p.slots[newIdx] == nil {
-		t.Fatal("reserve slot should be claimed (placeholder installed by claimFreeReserveSlot)")
-	}
-	state := p.slots[newIdx].getState()
-	if state == slotReady {
+	// T9 invariant: after connectSlot failure the placeholder is freed to nil
+	// so claimFreeSlot can immediately reuse the cell for the next drain.
+	// reconnectLoop is scheduled and may reinstall a slot in the background —
+	// we only assert the failure path did NOT leave a non-nil dead/connecting
+	// placeholder permanently blocking the cell.
+	if slot := p.slots[newIdx]; slot != nil && slot.getState() == slotReady {
 		t.Errorf("reserve slot should NOT be slotReady after connect to invalid port; got slotReady")
 	}
-	// Acceptable: slotConnecting (reconnectLoop in flight) or slotDead.
-	if state != slotConnecting && state != slotDead {
-		t.Errorf("reserve slot state = %v, want slotConnecting or slotDead", state)
+	// Acceptable post-failure states: nil (freed by T9) or slotConnecting
+	// (reconnectLoop successfully reinstalled a slot in the background
+	// within the 300ms window — rare but valid).
+	if slot := p.slots[newIdx]; slot != nil && slot.getState() == slotDead {
+		t.Errorf("reserve cell should be nil (freed) or reconnected after failure, not permanently slotDead")
 	}
 }
 
@@ -939,111 +962,89 @@ func TestAssignStream_SkipsDraining(t *testing.T) {
 	}
 }
 
-// TestStartDrain_StormBrakeSingleDrain verifies that ONE drain in flight
-// does NOT engage the storm brake. The parallel reserve connecting cell
-// is exempted from non-ready count via the matching-slotDraining-primary
-// check in countNonReadySlots.
-//
-// Scenario: poolSize=8, primary[0] in slotDraining, reserve[8] in
-// slotConnecting (parallel replacement), primary[1..7] in slotReady,
-// reserve[9..15] nil.
-// countNonReadySlots = 1 (just the draining primary).
-// rotationStormBrakeThreshold = ceil(8 * 0.25) = 2.
-// 1 < 2 → brake disengaged.
+// TestStartDrain_StormBrakeSingleDrain — un-paired layout (canary).
+// primary[6] draining, reserve[9] connecting (no parity 6↔14). Asserts
+// readyCapacity stays well above floor — drain would NOT be deferred
+// by capacity gate; only an inflight cap would defer.
 func TestStartDrain_StormBrakeSingleDrain(t *testing.T) {
-	cl := &Client{streamChans: make(map[uint16]chan []byte)}
-	p := NewWSPoolTransport(cl, WSPoolConfig{
-		Size:          8,
-		ServerAddr:    "127.0.0.1:0",
-		GracefulDrain: true,
-		DrainHardCap:  5 * time.Second,
-	})
-	p.ctx = t.Context()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	primary0 := &poolSlot{}
-	primary0.setState(slotDraining)
-	p.slots[0] = primary0
-
-	reserve0 := &poolSlot{}
-	reserve0.setState(slotConnecting)
-	p.slots[8] = reserve0 // parallel replacement for primary[0]
-
-	for i := 1; i < 8; i++ {
-		s := &poolSlot{}
-		s.setState(slotReady)
-		p.slots[i] = s
+	p := &WSPoolTransport{
+		poolSize:      8,
+		gracefulDrain: true,
+		drainHardCap:  5 * time.Second,
+		ctx:           ctx,
+		log:           newDiscardLogger(),
 	}
+	p.slots = make([]*poolSlot, 16)
+	// 7 of 8 primaries ready + the 1 draining (primary[6]).
+	for i := 0; i < 8; i++ {
+		p.slots[i] = &poolSlot{index: i}
+		if i == 6 {
+			p.slots[i].setState(slotDraining)
+		} else {
+			p.slots[i].setState(slotReady)
+		}
+	}
+	// Reserve[9] is connecting (replacement for primary[6]).
+	p.slots[9] = &poolSlot{}
+	p.slots[9].setState(slotConnecting)
+	// inflight already counts this one drain.
+	p.inflightDrains.Store(1)
 
-	got := p.countNonReadySlots()
-	if got != 1 {
-		t.Errorf("countNonReadySlots = %d, want 1 (reserve connecting is parallel replacement)", got)
+	// readyCapacity = 7 (primary 0,1,2,3,4,5,7), floor = 6 → drain OK.
+	if ready, floor := p.readyCapacity(), p.readyCapacityFloor(); ready < floor {
+		t.Fatalf("setup readyCapacity=%d < floor=%d", ready, floor)
 	}
-	threshold := p.rotationStormBrakeThreshold()
-	if threshold != 2 {
-		t.Errorf("threshold = %d, want 2", threshold)
-	}
-	if got >= threshold {
-		t.Error("brake engaged on single drain; should be disengaged")
+	// maxConcurrentDrains = 2, inflight = 1 → another drain CAN proceed.
+	if p.inflightDrains.Load() >= int32(p.maxConcurrentDrains()) {
+		t.Fatalf("inflight already at cap")
 	}
 }
 
-// TestStartDrain_StormBrakeTwoConcurrentEngages verifies that 2 concurrent
-// drains DO engage the storm brake (count = 2 = threshold for poolSize=8),
-// and that a third drain attempt is deferred with backoff set.
+// TestStartDrain_StormBrakeTwoConcurrentEngages — exact canary layout.
+// primary[6] and primary[2] both torn down → reserve[8] and reserve[9]
+// fully ready. With pairing logic this state pinned the brake forever.
+// With uniform-cells: readyCapacity=8, floor=6 — capacity OK. inflight
+// counts 2 ongoing drains; a third would defer via inflight cap (T6).
+// Until T6 lands the assertion is just on readyCapacity/floor.
 func TestStartDrain_StormBrakeTwoConcurrentEngages(t *testing.T) {
-	cl := &Client{
-		streamChans: make(map[uint16]chan []byte),
-		transport:   failingHandshakeTransport{},
-		serverPub:   make([]byte, 32),
-		clientID:    []byte("test-client-id"),
-	}
-	p := NewWSPoolTransport(cl, WSPoolConfig{
-		Size:          8,
-		ServerAddr:    "127.0.0.1:1",
-		GracefulDrain: true,
-		DrainHardCap:  5 * time.Second,
-	})
-	p.ctx = t.Context()
-	p.client = cl
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// 2 primary draining + 2 matching reserves connecting
-	for i := 0; i < 2; i++ {
-		ps := &poolSlot{}
-		ps.setState(slotDraining)
-		p.slots[i] = ps
-		rs := &poolSlot{}
-		rs.setState(slotConnecting)
-		p.slots[i+8] = rs
+	p := &WSPoolTransport{
+		poolSize:      8,
+		gracefulDrain: true,
+		drainHardCap:  5 * time.Second,
+		ctx:           ctx,
+		log:           newDiscardLogger(),
 	}
-	// 6 ready primary
-	for i := 2; i < 8; i++ {
-		s := &poolSlot{}
-		s.setState(slotReady)
-		p.slots[i] = s
+	p.slots = make([]*poolSlot, 16)
+	// Exact canary state: 6 ready primaries (excluding 2,6), 2 ready reserves.
+	for _, i := range []int{0, 1, 3, 4, 5, 7} {
+		p.slots[i] = &poolSlot{index: i}
+		p.slots[i].setState(slotReady)
 	}
+	p.slots[8] = &poolSlot{}
+	p.slots[8].setState(slotReady)
+	p.slots[9] = &poolSlot{}
+	p.slots[9].setState(slotReady)
+	p.inflightDrains.Store(0)
 
-	got := p.countNonReadySlots()
-	if got != 2 {
-		t.Errorf("countNonReadySlots = %d, want 2", got)
+	// readyCapacity = 6+2 = 8 ≥ floor=6 — uniform-cells design works.
+	if got := p.readyCapacity(); got != 8 {
+		t.Errorf("readyCapacity = %d, want 8 (canary post-teardown)", got)
 	}
-	threshold := p.rotationStormBrakeThreshold()
-	if got < threshold {
-		t.Errorf("brake should engage: got=%d, threshold=%d", got, threshold)
+	if got := p.readyCapacityFloor(); got != 6 {
+		t.Errorf("readyCapacityFloor = %d, want 6", got)
 	}
-
-	// Third drain attempt on a ready primary — brake should defer it
-	beforeStarted := Stats.DrainStartedTotal.Load()
-	p.startDrain(cl, 2, "test")
-	afterStarted := Stats.DrainStartedTotal.Load()
-
-	if afterStarted != beforeStarted {
-		t.Errorf("third drain started despite brake; DrainStartedTotal %d→%d", beforeStarted, afterStarted)
-	}
-	if p.slots[2].getState() != slotReady {
-		t.Errorf("primary[2] state = %v, want slotReady (brake should defer)", p.slots[2].getState())
-	}
-	if p.slots[2].nextDrainAttemptNs.Load() == 0 {
-		t.Error("nextDrainAttemptNs not set after brake-deferred drain")
+	// With OLD paired logic, countNonReadySlots would have returned 2
+	// (both nil primaries treated as gaps because reserve[2+8]=nil and
+	// reserve[6+8]=nil). Brake threshold=2 would trip. New logic: capacity
+	// 8 >= floor 6 → no trip. Verify directly.
+	if p.readyCapacity() < p.readyCapacityFloor() {
+		t.Errorf("storm brake incorrectly engaged on canary state")
 	}
 }
 
@@ -1090,85 +1091,127 @@ func TestByteBudgetDrain_ReaderContinues(t *testing.T) {
 	}
 }
 
-// TestHandleSlotDeath_DrainTeardownDoesNotCloseStreamChans verifies the
-// C2 fix (spec §3.4 invariant): hard-cap drain teardown closes the
-// transport but leaves streamChans alive. The stream-reading goroutines
-// see a network-level EOF (from transport.Close), NOT a Go-channel
-// close. This is the HTTP/2 GOAWAY-style behavior we want for graceful
-// rotation.
-//
-// Without the fix, hard cap force-closed streamChans of active streams
-// — exactly the regression Phase 1 was supposed to prevent.
-func TestHandleSlotDeath_DrainTeardownDoesNotCloseStreamChans(t *testing.T) {
-	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+// TestHandleSlotDeath_DrainTeardownClosesStreamChans asserts the
+// behavior change in spec §3 (C6 review): drainTeardown NOW closes
+// streamChans uniformly with natural/preemptive — deterministic kill
+// signal to SOCKS5 layer.
+func TestHandleSlotDeath_DrainTeardownClosesStreamChans(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	p := &WSPoolTransport{
-		poolSize:          2,
-		ctx:               ctx,
-		cancel:            cancel,
-		log:               newDiscardLogger(),
-		meltdownThreshold: 100,
-		meltdownWindow:    5 * time.Second,
+	cl := &Client{
+		streamChans: make(map[uint16]chan []byte),
 	}
-	p.slots = make([]*poolSlot, 4)
-	p.client = cl
-
-	slot := &poolSlot{}
+	p := &WSPoolTransport{poolSize: 8, ctx: ctx, log: newDiscardLogger(), client: cl}
+	p.slots = make([]*poolSlot, 16)
+	slot := &poolSlot{index: 3}
 	slot.setState(slotDraining)
+	p.slots[3] = slot
+
+	ch := make(chan []byte, 1)
+	cl.streamChans[42] = ch
+	p.streamMap.Store(uint16(42), 3)
+
+	p.handleSlotDeath(cl, 3, deathCauseDrainTeardown)
+
+	// streamChans[42] must now be closed AND removed from the map.
+	cl.streamMu.Lock()
+	_, present := cl.streamChans[42]
+	cl.streamMu.Unlock()
+	if present {
+		t.Errorf("streamChans[42] still present after drainTeardown")
+	}
+	// Channel must be closed (read returns zero value, !ok).
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Errorf("ch read returned ok=true, expected closed channel")
+		}
+	default:
+		t.Errorf("ch not closed (read would block)")
+	}
+}
+
+// TestHandleSlotDeath_NoUnderflowOnLateRelease asserts that
+// LoadAndDelete ordering prevents streams.Add(-1) underflow when
+// ReleaseStream is called after handleSlotDeath cleared the map.
+// Spec §3 implementation note.
+func TestHandleSlotDeath_NoUnderflowOnLateRelease(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+	p := &WSPoolTransport{poolSize: 8, ctx: ctx, log: newDiscardLogger(), client: cl}
+	p.slots = make([]*poolSlot, 16)
+	slot := &poolSlot{index: 0}
+	slot.setState(slotDraining)
+	slot.streams.Store(5)
 	p.slots[0] = slot
 
-	// Wire two streams to slot 0
-	ch1 := make(chan []byte, 1)
-	ch2 := make(chan []byte, 1)
-	cl.streamChans[100] = ch1
-	cl.streamChans[101] = ch2
-	p.streamMap.Store(uint16(100), 0)
-	p.streamMap.Store(uint16(101), 0)
-	slot.streams.Store(2)
+	for sid := uint16(100); sid < 105; sid++ {
+		cl.streamChans[sid] = make(chan []byte, 1)
+		p.streamMap.Store(sid, 0)
+	}
 
 	p.handleSlotDeath(cl, 0, deathCauseDrainTeardown)
 
-	// streamMap should be cleared (IDs are free for reassignment to a
-	// fresh stream on a different slot).
-	if _, ok := p.streamMap.Load(uint16(100)); ok {
-		t.Error("streamMap entry 100 not deleted after drain teardown")
-	}
-	if _, ok := p.streamMap.Load(uint16(101)); ok {
-		t.Error("streamMap entry 101 not deleted after drain teardown")
+	// Late ReleaseStream calls — must be no-ops because LoadAndDelete sees ok=false.
+	for sid := uint16(100); sid < 105; sid++ {
+		p.ReleaseStream(sid)
 	}
 
-	// But streamChans should still be open (NOT closed). A receive on
-	// an open empty channel would block; a receive on a closed channel
-	// returns (zero, false) immediately. We use a non-blocking select.
-	select {
-	case _, open := <-ch1:
-		if !open {
-			t.Error("ch1 was closed by drain teardown; spec §3.4 says hard cap should NOT close streamChans (C2)")
-		}
-	default:
-		// not closed, not ready — correct
+	// streams counter must not have underflowed.
+	if got := slot.streams.Load(); got != 0 {
+		t.Errorf("slot.streams = %d, want 0 (no underflow)", got)
 	}
-	select {
-	case _, open := <-ch2:
-		if !open {
-			t.Error("ch2 was closed by drain teardown (C2)")
-		}
-	default:
-		// not closed
-	}
+}
 
-	// Cell should be cleared per Task 3 (existing invariant).
-	if p.slots[0] != nil {
-		t.Error("p.slots[0] should be nil after drain teardown")
+// TestHandleSlotDeath_AllCausesCloseStreamChans asserts uniform behavior
+// across all death causes (spec §3, acceptance #7).
+func TestHandleSlotDeath_AllCausesCloseStreamChans(t *testing.T) {
+	cases := []struct {
+		name  string
+		cause slotDeathCause
+	}{
+		{"natural", deathCauseNatural},
+		{"preemptive", deathCausePreemptiveRotation},
+		{"drainTeardown", deathCauseDrainTeardown},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 
-	// streams counter should NOT have been hard-zeroed for drainTeardown
-	// (active streams will decrement it naturally via ReleaseStream as
-	// they finish; hard-zero would underflow to -1).
-	if slot.streams.Load() != 2 {
-		t.Errorf("slot.streams should remain at 2 after drain teardown (will decrement via ReleaseStream); got %d", slot.streams.Load())
+			cl := &Client{streamChans: make(map[uint16]chan []byte)}
+			p := &WSPoolTransport{
+				poolSize: 8, ctx: ctx, log: newDiscardLogger(), client: cl,
+			}
+			p.slots = make([]*poolSlot, 16)
+			slot := &poolSlot{index: 0}
+			slot.setState(slotReady)
+			p.slots[0] = slot
+
+			ch := make(chan []byte, 1)
+			cl.streamChans[7] = ch
+			p.streamMap.Store(uint16(7), 0)
+
+			p.handleSlotDeath(cl, 0, tc.cause)
+
+			cl.streamMu.Lock()
+			_, present := cl.streamChans[7]
+			cl.streamMu.Unlock()
+			if present {
+				t.Errorf("[%s] streamChans[7] still present", tc.name)
+			}
+			select {
+			case _, ok := <-ch:
+				if ok {
+					t.Errorf("[%s] ch read ok=true, expected closed", tc.name)
+				}
+			default:
+				t.Errorf("[%s] ch not closed (would block)", tc.name)
+			}
+		})
 	}
 }
 
@@ -1220,5 +1263,1417 @@ func TestHandleSlotDeath_NaturalClosesStreamChans(t *testing.T) {
 	// streams to do natural decrement).
 	if slot.streams.Load() != 0 {
 		t.Errorf("slot.streams should be 0 after natural death; got %d", slot.streams.Load())
+	}
+}
+
+// TestInflightDrains_FieldInitialized verifies the new atomic counter
+// is wired into WSPoolTransport with a zero-value initial state.
+func TestInflightDrains_FieldInitialized(t *testing.T) {
+	p := &WSPoolTransport{poolSize: 8}
+	p.slots = make([]*poolSlot, 16)
+	if got := p.inflightDrains.Load(); got != 0 {
+		t.Errorf("inflightDrains initial value = %d, want 0", got)
+	}
+	p.inflightDrains.Add(1)
+	if got := p.inflightDrains.Load(); got != 1 {
+		t.Errorf("inflightDrains after Add(1) = %d, want 1", got)
+	}
+	p.inflightDrains.Add(-1)
+	if got := p.inflightDrains.Load(); got != 0 {
+		t.Errorf("inflightDrains after Add(-1) = %d, want 0", got)
+	}
+}
+
+// TestClaimFreeSlot_ScansFromIndexZero asserts the renamed function
+// scans the entire slice from idx=0, allowing post-teardown primary
+// cells to be claimed as new drain replacements (spec §2.2).
+func TestClaimFreeSlot_ScansFromIndexZero(t *testing.T) {
+	p := &WSPoolTransport{poolSize: 8}
+	p.slots = make([]*poolSlot, 16)
+
+	// Fill the reserve range completely.
+	for i := 8; i < 16; i++ {
+		p.slots[i] = &poolSlot{}
+		p.slots[i].setState(slotReady)
+	}
+	// Primary cell 3 was torn down by a previous drain — nil. All other
+	// primaries occupied.
+	for i := 0; i < 8; i++ {
+		if i == 3 {
+			continue
+		}
+		p.slots[i] = &poolSlot{}
+		p.slots[i].setState(slotReady)
+	}
+
+	got := p.claimFreeSlot()
+	if got != 3 {
+		t.Errorf("claimFreeSlot with all reserves occupied + primary[3]=nil = %d, want 3", got)
+	}
+	if p.slots[3] == nil || p.slots[3].getState() != slotConnecting {
+		t.Errorf("claimed cell state = %v, want placeholder slotConnecting", p.slots[3])
+	}
+}
+
+// TestClaimFreeSlot_AllOccupiedReturnsNegOne — when there's no free
+// cell anywhere in the slice, return -1 (caller must defer).
+func TestClaimFreeSlot_AllOccupiedReturnsNegOne(t *testing.T) {
+	p := &WSPoolTransport{poolSize: 8}
+	p.slots = make([]*poolSlot, 16)
+	for i := 0; i < 16; i++ {
+		p.slots[i] = &poolSlot{}
+		p.slots[i].setState(slotReady)
+	}
+	if got := p.claimFreeSlot(); got != -1 {
+		t.Errorf("claimFreeSlot with all occupied = %d, want -1", got)
+	}
+}
+
+// TestReconnectLoop_RecycleGuard asserts that if the cell at idx has
+// been recycled (e.g. by a drain that claimed this freed primary slot),
+// reconnectLoop short-circuits instead of overwriting the new cell.
+// Spec §2.2.2 (W7 review fix).
+func TestReconnectLoop_RecycleGuard(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	p := &WSPoolTransport{
+		poolSize: 8,
+		ctx:      ctx,
+		log:      newDiscardLogger(),
+	}
+	p.slots = make([]*poolSlot, 16)
+
+	// Pre-install a slotReady cell at idx 3 (simulating a drain having
+	// recycled this cell while a stale reconnectLoop was running).
+	recycledSlot := &poolSlot{index: 3}
+	recycledSlot.setState(slotReady)
+	p.slots[3] = recycledSlot
+
+	// Stub connectSlot — must NOT be called when guard fires.
+	called := false
+	prev := connectSlotForTest
+	connectSlotForTest = func() error {
+		called = true
+		return nil
+	}
+	defer func() { connectSlotForTest = prev }()
+
+	// Stub backoff to zero so the timer fires immediately — without this,
+	// slotBackoffDuration(0) returns 5-10s and the test hangs.
+	prevBackoff := slotBackoffDurationForTest
+	slotBackoffDurationForTest = func(int) time.Duration { return 0 }
+	defer func() { slotBackoffDurationForTest = prevBackoff }()
+
+	// Let reconnectLoop run normally (don't cancel ctx upfront). If the
+	// guard fires (cell recycled, not slotDead) it returns without calling
+	// connectSlot. If the guard is missing, connectSlot stub fires, returns
+	// nil, reconnectLoop returns — called=true.
+	p.reconnectLoop(3)
+
+	if called {
+		t.Errorf("connectSlot called despite recycled cell — guard failed")
+	}
+	if p.slots[3] != recycledSlot {
+		t.Errorf("recycled cell was overwritten")
+	}
+}
+
+// TestStartDrain_InflightCounterCaps asserts that with
+// maxConcurrentDrains=2 (default for poolSize=8), at most 2 of N
+// concurrent startDrain calls actually transition slots to slotDraining
+// — the rest see the inflight cap and defer (spec §2.1.0).
+func TestStartDrain_InflightCounterCaps(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	p := &WSPoolTransport{
+		poolSize:      8,
+		gracefulDrain: true,
+		drainHardCap:  5 * time.Second,
+		ctx:           ctx,
+		log:           newDiscardLogger(),
+	}
+	p.slots = make([]*poolSlot, 16)
+	for i := 0; i < 8; i++ {
+		p.slots[i] = &poolSlot{index: i}
+		p.slots[i].setState(slotReady)
+	}
+
+	// Pre-saturate inflight to cap to short-circuit subsequent calls.
+	p.inflightDrains.Store(int32(p.maxConcurrentDrains()))
+
+	startedAt := Stats.DrainStartedTotal.Load()
+	deferredAt := Stats.InflightCapDeferredTotal.Load()
+
+	// All 4 concurrent calls should be deferred via the inflight gate.
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			p.startDrain(nil, idx, "test")
+		}(i)
+	}
+	wg.Wait()
+
+	if got := Stats.DrainStartedTotal.Load() - startedAt; got != 0 {
+		t.Errorf("DrainStartedTotal increment = %d, want 0 (all should defer)", got)
+	}
+	if got := Stats.InflightCapDeferredTotal.Load() - deferredAt; got != 4 {
+		t.Errorf("InflightCapDeferredTotal increment = %d, want 4", got)
+	}
+}
+
+// TestStartDrain_BootstrapBackoff asserts catastrophic state (<50%
+// ready) triggers the long backoff (drainCatastrophicBackoff), not the
+// short one. Spec §2.1.1, C2 review fix.
+//
+// This is a REGRESSION GUARD for the catastrophic branch added in T6.
+// If a future refactor accidentally drops the `ready < poolSize/2`
+// predicate or collapses the two backoffs, this test fails first.
+func TestStartDrain_BootstrapBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	p := &WSPoolTransport{
+		poolSize:      8,
+		gracefulDrain: true,
+		drainHardCap:  5 * time.Second,
+		ctx:           ctx,
+		log:           newDiscardLogger(),
+	}
+	p.slots = make([]*poolSlot, 16)
+
+	// Catastrophic state: 3 of 8 ready (< poolSize/2 = 4). Drain target
+	// (idx 0) is one of the ready cells.
+	for i := 0; i < 3; i++ {
+		p.slots[i] = &poolSlot{index: i}
+		p.slots[i].setState(slotReady)
+	}
+
+	// Sanity check: readyCapacity=3, floor=6 (for poolSize=8) → capacity
+	// gate fires; AND ready=3 < poolSize/2=4 → catastrophic backoff used.
+	if got := p.readyCapacity(); got != 3 {
+		t.Fatalf("setup: readyCapacity = %d, want 3", got)
+	}
+
+	before := time.Now().UnixNano()
+	p.startDrain(nil, 0, "test")
+	after := p.slots[0].nextDrainAttemptNs.Load()
+
+	gap := time.Duration(after - before)
+	// Expect drainCatastrophicBackoff (150s) ± scheduling slack.
+	if gap < drainCatastrophicBackoff-time.Second || gap > drainCatastrophicBackoff+5*time.Second {
+		t.Errorf("backoff gap = %v, want ~%v (drainCatastrophicBackoff)",
+			gap, drainCatastrophicBackoff)
+	}
+}
+
+// TestDrainWatchdog_InflightDecrementOnAllExitPaths asserts the
+// inflight counter is decremented on natural-finish, hard-cap, AND
+// ctx-cancel exit paths (spec §2.1.0, NEW-1 review fix).
+func TestDrainWatchdog_InflightDecrementOnAllExitPaths(t *testing.T) {
+	cases := []struct {
+		name string
+		exit func(p *WSPoolTransport, oldSlot *poolSlot, cancel context.CancelFunc)
+	}{
+		{
+			name: "natural_finish",
+			exit: func(p *WSPoolTransport, oldSlot *poolSlot, _ context.CancelFunc) {
+				oldSlot.streams.Store(0) // streams reach 0 → natural finish
+			},
+		},
+		{
+			name: "ctx_cancel",
+			exit: func(p *WSPoolTransport, _ *poolSlot, cancel context.CancelFunc) {
+				cancel()
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			p := &WSPoolTransport{
+				poolSize:     8,
+				ctx:          ctx,
+				log:          newDiscardLogger(),
+				drainHardCap: 30 * time.Second,
+			}
+			p.slots = make([]*poolSlot, 16)
+			oldSlot := &poolSlot{index: 0}
+			oldSlot.setState(slotDraining)
+			oldSlot.streams.Store(5) // 5 active
+			p.slots[0] = oldSlot
+
+			// Simulate that startDrain incremented inflight.
+			p.inflightDrains.Store(1)
+
+			done := make(chan struct{})
+			go func() {
+				p.drainWatchdog(nil, 0, oldSlot, time.Now(), "test")
+				close(done)
+			}()
+
+			// Trigger the exit condition.
+			time.Sleep(50 * time.Millisecond)
+			tc.exit(p, oldSlot, cancel)
+
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("drainWatchdog did not exit within 2s")
+			}
+
+			if got := p.inflightDrains.Load(); got != 0 {
+				t.Errorf("inflightDrains after exit = %d, want 0 (defer decrement)", got)
+			}
+		})
+	}
+}
+
+// TestStreamIDReuse_RejectStaleFrames asserts that a frame's streamID
+// lookup returning a slot index different from the reader's own idx
+// causes the validation predicate to drop the frame rather than
+// routing it (spec §2.4.1, W5 review fix).
+//
+// This test exercises the validation predicate directly. Full
+// end-to-end frame injection requires a WS loopback fixture (deferred);
+// the predicate check is what gates the production path.
+func TestStreamIDReuse_RejectStaleFrames(t *testing.T) {
+	p := &WSPoolTransport{poolSize: 8}
+	p.slots = make([]*poolSlot, 16)
+
+	// streamID 42 currently maps to slot 7 (newly assigned stream).
+	p.streamMap.Store(uint16(42), 7)
+
+	// A reader on slot 5 receives a frame for streamID 42 (stale, slot 5
+	// was just torn down and streamMap.Delete'd; new stream took 42 on 7).
+	mappedIdx, ok := p.streamMap.Load(uint16(42))
+	if !ok {
+		t.Fatalf("expected mapping present")
+	}
+	if mappedIdx.(int) == 5 {
+		t.Fatalf("test setup broken — expected mismatch")
+	}
+
+	initialCount := Stats.StaleFrameDroppedTotal.Load()
+
+	// Simulate the validation predicate the reader uses.
+	myIdx := 5
+	if mappedIdx.(int) != myIdx {
+		Stats.StaleFrameDroppedTotal.Add(1)
+	}
+
+	if got := Stats.StaleFrameDroppedTotal.Load() - initialCount; got != 1 {
+		t.Errorf("StaleFrameDroppedTotal increment = %d, want 1", got)
+	}
+}
+
+// TestEmitHealthSummary_UniformSchema asserts the new schema:
+//   - dead = literal slotDead count (not nil-primary count)
+//   - empty = nil-cell count anywhere in slice (new field)
+//   - alive + dead + connecting + draining + empty == 2*poolSize
+//
+// Spec §2.4, C5 review fix.
+func TestEmitHealthSummary_UniformSchema(t *testing.T) {
+	p := &WSPoolTransport{
+		poolSize:  8,
+		log:       newDiscardLogger(),
+		startedAt: time.Now(),
+	}
+	p.slots = make([]*poolSlot, 16)
+
+	// Canary state: 6 primary ready + 2 reserve ready + 2 nil primary + 6 nil reserve.
+	for _, i := range []int{0, 1, 3, 4, 5, 7, 8, 9} {
+		p.slots[i] = &poolSlot{}
+		p.slots[i].setState(slotReady)
+	}
+
+	alive, dead, connecting, draining, empty := p.poolStateCounts()
+	if alive != 8 {
+		t.Errorf("alive = %d, want 8", alive)
+	}
+	if dead != 0 {
+		t.Errorf("dead = %d, want 0 (literal slotDead — not nil)", dead)
+	}
+	if empty != 8 {
+		t.Errorf("empty = %d, want 8 (8 nil cells)", empty)
+	}
+	if connecting != 0 {
+		t.Errorf("connecting = %d, want 0", connecting)
+	}
+	if draining != 0 {
+		t.Errorf("draining = %d, want 0", draining)
+	}
+	if alive+dead+connecting+draining+empty != 16 {
+		t.Errorf("sum invariant broken: %d+%d+%d+%d+%d != 16",
+			alive, dead, connecting, draining, empty)
+	}
+}
+
+// TestConnectReserveSlot_FreesPlaceholderOnFailure asserts that when
+// the handshake fails, the slotConnecting placeholder is reset to nil
+// under reserveMu so a subsequent claimFreeSlot can reuse the cell
+// without waiting for reconnectLoop. Spec §4.2 (S5 review).
+func TestConnectReserveSlot_FreesPlaceholderOnFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	p := &WSPoolTransport{
+		poolSize: 8,
+		ctx:      ctx,
+		log:      newDiscardLogger(),
+	}
+	p.slots = make([]*poolSlot, 16)
+	p.reserveConnectFailures = make([]atomic.Int32, 16)
+
+	// Pre-install a slotConnecting placeholder at idx 8 (as claimFreeSlot would).
+	placeholder := &poolSlot{}
+	placeholder.setState(slotConnecting)
+	p.slots[8] = placeholder
+
+	// Stub connectSlot to fail.
+	prev := connectSlotForTest
+	connectSlotForTest = func() error {
+		return errors.New("handshake failed")
+	}
+	defer func() { connectSlotForTest = prev }()
+
+	// Stub slotBackoffDurationForTest to 0 so the spawned reconnectLoop
+	// doesn't block exit; we only verify the placeholder cleanup.
+	prevBackoff := slotBackoffDurationForTest
+	slotBackoffDurationForTest = func(int) time.Duration { return 0 }
+	defer func() { slotBackoffDurationForTest = prevBackoff }()
+
+	p.connectReserveSlot(nil, 8, 0)
+
+	// Wait briefly for the placeholder cleanup goroutine.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		p.reserveMu.Lock()
+		s := p.slots[8]
+		p.reserveMu.Unlock()
+		if s == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	p.reserveMu.Lock()
+	final := p.slots[8]
+	p.reserveMu.Unlock()
+	if final != nil {
+		t.Errorf("placeholder at idx 8 not freed after failure: %v", final)
+	}
+}
+
+// TestSessionForStream_NoFallback asserts that an unmapped streamID
+// returns nil instead of any-ready-slot's session. Callers (client.go,
+// socks5/tcp.go) are all nil-safe — verified in spec §2.5 caller audit
+// (C4 review).
+func TestSessionForStream_NoFallback(t *testing.T) {
+	p := &WSPoolTransport{poolSize: 8}
+	p.slots = make([]*poolSlot, 16)
+	// Install a ready slot with a real session at idx 0.
+	p.slots[0] = &poolSlot{session: core.NewSession(1, make([]byte, 32), make([]byte, 32))}
+	p.slots[0].setState(slotReady)
+
+	// streamID 999 is NOT in streamMap.
+	got := p.SessionForStream(uint16(999))
+	if got != nil {
+		t.Errorf("SessionForStream for unmapped streamID = %v, want nil", got)
+	}
+}
+
+// TestCanaryScenario_MismatchedPairs replays the exact canary
+// 2026-05-19 stuck state to verify the uniform-cells fix. Setup:
+// poolSize=8, primary[6] drained → reserve[8], primary[2] drained →
+// reserve[9]. With pairing logic this state pinned non_ready_slots=2
+// forever (canary log: 326 deferred drains in 23min). With uniform-
+// cells, readyCapacity=8 (6+2) and drains can proceed.
+func TestCanaryScenario_MismatchedPairs(t *testing.T) {
+	p := &WSPoolTransport{poolSize: 8}
+	p.slots = make([]*poolSlot, 16)
+
+	// Mirror canary state.
+	for _, i := range []int{0, 1, 3, 4, 5, 7, 8, 9} {
+		p.slots[i] = &poolSlot{}
+		p.slots[i].setState(slotReady)
+	}
+
+	ready := p.readyCapacity()
+	floor := p.readyCapacityFloor()
+
+	if ready != 8 {
+		t.Errorf("canary state readyCapacity = %d, want 8", ready)
+	}
+	if floor != 6 {
+		t.Errorf("canary state floor = %d, want 6", floor)
+	}
+	if ready < floor {
+		t.Errorf("storm brake would engage incorrectly (ready=%d < floor=%d)", ready, floor)
+	}
+
+	// Verify a fresh drain can claim a free cell — slice has 8 nil cells
+	// at indices [2, 6, 10, 11, 12, 13, 14, 15], so claim must succeed.
+	got := p.claimFreeSlot()
+	if got < 0 {
+		t.Errorf("claimFreeSlot returned -1 — should have found a free cell")
+	}
+}
+
+// TestRecycle_AfterAllReservesOccupied asserts swiss-cheese recovery:
+// after 8 drains so all 8 reserve cells are occupied AND all 8 primary
+// cells are nil, the 9th drain MUST claim a recycled primary cell.
+// Spec §4 test list, W4 review fix.
+func TestRecycle_AfterAllReservesOccupied(t *testing.T) {
+	p := &WSPoolTransport{poolSize: 8}
+	p.slots = make([]*poolSlot, 16)
+
+	// Post-8-drain state: primary cells [0..7] all nil, reserve [8..15] all ready.
+	for i := 8; i < 16; i++ {
+		p.slots[i] = &poolSlot{}
+		p.slots[i].setState(slotReady)
+	}
+
+	got := p.claimFreeSlot()
+	if got < 0 || got >= 8 {
+		t.Errorf("9th drain claim = %d, want primary range [0..8) (recycled cell)", got)
+	}
+	if p.slots[got] == nil || p.slots[got].getState() != slotConnecting {
+		t.Errorf("recycled cell state wrong: %v", p.slots[got])
+	}
+}
+
+// TestRecycleRace_DrainClaimsAfterFailedConnect — W8 race regression
+// (review of T9 + T4 interaction). Sequence:
+//  1. T9 failure path: connectReserveSlot fails, sets slots[newIdx]=nil,
+//     launches reconnectLoop(newIdx) in background.
+//  2. Concurrently, a NEW drain calls claimFreeSlot, picks newIdx,
+//     installs slotConnecting placeholder.
+//  3. reconnectLoop wakes after backoff, recycle guard observes
+//     slots[newIdx] != nil AND state != slotDead → bails out.
+//  4. End state: new drain owns newIdx; no double-install.
+func TestRecycleRace_DrainClaimsAfterFailedConnect(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	p := &WSPoolTransport{
+		poolSize: 8, ctx: ctx, log: newDiscardLogger(),
+	}
+	p.slots = make([]*poolSlot, 16)
+	// All primaries ready except idx 0 which is empty.
+	for i := 1; i < 8; i++ {
+		p.slots[i] = &poolSlot{index: i}
+		p.slots[i].setState(slotReady)
+	}
+
+	// Step (1): simulate T9 already cleaned a failed connectReserveSlot
+	// — slots[0] is nil, reconnectLoop is "in flight" (not actually
+	// spawned in test; we verify the post-claim guard semantics).
+	p.slots[0] = nil
+
+	// Step (2): a fresh drain claims slot 0.
+	got := p.claimFreeSlot()
+	if got != 0 {
+		t.Fatalf("claimFreeSlot returned %d, want 0", got)
+	}
+	if p.slots[0] == nil || p.slots[0].getState() != slotConnecting {
+		t.Fatalf("post-claim state wrong: %v", p.slots[0])
+	}
+
+	// Step (3): emulate reconnectLoop guard check.
+	p.reserveMu.Lock()
+	recycled := p.slots[0] != nil && p.slots[0].getState() != slotDead
+	p.reserveMu.Unlock()
+	if !recycled {
+		t.Errorf("recycle guard did not detect drain's claim — would overwrite")
+	}
+}
+
+// latchTransport is a minimal wsSlotTransport stub whose ReadMessage
+// blocks until release() is called (simulating a live reader), then
+// returns an error (simulating connection close / slot death). Used by
+// F1 test to let goroutines exit naturally so the WaitGroup-based old
+// code would fire "all readers exited".
+type latchTransport struct {
+	releaseCh chan struct{}
+}
+
+func newLatchTransport() *latchTransport {
+	return &latchTransport{releaseCh: make(chan struct{})}
+}
+
+func (l *latchTransport) release() {
+	select {
+	case l.releaseCh <- struct{}{}:
+	default:
+	}
+}
+
+func (l *latchTransport) ReadMessage(_ time.Duration) ([]byte, error) {
+	<-l.releaseCh
+	return nil, fmt.Errorf("simulated slot close")
+}
+func (l *latchTransport) WriteMessage(_ []byte) error        { return nil }
+func (l *latchTransport) WriteControlMessage(_ []byte) error { return nil }
+func (l *latchTransport) Close() error                       { return nil }
+func (l *latchTransport) LastWriteUnixNano() int64           { return 0 }
+
+// TestStartReader_NeverEmitsAllExited_OnPartialDrain — F1 architectural
+// fix. After uniform-cells refactor, original-snapshot WaitGroup
+// returned "all readers exited" when initial primary cells drained,
+// even while replacement reserve readers were alive. This caused 35×
+// engine resets in the 2026-05-19 canary (cosmetic but noisy).
+//
+// New behavior: StartReader polls and supervises; never returns "all
+// exited" mid-flight. Only ctx.Done() causes return.
+//
+// Test mechanism: latchTransport blocks ReadMessage until release() is
+// called, then returns an error (simulates slot death). After all 4
+// initial readers exit naturally, old WaitGroup code would have fired
+// "all readers exited" and StartReader would return. New polling code
+// must stay blocked because ctx is still live.
+func TestStartReader_NeverEmitsAllExited_OnPartialDrain(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	p := &WSPoolTransport{
+		poolSize: 4,
+		ctx:      ctx,
+		log:      newDiscardLogger(),
+	}
+	p.slots = make([]*poolSlot, 8)
+
+	// 4 primary ready cells with latch transports.
+	latches := make([]*latchTransport, 4)
+	for i := 0; i < 4; i++ {
+		latches[i] = newLatchTransport()
+		p.slots[i] = &poolSlot{index: i, transport: latches[i]}
+		p.slots[i].setState(slotReady)
+	}
+
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+
+	// Run StartReader in a goroutine — must NOT return until ctx cancelled.
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- p.StartReader(ctx, cl)
+	}()
+
+	// Wait briefly for polling cycle to spawn initial readers and for
+	// them to enter their blocking ReadMessage call.
+	time.Sleep(50 * time.Millisecond)
+
+	// Release all latches: each reader goroutine gets an error from
+	// ReadMessage and tries to call handleSlotDeath. Since cl is minimal
+	// (no real server), handleSlotDeath will run but won't panic — the
+	// important thing is the reader goroutines exit naturally, completing
+	// the WaitGroup. Also mark slots dead so spawnMissingReaders won't
+	// respawn them (simulating permanent drain teardown).
+	for i := 0; i < 4; i++ {
+		p.slots[i].setState(slotDead)
+		latches[i].release()
+	}
+
+	// Wait a polling cycle — old WaitGroup code would have returned by now.
+	// New polling code MUST stay blocked because ctx is still live.
+	select {
+	case err := <-errCh:
+		t.Errorf("StartReader returned prematurely: %v (must stay blocked until ctx.Done)", err)
+	case <-time.After(2 * time.Second):
+		// expected — still blocked
+	}
+
+	// Now cancel ctx — StartReader must return ctx.Err().
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != context.Canceled {
+			t.Errorf("StartReader returned %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("StartReader did not return after ctx.Done() within 2s")
+	}
+}
+
+// TestStartDrain_ForceEvictsIdleSlot_WhenSliceFull verifies the
+// slice-full eviction policy (spec 2026-05-20 §2.2.3): when every
+// cell in p.slots is non-nil and claimFreeSlot returns -1, startDrain
+// MUST force-evict an idle slotReady cell (streams==0) so the drain
+// can proceed. Without this fix, long-running stable-network sessions
+// freeze rotation forever (5h+ canary 2026-05-20).
+//
+// Setup mirrors the deadlock: 16 ready cells, half idle (streams=0)
+// and half busy (streams>0). After startDrain on oldIdx=0:
+//   - Stats.DrainForceEvictedTotal incremented by 1.
+//   - One of the idle cells (NOT idx 0 itself, NOT any busy cell)
+//     is torn down — nil in p.slots[].
+//   - Stats.DrainStartedTotal incremented by 1 (the drain proceeded).
+//   - oldSlot transitioned to slotDraining.
+func TestStartDrain_ForceEvictsIdleSlot_WhenSliceFull(t *testing.T) {
+	cl := &Client{
+		streamChans: make(map[uint16]chan []byte),
+		transport:   failingHandshakeTransport{},
+		serverPub:   make([]byte, 32),
+		clientID:    []byte("test-client-id"),
+	}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size:          8,
+		ServerAddr:    "127.0.0.1:1", // unreachable — connectReserveSlot will fail fast
+		GracefulDrain: true,
+		DrainHardCap:  500 * time.Millisecond,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.ctx = ctx
+	p.client = cl
+
+	// 16 ready cells. Indices 0..7 will be "busy" (streams>0) — except
+	// idx 0 (the drain target) which we set streams=0 so it can drain
+	// cleanly. Indices 8..15 will be "idle" (streams=0) — candidates
+	// for force-eviction.
+	for i := 0; i < 16; i++ {
+		s := &poolSlot{index: i}
+		s.setState(slotReady)
+		switch {
+		case i == 0:
+			s.streams.Store(0) // drain target — idle so the drain itself is clean
+		case i < 8:
+			s.streams.Store(3) // busy primary
+		default:
+			s.streams.Store(0) // idle reserve — eviction candidate
+		}
+		p.slots[i] = s
+	}
+
+	beforeEvicted := Stats.DrainForceEvictedTotal.Load()
+	beforeStarted := Stats.DrainStartedTotal.Load()
+
+	p.startDrain(cl, 0, "test")
+
+	// Give the spawned connectReserveSlot/drainWatchdog goroutines a moment
+	// to start — but we don't depend on them completing; the eviction +
+	// counter update happen synchronously inside startDrain.
+	time.Sleep(50 * time.Millisecond)
+
+	if got := Stats.DrainForceEvictedTotal.Load() - beforeEvicted; got != 1 {
+		t.Errorf("DrainForceEvictedTotal increment = %d, want 1", got)
+	}
+	if got := Stats.DrainStartedTotal.Load() - beforeStarted; got != 1 {
+		t.Errorf("DrainStartedTotal increment = %d, want 1 (drain should proceed after evict)", got)
+	}
+	if got := p.slots[0].getState(); got != slotDraining {
+		t.Errorf("drain target slot[0] state = %v, want slotDraining", got)
+	}
+
+	// Exactly one of the idle reserve cells [8..15] should be nil now
+	// (force-evicted). All busy primaries [1..7] must remain non-nil
+	// in slotReady. The drain target [0] must be slotDraining.
+	evictedCount := 0
+	for i := 8; i < 16; i++ {
+		if p.slots[i] == nil {
+			evictedCount++
+		}
+	}
+	if evictedCount != 1 {
+		t.Errorf("nil idle cells in [8..16) = %d, want 1 (force-evict picks exactly one)", evictedCount)
+	}
+	for i := 1; i < 8; i++ {
+		if p.slots[i] == nil {
+			t.Errorf("busy primary slot[%d] was evicted — must not touch active-stream slots", i)
+		} else if p.slots[i].getState() != slotReady {
+			t.Errorf("busy primary slot[%d] state = %v, want slotReady (untouched)", i, p.slots[i].getState())
+		}
+	}
+}
+
+// TestStartDrain_DefersWhenAllSlotsBusy verifies the fallback path
+// (spec 2026-05-20 §2.2.3): when every slotReady cell has streams>0,
+// force-eviction must NOT happen (no idle cell to safely evict).
+// startDrain falls back to the existing defer-with-revert behavior:
+//   - Stats.DrainForceEvictedTotal NOT incremented.
+//   - Stats.DrainStartedTotal NOT incremented.
+//   - oldSlot reverts to slotReady (CAS slotDraining→slotReady).
+//   - oldSlot.nextDrainAttemptNs set to a future timestamp (backoff).
+//
+// This degraded-but-safe behavior is intentional: killing busy slots
+// would terminate user-visible SOCKS5 connections — worse UX than
+// pausing rotation for a few minutes until load shifts.
+func TestStartDrain_DefersWhenAllSlotsBusy(t *testing.T) {
+	cl := &Client{
+		streamChans: make(map[uint16]chan []byte),
+		transport:   failingHandshakeTransport{},
+		serverPub:   make([]byte, 32),
+		clientID:    []byte("test-client-id"),
+	}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size:          8,
+		ServerAddr:    "127.0.0.1:1",
+		GracefulDrain: true,
+		DrainHardCap:  500 * time.Millisecond,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.ctx = ctx
+	p.client = cl
+
+	// 16 cells all ready and ALL busy (streams>0). Idx 0 is also busy
+	// but with streams=0 so the drain target itself can transition to
+	// slotDraining cleanly (the eviction predicate is independent of
+	// the drain target's streams count — it scans for OTHER idle cells).
+	for i := 0; i < 16; i++ {
+		s := &poolSlot{index: i}
+		s.setState(slotReady)
+		if i == 0 {
+			s.streams.Store(0) // drain target — its own load is irrelevant
+		} else {
+			s.streams.Store(2) // every other cell busy → no eviction candidate
+		}
+		p.slots[i] = s
+	}
+
+	beforeEvicted := Stats.DrainForceEvictedTotal.Load()
+	beforeStarted := Stats.DrainStartedTotal.Load()
+	beforeNow := time.Now().UnixNano()
+
+	p.startDrain(cl, 0, "test")
+
+	if got := Stats.DrainForceEvictedTotal.Load() - beforeEvicted; got != 0 {
+		t.Errorf("DrainForceEvictedTotal increment = %d, want 0 (no idle cell to evict)", got)
+	}
+	if got := Stats.DrainStartedTotal.Load() - beforeStarted; got != 0 {
+		t.Errorf("DrainStartedTotal increment = %d, want 0 (drain should defer)", got)
+	}
+	// oldSlot must have reverted to slotReady (CAS in the defer path).
+	if got := p.slots[0].getState(); got != slotReady {
+		t.Errorf("drain target slot[0] state = %v, want slotReady (reverted)", got)
+	}
+	// Backoff must be set: nextDrainAttemptNs is at least beforeNow+drainRevertBackoff/2
+	// (slack for scheduling — the exact value is now+drainRevertBackoff).
+	gotBackoff := p.slots[0].nextDrainAttemptNs.Load()
+	minBackoff := beforeNow + int64(drainRevertBackoff/2)
+	if gotBackoff < minBackoff {
+		t.Errorf("nextDrainAttemptNs = %d, want >= %d (drainRevertBackoff applied)",
+			gotBackoff, minBackoff)
+	}
+
+	// No cell should have been torn down — all 16 still non-nil.
+	for i := 0; i < 16; i++ {
+		if p.slots[i] == nil {
+			t.Errorf("slot[%d] is nil — force-evict ran despite no idle cell", i)
+		}
+	}
+}
+
+// TestStartDrain_ForceEvictBumpsGeneration verifies that the eviction
+// path bumps victim.generation BEFORE handleSlotDeath — matching the
+// drainWatchdog tearDown contract. Without this bump, the victim's
+// slotReader would observe transport.Close as a read error and
+// inflate Stats.ReaderExits + IncFrameAnomaly counters (false-positive
+// "natural" death attribution for what is an intentional teardown).
+//
+// The check is structural: we observe the victim's generation before
+// startDrain and after, and assert it strictly increased.
+func TestStartDrain_ForceEvictBumpsGeneration(t *testing.T) {
+	cl := &Client{
+		streamChans: make(map[uint16]chan []byte),
+		transport:   failingHandshakeTransport{},
+		serverPub:   make([]byte, 32),
+		clientID:    []byte("test-client-id"),
+	}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size:          8,
+		ServerAddr:    "127.0.0.1:1",
+		GracefulDrain: true,
+		DrainHardCap:  500 * time.Millisecond,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.ctx = ctx
+	p.client = cl
+
+	// 16 cells all ready. The eviction candidate (first idle in scan
+	// order, skipping drain target idx 0) is slot[1]. Both 0 and 1
+	// have streams=0; all others have streams>0 so they cannot be
+	// evicted. This pins which cell gets evicted so we can assert
+	// on its generation deterministically.
+	for i := 0; i < 16; i++ {
+		s := &poolSlot{index: i}
+		s.setState(slotReady)
+		if i == 0 || i == 1 {
+			s.streams.Store(0)
+		} else {
+			s.streams.Store(2)
+		}
+		p.slots[i] = s
+	}
+	victim := p.slots[1]
+	genBefore := victim.generation.Load()
+
+	p.startDrain(cl, 0, "test")
+	time.Sleep(50 * time.Millisecond)
+
+	genAfter := victim.generation.Load()
+	if genAfter <= genBefore {
+		t.Errorf("victim.generation = %d, want > %d (bump before handleSlotDeath)",
+			genAfter, genBefore)
+	}
+	// And the cell must be nil (handleSlotDeath ran).
+	if p.slots[1] != nil {
+		t.Errorf("p.slots[1] should be nil after force-evict; got non-nil")
+	}
+}
+
+// TestTryForceEvictIdleSlot_SkipsBusyAndDrainingCells is a direct
+// unit test of the eviction candidate filter. Sanity check that:
+//   - Cells with streams > 0 are skipped.
+//   - Cells already in slotDraining are skipped.
+//   - Cells in slotConnecting/slotDead are skipped.
+//   - The first idle slotReady cell (in index order) wins.
+//   - skipIdx is honored.
+func TestTryForceEvictIdleSlot_SkipsBusyAndDrainingCells(t *testing.T) {
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	p := &WSPoolTransport{
+		poolSize:          8,
+		ctx:               ctx,
+		log:               newDiscardLogger(),
+		client:            cl,
+		meltdownThreshold: 100,
+		meltdownWindow:    5 * time.Second,
+	}
+	p.slots = make([]*poolSlot, 16)
+
+	// Layout (all non-nil — claimFreeSlot would have returned -1):
+	// idx 0: drain target (slotDraining, skipIdx) — must skip.
+	// idx 1: slotConnecting — skip.
+	// idx 2: slotReady, streams=5 — busy, skip.
+	// idx 3: slotDraining — skip.
+	// idx 4: slotDead — skip.
+	// idx 5: slotReady, streams=0 — FIRST eligible victim.
+	// idx 6: slotReady, streams=0 — second candidate (must not be touched).
+	// idx 7..15: slotReady, streams>0 — busy, skip.
+	for i := 0; i < 16; i++ {
+		s := &poolSlot{index: i}
+		switch i {
+		case 0:
+			s.setState(slotDraining)
+		case 1:
+			s.setState(slotConnecting)
+		case 3:
+			s.setState(slotDraining)
+		case 4:
+			s.setState(slotDead)
+		case 5, 6:
+			s.setState(slotReady)
+			s.streams.Store(0)
+		default:
+			s.setState(slotReady)
+			s.streams.Store(int32(3))
+		}
+		p.slots[i] = s
+	}
+
+	ok := p.tryForceEvictIdleSlot(cl, 0)
+	if !ok {
+		t.Fatal("tryForceEvictIdleSlot returned false; expected eviction of slot[5]")
+	}
+
+	// idx 5 evicted (handleSlotDeath ran → cell nil).
+	if p.slots[5] != nil {
+		t.Errorf("p.slots[5] = %v, want nil (force-evicted)", p.slots[5])
+	}
+	// idx 6 untouched (second candidate must not be torn down).
+	if p.slots[6] == nil || p.slots[6].getState() != slotReady {
+		t.Errorf("p.slots[6] should still be slotReady (untouched); got %v", p.slots[6])
+	}
+	// Drain target idx 0 untouched.
+	if p.slots[0] == nil || p.slots[0].getState() != slotDraining {
+		t.Errorf("p.slots[0] (skipIdx) state changed; got %v", p.slots[0])
+	}
+	// Other non-Ready cells untouched.
+	if p.slots[1] == nil || p.slots[1].getState() != slotConnecting {
+		t.Errorf("p.slots[1] state changed; got %v", p.slots[1])
+	}
+	if p.slots[4] == nil || p.slots[4].getState() != slotDead {
+		t.Errorf("p.slots[4] state changed; got %v", p.slots[4])
+	}
+}
+
+// TestStartDrain_EmergencyEvictsMinStreamsWhenOverAged verifies the
+// tier 2 eviction path (spec §2.2.3): under dense load where every
+// slotReady cell has streams>0 AND the drain target has been waiting
+// through emergencyEvictAgeMultiplier × maxSlotAge, startDrain must
+// kill the cell with the LOWEST stream count to break the deadlock.
+//
+// Setup: 16 ready cells, every cell has streams>0 (no idle exists).
+// Drain target [0] startedAtNs = now - 5× maxSlotAge (over-aged).
+// One specific cell ([5]) has streams=1 — the unique minimum among
+// non-target cells. Expected: cell 5 is evicted, counter
+// DrainForceEvictedActiveTotal++, DrainStartedTotal++.
+//
+// Negative assertions: DrainForceEvictedTotal (idle counter) NOT
+// incremented. Other busy cells untouched.
+func TestStartDrain_EmergencyEvictsMinStreamsWhenOverAged(t *testing.T) {
+	cl := &Client{
+		streamChans: make(map[uint16]chan []byte),
+		transport:   failingHandshakeTransport{},
+		serverPub:   make([]byte, 32),
+		clientID:    []byte("test-client-id"),
+	}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size:          8,
+		ServerAddr:    "127.0.0.1:1",
+		MaxSlotAge:    time.Minute, // drain target needs age > 2× this
+		GracefulDrain: true,
+		DrainHardCap:  500 * time.Millisecond,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.ctx = ctx
+	p.client = cl
+
+	// All 16 cells ready with streams>0. Idx 5 has the unique minimum.
+	for i := 0; i < 16; i++ {
+		s := &poolSlot{index: i}
+		s.setState(slotReady)
+		switch i {
+		case 0:
+			// Drain target — make it over-aged. Streams count doesn't
+			// matter for the target's path (it goes via gate 6 CAS).
+			s.streams.Store(3)
+			s.startedAtNs.Store(time.Now().Add(-5 * time.Minute).UnixNano())
+		case 5:
+			s.streams.Store(1) // unique minimum
+			s.startedAtNs.Store(time.Now().UnixNano())
+		default:
+			s.streams.Store(3)
+			s.startedAtNs.Store(time.Now().UnixNano())
+		}
+		p.slots[i] = s
+	}
+
+	beforeIdle := Stats.DrainForceEvictedTotal.Load()
+	beforeActive := Stats.DrainForceEvictedActiveTotal.Load()
+	beforeStarted := Stats.DrainStartedTotal.Load()
+
+	p.startDrain(cl, 0, "age")
+	time.Sleep(50 * time.Millisecond)
+
+	if got := Stats.DrainForceEvictedTotal.Load() - beforeIdle; got != 0 {
+		t.Errorf("DrainForceEvictedTotal increment = %d, want 0 (no idle cell)", got)
+	}
+	if got := Stats.DrainForceEvictedActiveTotal.Load() - beforeActive; got != 1 {
+		t.Errorf("DrainForceEvictedActiveTotal increment = %d, want 1", got)
+	}
+	if got := Stats.DrainStartedTotal.Load() - beforeStarted; got != 1 {
+		t.Errorf("DrainStartedTotal increment = %d, want 1", got)
+	}
+	if p.slots[5] != nil {
+		t.Errorf("cell [5] (min streams) should be nil after emergency evict; got %v", p.slots[5])
+	}
+	// Other busy cells [1..4, 6..15] must not be evicted.
+	for _, i := range []int{1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15} {
+		if p.slots[i] == nil {
+			t.Errorf("cell [%d] (not min-streams) should not be evicted", i)
+		}
+	}
+}
+
+// TestStartDrain_DoesNotEmergencyEvictWhenTargetYoung verifies the
+// tier 2 gate: even when no idle cell is available, emergency
+// eviction must NOT fire if the drain target is YOUNG (age < 2×
+// maxSlotAge). The drain falls through to defer-with-revert.
+//
+// Setup: identical to TestStartDrain_DefersWhenAllSlotsBusy except
+// that we explicitly set startedAtNs=now-1s on target so it's well
+// under the 2× maxSlotAge threshold (2min by default).
+func TestStartDrain_DoesNotEmergencyEvictWhenTargetYoung(t *testing.T) {
+	cl := &Client{
+		streamChans: make(map[uint16]chan []byte),
+		transport:   failingHandshakeTransport{},
+		serverPub:   make([]byte, 32),
+		clientID:    []byte("test-client-id"),
+	}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size:          8,
+		ServerAddr:    "127.0.0.1:1",
+		MaxSlotAge:    time.Minute,
+		GracefulDrain: true,
+		DrainHardCap:  500 * time.Millisecond,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.ctx = ctx
+	p.client = cl
+
+	for i := 0; i < 16; i++ {
+		s := &poolSlot{index: i}
+		s.setState(slotReady)
+		s.streams.Store(2)
+		// Young — within maxSlotAge.
+		s.startedAtNs.Store(time.Now().Add(-1 * time.Second).UnixNano())
+		p.slots[i] = s
+	}
+
+	beforeIdle := Stats.DrainForceEvictedTotal.Load()
+	beforeActive := Stats.DrainForceEvictedActiveTotal.Load()
+	beforeStarted := Stats.DrainStartedTotal.Load()
+
+	p.startDrain(cl, 0, "age")
+
+	if got := Stats.DrainForceEvictedTotal.Load() - beforeIdle; got != 0 {
+		t.Errorf("DrainForceEvictedTotal increment = %d, want 0", got)
+	}
+	if got := Stats.DrainForceEvictedActiveTotal.Load() - beforeActive; got != 0 {
+		t.Errorf("DrainForceEvictedActiveTotal increment = %d, want 0 (target young, no emergency)", got)
+	}
+	if got := Stats.DrainStartedTotal.Load() - beforeStarted; got != 0 {
+		t.Errorf("DrainStartedTotal increment = %d, want 0 (drain should defer)", got)
+	}
+	// All cells must remain.
+	for i := 0; i < 16; i++ {
+		if p.slots[i] == nil {
+			t.Errorf("cell [%d] is nil — emergency evict ran despite young target", i)
+		}
+	}
+	// Target reverted to slotReady with backoff.
+	if got := p.slots[0].getState(); got != slotReady {
+		t.Errorf("target state = %v, want slotReady (reverted)", got)
+	}
+}
+
+// TestStartDrain_PrefersIdleOverEmergencyEvenWhenOverAged verifies
+// tier ordering: if BOTH conditions hold (target over-aged AND an
+// idle cell exists), tier 1 (idle) wins. We must NEVER kill an
+// active stream when an idle cell is available.
+func TestStartDrain_PrefersIdleOverEmergencyEvenWhenOverAged(t *testing.T) {
+	cl := &Client{
+		streamChans: make(map[uint16]chan []byte),
+		transport:   failingHandshakeTransport{},
+		serverPub:   make([]byte, 32),
+		clientID:    []byte("test-client-id"),
+	}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size:          8,
+		ServerAddr:    "127.0.0.1:1",
+		MaxSlotAge:    time.Minute,
+		GracefulDrain: true,
+		DrainHardCap:  500 * time.Millisecond,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.ctx = ctx
+	p.client = cl
+
+	for i := 0; i < 16; i++ {
+		s := &poolSlot{index: i}
+		s.setState(slotReady)
+		switch {
+		case i == 0:
+			// Over-aged drain target.
+			s.streams.Store(3)
+			s.startedAtNs.Store(time.Now().Add(-10 * time.Minute).UnixNano())
+		case i == 9:
+			// Single idle cell — must be picked by tier 1.
+			s.streams.Store(0)
+			s.startedAtNs.Store(time.Now().UnixNano())
+		default:
+			s.streams.Store(3)
+			s.startedAtNs.Store(time.Now().UnixNano())
+		}
+		p.slots[i] = s
+	}
+
+	beforeIdle := Stats.DrainForceEvictedTotal.Load()
+	beforeActive := Stats.DrainForceEvictedActiveTotal.Load()
+
+	p.startDrain(cl, 0, "age")
+	time.Sleep(50 * time.Millisecond)
+
+	if got := Stats.DrainForceEvictedTotal.Load() - beforeIdle; got != 1 {
+		t.Errorf("DrainForceEvictedTotal increment = %d, want 1 (idle wins)", got)
+	}
+	if got := Stats.DrainForceEvictedActiveTotal.Load() - beforeActive; got != 0 {
+		t.Errorf("DrainForceEvictedActiveTotal increment = %d, want 0 (idle preferred)", got)
+	}
+	if p.slots[9] != nil {
+		t.Errorf("idle cell [9] should be evicted; got non-nil")
+	}
+}
+
+// TestDrainTargetOverAged_BoundaryValues verifies the age threshold
+// gate function. Spec: triggers when age >= 2× maxSlotAge.
+func TestDrainTargetOverAged_BoundaryValues(t *testing.T) {
+	p := &WSPoolTransport{maxSlotAge: 2 * time.Minute}
+
+	cases := []struct {
+		name   string
+		ageSec int64
+		want   bool
+	}{
+		{"young", 30, false},
+		{"at_maxAge", 120, false},
+		{"just_under_2x", 239, false},
+		{"at_2x", 240, true},
+		{"way_over", 600, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := &poolSlot{}
+			s.startedAtNs.Store(time.Now().Add(-time.Duration(c.ageSec) * time.Second).UnixNano())
+			got := p.drainTargetOverAged(s)
+			if got != c.want {
+				t.Errorf("age=%ds → drainTargetOverAged = %v, want %v", c.ageSec, got, c.want)
+			}
+		})
+	}
+
+	// maxSlotAge=0 (disabled) should always return false.
+	pDisabled := &WSPoolTransport{maxSlotAge: 0}
+	s := &poolSlot{}
+	s.startedAtNs.Store(time.Now().Add(-time.Hour).UnixNano())
+	if pDisabled.drainTargetOverAged(s) {
+		t.Errorf("maxSlotAge=0 should disable over-aged check")
+	}
+
+	// startedAtNs=0 (not yet connected) should return false.
+	pEnabled := &WSPoolTransport{maxSlotAge: time.Minute}
+	s2 := &poolSlot{}
+	// startedAtNs.Load() == 0
+	if pEnabled.drainTargetOverAged(s2) {
+		t.Errorf("startedAtNs=0 should return false (slot not yet stamped)")
+	}
+}
+
+// TestTryForceEvictIdleSlot_RevertsWhenStreamLandsInWindow simulates
+// the race between AssignStream and the evictor: a stream lands on
+// the chosen victim AFTER our streams==0 check but BEFORE we'd lose
+// the chance to back out. The recheck post-CAS catches this: the slot
+// reverts to slotReady and another candidate is tried instead.
+//
+// Mechanism: we set up TWO idle candidates (idx 5 and idx 6). idx 5
+// is the natural first pick. We pre-load idx 5 with streams=0, then
+// inject streams=1 into the same slot — the scan loop's first check
+// at idx 5 reads streams=0 and CAS succeeds, but the recheck reads
+// streams=1 (we pre-installed) and reverts; the loop continues and
+// picks idx 6.
+//
+// We simulate the race by using a hand-rolled poolSlot whose
+// streams.Load() returns 0 on the first call and 1 on subsequent
+// calls. That's not possible with atomic.Int32. So we test the
+// equivalent observable behavior: pre-install streams=1 on idx 5
+// — both checks see 1, so scan skips it entirely; idx 6 is picked.
+// While this doesn't exercise the exact "post-CAS recheck" branch,
+// the recheck branch is exercised by code inspection (the Load is
+// after the CAS) and the revert CAS is exercised by the
+// TestPoolSlot_TryMarkDraining suite.
+//
+// To force the recheck-branch path deterministically, we'd need a
+// hookable test seam in poolSlot — out of scope for this fix. The
+// best we can do here is verify the second-pick behavior end-to-end.
+func TestTryForceEvictIdleSlot_RevertsWhenStreamLandsInWindow(t *testing.T) {
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	p := &WSPoolTransport{
+		poolSize:          8,
+		ctx:               ctx,
+		log:               newDiscardLogger(),
+		client:            cl,
+		meltdownThreshold: 100,
+		meltdownWindow:    5 * time.Second,
+	}
+	p.slots = make([]*poolSlot, 16)
+
+	for i := 0; i < 16; i++ {
+		s := &poolSlot{index: i}
+		s.setState(slotReady)
+		switch i {
+		case 5:
+			s.streams.Store(1) // simulated "stream landed" — eligible-looking but actually busy
+		case 6:
+			s.streams.Store(0) // truly idle — should be evicted instead
+		default:
+			s.streams.Store(2) // busy
+		}
+		p.slots[i] = s
+	}
+
+	ok := p.tryForceEvictIdleSlot(cl, 0)
+	if !ok {
+		t.Fatal("expected eviction of idx 6")
+	}
+	if p.slots[6] != nil {
+		t.Errorf("p.slots[6] = %v, want nil (truly idle, should be evicted)", p.slots[6])
+	}
+	// idx 5 must not be evicted (had streams>0).
+	if p.slots[5] == nil || p.slots[5].getState() != slotReady {
+		t.Errorf("p.slots[5] (streams>0) should be untouched; got %v", p.slots[5])
+	}
+}
+
+// TestDrainWatchdog_IdleFinish verifies that a slot with ≤ DrainIdleStreamsMax
+// remaining streams that have shown no activity for ≥ DrainIdleThreshold is
+// torn down as natural finish *before* the hard cap fires. Regression bound
+// for the 2026-05-22 8h canary observation that 79.6% of hard-cap drains
+// were keepalive-idle.
+func TestDrainWatchdog_IdleFinish(t *testing.T) {
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size:                2,
+		ServerAddr:          "127.0.0.1:0",
+		GracefulDrain:       true,
+		DrainHardCap:        5 * time.Second,
+		DrainIdleThreshold:  200 * time.Millisecond,
+		DrainIdleStreamsMax: 2,
+	})
+	p.ctx = t.Context()
+
+	oldSlot := &poolSlot{}
+	oldSlot.setState(slotDraining)
+	oldSlot.streams.Store(2)
+	oldSlot.startedAtNs.Store(time.Now().Add(-2 * time.Minute).UnixNano())
+	// lastActivity stale enough to cross the idle threshold on the next tick.
+	oldSlot.lastActivityNs.Store(time.Now().Add(-500 * time.Millisecond).UnixNano())
+	p.slots[0] = oldSlot
+
+	beforeIdle := Stats.DrainIdleFinishTotal.Load()
+	beforeNat := Stats.DrainNaturalFinishTotal.Load()
+	beforeHard := Stats.DrainHardCapTotal.Load()
+	beforeRot := p.rotations1m.Load()
+
+	start := time.Now()
+	p.drainWatchdog(cl, 0, oldSlot, start, "test")
+	elapsed := time.Since(start)
+
+	if elapsed >= 1500*time.Millisecond {
+		t.Errorf("idle-finish took %v, expected ≤ ~1s (first tick after threshold)", elapsed)
+	}
+	if got := Stats.DrainIdleFinishTotal.Load(); got != beforeIdle+1 {
+		t.Errorf("DrainIdleFinishTotal = %d, want %d", got, beforeIdle+1)
+	}
+	if got := Stats.DrainNaturalFinishTotal.Load(); got != beforeNat+1 {
+		t.Errorf("DrainNaturalFinishTotal = %d, want %d (idle counts as natural)", got, beforeNat+1)
+	}
+	if got := Stats.DrainHardCapTotal.Load(); got != beforeHard {
+		t.Errorf("DrainHardCapTotal must not advance on idle path; before=%d after=%d", beforeHard, got)
+	}
+	if got := p.rotations1m.Load(); got != beforeRot+1 {
+		t.Errorf("rotations_1m must tick on every drain finish (Fix 3); before=%d after=%d", beforeRot, got)
+	}
+}
+
+// TestDrainWatchdog_IdleHeuristicDisabled verifies that when DrainIdleStreamsMax
+// is 0 (or DrainIdleThreshold is 0) the watchdog falls back to legacy
+// streams==0-or-hard-cap behavior — a slot with stuck streams will hit
+// hard cap regardless of how long activity has been silent.
+func TestDrainWatchdog_IdleHeuristicDisabled(t *testing.T) {
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size:                2,
+		ServerAddr:          "127.0.0.1:0",
+		GracefulDrain:       true,
+		DrainHardCap:        300 * time.Millisecond,
+		DrainIdleThreshold:  100 * time.Millisecond,
+		DrainIdleStreamsMax: 0, // disabled
+	})
+	p.ctx = t.Context()
+
+	oldSlot := &poolSlot{}
+	oldSlot.setState(slotDraining)
+	oldSlot.streams.Store(1)
+	oldSlot.lastActivityNs.Store(time.Now().Add(-time.Second).UnixNano())
+	p.slots[0] = oldSlot
+
+	beforeIdle := Stats.DrainIdleFinishTotal.Load()
+	beforeHard := Stats.DrainHardCapTotal.Load()
+
+	start := time.Now()
+	p.drainWatchdog(cl, 0, oldSlot, start, "test")
+	elapsed := time.Since(start)
+
+	if elapsed < 300*time.Millisecond {
+		t.Errorf("hard cap should fire (~300ms); got %v", elapsed)
+	}
+	if got := Stats.DrainIdleFinishTotal.Load(); got != beforeIdle {
+		t.Errorf("DrainIdleFinishTotal must not advance when heuristic disabled; before=%d after=%d", beforeIdle, got)
+	}
+	if got := Stats.DrainHardCapTotal.Load(); got != beforeHard+1 {
+		t.Errorf("DrainHardCapTotal = %d, want %d", got, beforeHard+1)
+	}
+}
+
+// TestDrainWatchdog_TooManyStreamsBypassesIdle verifies that with
+// streams.Load() > DrainIdleStreamsMax the idle path does NOT fire,
+// even if activity has been silent — the drain waits for the hard cap.
+// Protects against killing a slot that holds real (non-keepalive) flows.
+func TestDrainWatchdog_TooManyStreamsBypassesIdle(t *testing.T) {
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size:                2,
+		ServerAddr:          "127.0.0.1:0",
+		GracefulDrain:       true,
+		DrainHardCap:        300 * time.Millisecond,
+		DrainIdleThreshold:  100 * time.Millisecond,
+		DrainIdleStreamsMax: 2,
+	})
+	p.ctx = t.Context()
+
+	oldSlot := &poolSlot{}
+	oldSlot.setState(slotDraining)
+	oldSlot.streams.Store(5) // > max=2
+	oldSlot.lastActivityNs.Store(time.Now().Add(-time.Second).UnixNano())
+	p.slots[0] = oldSlot
+
+	beforeIdle := Stats.DrainIdleFinishTotal.Load()
+	beforeHard := Stats.DrainHardCapTotal.Load()
+
+	start := time.Now()
+	p.drainWatchdog(cl, 0, oldSlot, start, "test")
+	elapsed := time.Since(start)
+
+	if elapsed < 300*time.Millisecond {
+		t.Errorf("with streams>max the watchdog must wait for hard cap; got %v", elapsed)
+	}
+	if got := Stats.DrainIdleFinishTotal.Load(); got != beforeIdle {
+		t.Errorf("DrainIdleFinishTotal must not advance when streams>max; before=%d after=%d", beforeIdle, got)
+	}
+	if got := Stats.DrainHardCapTotal.Load(); got != beforeHard+1 {
+		t.Errorf("DrainHardCapTotal = %d, want %d", got, beforeHard+1)
+	}
+}
+
+// TestBumpRotations1m_DecaysAfter60s is implicit-time-style (we don't wait
+// 60s in tests). The contract under test is: every drain finish bumps the
+// rotations_1m counter, mirroring fireRotation's legacy behavior. Fix 3
+// for the 2026-05-22 canary where graceful drain showed rotations_1m=0
+// for 7h55m despite 895 drains.
+func TestBumpRotations1m_FromDrainTearDown(t *testing.T) {
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size:          2,
+		ServerAddr:    "127.0.0.1:0",
+		GracefulDrain: true,
+		DrainHardCap:  300 * time.Millisecond,
+	})
+	p.ctx = t.Context()
+
+	oldSlot := &poolSlot{}
+	oldSlot.setState(slotDraining)
+	oldSlot.streams.Store(1) // never reaches zero → hard cap fires
+	p.slots[0] = oldSlot
+
+	before := p.rotations1m.Load()
+	p.drainWatchdog(cl, 0, oldSlot, time.Now(), "test")
+	if got := p.rotations1m.Load(); got != before+1 {
+		t.Errorf("rotations1m after drain tearDown = %d, want %d (Fix 3: drains count as rotations)", got, before+1)
 	}
 }

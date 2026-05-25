@@ -69,7 +69,7 @@ func (d *BypassDialer) DialUDP(m *M.Metadata) (net.PacketConn, error) {
 }
 
 func (d *BypassDialer) shouldBypass(m *M.Metadata) bool {
-	if d.resolved == nil || m == nil {
+	if m == nil {
 		return false
 	}
 	addr := m.DstIP
@@ -78,6 +78,15 @@ func (d *BypassDialer) shouldBypass(m *M.Metadata) bool {
 	}
 	addr = addr.Unmap()
 	if !addr.Is4() {
+		return false
+	}
+	// Reserved IPv4 ranges (link-local, loopback, RFC1918, multicast, …) must
+	// never traverse the tunnel — they're local-stack traffic that the server
+	// can't reach from its vantage point. See reserved.go for the why.
+	if isReservedIPv4(addr) {
+		return true
+	}
+	if d.resolved == nil {
 		return false
 	}
 	return d.resolved.Match(addr)

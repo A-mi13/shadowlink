@@ -1,3 +1,13 @@
+> **2026-05-20 UPDATE:** Sections on primary/reserve cell pairing (§Fix C3
+> `i + p.poolSize` rule, §`countNonReadySlots` paired indexing) are
+> SUPERSEDED by `2026-05-20-ws-pool-uniform-cells-design.md`. The new
+> design implements §"primary and reserve cells circulate" (line 101 of
+> this doc) consistently across all iteration sites; the §Fix C3
+> pairing rule was a contradictory band-aid that triggered the
+> 2026-05-19 canary stuck state. The HTTP/2 GOAWAY-style drain mechanism
+> (slotDraining state, drainHardCap, env flag, watchdog poll) is
+> RETAINED.
+
 # WS Pool Graceful Drain — Design
 
 **Date:** 2026-05-19 (v2 — post Opus-review)

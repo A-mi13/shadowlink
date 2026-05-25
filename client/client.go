@@ -139,6 +139,12 @@ type Client struct {
 	streamChans   map[uint16]chan []byte // StreamID → incoming data from server
 	streamMu      sync.Mutex
 
+	// streamOverflow tracks per-stream RouteToStream drops so we emit a
+	// single aggregated INFO at UnregisterStream instead of N WARNs per
+	// drop. See spec 2026-05-23.
+	streamOverflow   map[uint16]*streamOverflowState
+	streamOverflowMu sync.Mutex
+
 	// Cold-start observability (Task D5, 2026-05-02 plan).
 	//
 	// connectStartUnixNano stores time.Now().UnixNano() at the start of
@@ -691,11 +697,13 @@ func (c *Client) RegisterStream(streamID uint16) (chan []byte, error) {
 	return ch, nil
 }
 
-// UnregisterStream removes a stream channel.
+// UnregisterStream removes a stream channel and flushes any
+// per-stream buffer-overflow state (aggregated INFO if non-empty).
 func (c *Client) UnregisterStream(streamID uint16) {
 	c.streamMu.Lock()
-	defer c.streamMu.Unlock()
 	delete(c.streamChans, streamID)
+	c.streamMu.Unlock()
+	c.flushBufferOverflow(streamID)
 }
 
 // CloseStream sends a per-stream FIN to the server and unregisters the stream locally.
@@ -802,16 +810,7 @@ func (c *Client) SendStream(ctx context.Context, streamID uint16, data []byte) e
 	if len(respChunk.Payload) > 0 {
 		respStreamID, respData := core.ParseStreamID(respChunk.Payload)
 		if len(respData) > 0 {
-			c.streamMu.Lock()
-			ch := c.streamChans[respStreamID]
-			c.streamMu.Unlock()
-			if ch != nil {
-				select {
-				case ch <- respData:
-				default:
-					slog.Warn("stream buffer full in SendStream", "stream_id", respStreamID, "bytes", len(respData))
-				}
-			}
+			c.RouteToStream(respStreamID, respData)
 		}
 	}
 
@@ -905,7 +904,9 @@ func (c *Client) HasStream(streamID uint16) bool {
 }
 
 // RouteToStream delivers data to a registered stream's channel.
-// MED-5 fix: logs warning on buffer full instead of silent drop.
+// On buffer-full it records an overflow event; aggregated WARN/INFO
+// pair is emitted by recordBufferOverflow/flushBufferOverflow rather
+// than a WARN per dropped frame. See spec 2026-05-23.
 func (c *Client) RouteToStream(streamID uint16, data []byte) {
 	c.streamMu.Lock()
 	ch := c.streamChans[streamID]
@@ -914,7 +915,7 @@ func (c *Client) RouteToStream(streamID uint16, data []byte) {
 		select {
 		case ch <- data:
 		default:
-			slog.Warn("stream buffer full, data dropped", "stream_id", streamID, "bytes", len(data))
+			c.recordBufferOverflow(streamID, len(data))
 		}
 	}
 }

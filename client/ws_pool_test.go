@@ -926,23 +926,25 @@ func TestMaybeRotateSlot_StormBrakeAllowsHealthyPool(t *testing.T) {
 	require.Equal(t, slotDead, target.getState())
 }
 
-// TestRotationStormBrakeThreshold_ScalesWithPoolSize pins the threshold
-// formula. For pool sizes 2/4/8/16 the brake engages at 1/1/2/4 slots,
-// matching ceil(poolSize × 0.25) with a floor of 1.
+// TestRotationStormBrakeThreshold_ScalesWithPoolSize pins the maxConcurrentDrains
+// formula. After 2026-05-24 knob decoupling the cap is ceil(poolSize × 0.5),
+// clamped to [1, poolSize-1]. Upper clamp (poolSize-1) is applied before lower
+// clamp (min=1) so the degenerate poolSize=1 case (ceil(0.5)=1 → upper→0 →
+// lower→1) always yields ≥ 1 — cap=0 would deadlock the drain scheduler.
 func TestRotationStormBrakeThreshold_ScalesWithPoolSize(t *testing.T) {
 	cases := []struct {
 		poolSize int
 		want     int
 	}{
-		{poolSize: 1, want: 1}, // floor
-		{poolSize: 2, want: 1}, // ceil(0.5)=1
-		{poolSize: 4, want: 1}, // ceil(1.0)=1
-		{poolSize: 8, want: 2}, // ceil(2.0)=2
-		{poolSize: 16, want: 4},
+		{poolSize: 1, want: 1},  // degenerate: ceil(0.5)=1 → upper→0 → lower rescues → 1
+		{poolSize: 2, want: 1},  // ceil(1.0)=1
+		{poolSize: 4, want: 2},  // ceil(2.0)=2
+		{poolSize: 8, want: 4},  // ceil(4.0)=4
+		{poolSize: 16, want: 8}, // ceil(8.0)=8
 	}
 	for _, tc := range cases {
 		p := &WSPoolTransport{poolSize: tc.poolSize}
-		require.Equal(t, tc.want, p.rotationStormBrakeThreshold(),
+		require.Equal(t, tc.want, p.maxConcurrentDrains(),
 			"poolSize=%d", tc.poolSize)
 	}
 }
@@ -1096,7 +1098,7 @@ func TestCountNonReadySlots_TreatsAllNonReadyStates(t *testing.T) {
 	pool.slots[4] = &poolSlot{}
 	pool.slots[4].setState(slotDraining)
 
-	require.Equal(t, 4, pool.countNonReadySlots(),
+	require.Equal(t, 4, pool.poolSize-pool.readyCapacity(),
 		"nil + connecting + dead + draining = 4 non-ready")
 }
 

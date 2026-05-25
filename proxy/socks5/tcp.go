@@ -673,7 +673,25 @@ func HandleTCPConnectWS(ctx context.Context, conn net.Conn, cl *client.Client, w
 				}
 				if _, err := conn.Write(data); err != nil {
 					slog.Warn("downlink write error", "dest", destAddr, "stream", streamID, "err", err)
-					return
+					// Consumer (local SOCKS5 client) is gone. The uplink
+					// goroutine still sits in its 15s grace before
+					// canceling ctx2, during which the WS demux keeps
+					// pushing frames into incomingCh. Without an active
+					// reader the chan buffer (cap 512) fills and
+					// RouteToStream starts recording per-stream overflow
+					// (logged once aggregated at UnregisterStream, spec
+					// 2026-05-23). Here we just keep reading so the demux
+					// is not blocked on a full channel.
+					for {
+						select {
+						case _, ok := <-incomingCh:
+							if !ok {
+								return
+							}
+						case <-ctx2.Done():
+							return
+						}
+					}
 				}
 			case <-ctx2.Done():
 				slog.Info("downlink cancelled", "dest", destAddr, "stream", streamID,
