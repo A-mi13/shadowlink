@@ -2522,20 +2522,21 @@ func TestTryForceEvictIdleSlot_RevertsWhenStreamLandsInWindow(t *testing.T) {
 	}
 }
 
-// TestDrainWatchdog_IdleFinish verifies that a slot with ≤ DrainIdleStreamsMax
-// remaining streams that have shown no activity for ≥ DrainIdleThreshold is
-// torn down as natural finish *before* the hard cap fires. Regression bound
-// for the 2026-05-22 8h canary observation that 79.6% of hard-cap drains
-// were keepalive-idle.
+// TestDrainWatchdog_IdleFinish verifies that with all attached streams
+// silent for >= DrainIdleThreshold, drainWatchdog tears down via
+// finishIdle (natural finish) before the hard cap. Step 2 per-stream
+// version: setup uses storeStreamForTestWithAge for per-stream state
+// instead of slot.lastActivityNs (which no longer exists).
+//
+// Spec 2026-05-25-drain-per-stream-idle-decision-design §2.2.
 func TestDrainWatchdog_IdleFinish(t *testing.T) {
 	cl := &Client{streamChans: make(map[uint16]chan []byte)}
 	p := NewWSPoolTransport(cl, WSPoolConfig{
-		Size:                2,
-		ServerAddr:          "127.0.0.1:0",
-		GracefulDrain:       true,
-		DrainHardCap:        5 * time.Second,
-		DrainIdleThreshold:  200 * time.Millisecond,
-		DrainIdleStreamsMax: 2,
+		Size:               2,
+		ServerAddr:         "127.0.0.1:0",
+		GracefulDrain:      true,
+		DrainHardCap:       5 * time.Second,
+		DrainIdleThreshold: 200 * time.Millisecond,
 	})
 	p.ctx = t.Context()
 
@@ -2543,9 +2544,12 @@ func TestDrainWatchdog_IdleFinish(t *testing.T) {
 	oldSlot.setState(slotDraining)
 	oldSlot.streams.Store(2)
 	oldSlot.startedAtNs.Store(time.Now().Add(-2 * time.Minute).UnixNano())
-	// lastActivity stale enough to cross the idle threshold on the next tick.
-	oldSlot.lastActivityNs.Store(time.Now().Add(-500 * time.Millisecond).UnixNano())
 	p.slots[0] = oldSlot
+
+	// Both streams stamped 500ms ago — past the 200ms threshold. The
+	// next watchdog tick must see allStreamsIdle()==true and tear down.
+	storeStreamForTestWithAge(p, 1, 0, 500*time.Millisecond)
+	storeStreamForTestWithAge(p, 2, 0, 500*time.Millisecond)
 
 	beforeIdle := Stats.DrainIdleFinishTotal.Load()
 	beforeNat := Stats.DrainNaturalFinishTotal.Load()
@@ -2569,31 +2573,36 @@ func TestDrainWatchdog_IdleFinish(t *testing.T) {
 		t.Errorf("DrainHardCapTotal must not advance on idle path; before=%d after=%d", beforeHard, got)
 	}
 	if got := p.rotations1m.Load(); got != beforeRot+1 {
-		t.Errorf("rotations_1m must tick on every drain finish (Fix 3); before=%d after=%d", beforeRot, got)
+		t.Errorf("rotations_1m must tick on every drain finish; before=%d after=%d", beforeRot, got)
 	}
 }
 
-// TestDrainWatchdog_IdleHeuristicDisabled verifies that when DrainIdleStreamsMax
-// is 0 (or DrainIdleThreshold is 0) the watchdog falls back to legacy
-// streams==0-or-hard-cap behavior — a slot with stuck streams will hit
-// hard cap regardless of how long activity has been silent.
+// TestDrainWatchdog_IdleHeuristicDisabled verifies that DrainIdleThreshold=0
+// disables the idle gate entirely — slot rides to hard cap regardless
+// of per-stream silence. After Step 2 this is the canonical disable
+// knob (DrainIdleStreamsMax=0 is deprecated no-op).
+//
+// Spec 2026-05-25-drain-per-stream-idle-decision-design §2.5.
 func TestDrainWatchdog_IdleHeuristicDisabled(t *testing.T) {
 	cl := &Client{streamChans: make(map[uint16]chan []byte)}
 	p := NewWSPoolTransport(cl, WSPoolConfig{
-		Size:                2,
-		ServerAddr:          "127.0.0.1:0",
-		GracefulDrain:       true,
-		DrainHardCap:        300 * time.Millisecond,
-		DrainIdleThreshold:  100 * time.Millisecond,
-		DrainIdleStreamsMax: 0, // disabled
+		Size:               2,
+		ServerAddr:         "127.0.0.1:0",
+		GracefulDrain:      true,
+		DrainHardCap:       300 * time.Millisecond,
+		DrainIdleThreshold: 0, // DISABLED (Step 2: this is the only disable knob)
 	})
 	p.ctx = t.Context()
 
 	oldSlot := &poolSlot{}
 	oldSlot.setState(slotDraining)
 	oldSlot.streams.Store(1)
-	oldSlot.lastActivityNs.Store(time.Now().Add(-time.Second).UnixNano())
 	p.slots[0] = oldSlot
+
+	// Stream IS idle (1s old, well past any reasonable threshold). With
+	// idle gate disabled, this should NOT trigger finishIdle — must hit
+	// hard cap.
+	storeStreamForTestWithAge(p, 1, 0, 1*time.Second)
 
 	beforeIdle := Stats.DrainIdleFinishTotal.Load()
 	beforeHard := Stats.DrainHardCapTotal.Load()
@@ -2607,46 +2616,6 @@ func TestDrainWatchdog_IdleHeuristicDisabled(t *testing.T) {
 	}
 	if got := Stats.DrainIdleFinishTotal.Load(); got != beforeIdle {
 		t.Errorf("DrainIdleFinishTotal must not advance when heuristic disabled; before=%d after=%d", beforeIdle, got)
-	}
-	if got := Stats.DrainHardCapTotal.Load(); got != beforeHard+1 {
-		t.Errorf("DrainHardCapTotal = %d, want %d", got, beforeHard+1)
-	}
-}
-
-// TestDrainWatchdog_TooManyStreamsBypassesIdle verifies that with
-// streams.Load() > DrainIdleStreamsMax the idle path does NOT fire,
-// even if activity has been silent — the drain waits for the hard cap.
-// Protects against killing a slot that holds real (non-keepalive) flows.
-func TestDrainWatchdog_TooManyStreamsBypassesIdle(t *testing.T) {
-	cl := &Client{streamChans: make(map[uint16]chan []byte)}
-	p := NewWSPoolTransport(cl, WSPoolConfig{
-		Size:                2,
-		ServerAddr:          "127.0.0.1:0",
-		GracefulDrain:       true,
-		DrainHardCap:        300 * time.Millisecond,
-		DrainIdleThreshold:  100 * time.Millisecond,
-		DrainIdleStreamsMax: 2,
-	})
-	p.ctx = t.Context()
-
-	oldSlot := &poolSlot{}
-	oldSlot.setState(slotDraining)
-	oldSlot.streams.Store(5) // > max=2
-	oldSlot.lastActivityNs.Store(time.Now().Add(-time.Second).UnixNano())
-	p.slots[0] = oldSlot
-
-	beforeIdle := Stats.DrainIdleFinishTotal.Load()
-	beforeHard := Stats.DrainHardCapTotal.Load()
-
-	start := time.Now()
-	p.drainWatchdog(cl, 0, oldSlot, start, "test")
-	elapsed := time.Since(start)
-
-	if elapsed < 300*time.Millisecond {
-		t.Errorf("with streams>max the watchdog must wait for hard cap; got %v", elapsed)
-	}
-	if got := Stats.DrainIdleFinishTotal.Load(); got != beforeIdle {
-		t.Errorf("DrainIdleFinishTotal must not advance when streams>max; before=%d after=%d", beforeIdle, got)
 	}
 	if got := Stats.DrainHardCapTotal.Load(); got != beforeHard+1 {
 		t.Errorf("DrainHardCapTotal = %d, want %d", got, beforeHard+1)
@@ -2680,12 +2649,11 @@ func TestBumpRotations1m_FromDrainTearDown(t *testing.T) {
 	}
 }
 
-// TestWriteMessageForStream_StampsBothPerSlotAndPerStream verifies that
-// a successful WriteMessageForStream call updates BOTH the existing
-// per-slot lastActivityNs AND the new per-stream lastWriteNs (Task 3
-// spec §2.3). The two timestamps must match (same time.Now().UnixNano()
-// value). Mirrors the fixture pattern from TestWriteMessageForStream_AcceptsDraining.
-func TestWriteMessageForStream_StampsBothPerSlotAndPerStream(t *testing.T) {
+// TestWriteMessageForStream_StampsPerStream verifies that
+// a successful WriteMessageForStream call updates the per-stream
+// lastWriteNs timestamp. Step 2 removes slot.lastActivityNs, so this
+// test now only asserts per-stream behavior.
+func TestWriteMessageForStream_StampsPerStream(t *testing.T) {
 	cl := &Client{streamChans: make(map[uint16]chan []byte)}
 	p := NewWSPoolTransport(cl, WSPoolConfig{
 		Size:       1,
@@ -2704,13 +2672,7 @@ func TestWriteMessageForStream_StampsBothPerSlotAndPerStream(t *testing.T) {
 	}
 	after := time.Now().UnixNano()
 
-	// Per-slot stamp (existing behavior)
-	slotStamp := p.slots[0].lastActivityNs.Load()
-	if slotStamp < before || slotStamp > after {
-		t.Errorf("per-slot lastActivityNs = %d, want in [%d, %d]", slotStamp, before, after)
-	}
-
-	// Per-stream stamp (new behavior — Task 3)
+	// Per-stream stamp (Step 1+2: only remaining stamp after slot.lastActivityNs removal)
 	v, ok := p.streamMap.Load(uint16(42))
 	if !ok {
 		t.Fatal("streamMap missing entry after write")
@@ -2722,12 +2684,6 @@ func TestWriteMessageForStream_StampsBothPerSlotAndPerStream(t *testing.T) {
 	streamStamp := e.lastWriteNs.Load()
 	if streamStamp < before || streamStamp > after {
 		t.Errorf("per-stream lastWriteNs = %d, want in [%d, %d]", streamStamp, before, after)
-	}
-
-	// Both stamps should be the same value (same time.Now().UnixNano() call).
-	if slotStamp != streamStamp {
-		t.Errorf("per-slot stamp (%d) != per-stream stamp (%d); they must be derived from the same time.Now() call",
-			slotStamp, streamStamp)
 	}
 }
 
@@ -2792,8 +2748,9 @@ func TestTearDownIdle_IncludesDiagSnapshot(t *testing.T) {
 	t.Skip("Requires drainWatchdog harness; integration coverage via canary logs.")
 }
 
-// TestWriteControlMessageForStream_StampsBothPerSlotAndPerStream — control-frame counterpart.
-func TestWriteControlMessageForStream_StampsBothPerSlotAndPerStream(t *testing.T) {
+// TestWriteControlMessageForStream_StampsPerStream — control-frame counterpart.
+// Step 2 removes slot.lastActivityNs, so this test now only asserts per-stream behavior.
+func TestWriteControlMessageForStream_StampsPerStream(t *testing.T) {
 	cl := &Client{streamChans: make(map[uint16]chan []byte)}
 	p := NewWSPoolTransport(cl, WSPoolConfig{
 		Size:       1,
@@ -2812,11 +2769,6 @@ func TestWriteControlMessageForStream_StampsBothPerSlotAndPerStream(t *testing.T
 	}
 	after := time.Now().UnixNano()
 
-	slotStamp := p.slots[0].lastActivityNs.Load()
-	if slotStamp < before || slotStamp > after {
-		t.Errorf("per-slot lastActivityNs = %d, want in [%d, %d]", slotStamp, before, after)
-	}
-
 	v, ok := p.streamMap.Load(uint16(43))
 	if !ok {
 		t.Fatal("streamMap missing entry after control write")
@@ -2828,10 +2780,5 @@ func TestWriteControlMessageForStream_StampsBothPerSlotAndPerStream(t *testing.T
 	streamStamp := e.lastWriteNs.Load()
 	if streamStamp < before || streamStamp > after {
 		t.Errorf("per-stream lastWriteNs = %d, want in [%d, %d]", streamStamp, before, after)
-	}
-
-	if slotStamp != streamStamp {
-		t.Errorf("per-slot stamp (%d) != per-stream stamp (%d); must derive from same time.Now()",
-			slotStamp, streamStamp)
 	}
 }
