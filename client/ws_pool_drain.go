@@ -562,6 +562,11 @@ func (p *WSPoolTransport) drainWatchdog(cl *Client, oldIdx int, oldSlot *poolSlo
 	// ctx cancel, panic) — spec §2.1.0 NEW-1.
 	defer p.inflightDrains.Add(-1)
 
+	// Bug #6: free this slot's sticky extension on EVERY watchdog exit path
+	// (tearDown→return, ctx.Done, panic). Operates on the captured oldSlot
+	// pointer — safe across cell recycle (spec H2). Idempotent if never sticky.
+	defer p.releaseSticky(oldSlot)
+
 	ticker := time.NewTicker(drainPollInterval)
 	defer ticker.Stop()
 	deadline := time.NewTimer(p.drainHardCap)
@@ -574,6 +579,9 @@ func (p *WSPoolTransport) drainWatchdog(cl *Client, oldIdx int, oldSlot *poolSlo
 		finishStreamsZero finishCause = iota
 		finishIdle
 		finishHardCap
+		finishStickyAgeBackstop   // Bug #6: активный стрим, достигнут возрастной предел дренажа
+		finishStickyBytesBackstop // Bug #6: активный стрим, достигнут объёмный предел TCP
+		finishStickyQuotaDenied   // Bug #6: активный стрим, но sticky-квота/ёмкость не позволяют
 	)
 
 	tearDown := func(cause finishCause) {
@@ -581,6 +589,15 @@ func (p *WSPoolTransport) drainWatchdog(cl *Client, oldIdx int, oldSlot *poolSlo
 		switch cause {
 		case finishHardCap:
 			emitHardCapLog(p, oldIdx, oldSlot, reason, duration)
+		case finishStickyAgeBackstop:
+			Stats.DrainStickyBackstopAgeTotal.Add(1)
+			emitStickyTeardownLog(p, oldIdx, oldSlot, reason, duration, "age_backstop")
+		case finishStickyBytesBackstop:
+			Stats.DrainStickyBackstopBytesTotal.Add(1)
+			emitStickyTeardownLog(p, oldIdx, oldSlot, reason, duration, "bytes_backstop")
+		case finishStickyQuotaDenied:
+			Stats.DrainStickyQuotaDeniedTotal.Add(1)
+			emitStickyTeardownLog(p, oldIdx, oldSlot, reason, duration, "quota_denied")
 		case finishIdle:
 			Stats.DrainNaturalFinishTotal.Add(1)
 			Stats.DrainIdleFinishTotal.Add(1)
@@ -671,4 +688,24 @@ func emitHardCapLog(p *WSPoolTransport, oldIdx int, slot *poolSlot, reason strin
 		"diag_max_stream_age_ms", snap.maxStreamAgeMs,
 		"diag_min_stream_age_ms", snap.minStreamAgeMs,
 	)
+}
+
+// emitStickyTeardownLog records a Bug #6 sticky-backstop teardown: an active
+// stream was finally torn down because a backstop (age/bytes) or quota gate
+// fired. outcome ∈ {age_backstop, bytes_backstop, quota_denied}. Mirrors
+// emitHardCapLog's diag fields so operators see WHY an active download was cut.
+func emitStickyTeardownLog(p *WSPoolTransport, oldIdx int, slot *poolSlot,
+	reason string, duration time.Duration, outcome string) {
+	snap := snapshotDrainStreams(p, oldIdx, time.Now())
+	p.log.Info("WS pool slot drain sticky backstop teardown",
+		"slot", oldIdx, "reason", reason,
+		"sticky_outcome", outcome,
+		"remaining_streams", slot.streams.Load(),
+		"down_bytes", slot.downBytes.Load(),
+		"drain_duration", duration.Truncate(time.Second),
+		"diag_total", snap.total,
+		"diag_active_count", snap.activeCount,
+		"diag_max_stream_age_ms", snap.maxStreamAgeMs,
+	)
+	p.bumpRotations1m()
 }

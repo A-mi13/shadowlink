@@ -215,6 +215,19 @@ type statsRegistry struct {
 	// (file downloads, persistent connections) that survive rotation
 	// — review whether to extend the cap or rotate less aggressively.
 	DrainHardCapTotal atomic.Uint64
+	// Bug #6 sticky stream counters.
+	// DrainStickyExtendedTotal — times the deadline branch extended a drain
+	// because an active stream was still flowing (incremented in Task 6).
+	DrainStickyExtendedTotal atomic.Uint64
+	// DrainStickyBackstopAgeTotal — sticky drains torn down because the
+	// per-drain age backstop (StickyMaxDrainAge) fired on an active stream.
+	DrainStickyBackstopAgeTotal atomic.Uint64
+	// DrainStickyBackstopBytesTotal — sticky drains torn down because the
+	// per-TCP byte backstop (StickyMaxTotalBytes) fired on an active stream.
+	DrainStickyBackstopBytesTotal atomic.Uint64
+	// DrainStickyQuotaDeniedTotal — sticky drains torn down because the
+	// sticky quota / readyCapacity gate denied (or revoked) the extension.
+	DrainStickyQuotaDeniedTotal atomic.Uint64
 	// DrainDurationSeconds — distribution of drain durations from
 	// startDrain → terminal teardown (either natural finish or hard
 	// cap). Bucket boundaries 1/5/10/30/60/90/120s match the operational
@@ -600,6 +613,19 @@ func WritePromMetrics(w io.Writer) {
 	fmt.Fprintf(w, "# HELP shadowlink_slot_drain_hard_cap_total Drains force-torn-down by the hard-cap deadline (SHADOWLINK_DRAIN_HARD_CAP, default 90s)\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_slot_drain_hard_cap_total counter\n")
 	fmt.Fprintf(w, "shadowlink_slot_drain_hard_cap_total %d\n", Stats.DrainHardCapTotal.Load())
+
+	fmt.Fprintf(w, "# HELP shadowlink_drain_sticky_extended_total Times the drain deadline was extended because an active stream was still flowing (Bug #6)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_drain_sticky_extended_total counter\n")
+	fmt.Fprintf(w, "shadowlink_drain_sticky_extended_total %d\n", Stats.DrainStickyExtendedTotal.Load())
+	fmt.Fprintf(w, "# HELP shadowlink_drain_sticky_backstop_age_total Sticky drains torn down by the per-drain age backstop on an active stream\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_drain_sticky_backstop_age_total counter\n")
+	fmt.Fprintf(w, "shadowlink_drain_sticky_backstop_age_total %d\n", Stats.DrainStickyBackstopAgeTotal.Load())
+	fmt.Fprintf(w, "# HELP shadowlink_drain_sticky_backstop_bytes_total Sticky drains torn down by the per-TCP byte backstop on an active stream\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_drain_sticky_backstop_bytes_total counter\n")
+	fmt.Fprintf(w, "shadowlink_drain_sticky_backstop_bytes_total %d\n", Stats.DrainStickyBackstopBytesTotal.Load())
+	fmt.Fprintf(w, "# HELP shadowlink_drain_sticky_quota_denied_total Sticky drains torn down because the quota/readyCapacity gate denied the extension\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_drain_sticky_quota_denied_total counter\n")
+	fmt.Fprintf(w, "shadowlink_drain_sticky_quota_denied_total %d\n", Stats.DrainStickyQuotaDeniedTotal.Load())
 
 	// Histogram exposition: cumulative bucket counts with le-labels, plus
 	// _sum (seconds) and _count. Matches Prometheus histogram conventions.
