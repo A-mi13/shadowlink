@@ -17,6 +17,7 @@ import (
 	"github.com/nixavpn/shadowlink/client"
 	"github.com/nixavpn/shadowlink/core"
 	"github.com/nixavpn/shadowlink/proxy/socks5"
+	"github.com/xjasonlyu/tun2socks/v2/proxy"
 )
 
 type ShadowLinkEngine struct {
@@ -26,6 +27,7 @@ type ShadowLinkEngine struct {
 	socksAddr string
 	cfg       *Config
 	cancel    context.CancelFunc
+	engineCtx context.Context // long-lived engine ctx; relay lifetime for in-process dialer (Bug #5)
 
 	// W8: error channel — signals main loop when engine dies
 	errCh         chan error
@@ -132,6 +134,10 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 
 	ctx2, cancel := context.WithCancel(ctx)
 	e.cancel = cancel
+	// engineCtx is the long-lived context for the whole engine session. The
+	// in-process tun2socks dialer (Bug #5) uses it as the relay lifetime ctx so
+	// streams aren't bound to tun2socks' 5s dial ctx (review HIGH-5).
+	e.engineCtx = ctx2
 
 	// Build ordered list of endpoints: primary first, then backup_servers.
 	// Each backup must share the same X25519 pubkey (different CF domain).
@@ -440,6 +446,12 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 					slog.Warn("SHADOWLINK_DRAIN_IDLE_STREAMS_MAX is deprecated and no longer affects drain behavior. " +
 						"Use SHADOWLINK_DRAIN_IDLE_THRESHOLD=0 to disable the idle gate.")
 				}
+				// Bug #6 sticky stream (adaptive backstop). Defaults live in
+				// NewWSPoolTransport; these env vars override for field tuning
+				// without a rebuild. StickyMaxDrainAge<=0 is the kill switch.
+				stickyMaxDrainAge := envDurationDefault("SHADOWLINK_STICKY_MAX_DRAIN_AGE", 10*time.Minute)
+				stickyMaxTotalBytes := int64(envIntDefault("SHADOWLINK_STICKY_MAX_TOTAL_BYTES", 256*1024*1024))
+				stickyMaxSlots := envIntDefault("SHADOWLINK_STICKY_MAX_SLOTS", 0)
 
 				pool := client.NewWSPoolTransport(e.cl, client.WSPoolConfig{
 					Size:                poolSize,
@@ -458,6 +470,9 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 					DrainHardCap:        drainHardCap,
 					DrainIdleThreshold:  drainIdleThreshold,
 					DrainIdleStreamsMax: drainIdleStreamsMax,
+					StickyMaxDrainAge:   stickyMaxDrainAge,
+					StickyMaxTotalBytes: stickyMaxTotalBytes,
+					StickyMaxSlots:      stickyMaxSlots,
 				})
 				if err := pool.Connect(ctx2); err != nil {
 					slog.Warn("WS Pool не удался, fallback на SplitHTTP", "err", err)
@@ -730,6 +745,18 @@ func (e *ShadowLinkEngine) StartDownloadStream() {
 
 func (e *ShadowLinkEngine) SOCKSAddr() string { return e.socksAddr }
 func (e *ShadowLinkEngine) Name() string      { return "shadowlink" }
+
+// InProcessDialer returns the in-process tun2socks dialer (Bug #5), tunnelling
+// TUN traffic over the WS transport without a loopback SOCKS5 socket — which
+// eliminates Windows ephemeral port exhaustion at high throughput. Returns nil
+// if the engine isn't ready (no SOCKS server / transport yet), so callers fall
+// back to the loopback dialer. Implements InProcessDialerProvider.
+func (e *ShadowLinkEngine) InProcessDialer() proxy.Dialer {
+	if e.socks == nil || e.socks.WST == nil || e.cl == nil || e.engineCtx == nil {
+		return nil
+	}
+	return socks5.NewInProcessDialer(e.engineCtx, e.socks)
+}
 
 func (e *ShadowLinkEngine) Close() error {
 	if e.cancel != nil {
