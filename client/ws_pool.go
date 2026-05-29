@@ -327,6 +327,15 @@ type poolSlot struct {
 	// same deferred drain. Zero = no backoff (slot eligible for drain
 	// on next tick).
 	nextDrainAttemptNs atomic.Int64
+
+	// isSticky marks that THIS slot's drainWatchdog currently holds a sticky
+	// extension slot in the pool-wide stickyDrainCount (Bug #6). Set via
+	// markSticky (CAS false→true, increments count once), cleared via
+	// releaseSticky (Swap, decrements once). Lives on poolSlot (not keyed by
+	// index) so a recycled cell's NEW *poolSlot starts with isSticky=false
+	// (zero value) and the OLD watchdog's deferred releaseSticky operates on
+	// its OWN captured *poolSlot — no cross-recycle counter desync (spec H2).
+	isSticky atomic.Bool
 }
 
 // slotFreshnessPenaltyWindow defines how long after a slot's last death
@@ -630,6 +639,24 @@ func (p *WSPoolTransport) readyCapacityFloor() int {
 		floor = p.poolSize - 1
 	}
 	return floor
+}
+
+// effectiveStickyMaxSlots is the static ceiling on concurrently-sticky slots
+// (Bug #6). 0 (config) → auto = poolSize/2 (min 1). <0 → 0 (sticky disabled).
+// The ACTUAL cap is further gated dynamically by readyCapacity in
+// stickyQuotaAvailable — this is only the upper bound.
+func (p *WSPoolTransport) effectiveStickyMaxSlots() int {
+	if p.stickyMaxSlots > 0 {
+		return p.stickyMaxSlots
+	}
+	if p.stickyMaxSlots < 0 {
+		return 0
+	}
+	half := p.poolSize / 2
+	if half < 1 {
+		half = 1
+	}
+	return half
 }
 
 // maxConcurrentDrains is the inflightDrains hard cap. Independent of
