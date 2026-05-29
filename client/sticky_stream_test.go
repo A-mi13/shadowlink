@@ -1,6 +1,7 @@
 package client
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -194,5 +195,230 @@ func TestDrainWatchdog_StickyAgeBackstop(t *testing.T) {
 	}
 	if got := Stats.DrainStickyBackstopAgeTotal.Load(); got != before+1 {
 		t.Errorf("DrainStickyBackstopAgeTotal: %d → %d, want +1", before, got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 7 — idle / bytes / kill-switch behavior at the deadline branch.
+// ---------------------------------------------------------------------------
+
+// idle stream at deadline → natural-finish (NOT hard-cap). Verifies M5: idle
+// teardown in the deadline branch goes to natural-finish metrics, keeping
+// DrainHardCapTotal clean.
+func TestDrainWatchdog_IdleGoesToNaturalFinish(t *testing.T) {
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size: 6, ServerAddr: "127.0.0.1:0",
+		DrainHardCap:        50 * time.Millisecond,
+		DrainIdleThreshold:  30 * time.Millisecond, // small → stream reads idle
+		StickyMaxDrainAge:   10 * time.Minute,
+		StickyMaxTotalBytes: 1 << 30,
+	})
+	oldSlot := &poolSlot{index: 0}
+	oldSlot.setState(slotDraining)
+	oldSlot.streams.Store(1)
+	p.slots[0] = oldSlot
+	for i := 1; i < 6; i++ {
+		s := &poolSlot{index: i}
+		s.setState(slotReady)
+		p.slots[i] = s
+	}
+	// IDLE stream: lastWriteNs 1s in the past (> 30ms idle threshold)
+	storeStreamForTestWithAge(p, 1, 0, 1*time.Second)
+	p.inflightDrains.Add(1)
+
+	hardBefore := Stats.DrainHardCapTotal.Load()
+	natBefore := Stats.DrainNaturalFinishTotal.Load()
+	done := make(chan struct{})
+	go func() { p.drainWatchdog(cl, 0, oldSlot, time.Now(), "test"); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchdog did not finish")
+	}
+	if got := Stats.DrainHardCapTotal.Load(); got != hardBefore {
+		t.Errorf("idle teardown must NOT bump DrainHardCapTotal: %d → %d", hardBefore, got)
+	}
+	if got := Stats.DrainNaturalFinishTotal.Load(); got <= natBefore {
+		t.Errorf("idle teardown must bump natural-finish: %d → %d", natBefore, got)
+	}
+}
+
+// active stream whose downBytes exceeds the byte backstop → bytes backstop.
+func TestDrainWatchdog_StickyBytesBackstop(t *testing.T) {
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size: 6, ServerAddr: "127.0.0.1:0",
+		DrainHardCap:        50 * time.Millisecond,
+		DrainIdleThreshold:  15 * time.Second, // wide → stream active
+		StickyMaxDrainAge:   10 * time.Minute,
+		StickyMaxTotalBytes: 1024, // 1KB limit
+	})
+	oldSlot := &poolSlot{index: 0}
+	oldSlot.setState(slotDraining)
+	oldSlot.streams.Store(1)
+	oldSlot.downBytes.Store(2048) // > 1KB
+	p.slots[0] = oldSlot
+	for i := 1; i < 6; i++ {
+		s := &poolSlot{index: i}
+		s.setState(slotReady)
+		p.slots[i] = s
+	}
+	storeStreamForTest(p, 1, 0) // active
+	p.inflightDrains.Add(1)
+
+	before := Stats.DrainStickyBackstopBytesTotal.Load()
+	done := make(chan struct{})
+	go func() { p.drainWatchdog(cl, 0, oldSlot, time.Now(), "test"); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchdog did not finish")
+	}
+	if got := Stats.DrainStickyBackstopBytesTotal.Load(); got != before+1 {
+		t.Errorf("DrainStickyBackstopBytesTotal: %d → %d, want +1", before, got)
+	}
+}
+
+// kill switch: StickyMaxDrainAge<=0 → blind hard-cap even for an active stream.
+func TestDrainWatchdog_StickyKillSwitch(t *testing.T) {
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size: 6, ServerAddr: "127.0.0.1:0",
+		DrainHardCap:        50 * time.Millisecond,
+		DrainIdleThreshold:  15 * time.Second,
+		StickyMaxDrainAge:   -1, // kill switch (negative survives NewWSPoolTransport default)
+		StickyMaxTotalBytes: 1 << 30,
+	})
+	oldSlot := &poolSlot{index: 0}
+	oldSlot.setState(slotDraining)
+	oldSlot.streams.Store(1)
+	p.slots[0] = oldSlot
+	for i := 1; i < 6; i++ {
+		s := &poolSlot{index: i}
+		s.setState(slotReady)
+		p.slots[i] = s
+	}
+	storeStreamForTest(p, 1, 0) // active
+	p.inflightDrains.Add(1)
+
+	before := Stats.DrainHardCapTotal.Load()
+	start := time.Now()
+	done := make(chan struct{})
+	go func() { p.drainWatchdog(cl, 0, oldSlot, time.Now(), "test"); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchdog did not finish")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Errorf("kill switch: should tear down at hard cap (~50ms), took %v", elapsed)
+	}
+	if got := Stats.DrainHardCapTotal.Load(); got != before+1 {
+		t.Errorf("kill switch must bump DrainHardCapTotal: %d → %d", before, got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 8 — cross-recycle (H2) + clinch (H4) coverage.
+// ---------------------------------------------------------------------------
+
+// H2: old watchdog marked sticky, cell recycled to a NEW *poolSlot, old
+// deferred releaseSticky must NOT touch the new slot or corrupt the counter.
+func TestSticky_CrossRecycleNoDesync(t *testing.T) {
+	p := &WSPoolTransport{poolSize: 6, stickyMaxSlots: 0}
+	oldSlot := &poolSlot{index: 0}
+	newSlot := &poolSlot{index: 0} // same cell idx, NEW pointer
+
+	p.markSticky(oldSlot)
+	if p.stickyDrainCount.Load() != 1 {
+		t.Fatalf("after old markSticky: count=%d want 1", p.stickyDrainCount.Load())
+	}
+	p.markSticky(newSlot)
+	if p.stickyDrainCount.Load() != 2 {
+		t.Fatalf("after new markSticky: count=%d want 2", p.stickyDrainCount.Load())
+	}
+	p.releaseSticky(oldSlot) // old defer — operates on its OWN pointer
+	if p.stickyDrainCount.Load() != 1 {
+		t.Fatalf("after old release: count=%d want 1 (newSlot still sticky)", p.stickyDrainCount.Load())
+	}
+	if !newSlot.isSticky.Load() {
+		t.Fatal("newSlot must still be sticky — old release must not touch it")
+	}
+	p.releaseSticky(newSlot)
+	if p.stickyDrainCount.Load() != 0 {
+		t.Fatalf("after new release: count=%d want 0", p.stickyDrainCount.Load())
+	}
+}
+
+// H2 reordered: old release BEFORE new mark.
+func TestSticky_CrossRecycleReorderedRelease(t *testing.T) {
+	p := &WSPoolTransport{poolSize: 6, stickyMaxSlots: 0}
+	oldSlot := &poolSlot{index: 0}
+	newSlot := &poolSlot{index: 0}
+	p.markSticky(oldSlot)
+	p.releaseSticky(oldSlot)
+	p.markSticky(newSlot)
+	if p.stickyDrainCount.Load() != 1 {
+		t.Fatalf("count=%d want 1", p.stickyDrainCount.Load())
+	}
+}
+
+// H2 concurrent under -race: balanced mark/release on many slots → count 0.
+func TestSticky_ConcurrentMarkRelease(t *testing.T) {
+	p := &WSPoolTransport{poolSize: 100, stickyMaxSlots: 1000}
+	const n = 200
+	slots := make([]*poolSlot, n)
+	for i := range slots {
+		slots[i] = &poolSlot{index: i % 100}
+	}
+	var wg sync.WaitGroup
+	for i := range slots {
+		wg.Add(1)
+		go func(s *poolSlot) {
+			defer wg.Done()
+			p.markSticky(s)
+			p.markSticky(s)
+			p.releaseSticky(s)
+			p.releaseSticky(s)
+		}(slots[i])
+	}
+	wg.Wait()
+	if got := p.stickyDrainCount.Load(); got != 0 {
+		t.Fatalf("after balanced concurrent mark/release: count=%d want 0", got)
+	}
+}
+
+// H4: unhealthy capacity → new sticky denied (no clinch).
+func TestSticky_NoClinch_UnhealthyCapacity(t *testing.T) {
+	p := &WSPoolTransport{poolSize: 6, stickyMaxSlots: 0}
+	p.slots = make([]*poolSlot, 12)
+	for i := 0; i < 6; i++ {
+		s := &poolSlot{index: i}
+		if i < p.readyCapacityFloor() {
+			s.state.Store(int32(slotReady))
+		} else {
+			s.state.Store(int32(slotDraining))
+		}
+		p.slots[i] = s
+	}
+	fresh := &poolSlot{index: 0}
+	if p.stickyQuotaAvailable(fresh) {
+		t.Fatal("unhealthy capacity: new sticky must be denied (no clinch)")
+	}
+}
+
+// H4: healthy capacity under cap → sticky granted (not falsely denied).
+func TestSticky_HealthyCapacity_Granted(t *testing.T) {
+	p := &WSPoolTransport{poolSize: 6, stickyMaxSlots: 0}
+	p.slots = make([]*poolSlot, 12)
+	for i := 0; i < 6; i++ {
+		s := &poolSlot{index: i}
+		s.state.Store(int32(slotReady))
+		p.slots[i] = s
+	}
+	fresh := &poolSlot{index: 0}
+	if !p.stickyQuotaAvailable(fresh) {
+		t.Fatal("healthy capacity under cap: sticky must be granted")
 	}
 }
