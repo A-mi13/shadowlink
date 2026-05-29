@@ -2916,8 +2916,10 @@ func TestDrainWatchdog_PerStreamIdle_HoldsOpenForActiveStream(t *testing.T) {
 	go func() { p.drainWatchdog(cl, 0, oldSlot, start, "test"); close(done) }()
 
 	// Wait long enough for the hard cap (400ms) to fire at least once and the
-	// deadline branch to extend the drain (active stream → sticky).
-	time.Sleep(700 * time.Millisecond)
+	// deadline branch to extend the drain (active stream → sticky). Margin is
+	// ~800ms over the 400ms cap so a slow CI runner's timer slip cannot make
+	// the DrainStickyExtendedTotal assertion flake (code-review T6 follow-up).
+	time.Sleep(1200 * time.Millisecond)
 	if got := Stats.DrainStickyExtendedTotal.Load(); got != beforeExt+1 {
 		t.Errorf("DrainStickyExtendedTotal = %d, want %d (active stream should extend drain past hard cap)", got, beforeExt+1)
 	}
