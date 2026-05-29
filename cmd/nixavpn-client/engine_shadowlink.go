@@ -448,8 +448,19 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 				}
 				// Bug #6 sticky stream (adaptive backstop). Defaults live in
 				// NewWSPoolTransport; these env vars override for field tuning
-				// without a rebuild. StickyMaxDrainAge<=0 is the kill switch.
+				// without a rebuild.
+				//
+				// Kill switch: set SHADOWLINK_STICKY_MAX_DRAIN_AGE=0 to disable
+				// sticky (deadline reverts to blind hard-cap). We translate an
+				// explicit "0" to -1 here because NewWSPoolTransport treats a
+				// cfg value of exactly 0 as "unset → default 10m"; only a
+				// negative value reaches the watchdog's `<= 0` kill gate. Unset
+				// env → envDurationDefault returns 10m (not 0), so the default
+				// path is unaffected (final review M-1).
 				stickyMaxDrainAge := envDurationDefault("SHADOWLINK_STICKY_MAX_DRAIN_AGE", 10*time.Minute)
+				if stickyMaxDrainAge == 0 {
+					stickyMaxDrainAge = -1
+				}
 				stickyMaxTotalBytes := int64(envIntDefault("SHADOWLINK_STICKY_MAX_TOTAL_BYTES", 256*1024*1024))
 				stickyMaxSlots := envIntDefault("SHADOWLINK_STICKY_MAX_SLOTS", 0)
 

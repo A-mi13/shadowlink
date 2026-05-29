@@ -667,6 +667,13 @@ func (p *WSPoolTransport) drainWatchdog(cl *Client, oldIdx int, oldSlot *poolSlo
 			drainAge := now.Sub(drainStart) // монотонные часы
 			drainBytes := oldSlot.downBytes.Load()
 			switch {
+			case oldSlot.streams.Load() == 0:
+				// последний стрим закрылся между ticker-тиком и deadline.C —
+				// рвём как пустой слот (симметрично ticker-ветке). Без этого
+				// case'а allStreamsIdle({}) возвращает false (found==false), и
+				// пустой слот ушёл бы в default→extend на лишние 5s (spec M-2).
+				tearDown(finishStreamsZero)
+				return
 			case idle:
 				// стрим простаивает → natural-finish (НЕ hard-cap метрика, spec M5)
 				tearDown(finishIdle)
@@ -753,5 +760,7 @@ func emitStickyTeardownLog(p *WSPoolTransport, oldIdx int, slot *poolSlot,
 		"diag_active_count", snap.activeCount,
 		"diag_max_stream_age_ms", snap.maxStreamAgeMs,
 	)
-	p.bumpRotations1m()
+	// NB: bumpRotations1m is called by tearDown for ALL finish causes (incl.
+	// sticky backstops) — do NOT bump here, or sticky teardowns would
+	// double-count rotations_1m vs hard-cap/idle paths (final review H-1).
 }

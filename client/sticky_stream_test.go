@@ -198,6 +198,93 @@ func TestDrainWatchdog_StickyAgeBackstop(t *testing.T) {
 	}
 }
 
+// TestDrainWatchdog_StickyTeardownBumpsRotationsOnce is the regression guard
+// for final-review H-1: a sticky-backstop teardown must bump rotations1m
+// EXACTLY ONCE (like hard-cap / idle / streams-zero), not twice. The bug was
+// that both tearDown and emitStickyTeardownLog called bumpRotations1m.
+func TestDrainWatchdog_StickyTeardownBumpsRotationsOnce(t *testing.T) {
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size: 6, ServerAddr: "127.0.0.1:0",
+		DrainHardCap:        50 * time.Millisecond,
+		DrainIdleThreshold:  15 * time.Second, // stream stays active
+		StickyMaxDrainAge:   2 * time.Second,  // age backstop trips at ~5s recheck
+		StickyMaxTotalBytes: 1 << 30,
+	})
+	oldSlot := &poolSlot{index: 0}
+	oldSlot.setState(slotDraining)
+	oldSlot.streams.Store(1)
+	p.slots[0] = oldSlot
+	for i := 1; i < 6; i++ {
+		s := &poolSlot{index: i}
+		s.setState(slotReady)
+		p.slots[i] = s
+	}
+	storeStreamForTest(p, 1, 0) // active
+	p.inflightDrains.Add(1)
+
+	before := p.rotations1m.Load()
+	done := make(chan struct{})
+	go func() { p.drainWatchdog(cl, 0, oldSlot, time.Now(), "test"); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("watchdog did not finish")
+	}
+	if got := p.rotations1m.Load(); got != before+1 {
+		t.Errorf("sticky teardown bumped rotations1m by %d, want exactly 1 (H-1 double-bump regression)", got-before)
+	}
+}
+
+// TestDrainWatchdog_DeadlineEmptySlotStreamsZero is the regression guard for
+// final-review M-2: if the last stream closes between a ticker tick and the
+// deadline fire, the deadline branch must tear the empty slot down as
+// finishStreamsZero — not fall into default→extend (allStreamsIdle returns
+// false for an empty set, so without the explicit streams==0 case the slot
+// would be extended for a needless 5s).
+func TestDrainWatchdog_DeadlineEmptySlotStreamsZero(t *testing.T) {
+	cl := &Client{streamChans: make(map[uint16]chan []byte)}
+	p := NewWSPoolTransport(cl, WSPoolConfig{
+		Size: 6, ServerAddr: "127.0.0.1:0",
+		DrainHardCap:        50 * time.Millisecond,
+		DrainIdleThreshold:  15 * time.Second,
+		StickyMaxDrainAge:   10 * time.Minute,
+		StickyMaxTotalBytes: 1 << 30,
+	})
+	oldSlot := &poolSlot{index: 0}
+	oldSlot.setState(slotDraining)
+	oldSlot.streams.Store(0) // empty — no stream entries in streamMap either
+	p.slots[0] = oldSlot
+	for i := 1; i < 6; i++ {
+		s := &poolSlot{index: i}
+		s.setState(slotReady)
+		p.slots[i] = s
+	}
+	p.inflightDrains.Add(1)
+
+	natBefore := Stats.DrainNaturalFinishTotal.Load()
+	extBefore := Stats.DrainStickyExtendedTotal.Load()
+	start := time.Now()
+	done := make(chan struct{})
+	go func() { p.drainWatchdog(cl, 0, oldSlot, time.Now(), "test"); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchdog did not finish")
+	}
+	// Empty slot torn down promptly (ticker at 500ms OR deadline at 50ms),
+	// never extended.
+	if elapsed := time.Since(start); elapsed > 1*time.Second {
+		t.Errorf("empty slot took %v to tear down, should be prompt", elapsed)
+	}
+	if got := Stats.DrainStickyExtendedTotal.Load(); got != extBefore {
+		t.Errorf("empty slot must NOT be sticky-extended: extended %d → %d", extBefore, got)
+	}
+	if got := Stats.DrainNaturalFinishTotal.Load(); got <= natBefore {
+		t.Errorf("empty slot must tear down as natural finish (streams-zero): %d → %d", natBefore, got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Task 7 — idle / bytes / kill-switch behavior at the deadline branch.
 // ---------------------------------------------------------------------------
