@@ -49,6 +49,15 @@ func TestStickyMarkReleaseIdempotent(t *testing.T) {
 	if slot.isSticky.Load() {
 		t.Fatal("isSticky should be false after releaseSticky")
 	}
+
+	// release on a never-marked slot must be a no-op (Task 4 defers
+	// releaseSticky for slots that never reached markSticky, e.g. a fast
+	// idle-finish on the first deadline tick). Swap(false)→false → no decrement.
+	fresh := &poolSlot{index: 1}
+	p.releaseSticky(fresh)
+	if got := p.stickyDrainCount.Load(); got != 0 {
+		t.Fatalf("release on unmarked slot: count=%d, want 0", got)
+	}
 }
 
 func TestStickyQuotaAvailable(t *testing.T) {

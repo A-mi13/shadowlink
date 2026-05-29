@@ -686,12 +686,21 @@ func (p *WSPoolTransport) releaseSticky(slot *poolSlot) {
 // readyCapacity to/below the storm-brake floor — otherwise the pool could
 // clinch and stop rotating entirely (spec H4). The dynamic gate is
 // deliberately conservative (fail-safe toward rotation).
+//
+// Best-effort under concurrent drains: the cap and capacity reads are not
+// atomic relative to each other or to parallel drainWatchdog goroutines, so N
+// slots hitting deadline.C simultaneously could each observe count<cap and all
+// mark sticky, briefly exceeding the cap. This is acceptable — the cap is a
+// soft ceiling, the readyCapacityFloor still prevents clinch, and the overshoot
+// self-corrects within one stickyRecheckInterval as already-sticky slots take
+// the fast path above. A hard cap (atomic check-and-reserve) is unnecessary
+// given one drainWatchdog per slot ticking at multi-second intervals.
 func (p *WSPoolTransport) stickyQuotaAvailable(slot *poolSlot) bool {
 	if slot.isSticky.Load() {
 		return true
 	}
-	max := p.effectiveStickyMaxSlots()
-	if p.stickyDrainCount.Load() >= int32(max) {
+	stickyMax := p.effectiveStickyMaxSlots()
+	if p.stickyDrainCount.Load() >= int32(stickyMax) {
 		return false
 	}
 	if p.readyCapacity() <= p.readyCapacityFloor() {
