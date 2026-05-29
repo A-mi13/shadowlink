@@ -25,42 +25,74 @@ import (
 // Adding a new range: declare it as a named `reservedRange` below. The
 // `init()` block parses every entry once at startup and panics if a CIDR
 // is malformed — that contract is locked by `TestReservedRanges_AllParse`.
+// drop classifies a reserved range by physical reachability via the host's
+// direct (physical-NIC) dialer, splitting Bug #7's two failure modes:
+//
+//   - drop=false (DIRECT): RFC1918 LAN ranges. Real machines on the user's
+//     LAN — router, NAS, printer. Physically reachable via the NIC; the
+//     BypassDialer routes them through proxy.NewDirect() so they keep working
+//     outside the tunnel.
+//   - drop=true (DROP): ranges that have NO listener on the user's machine and
+//     are unreachable by a physical-NIC dial. Routing them to proxy.NewDirect()
+//     opens a real OS socket against a host that never answers; on Windows each
+//     failed dial leaks an ephemeral port until "Only one usage of each socket
+//     address" — which then breaks every other connection (downloads included).
+//     The canonical offender is 169.254.169.254 (cloud metadata) on a non-cloud
+//     laptop. These are rejected WITHOUT opening a socket.
 type reservedRange struct {
 	cidr string
 	why  string
+	drop bool
 }
 
 var reservedRanges = []reservedRange{
-	{"0.0.0.0/8", "RFC 1122 §3.2.1.3 — \"this network\" / DHCP source before lease"},
-	{"10.0.0.0/8", "RFC 1918 — private network; user's LAN, must not tunnel"},
-	{"127.0.0.0/8", "RFC 1122 — loopback; local-only by definition"},
-	{"169.254.0.0/16", "RFC 3927 — IPv4 link-local; covers AWS/GCP/Azure/OpenStack metadata (169.254.169.254 etc.)"},
-	{"172.16.0.0/12", "RFC 1918 — private network; user's LAN, must not tunnel"},
-	{"192.168.0.0/16", "RFC 1918 — private network; user's LAN, must not tunnel"},
-	{"224.0.0.0/4", "RFC 5771 — multicast; not meaningful through a unicast tunnel"},
-	{"240.0.0.0/4", "RFC 1112 — reserved future use / 255.255.255.255 broadcast"},
+	{"0.0.0.0/8", "RFC 1122 §3.2.1.3 — \"this network\"; no real listener, drop", true},
+	{"10.0.0.0/8", "RFC 1918 — private network; user's LAN, reachable via NIC", false},
+	{"127.0.0.0/8", "RFC 1122 — loopback; never via physical NIC, drop", true},
+	{"169.254.0.0/16", "RFC 3927 — IPv4 link-local; cloud metadata (169.254.169.254) unreachable on non-cloud host, drop", true},
+	{"172.16.0.0/12", "RFC 1918 — private network; user's LAN, reachable via NIC", false},
+	{"192.168.0.0/16", "RFC 1918 — private network; user's LAN, reachable via NIC", false},
+	{"224.0.0.0/4", "RFC 5771 — multicast; no unicast listener via NIC, drop", true},
+	{"240.0.0.0/4", "RFC 1112 — reserved future use / 255.255.255.255 broadcast, drop", true},
 }
 
 var (
 	reservedTrieOnce sync.Once
-	reservedTrie     *Trie
+	reservedTrie     *Trie // all reserved ranges
+	unreachableTrie  *Trie // subset with drop=true (unreachable via physical NIC)
 )
 
 // reservedTrieInstance returns a lazily-built singleton trie of reservedRanges.
-// It is safe for concurrent reads; the trie is read-only after init.
+// It is safe for concurrent reads; the trie is read-only after init. The same
+// Do also builds unreachableTrie (the drop=true subset) so the two stay in
+// lockstep with reservedRanges.
 func reservedTrieInstance() *Trie {
-	reservedTrieOnce.Do(func() {
-		t := New()
-		for _, r := range reservedRanges {
-			p, err := netip.ParsePrefix(r.cidr)
-			if err != nil {
-				panic("bypassroute: malformed reserved CIDR " + r.cidr + ": " + err.Error())
-			}
-			t.Insert(p)
-		}
-		reservedTrie = t
-	})
+	reservedTrieOnce.Do(buildReservedTries)
 	return reservedTrie
+}
+
+// unreachableTrieInstance returns the lazily-built singleton trie of the
+// drop=true subset of reservedRanges (unreachable via the physical NIC).
+func unreachableTrieInstance() *Trie {
+	reservedTrieOnce.Do(buildReservedTries)
+	return unreachableTrie
+}
+
+func buildReservedTries() {
+	all := New()
+	drop := New()
+	for _, r := range reservedRanges {
+		p, err := netip.ParsePrefix(r.cidr)
+		if err != nil {
+			panic("bypassroute: malformed reserved CIDR " + r.cidr + ": " + err.Error())
+		}
+		all.Insert(p)
+		if r.drop {
+			drop.Insert(p)
+		}
+	}
+	reservedTrie = all
+	unreachableTrie = drop
 }
 
 // isReservedIPv4 reports whether addr is in any reservedRanges entry. addr
@@ -71,4 +103,15 @@ func isReservedIPv4(addr netip.Addr) bool {
 		return false
 	}
 	return reservedTrieInstance().Match(addr)
+}
+
+// isUnreachableReserved reports whether addr is in a reserved range marked
+// drop=true — i.e. a host that cannot be reached by a physical-NIC dial and
+// must be DROPPED rather than handed to the direct dialer (Bug #7). addr MUST
+// already be Unmap'd to IPv4; non-v4 returns false.
+func isUnreachableReserved(addr netip.Addr) bool {
+	if !addr.Is4() {
+		return false
+	}
+	return unreachableTrieInstance().Match(addr)
 }
