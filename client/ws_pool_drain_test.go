@@ -2841,28 +2841,45 @@ func TestDrainWatchdog_PerStreamIdle_TriggersWhenAllSilent(t *testing.T) {
 	}
 }
 
-// TestDrainWatchdog_PerStreamIdle_HoldsOpenForActiveStream verifies
-// that a slot with one persistently-active stream does NOT trigger
-// finishIdle — it rides to hard cap. Active stream's lastWriteNs is
-// re-stamped every 50ms (well under the 100ms threshold), so
-// allStreamsIdle should always see at least one active stream.
+// TestDrainWatchdog_PerStreamIdle_HoldsOpenForActiveStream verifies that a
+// slot with one persistently-active stream does NOT trigger finishIdle.
 //
-// Spec 2026-05-25-drain-per-stream-idle-decision-design §4.2 #8.
+// Bug #6 changed the contract here: pre-Bug#6 an active stream rode to the
+// hard cap and was torn down via finishHardCap. Now the deadline branch
+// EXTENDS the drain (sticky) instead of blindly killing the active stream —
+// the whole point of the sticky-stream fix. So with healthy ready capacity
+// the active stream must (a) survive past the hard cap and (b) increment
+// DrainStickyExtendedTotal, NOT DrainIdleFinishTotal and NOT DrainHardCapTotal.
+// We tear the watchdog down via ctx cancel after observing the extension.
+//
+// Spec 2026-05-25-drain-per-stream-idle-decision-design §4.2 #8 (updated for
+// Bug #6 sticky stream, 2026-05-29).
 func TestDrainWatchdog_PerStreamIdle_HoldsOpenForActiveStream(t *testing.T) {
 	cl := &Client{streamChans: make(map[uint16]chan []byte)}
 	p := NewWSPoolTransport(cl, WSPoolConfig{
-		Size:               2,
+		Size:               6,
 		ServerAddr:         "127.0.0.1:0",
 		GracefulDrain:      true,
 		DrainHardCap:       400 * time.Millisecond,
 		DrainIdleThreshold: 100 * time.Millisecond,
+		// StickyMaxDrainAge/StickyMaxTotalBytes default (10m / 256MiB) — neither
+		// trips in this short test, so the active stream extends cleanly.
 	})
-	p.ctx = t.Context()
+	ctx, cancel := context.WithCancel(context.Background())
+	p.ctx = ctx
+	t.Cleanup(cancel)
 
 	oldSlot := &poolSlot{}
 	oldSlot.setState(slotDraining)
 	oldSlot.streams.Store(2)
 	p.slots[0] = oldSlot
+	// Healthy ready capacity (slots 1..5 ready) so the sticky-quota gate does
+	// NOT deny the extension (readyCapacity 5 > floor(6*0.75)=4).
+	for i := 1; i < 6; i++ {
+		ready := &poolSlot{index: i}
+		ready.setState(slotReady)
+		p.slots[i] = ready
+	}
 
 	// Stream 1: idle (would-be candidate to trigger idle alone).
 	storeStreamForTestWithAge(p, 1, 0, 200*time.Millisecond)
@@ -2892,22 +2909,41 @@ func TestDrainWatchdog_PerStreamIdle_HoldsOpenForActiveStream(t *testing.T) {
 
 	beforeIdle := Stats.DrainIdleFinishTotal.Load()
 	beforeHard := Stats.DrainHardCapTotal.Load()
+	beforeExt := Stats.DrainStickyExtendedTotal.Load()
 
+	done := make(chan struct{})
 	start := time.Now()
-	p.drainWatchdog(cl, 0, oldSlot, start, "test")
-	elapsed := time.Since(start)
+	go func() { p.drainWatchdog(cl, 0, oldSlot, start, "test"); close(done) }()
+
+	// Wait long enough for the hard cap (400ms) to fire at least once and the
+	// deadline branch to extend the drain (active stream → sticky).
+	time.Sleep(700 * time.Millisecond)
+	if got := Stats.DrainStickyExtendedTotal.Load(); got != beforeExt+1 {
+		t.Errorf("DrainStickyExtendedTotal = %d, want %d (active stream should extend drain past hard cap)", got, beforeExt+1)
+	}
+	// Stream still held open — watchdog has NOT finished.
+	select {
+	case <-done:
+		t.Fatal("watchdog finished while stream still active — should have extended")
+	default:
+	}
+
+	// Tear down via ctx cancel; watchdog must exit promptly.
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchdog did not exit after ctx cancel")
+	}
 
 	close(stopActive)
 	<-activeDone
 
-	// Should ride to hard cap (~400ms), NOT finishIdle.
-	if elapsed < 350*time.Millisecond {
-		t.Errorf("expected hard cap (~400ms), got %v (active stream did not hold slot open?)", elapsed)
-	}
+	// Active stream must NEVER have been classified idle or hard-capped.
 	if got := Stats.DrainIdleFinishTotal.Load(); got != beforeIdle {
 		t.Errorf("DrainIdleFinishTotal must not advance with active stream; before=%d after=%d", beforeIdle, got)
 	}
-	if got := Stats.DrainHardCapTotal.Load(); got != beforeHard+1 {
-		t.Errorf("DrainHardCapTotal = %d, want %d", got, beforeHard+1)
+	if got := Stats.DrainHardCapTotal.Load(); got != beforeHard {
+		t.Errorf("DrainHardCapTotal must not advance — active stream extends, not hard-caps; before=%d after=%d", beforeHard, got)
 	}
 }

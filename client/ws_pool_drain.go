@@ -11,6 +11,12 @@ const (
 	// streams have drained naturally.
 	drainPollInterval = 500 * time.Millisecond
 
+	// stickyRecheckInterval is how often the deadline branch re-evaluates an
+	// extended (sticky) drain (Bug #6). Must be >= drainPollInterval so the ticker
+	// idle/streams-zero branch catches natural finish between rechecks (spec L3).
+	// 5s keeps lifetime overshoot small vs the 10m age backstop.
+	stickyRecheckInterval = 5 * time.Second
+
 	// drainRevertBackoff — backoff after startDrain failed because
 	// claimFreeSlot returned -1 (slice fully occupied). Genuine resource
 	// exhaustion, retry slowly.
@@ -643,8 +649,48 @@ func (p *WSPoolTransport) drainWatchdog(cl *Client, oldIdx int, oldSlot *poolSlo
 		case <-p.ctx.Done():
 			return
 		case <-deadline.C:
-			tearDown(finishHardCap)
-			return
+			// Bug #6: осознанное решение вместо слепого hard-cap teardown.
+			// Kill switch (StickyMaxDrainAge<=0) → ведём себя как раньше.
+			//
+			// idle-детекция выключена (DrainIdleThreshold==0) → нельзя
+			// безопасно отличить активный стрим от простаивающего, поэтому
+			// sticky НЕ активируется и deadline рвёт слепо по hard-cap, как
+			// до Bug #6 (spec §3.1 / урок L2). Без этого гейта !idleEnabled
+			// провалился бы в idle-ветку switch'а и поехал бы в finishIdle —
+			// неверно классифицируя hard-cap teardown как natural-finish.
+			if p.stickyMaxDrainAge <= 0 || !idleEnabled {
+				tearDown(finishHardCap)
+				return
+			}
+			now := time.Now()
+			idle := allStreamsIdle(p, oldIdx, idleThreshold, now)
+			drainAge := now.Sub(drainStart) // монотонные часы
+			drainBytes := oldSlot.downBytes.Load()
+			switch {
+			case idle:
+				// стрим простаивает → natural-finish (НЕ hard-cap метрика, spec M5)
+				tearDown(finishIdle)
+				return
+			case drainAge >= p.stickyMaxDrainAge:
+				tearDown(finishStickyAgeBackstop)
+				return
+			case drainBytes >= p.stickyMaxTotalBytes:
+				tearDown(finishStickyBytesBackstop)
+				return
+			case oldSlot.isSticky.Load() && p.readyCapacity() <= p.readyCapacityFloor():
+				// уже-sticky слот при просадке ёмкости → досрочно рвём (spec H4:
+				// приоритет ротация > UX одной закачки, клинч саморазрешается).
+				tearDown(finishStickyQuotaDenied)
+				return
+			case !p.stickyQuotaAvailable(oldSlot):
+				tearDown(finishStickyQuotaDenied)
+				return
+			default:
+				// активная закачка, в пределах backstop, квота есть → продлеваем.
+				p.markSticky(oldSlot)
+				Stats.DrainStickyExtendedTotal.Add(1)
+				deadline.Reset(stickyRecheckInterval)
+			}
 		case <-ticker.C:
 			streams := oldSlot.streams.Load()
 			if streams == 0 {
