@@ -659,6 +659,47 @@ func (p *WSPoolTransport) effectiveStickyMaxSlots() int {
 	return half
 }
 
+// markSticky records that slot's watchdog holds a sticky extension. CAS gate
+// makes the pool-wide stickyDrainCount increment exactly once per slot,
+// regardless of how many times the deadline branch extends (Bug #6, spec §4).
+// Operates on the CAPTURED *poolSlot — never via p.slots[idx] — so a recycled
+// cell cannot make this collide with another slot's accounting (spec H2).
+func (p *WSPoolTransport) markSticky(slot *poolSlot) {
+	if slot.isSticky.CompareAndSwap(false, true) {
+		p.stickyDrainCount.Add(1)
+	}
+}
+
+// releaseSticky frees slot's sticky extension. Idempotent: Swap returns the
+// prior value, so a second call (panic + defer, double teardown path) does
+// NOT double-decrement. Operates on the captured *poolSlot (spec H2).
+func (p *WSPoolTransport) releaseSticky(slot *poolSlot) {
+	if slot.isSticky.Swap(false) {
+		p.stickyDrainCount.Add(-1)
+	}
+}
+
+// stickyQuotaAvailable reports whether slot may (continue to) hold a sticky
+// extension. Already-sticky slots always pass (we extend, not re-acquire).
+// Fresh slots gate on BOTH the static cap (effectiveStickyMaxSlots) AND a
+// dynamic capacity check: holding one more slot in slotDraining must not push
+// readyCapacity to/below the storm-brake floor — otherwise the pool could
+// clinch and stop rotating entirely (spec H4). The dynamic gate is
+// deliberately conservative (fail-safe toward rotation).
+func (p *WSPoolTransport) stickyQuotaAvailable(slot *poolSlot) bool {
+	if slot.isSticky.Load() {
+		return true
+	}
+	max := p.effectiveStickyMaxSlots()
+	if p.stickyDrainCount.Load() >= int32(max) {
+		return false
+	}
+	if p.readyCapacity() <= p.readyCapacityFloor() {
+		return false
+	}
+	return true
+}
+
 // maxConcurrentDrains is the inflightDrains hard cap. Independent of
 // readyCapacityFloor after the 2026-05-24 knob decoupling — see spec
 // §1.
