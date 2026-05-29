@@ -540,6 +540,36 @@ const (
 	byteBudgetJitterHigh = 2.0
 )
 
+// byteBudgetMinRotationInterval is the wall-clock floor between a slot becoming
+// ready and its first byte-budget-triggered rotation. It re-anchors the
+// anti-TSPU rotation cadence to TIME rather than raw bytes.
+//
+// Why (Bug #4, 2026-05-29): byte budget (8 MiB) is a proxy for TCP lifetime.
+// At ~50 MB/s a slot burns 8 MiB in ~0.16s, so without a floor every slot
+// rotates several times per second — replacement handshakes (~0.5-1s) can't
+// keep up, the reserve cells exhaust ("no free cell"), and pool downlink
+// collapses mid-download. A new TCP that has lived 0.16s gives no anti-TSPU
+// benefit anyway (the censor's per-flow age/volume counter hasn't tripped on a
+// flow that young at that byte count over that little time). 10s floor: a slot
+// rotates on byte budget at most once per 10s, capping byte-driven rotations at
+// ~0.8/slot/8s-window even under saturation, while the 2-min age budget remains
+// the upper bound so TCPs still cycle well inside any TSPU window.
+//
+// Tunable via SHADOWLINK_BYTE_BUDGET_MIN_INTERVAL; 0 disables the floor
+// (restores pre-fix byte-only behaviour).
+const byteBudgetMinRotationInterval = 10 * time.Second
+
+// byteBudgetRotationAllowed reports whether a byte-budget-triggered rotation may
+// fire given the slot's current age and the configured minimum interval. A
+// non-positive minInterval disables the floor (always allowed). Pure function —
+// unit-tested in byte_budget_floor_test.go.
+func byteBudgetRotationAllowed(slotAge, minInterval time.Duration) bool {
+	if minInterval <= 0 {
+		return true
+	}
+	return slotAge >= minInterval
+}
+
 // sampleByteBudget returns a freshly sampled byte budget for the given slot
 // index. Returns 0 when byte-budget rotation is disabled (maxBytesPerSlot
 // = 0, viaCF mode). Otherwise samples uniformly from
@@ -796,6 +826,11 @@ type WSPoolTransport struct {
 	maxStreamsPerSlot int32 // cap on active streams per slot (0 = unlimited)
 	maxBytesPerSlot   int64         // rotate slot after N downstream bytes (0 = disabled)
 	maxSlotAge        time.Duration // rotate slot after this much wallclock age (0 = disabled)
+	// byteBudgetMinInterval — wall-clock floor before a byte-budget rotation
+	// may fire on a freshly-(re)connected slot (Bug #4 storm fix). 0 disables
+	// the floor. Defaults to byteBudgetMinRotationInterval when byte budget is
+	// enabled; see NewWSPoolTransport.
+	byteBudgetMinInterval time.Duration
 
 	// gracefulDrain — when true, slot rotation transitions through
 	// slotDraining + parallel reserve reconnect. When false, rotation
@@ -822,6 +857,12 @@ type WSPoolTransport struct {
 	// this value in decision logic. Use DrainIdleThreshold=0 to disable
 	// the idle gate. See spec 2026-05-25-drain-per-stream-idle-decision-design §2.5.
 	drainIdleStreamsMax int32
+
+	// ── Bug #6 sticky stream (adaptive backstop) ──
+	stickyMaxDrainAge   time.Duration // от старта дренажа; <=0 = sticky выключен
+	stickyMaxTotalBytes int64         // анти-TSPU потолок на TCP
+	stickyMaxSlots      int           // статический потолок (0=авто poolSize/2, <0=выкл)
+	stickyDrainCount    atomic.Int32  // слотов СЕЙЧАС в sticky-продлении (глобальный)
 
 	// reserveMu serializes ALL writes to p.slots[idx] across drain
 	// teardown, claim, and reconnect — see graceful drain spec §C3 race
@@ -986,6 +1027,13 @@ type WSPoolConfig struct {
 	// and create a handshake storm.
 	MaxSlotAge time.Duration
 
+	// ByteBudgetMinInterval is the wall-clock floor before a byte-budget
+	// rotation may fire on a freshly-(re)connected slot (Bug #4 storm fix).
+	// 0 → use the default (byteBudgetMinRotationInterval) when byte budget is
+	// enabled. Negative → disable the floor entirely. See
+	// byteBudgetRotationAllowed.
+	ByteBudgetMinInterval time.Duration
+
 	// WriteTimeout caps each WS frame's write deadline. 0 → WSAsyncWriter
 	// default (30s). For viaCF mode pass 5-8s: CF-side stalls propagate as
 	// TCP backpressure, and 30s means a stuck slot blocks traffic for 30s
@@ -1033,6 +1081,22 @@ type WSPoolConfig struct {
 	// Kept on the struct for env-parsing backward compatibility. Use
 	// DrainIdleThreshold=0 to disable the idle gate.
 	DrainIdleStreamsMax int32
+
+	// ── Bug #6 sticky stream (adaptive backstop) ──
+	// StickyMaxDrainAge: макс. время, которое активный стрим переживает дренаж
+	// (от старта дренажа, монотонные часы). 0 → default 10m. Отрицательное
+	// cfg-значение → kill switch: deadline-ветка деградирует в слепой hard-cap.
+	StickyMaxDrainAge time.Duration
+
+	// StickyMaxTotalBytes: анти-TSPU потолок на текущем отрезке TCP (downBytes).
+	// 0 → default 256 MiB. Рвём активный стрим если TCP прокачал столько —
+	// per-flow byte counter detection vector (см. poolSlot.byteBudget docstring).
+	StickyMaxTotalBytes int64
+
+	// StickyMaxSlots: статический потолок одновременно sticky-слотов. 0 → авто
+	// (poolSize/2). <0 → sticky запрещён (cap=0). Фактический cap ещё и
+	// динамический — гейтится readyCapacity (см. stickyQuotaAvailable, позже).
+	StickyMaxSlots int
 }
 
 // NewWSPoolTransport creates a pool of WebSocket connections.
@@ -1075,6 +1139,27 @@ func NewWSPoolTransport(cl *Client, cfg WSPoolConfig) *WSPoolTransport {
 	if drainIdleStreamsMax < 0 {
 		drainIdleStreamsMax = 0
 	}
+	// Byte-budget rotation rate floor (Bug #4). Apply the default only when
+	// byte-budget rotation is actually enabled (maxBytesPerSlot > 0); with the
+	// budget off the floor is meaningless. Negative cfg value disables it.
+	byteBudgetMinInterval := cfg.ByteBudgetMinInterval
+	if byteBudgetMinInterval == 0 && cfg.MaxBytesPerSlot > 0 {
+		byteBudgetMinInterval = byteBudgetMinRotationInterval
+	}
+	if byteBudgetMinInterval < 0 {
+		byteBudgetMinInterval = 0
+	}
+	// Bug #6 sticky stream defaults. StickyMaxDrainAge<=0 is the kill switch:
+	// the deadline branch degrades to the legacy blind hard-cap teardown.
+	stickyMaxDrainAge := cfg.StickyMaxDrainAge
+	if stickyMaxDrainAge == 0 {
+		stickyMaxDrainAge = 10 * time.Minute
+	}
+	// negative stays negative → sticky disabled (kill switch).
+	stickyMaxTotalBytes := cfg.StickyMaxTotalBytes
+	if stickyMaxTotalBytes <= 0 {
+		stickyMaxTotalBytes = 256 * 1024 * 1024 // 256 MiB
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &WSPoolTransport{
 		poolSize:          cfg.Size,
@@ -1082,10 +1167,14 @@ func NewWSPoolTransport(cl *Client, cfg WSPoolConfig) *WSPoolTransport {
 		maxStreamsPerSlot: int32(cfg.MaxStreamsPerSlot),
 		maxBytesPerSlot:   cfg.MaxBytesPerSlot,
 		maxSlotAge:        cfg.MaxSlotAge,
+		byteBudgetMinInterval: byteBudgetMinInterval,
 		gracefulDrain:       cfg.GracefulDrain,
 		drainHardCap:        drainHardCap,
 		drainIdleThreshold:  drainIdleThreshold,
 		drainIdleStreamsMax: drainIdleStreamsMax,
+		stickyMaxDrainAge:   stickyMaxDrainAge,
+		stickyMaxTotalBytes: stickyMaxTotalBytes,
+		stickyMaxSlots:      cfg.StickyMaxSlots,
 		serverAddr:        cfg.ServerAddr,
 		sniHost:           cfg.SNIHost,
 		cfIP:              cfg.CFIP,
@@ -1376,6 +1465,44 @@ func (p *WSPoolTransport) sendKeepaliveToAllSlots() {
 	}
 	if sent > 0 {
 		Trace("keepalive sent", "slots", sent)
+	}
+}
+
+// sendSlotSessionFIN emits a session-wide FIN (streamID=0) over the slot's
+// still-live transport so the server can release the session immediately
+// instead of waiting for its idle timeout.
+//
+// Why this exists (2026-05-29 ghost-session fix): when the pool retires a slot
+// it controls — preemptive rotation or graceful-drain teardown — the slot's WS
+// is closed but the server is never told the session is finished. The server
+// keeps the session in its map until SessionTimeout (90s). With max_conns=8 and
+// rotation every 30-90s, sessions accumulate faster than they idle out, so
+// h.sessions.Count() breaches MaxClients and the server serves a max_clients
+// decoy to a single legitimate client. A session-wide FIN drives the server's
+// handleFin (Remove + ActiveClients--) at once, mirroring the single-WS path's
+// sendBestEffortSessionFIN.
+//
+// Best-effort: the FIN rides the slot's control queue on the open transport;
+// any error is ignored (the server's idle sweeper is the fallback, exactly as
+// before this fix). Caller must invoke this BEFORE transport.Close(). No-op for
+// nil slot / nil session / nil transport (e.g. a slot already dead from a real
+// network failure — there is nothing live to send over).
+func (p *WSPoolTransport) sendSlotSessionFIN(slot *poolSlot) {
+	if slot == nil || slot.session == nil || slot.transport == nil {
+		return
+	}
+	// Session-wide FIN: empty payload routes through the server's handleFinChunk
+	// to handleFin (Remove session + ActiveClients--). NewStreamFinChunk(...,0)
+	// would NOT work — its 2-byte streamID lands on the per-stream branch and
+	// leaves the session to linger until idle timeout (the original bug).
+	fin := core.NewSessionFinChunk(slot.session.ID, slot.session.NextSeqNum())
+	enc, err := slot.session.EncryptChunk(fin)
+	if err != nil {
+		p.log.Debug("slot session FIN: encrypt failed", "err", err)
+		return
+	}
+	if err := slot.transport.WriteControlMessage(enc); err != nil {
+		p.log.Debug("slot session FIN: write failed", "err", err)
 	}
 }
 
@@ -2432,7 +2559,13 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 			// Always advance the counter (even if we don't rotate here) so a
 			// future read sees the correct total.
 			total := slot.downBytes.Add(int64(len(data)))
-			if total >= budget {
+			// Rate floor (Bug #4): even if the byte budget is exhausted, do not
+			// rotate until the slot has lived at least the min interval. Prevents
+			// the high-throughput rotation storm where a fast download burns the
+			// budget in a fraction of a second and the pool thrashes. The budget
+			// counter keeps accumulating; the rotation just waits for the time
+			// floor. The age budget (rotationWatchdog) remains the upper bound.
+			if total >= budget && byteBudgetRotationAllowed(time.Since(slotStart), p.byteBudgetMinInterval) {
 				if p.gracefulDrain {
 					// Graceful path: startDrain transitions the slot to
 					// slotDraining and spawns parallel reserve reconnect.
@@ -2727,6 +2860,17 @@ func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int, cause slotDeathCa
 	slot.streams.Store(0)
 	slot.pendingConnects.Store(0) // Reset: pending CONNECTs from dead slot can't be decremented normally
 
+	// For OUR teardowns (preemptive rotation / graceful-drain) the transport is
+	// still live, so tell the server to release this slot's session right away
+	// via a session-wide FIN before we close the socket. Without this the server
+	// keeps the session until its idle timeout; under pool rotation that lets
+	// sessions accumulate and trip the server's MaxClients gate (ghost-session
+	// bug, 2026-05-29). For deathCauseNatural the transport is already broken —
+	// nothing to send over — so we skip and rely on the server's idle sweeper.
+	if cause != deathCauseNatural {
+		p.sendSlotSessionFIN(slot)
+	}
+
 	if slot.transport != nil {
 		slot.transport.Close()
 	}
@@ -2761,8 +2905,19 @@ func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int, cause slotDeathCa
 
 // Close shuts down all slots.
 func (p *WSPoolTransport) Close() error {
-	p.cancel()
 	SetGlobalPoolForStats(nil)
+	// Best-effort: tell the server to release every slot's session before we
+	// tear the pool down (client exit / transport swap). Done BEFORE p.cancel()
+	// so the slot transports are still live for the FIN write. Without this a
+	// clean client shutdown leaves up to poolSize ghost sessions on the server
+	// until their idle timeout (ghost-session bug, 2026-05-29).
+	for _, slot := range p.slots {
+		if slot == nil || slot.getState() != slotReady {
+			continue
+		}
+		p.sendSlotSessionFIN(slot)
+	}
+	p.cancel()
 	for _, slot := range p.slots {
 		if slot == nil {
 			continue
