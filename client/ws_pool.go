@@ -1491,6 +1491,7 @@ func (p *WSPoolTransport) emitHealthSummary() {
 		"empty", empty,
 		"connecting", connecting,
 		"draining", draining,
+		"sticky_active", p.stickyDrainCount.Load(), // Bug #6: slots currently in sticky drain extension
 		"rate_limited_recent", rateLimited,
 		"active_streams", totalStreams,
 		"meltdowns_1m", p.meltdowns1m.Load(),
