@@ -138,3 +138,20 @@ func TestCreditSender_KeepsDeltaOnSendFailure(t *testing.T) {
 		t.Fatalf("pendingDelta after failed send = %d, want 600 (kept)", got)
 	}
 }
+
+func TestCreditSender_WatchdogFlushesStaleTail(t *testing.T) {
+	c := &Client{}
+	c.flowControlEnabled = true
+	c.flowWindow = 1000
+	c.streamFlow = map[uint16]*streamFlowState{7: {window: 1000}}
+	// below threshold (400 < 500) but a previous send happened long ago
+	c.streamFlow[7].pendingDelta.Store(400)
+	c.streamFlow[7].lastSentNs.Store(1) // non-zero, ancient → stale
+
+	var sentDelta uint32
+	c.flowSendForTest = func(_ uint16, d uint32) bool { sentDelta = d; return true }
+	c.creditSenderTick(0.5)
+	if sentDelta != 400 {
+		t.Fatalf("watchdog should flush stale tail: sent %d, want 400", sentDelta)
+	}
+}

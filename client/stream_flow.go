@@ -95,7 +95,8 @@ func (c *Client) creditSenderTick(thresholdRatio float64) {
 		// Watchdog fires only after at least one successful send (lastSentNs != 0);
 		// this prevents new streams (lastSentNs=0) from triggering a watchdog-send
 		// even when d < threshold (would break TestCreditSender_BelowThresholdNoSend).
-		stale := it.st.lastSentNs.Load() != 0 && nowNs-it.st.lastSentNs.Load() >= creditWatchdogNs
+		lastNs := it.st.lastSentNs.Load()
+		stale := lastNs != 0 && nowNs-lastNs >= creditWatchdogNs
 		if d < threshold && !stale {
 			continue
 		}
@@ -112,6 +113,10 @@ func (c *Client) creditSenderTick(thresholdRatio float64) {
 		// CAS failure → OnStreamConsumed added concurrently; next tick handles it.
 	}
 }
+
+// NOTE: c.flowTransport must be assigned BEFORE startCreditSender launches the
+// sender goroutine (happens-before via goroutine start) and not mutated after —
+// so this lock-free read is race-free. Wiring (later task) must honor this.
 
 // sendWindowUpdate builds and non-blockingly sends a WINDOW_UPDATE for streamID.
 // Returns true if enqueued. Uses the test seam when set.
