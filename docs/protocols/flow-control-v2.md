@@ -162,8 +162,12 @@ Teardown: `streamCredit.close()` + `wake()` при закрытии сессии
 | `FlowWindowUpdatesRecv` | counter | WINDOW\_UPDATE фреймов получено от клиента |
 | `UnknownFlag` | counter | Фреймы с неизвестным Flags байтом (defensive default) |
 | `FlowSessionsActive` | gauge | WS-сессий с активным flow control прямо сейчас |
+| `FlowStreamCreditWaitsTotal` | counter | Сколько раз per-stream relay заблокировался в `waitForCredit` (available≤0 дольше 1 мс) |
+| `FlowStreamCreditWaitMsTotal` | counter | Суммарное время простоя в `waitForCredit`, мс; высокое значение = окно 1 MiB мало, throughput душится credit'ом |
 
-> Все три метрики экспортируются через Prometheus (`writePromMetrics`) и JSON snapshot (`Snapshot()`) — добавлены 2026-05-30 для канарейки Bug #8.
+> `FlowStreamCreditWaitsTotal` / `FlowStreamCreditWaitMsTotal` замеряются в `server/websocket.go` вокруг `cr.waitForCredit(done)` — порог >1 мс фильтрует мгновенные возвраты когда credit был. Prom-имена: `shadowlink_flow_stream_credit_waits_total`, `shadowlink_flow_stream_credit_wait_ms_total`. Добавлены 2026-05-30 (Bug #8 MEDIUM-2) — канарейка «достаточно ли окно 1 MiB?».
+
+> Все метрики экспортируются через Prometheus (`writePromMetrics`) и JSON snapshot (`Snapshot()`) — добавлены 2026-05-30 для канарейки Bug #8.
 
 ---
 

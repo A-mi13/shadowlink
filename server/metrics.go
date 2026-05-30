@@ -205,6 +205,13 @@ type Metrics struct {
 	FlowWindowUpdatesRecv atomic.Uint64
 	UnknownFlag           atomic.Uint64
 	FlowSessionsActive    atomic.Int64
+	// Bug #8 credit-wait canary metrics (MEDIUM-2).
+	// FlowStreamCreditWaitsTotal — number of waitForCredit calls that actually blocked
+	// (available was <=0 on entry; threshold >1ms filters instant-return paths).
+	// FlowStreamCreditWaitMsTotal — total milliseconds spent blocked in waitForCredit;
+	// high value = window too small, throughput throttled by credit starvation.
+	FlowStreamCreditWaitsTotal  atomic.Uint64
+	FlowStreamCreditWaitMsTotal atomic.Uint64
 
 	backpressureActive atomic.Bool
 
@@ -397,6 +404,9 @@ type MetricsSnapshot struct {
 	FlowWindowUpdatesRecv uint64 `json:"flow_window_updates_recv"`
 	UnknownFlag           uint64 `json:"unknown_flag"`
 	FlowSessionsActive    int64  `json:"flow_sessions_active"`
+	// Bug #8 credit-wait canary (MEDIUM-2, 2026-05-30).
+	FlowStreamCreditWaitsTotal  uint64 `json:"flow_stream_credit_waits_total"`
+	FlowStreamCreditWaitMsTotal uint64 `json:"flow_stream_credit_wait_ms_total"`
 	// Wave 2.1 (2026-05-17) — WS upgrade accepts on retired legacy paths.
 	WSPathLegacyHits uint64 `json:"ws_path_legacy_hits"`
 	// T1.7 (Phase 2) — BroadcastStreamClose drain SLA telemetry.
@@ -461,6 +471,8 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		FlowWindowUpdatesRecv:              m.FlowWindowUpdatesRecv.Load(),
 		UnknownFlag:                        m.UnknownFlag.Load(),
 		FlowSessionsActive:                 m.FlowSessionsActive.Load(),
+		FlowStreamCreditWaitsTotal:         m.FlowStreamCreditWaitsTotal.Load(),
+		FlowStreamCreditWaitMsTotal:        m.FlowStreamCreditWaitMsTotal.Load(),
 		WSPathLegacyHits:                   m.WSPathLegacyHits.Load(),
 		BroadcastCloseDrainCount:           m.broadcastCloseDrainCount.Load(),
 		BroadcastCloseDrainSecondsLast:     float64(m.broadcastCloseDrainNanosLast.Load()) / 1e9,
@@ -696,4 +708,16 @@ func writePromMetrics(w http.ResponseWriter, s *MetricsSnapshot) {
 	fmt.Fprintf(w, "# HELP shadowlink_flow_sessions_active WS sessions with per-stream flow control negotiated ON (Bug #8)\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_flow_sessions_active gauge\n")
 	fmt.Fprintf(w, "shadowlink_flow_sessions_active %d\n", s.FlowSessionsActive)
+
+	// Bug #8 credit-wait canary (MEDIUM-2, 2026-05-30).
+	// High waits_total / wait_ms_total = window (default 1 MiB) too small;
+	// throughput is being throttled by credit starvation. If both stay near zero
+	// the 1 MiB window is adequate and can be kept.
+	fmt.Fprintf(w, "# HELP shadowlink_flow_stream_credit_waits_total Times the per-stream relay blocked in waitForCredit (available<=0 for >1ms); high value = window too small\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_flow_stream_credit_waits_total counter\n")
+	fmt.Fprintf(w, "shadowlink_flow_stream_credit_waits_total %d\n", s.FlowStreamCreditWaitsTotal)
+
+	fmt.Fprintf(w, "# HELP shadowlink_flow_stream_credit_wait_ms_total Total milliseconds the per-stream relay spent blocked in waitForCredit; high value = credit starvation\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_flow_stream_credit_wait_ms_total counter\n")
+	fmt.Fprintf(w, "shadowlink_flow_stream_credit_wait_ms_total %d\n", s.FlowStreamCreditWaitMsTotal)
 }

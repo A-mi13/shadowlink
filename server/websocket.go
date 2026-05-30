@@ -811,7 +811,12 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 							cr := credits[sid]
 							creditsMu.Unlock()
 							if cr != nil {
+								waitStart := time.Now()
 								got := cr.waitForCredit(done)
+								if waited := time.Since(waitStart); waited > time.Millisecond {
+									h.metrics.FlowStreamCreditWaitsTotal.Add(1)
+									h.metrics.FlowStreamCreditWaitMsTotal.Add(uint64(waited.Milliseconds()))
+								}
 								if got <= 0 {
 									return
 								}
