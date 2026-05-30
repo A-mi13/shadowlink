@@ -376,6 +376,26 @@ func BenchmarkEncryptWith(b *testing.B) {
 	}
 }
 
+func TestWindowUpdateChunk_RoundTrip(t *testing.T) {
+	c := NewWindowUpdateChunk(0x11223344, 7, 0xABCD, 0x0010FFFF)
+	if c.Flags != FlagWindowUpdate {
+		t.Fatalf("Flags = %#x, want %#x", c.Flags, FlagWindowUpdate)
+	}
+	sid, delta, err := ParseWindowUpdate(c.Payload)
+	if err != nil {
+		t.Fatalf("ParseWindowUpdate: %v", err)
+	}
+	if sid != 0xABCD || delta != 0x0010FFFF {
+		t.Fatalf("got sid=%#x delta=%#x, want 0xABCD/0x0010FFFF", sid, delta)
+	}
+}
+
+func TestParseWindowUpdate_TooShort(t *testing.T) {
+	if _, _, err := ParseWindowUpdate([]byte{0x00, 0x01, 0x02}); err == nil {
+		t.Fatal("expected error for <6-byte payload, got nil")
+	}
+}
+
 func BenchmarkDecryptWith(b *testing.B) {
 	key := make([]byte, 32)
 	rand.Read(key)

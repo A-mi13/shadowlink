@@ -19,7 +19,8 @@ const (
 	FlagControl    byte = 0x06
 	FlagConnect    byte = 0x07 // payload = target address "host:port"
 	FlagUDP        byte = 0x08 // payload = [StreamID(2)] + [UDP data]
-	FlagStreamOpen byte = 0x09 // client requests a streaming POST response (server→client download channel)
+	FlagStreamOpen   byte = 0x09 // client requests a streaming POST response (server→client download channel)
+	FlagWindowUpdate byte = 0x0A // payload = [StreamID(2)] + [delta(4)] per-stream flow-control credit
 )
 
 const (
@@ -212,6 +213,21 @@ func NewStreamFinChunk(sessID, seq uint32, streamID uint16) *Chunk {
 	return &Chunk{SessionID: sessID, SeqNum: seq, Flags: FlagFin, Payload: p}
 }
 
+// NewSessionFinChunk creates a session-wide FIN chunk that tears down the whole
+// session, not a single stream.
+//
+// Wire contract: the server's handleFinChunk routes by payload length —
+// len(payload) >= 2 is a per-stream FIN (streamID = payload[0:2]); a shorter
+// payload is session-wide. We therefore emit an EMPTY payload so the server
+// runs handleFin (Remove session + ActiveClients--) immediately rather than
+// handleStreamFin (which would only close stream 0 and leave the session to
+// linger until its idle timeout). This is the constructor that actually
+// releases a server session — NewStreamFinChunk(...,0) does NOT, because its
+// 2-byte streamID lands on the per-stream branch.
+func NewSessionFinChunk(sessID, seq uint32) *Chunk {
+	return &Chunk{SessionID: sessID, SeqNum: seq, Flags: FlagFin, Payload: nil}
+}
+
 // ParseStreamID extracts StreamID from payload (first 2 bytes).
 // Returns streamID=0 if payload too short (legacy chunks).
 func ParseStreamID(payload []byte) (streamID uint16, data []byte) {
@@ -219,6 +235,28 @@ func ParseStreamID(payload []byte) (streamID uint16, data []byte) {
 		return 0, payload
 	}
 	return binary.BigEndian.Uint16(payload[0:2]), payload[2:]
+}
+
+// NewWindowUpdateChunk creates a per-stream flow-control credit update.
+// Payload format: [StreamID(2 BE)] + [delta(4 BE)]. delta is the additive
+// number of bytes the receiver has consumed since its last update (HTTP/2
+// WINDOW_UPDATE semantics — always positive, never absolute).
+func NewWindowUpdateChunk(sessID, seq uint32, streamID uint16, delta uint32) *Chunk {
+	p := make([]byte, 6)
+	binary.BigEndian.PutUint16(p[0:2], streamID)
+	binary.BigEndian.PutUint32(p[2:6], delta)
+	return &Chunk{SessionID: sessID, SeqNum: seq, Flags: FlagWindowUpdate, Payload: p}
+}
+
+// ParseWindowUpdate extracts stream ID and credit delta from a window-update
+// payload. Returns an error (never panics) on a payload shorter than 6 bytes.
+func ParseWindowUpdate(payload []byte) (streamID uint16, delta uint32, err error) {
+	if len(payload) < 6 {
+		return 0, 0, fmt.Errorf("window update payload too short: %d < 6", len(payload))
+	}
+	streamID = binary.BigEndian.Uint16(payload[0:2])
+	delta = binary.BigEndian.Uint32(payload[2:6])
+	return streamID, delta, nil
 }
 
 // NewUDPDataChunk creates a UDP data chunk.
