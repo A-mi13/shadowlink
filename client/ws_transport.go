@@ -602,7 +602,11 @@ func (t *WebSocketTransport) sendBestEffortSessionFIN(token []byte, session *cor
 	// Build the FIN chunk synchronously so we capture the seq number BEFORE
 	// returning to the caller — concurrent goroutines on the same session
 	// must not collide on NextSeqNum() ordering.
-	fin := core.NewStreamFinChunk(session.ID, session.NextSeqNum(), 0)
+	// Session-wide FIN (empty payload) so the server runs handleFin and releases
+	// the session. NewStreamFinChunk(...,0) does NOT — its 2-byte streamID routes
+	// to the per-stream branch and leaves the session to linger until idle
+	// timeout (latent bug found alongside the pool ghost-session fix, 2026-05-29).
+	fin := core.NewSessionFinChunk(session.ID, session.NextSeqNum())
 	encrypted, err := session.EncryptChunk(fin)
 	if err != nil {
 		// Session may have been destroyed concurrently between handshake-OK
@@ -804,6 +808,18 @@ func (t *WebSocketTransport) WriteControlMessage(data []byte) error {
 		return fmt.Errorf("websocket not connected")
 	}
 	return w.EnqueueControl(websocket.BinaryMessage, data)
+}
+
+// TryWriteControlMessage enqueues a control frame without blocking. Returns
+// false if the async writer is absent or its control channel is full.
+func (t *WebSocketTransport) TryWriteControlMessage(data []byte) bool {
+	t.mu.Lock()
+	w := t.asyncWriter
+	t.mu.Unlock()
+	if w == nil {
+		return false
+	}
+	return w.TryEnqueueControl(websocket.BinaryMessage, data)
 }
 
 // StartReader runs the background WS message reader.

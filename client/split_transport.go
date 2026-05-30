@@ -61,6 +61,25 @@ type ControlPoolAware interface {
 	WriteControlMessageForStream(streamID uint16, data []byte) error
 }
 
+// TryControlPoolAware extends ControlPoolAware with a non-blocking priority
+// write per stream. Used by the flow-control credit sender (Bug #8): a credit
+// frame that can't be enqueued right now is simply retried on the next tick
+// (the delta is additive), so the sender must never block.
+type TryControlPoolAware interface {
+	TryWriteControlMessageForStream(streamID uint16, data []byte) bool
+}
+
+// TryStreamWriteControl sends a control frame to the stream's slot without
+// blocking. Returns true if enqueued, false if the channel was full / the
+// transport doesn't support non-blocking control writes (caller keeps the
+// pending delta to retry).
+func TryStreamWriteControl(wst StreamTransport, streamID uint16, data []byte) bool {
+	if tpa, ok := wst.(TryControlPoolAware); ok {
+		return tpa.TryWriteControlMessageForStream(streamID, data)
+	}
+	return false
+}
+
 // PoolReadiness reports the live health of an underlying transport pool. Used
 // by the SOCKS5 UDP ASSOCIATE handler (C12 F6, May audit) to fail-fast when
 // the pool is starved of ready slots — without this gate, a UDP ASSOCIATE

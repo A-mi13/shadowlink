@@ -2401,6 +2401,41 @@ func (p *WSPoolTransport) WriteControlMessageForStream(streamID uint16, data []b
 	return p.WriteControlMessage(data)
 }
 
+// TryWriteControlMessageForStream sends a control frame to the stream's slot
+// WITHOUT blocking (Bug #8 credit sender). Returns true if enqueued. Returns
+// false if the stream has no ready/draining slot or the slot's control channel
+// is full — the caller keeps the accumulated delta for the next tick.
+func (p *WSPoolTransport) TryWriteControlMessageForStream(streamID uint16, data []byte) bool {
+	v, ok := p.streamMap.Load(streamID)
+	if !ok {
+		return false
+	}
+	e, ok := v.(*streamEntry)
+	if !ok {
+		return false
+	}
+	idx := e.slotIdx
+	if idx >= len(p.slots) {
+		return false
+	}
+	slot := p.slots[idx]
+	if slot == nil || slot.transport == nil {
+		return false
+	}
+	if st := slot.getState(); st != slotReady && st != slotDraining {
+		return false
+	}
+	tw, ok := slot.transport.(interface{ TryWriteControlMessage(data []byte) bool })
+	if !ok {
+		return false
+	}
+	if tw.TryWriteControlMessage(data) {
+		e.lastWriteNs.Store(time.Now().UnixNano())
+		return true
+	}
+	return false
+}
+
 // WriteMessage sends a data frame to a random ready slot (for non-stream data).
 func (p *WSPoolTransport) WriteMessage(data []byte) error {
 	for _, slot := range p.slots {
