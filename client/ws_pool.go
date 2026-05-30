@@ -1058,11 +1058,12 @@ type WSPoolTransport struct {
 
 // Compile-time assertions.
 var (
-	_ StreamTransport  = (*WSPoolTransport)(nil)
-	_ PoolAware        = (*WSPoolTransport)(nil)
-	_ PendingTracker   = (*WSPoolTransport)(nil)
-	_ ControlPoolAware = (*WSPoolTransport)(nil)
-	_ PoolReadiness    = (*WSPoolTransport)(nil)
+	_ StreamTransport      = (*WSPoolTransport)(nil)
+	_ PoolAware            = (*WSPoolTransport)(nil)
+	_ PendingTracker       = (*WSPoolTransport)(nil)
+	_ ControlPoolAware     = (*WSPoolTransport)(nil)
+	_ TryControlPoolAware  = (*WSPoolTransport)(nil) // Bug #8 Task 11: guards TryWriteControlMessageForStream
+	_ PoolReadiness        = (*WSPoolTransport)(nil)
 )
 
 // WSPoolConfig configures the WebSocket pool.

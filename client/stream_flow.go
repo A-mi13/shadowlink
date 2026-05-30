@@ -31,7 +31,7 @@ func flowWindowFromEnv(def uint64) uint64 {
 	if v == "" {
 		return clampFlowWindow(def)
 	}
-	n, err := strconv.ParseUint(v, 10, 32)
+	n, err := strconv.ParseUint(v, 10, 64)
 	if err != nil {
 		return clampFlowWindow(def)
 	}

@@ -147,15 +147,11 @@ type RateLimitConfig struct {
 	ClientIDSoftWindowSec int `yaml:"client_id_soft_window_sec"`
 }
 
-// flowMaxWindowOrDefault returns Config.FlowMaxWindow if set (non-zero),
-// otherwise 1 MiB (the Bug #8 production default). Zero in Config means
-// "operator did not set it", not "disable flow control".
-// To disable flow control via config, set FlowMaxWindow to a sentinel —
-// use the CLI flag -flow-max-window=0 which bypasses this default.
+// flowMaxWindowOrDefault returns Config.FlowMaxWindow as-is.
+// Zero means "disable flow control" — the default is set at the CLI flag
+// level (flag default 1048576), not here. This preserves the invariant
+// that an explicit -flow-max-window=0 actually disables flow control.
 func (c Config) flowMaxWindowOrDefault() uint64 {
-	if c.FlowMaxWindow == 0 {
-		return 1 << 20 // 1 MiB default
-	}
 	return c.FlowMaxWindow
 }
 
