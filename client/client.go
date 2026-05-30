@@ -145,6 +145,13 @@ type Client struct {
 	streamOverflow   map[uint16]*streamOverflowState
 	streamOverflowMu sync.Mutex
 
+	// Per-stream flow control (Bug #8). Guarded by streamMu (same lifecycle as
+	// streamChans). flowControlEnabled is set true only when the slot this
+	// client's streams ride negotiated FLOWCTL with the server.
+	streamFlow         map[uint16]*streamFlowState
+	flowControlEnabled bool
+	flowWindow         uint64
+
 	// Cold-start observability (Task D5, 2026-05-02 plan).
 	//
 	// connectStartUnixNano stores time.Now().UnixNano() at the start of
@@ -694,6 +701,12 @@ func (c *Client) RegisterStream(streamID uint16) (chan []byte, error) {
 	}
 	ch := make(chan []byte, 512) // large buffer to avoid drops
 	c.streamChans[streamID] = ch
+	if c.flowControlEnabled {
+		if c.streamFlow == nil {
+			c.streamFlow = make(map[uint16]*streamFlowState)
+		}
+		c.streamFlow[streamID] = &streamFlowState{window: c.flowWindow}
+	}
 	return ch, nil
 }
 
@@ -702,6 +715,7 @@ func (c *Client) RegisterStream(streamID uint16) (chan []byte, error) {
 func (c *Client) UnregisterStream(streamID uint16) {
 	c.streamMu.Lock()
 	delete(c.streamChans, streamID)
+	delete(c.streamFlow, streamID)
 	c.streamMu.Unlock()
 	c.flushBufferOverflow(streamID)
 }
