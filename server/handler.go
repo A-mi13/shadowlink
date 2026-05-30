@@ -246,7 +246,7 @@ func NewHandler(serverKey *core.KeyPair, config Config, decoyDir string) *Handle
 		tunnels:            make(map[uint32]*Tunnel),
 		exemption:          exempt,
 		safeDialFn:         SafeDial,
-		flowMaxWindow:      1 << 20, // 1 MiB default (Bug #8); Task 11 exposes via Config
+		flowMaxWindow:      config.flowMaxWindowOrDefault(), // Bug #8 Task 11: from Config.FlowMaxWindow
 	}
 
 	// Eagerly populate the asymmetric decoy fixture used by the

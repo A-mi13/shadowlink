@@ -1042,6 +1042,7 @@ func (c *Client) NewStreamSession(ctx context.Context) (*core.Session, []byte, e
 // Close disconnects and cleans up resources.
 // H2 fix: zeroes key material before releasing session.
 func (c *Client) Close() error {
+	c.stopCreditSender()
 	c.mu.Lock()
 	if c.session != nil {
 		c.session.Destroy() // zero SendKey, RecvKey, oldRecvKey
@@ -1105,6 +1106,7 @@ func (c *Client) ConnectWithRetry(ctx context.Context) error {
 // snapshotted the session can finish their encrypt/decrypt operations. New handlers
 // will see session=nil and return "not connected" immediately.
 func (c *Client) ResetStreams() {
+	c.stopCreditSender()
 	c.streamMu.Lock()
 	for id, ch := range c.streamChans {
 		close(ch)

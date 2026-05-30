@@ -1,6 +1,9 @@
 package client
 
 import (
+	"os"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -8,6 +11,53 @@ import (
 
 	"github.com/nixavpn/shadowlink/core"
 )
+
+const maxFlowWindow = 6 << 20 // M2: window/minChunk must fit incomingCh cap (512)
+
+// clampFlowWindow caps the window so window/minChunk stays within the
+// per-stream incomingCh capacity (512), preventing overflow re-introduction.
+func clampFlowWindow(w uint64) uint64 {
+	if w > maxFlowWindow {
+		return maxFlowWindow
+	}
+	return w
+}
+
+// flowWindowFromEnv resolves the client's desired flow-control window.
+// SHADOWLINK_FLOW_WINDOW (bytes): empty/unset → def; "0" → 0 (disable);
+// other → parsed value (clamped). Invalid → def.
+func flowWindowFromEnv(def uint64) uint64 {
+	v := strings.TrimSpace(os.Getenv("SHADOWLINK_FLOW_WINDOW"))
+	if v == "" {
+		return clampFlowWindow(def)
+	}
+	n, err := strconv.ParseUint(v, 10, 32)
+	if err != nil {
+		return clampFlowWindow(def)
+	}
+	if n == 0 {
+		return 0
+	}
+	return clampFlowWindow(n)
+}
+
+// EnableFlowControl turns on per-stream flow control for this client and starts
+// the credit sender. Idempotent: safe to call once per ready slot (only the
+// first call wires state + launches the sender). transport is the pool the
+// credit sender rides. Called from connectSlot when a slot negotiates FLOWCTL.
+func (c *Client) EnableFlowControl(window uint64, transport StreamTransport) {
+	c.streamMu.Lock()
+	already := c.flowControlEnabled
+	if !already {
+		c.flowControlEnabled = true
+		c.flowWindow = window
+		c.flowTransport = transport
+	}
+	c.streamMu.Unlock()
+	if !already {
+		c.startCreditSender()
+	}
+}
 
 // stream_flow.go — client-side per-stream flow control (Bug #8). The downlink
 // relay goroutine calls OnStreamConsumed after each successful conn.Write into

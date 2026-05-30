@@ -25,6 +25,17 @@ type Config struct {
 	// decoy_template_id assignments at deploy time.
 	DomainDecoyMap map[string]string `yaml:"domain_decoy_map,omitempty"`
 
+	// DomainPersonaMap maps Host header → persona ("saas"|"blog"|"utility") for
+	// per-host persona-aware DecoyHandler responses. Populated only when YAML uses
+	// the new domain_decoy_map format ({directory, persona} per host). Nil/empty
+	// for legacy YAML — all hosts then fall back to DefaultDecoyPersona.
+	// Phase G — spec §8.2.
+	DomainPersonaMap map[string]string `yaml:"-"`
+
+	// DefaultDecoyPersona is the persona used when a host is not in DomainPersonaMap.
+	// Empty → "saas" (matches NewDecoyHandlerV2 default). Phase G — spec §2.4.
+	DefaultDecoyPersona string `yaml:"-"`
+
 	// MaxClients is the maximum number of concurrent client sessions.
 	// Configurable per-server in NixaVPN admin panel.
 	MaxClients int
@@ -61,6 +72,12 @@ type Config struct {
 	// DefaultMaxDevices is the default device limit per user (default 3).
 	DefaultMaxDevices int
 
+	// FlowMaxWindow is the maximum per-stream flow-control window (bytes) the
+	// server grants during FLOWCTL negotiation. 0 disables flow control (server
+	// will not advertise FLOWCTL capability). Default 1 MiB.
+	// Bug #8: exposed via -flow-max-window CLI flag (Task 11).
+	FlowMaxWindow uint64
+
 	// BlockDomains is a list of domain suffixes/exact names the server refuses to dial.
 	BlockDomains []string
 
@@ -95,10 +112,6 @@ type Config struct {
 	// the limit and falling through to the decoy (HTTP 404 / HTML responses).
 	HandshakeRateLimitPerMin int
 
-	// LiveBlog configures the /blog/* and /_cdn/* live reverse-proxy decoy paths.
-	// Zero value has Enabled=false — no behaviour change when not set.
-	LiveBlog LiveBlogConfig `yaml:"live_blog"`
-
 	// RateLimit configures per-bucket rate-limit specs (handshake, ws_upgrade)
 	// and the ClientID exemption cache. Zero values fall through to safe
 	// defaults applied at handler construction (NewHandler) so existing
@@ -132,6 +145,18 @@ type RateLimitConfig struct {
 	// ClientIDSoftWindowSec sliding window for the soft limit (seconds).
 	// Zero → 60.
 	ClientIDSoftWindowSec int `yaml:"client_id_soft_window_sec"`
+}
+
+// flowMaxWindowOrDefault returns Config.FlowMaxWindow if set (non-zero),
+// otherwise 1 MiB (the Bug #8 production default). Zero in Config means
+// "operator did not set it", not "disable flow control".
+// To disable flow control via config, set FlowMaxWindow to a sentinel —
+// use the CLI flag -flow-max-window=0 which bypasses this default.
+func (c Config) flowMaxWindowOrDefault() uint64 {
+	if c.FlowMaxWindow == 0 {
+		return 1 << 20 // 1 MiB default
+	}
+	return c.FlowMaxWindow
 }
 
 // DefaultConfig returns production-ready defaults for a 2 vCPU / 2 GB RAM VPS.
@@ -169,108 +194,3 @@ func TestConfig() Config {
 	}
 }
 
-// LiveBlogConfig configures the /blog/* and /_cdn/* reverse-proxy decoy paths.
-// Default Enabled=false — zero regression when omitted from YAML.
-// See docs/superpowers/specs/2026-04-23-t13-live-decoy-design.md.
-type LiveBlogConfig struct {
-	Enabled           bool          `yaml:"enabled"`
-	Upstream          string        `yaml:"upstream"`            // e.g. "https://habr.com"
-	CDNUpstream       string        `yaml:"cdn_upstream"`        // e.g. "https://dr.habracdn.net"
-	CacheTTL          time.Duration `yaml:"cache_ttl"`           // fresh cache window, default 1h
-	CacheMaxEntries   int           `yaml:"cache_max_entries"`   // LRU cap, default 500
-	CacheStaleGrace   time.Duration `yaml:"cache_stale_grace"`   // serve-stale window on fetch fail, default 24h
-	UpstreamRPS       float64       `yaml:"upstream_rps"`        // rate.Limiter RPS, default 1.0
-	UpstreamBurst     int           `yaml:"upstream_burst"`      // rate.Limiter burst, default 5
-	UpstreamTimeout   time.Duration `yaml:"upstream_timeout"`    // http.Client.Timeout, default 10s
-	MaxBodyBytes      int           `yaml:"max_body_bytes"`      // /blog/* body cap, default 2 MiB
-	CDNMaxBodyBytes   int           `yaml:"cdn_max_body_bytes"`  // /_cdn/* body cap, default 16 MiB
-	CanaryArticleID   string        `yaml:"canary_article_id"`   // digit-only habr article ID
-	CanaryInterval    time.Duration `yaml:"canary_interval"`     // canary loop period, default 15m
-	TargetBrand       string        `yaml:"target_brand"`        // replaces visible "Хабр" text
-	TargetLogoPath    string        `yaml:"target_logo_path"`    // e.g. "/assets/logo.svg"
-	TargetTitleSuffix string        `yaml:"target_title_suffix"` // appended to <title>
-	FallbackLatencyMs int           `yaml:"fallback_latency_ms"` // fail/limit path target latency, default 150
-	FallbackJitterMs  int           `yaml:"fallback_jitter_ms"`  // jitter ±ms around latency, default 20
-}
-
-// DefaultLiveBlogConfig returns the built-in defaults. Applied when a YAML key
-// is present but empty, or when filling missing keys on a loaded config.
-func DefaultLiveBlogConfig() LiveBlogConfig {
-	return LiveBlogConfig{
-		Enabled:           false,
-		Upstream:          "https://habr.com",
-		CDNUpstream:       "https://dr.habracdn.net",
-		CacheTTL:          time.Hour,
-		CacheMaxEntries:   500,
-		CacheStaleGrace:   24 * time.Hour,
-		UpstreamRPS:       1.0,
-		UpstreamBurst:     5,
-		UpstreamTimeout:   10 * time.Second,
-		MaxBodyBytes:      2 * 1024 * 1024,
-		CDNMaxBodyBytes:   16 * 1024 * 1024,
-		CanaryArticleID:   "723128",
-		CanaryInterval:    15 * time.Minute,
-		TargetBrand:       "DataCanvases",
-		TargetLogoPath:    "/assets/logo.svg",
-		TargetTitleSuffix: " — DataCanvases Research",
-		FallbackLatencyMs: 150,
-		FallbackJitterMs:  20,
-	}
-}
-
-// applyLiveBlogDefaults fills zero-valued fields in c with defaults. Called
-// after YAML load so operators can override only the values they care about.
-func applyLiveBlogDefaults(c *LiveBlogConfig) {
-	d := DefaultLiveBlogConfig()
-	if c.Upstream == "" {
-		c.Upstream = d.Upstream
-	}
-	if c.CDNUpstream == "" {
-		c.CDNUpstream = d.CDNUpstream
-	}
-	if c.CacheTTL == 0 {
-		c.CacheTTL = d.CacheTTL
-	}
-	if c.CacheMaxEntries == 0 {
-		c.CacheMaxEntries = d.CacheMaxEntries
-	}
-	if c.CacheStaleGrace == 0 {
-		c.CacheStaleGrace = d.CacheStaleGrace
-	}
-	if c.UpstreamRPS == 0 {
-		c.UpstreamRPS = d.UpstreamRPS
-	}
-	if c.UpstreamBurst == 0 {
-		c.UpstreamBurst = d.UpstreamBurst
-	}
-	if c.UpstreamTimeout == 0 {
-		c.UpstreamTimeout = d.UpstreamTimeout
-	}
-	if c.MaxBodyBytes == 0 {
-		c.MaxBodyBytes = d.MaxBodyBytes
-	}
-	if c.CDNMaxBodyBytes == 0 {
-		c.CDNMaxBodyBytes = d.CDNMaxBodyBytes
-	}
-	if c.CanaryArticleID == "" {
-		c.CanaryArticleID = d.CanaryArticleID
-	}
-	if c.CanaryInterval == 0 {
-		c.CanaryInterval = d.CanaryInterval
-	}
-	if c.TargetBrand == "" {
-		c.TargetBrand = d.TargetBrand
-	}
-	if c.TargetLogoPath == "" {
-		c.TargetLogoPath = d.TargetLogoPath
-	}
-	if c.TargetTitleSuffix == "" {
-		c.TargetTitleSuffix = d.TargetTitleSuffix
-	}
-	if c.FallbackLatencyMs <= 0 {
-		c.FallbackLatencyMs = d.FallbackLatencyMs
-	}
-	if c.FallbackJitterMs < 0 {
-		c.FallbackJitterMs = d.FallbackJitterMs
-	}
-}

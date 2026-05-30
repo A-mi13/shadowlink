@@ -1277,6 +1277,7 @@ func NewWSPoolTransport(cl *Client, cfg WSPoolConfig) *WSPoolTransport {
 		cancel:            cancel,
 		log:               slog.Default(),
 	}
+	p.flowDesiredWindow = flowWindowFromEnv(1 << 20)
 	p.allocSlots()
 	return p
 }
@@ -1678,6 +1679,7 @@ func (p *WSPoolTransport) connectSlot(ctx context.Context, idx int) error {
 	if wst.flowControlEnabled {
 		slot.flowControlEnabled = true
 		slot.flowWindow = uint64(wst.flowWindow)
+		p.client.EnableFlowControl(uint64(wst.flowWindow), p)
 	}
 	// Reset downstream byte counter — fresh TCP starts the TSPU 15-20KB budget over.
 	slot.downBytes.Store(0)

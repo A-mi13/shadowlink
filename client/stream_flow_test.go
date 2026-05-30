@@ -167,3 +167,27 @@ func TestParseFlowAck_Recognizes(t *testing.T) {
 		t.Fatal("nil ack must not parse as flow ack")
 	}
 }
+
+func TestFlowWindowFromEnv(t *testing.T) {
+	t.Setenv("SHADOWLINK_FLOW_WINDOW", "2097152") // 2 MiB
+	if got := flowWindowFromEnv(1 << 20); got != 2<<20 {
+		t.Fatalf("got %d, want 2MiB", got)
+	}
+	t.Setenv("SHADOWLINK_FLOW_WINDOW", "0")
+	if got := flowWindowFromEnv(1 << 20); got != 0 {
+		t.Fatalf("got %d, want 0 (off)", got)
+	}
+	t.Setenv("SHADOWLINK_FLOW_WINDOW", "")
+	if got := flowWindowFromEnv(1 << 20); got != 1<<20 {
+		t.Fatalf("got %d, want default 1MiB", got)
+	}
+}
+
+func TestClampFlowWindow(t *testing.T) {
+	if got := clampFlowWindow(100 << 20); got != maxFlowWindow {
+		t.Fatalf("clamp got %d, want maxFlowWindow %d", got, maxFlowWindow)
+	}
+	if got := clampFlowWindow(512 << 10); got != 512<<10 {
+		t.Fatalf("clamp got %d, want 512KiB unchanged", got)
+	}
+}
