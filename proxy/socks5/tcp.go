@@ -651,13 +651,9 @@ func tunnelTCPStream(ctx context.Context, conn net.Conn, cl *client.Client, wst 
 		for {
 			n, err := conn.Read(buf)
 			if err != nil {
-				wclosed := false
-				if hasWriteCloseDetector {
-					wclosed = connWriteClosed.writeClosed()
-				}
 				slog.Info("uplink done", "dest", destAddr, "stream", streamID,
 					"bytes", total, "uploads", uploads, "elapsed", time.Since(relayStart).Round(time.Millisecond),
-					"err", err, "fullClose", wclosed)
+					"err", err)
 
 				// In-process tun2socks path: uplink EOF does NOT mean the stream
 				// is over. tun2socks does appConn.CloseWrite() (TCP half-close)
@@ -776,9 +772,7 @@ func tunnelTCPStream(ctx context.Context, conn net.Conn, cl *client.Client, wst 
 						"chunk", chunks, "bytes", len(data), "totalBytes", total)
 				}
 				if _, err := conn.Write(data); err != nil {
-					slog.Warn("downlink write error", "dest", destAddr, "stream", streamID, "err", err,
-						"connectConfirmed", connectConfirmed, "downlinkBytes", total, "downlinkChunks", chunks,
-						"streamAgeMs", time.Since(relayStart).Milliseconds())
+					slog.Warn("downlink write error", "dest", destAddr, "stream", streamID, "err", err)
 					// Consumer (local SOCKS5 client) is gone. The uplink
 					// goroutine still sits in its 15s grace before
 					// canceling ctx2, during which the WS demux keeps
@@ -812,8 +806,7 @@ func tunnelTCPStream(ctx context.Context, conn net.Conn, cl *client.Client, wst 
 				return
 			case <-ctx2.Done():
 				slog.Info("downlink cancelled", "dest", destAddr, "stream", streamID,
-					"bytes", total, "chunks", chunks, "elapsed", time.Since(relayStart).Round(time.Millisecond),
-					"connectConfirmed", connectConfirmed, "ctxErr", ctx2.Err())
+					"bytes", total, "chunks", chunks, "elapsed", time.Since(relayStart).Round(time.Millisecond))
 				return
 			}
 		}
