@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nixavpn/shadowlink/client"
@@ -407,6 +408,11 @@ func HandleTCPConnectWSPerStream(ctx context.Context, conn net.Conn, cl *client.
 // HandleTCPConnectWS handles a SOCKS5 CONNECT command over WebSocket (full-duplex).
 // Each CONNECT gets a StreamID. All streams share one WS connection.
 // Server pushes data instantly -- no polling.
+//
+// This is the loopback-SOCKS5 front-end: it applies routing (block/direct) then
+// delegates the tunnel relay to tunnelTCPStream. The in-process tun2socks dialer
+// (Bug #5) calls tunnelTCPStream directly (routing already done by BypassDialer),
+// so the relay core is shared and behavior-identical between both front-ends.
 func HandleTCPConnectWS(ctx context.Context, conn net.Conn, cl *client.Client, wst client.StreamTransport, router *client.Router, destAddr string, srv *Server) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -424,6 +430,40 @@ func HandleTCPConnectWS(ctx context.Context, conn net.Conn, cl *client.Client, w
 	case client.ActionDirect:
 		DirectDial(conn, destAddr)
 		return
+	}
+
+	tunnelTCPStream(ctx, conn, cl, wst, destAddr, srv, true)
+}
+
+// tunnelTCPStream is the shared TCP relay core: it tunnels `conn` to `destAddr`
+// over the WS transport, having ALREADY decided the destination is tunnel-bound
+// (no router.Decide here — callers do routing). Used by both the loopback SOCKS5
+// front-end (HandleTCPConnectWS) and the in-process tun2socks dialer (Bug #5).
+//
+// ctx governs the relay lifetime: pass a long-lived (engine) context. The
+// in-process dialer must NOT pass tun2socks' 5s dial-ctx here, or every stream
+// would be torn down after 5s (review HIGH-5). conn may be a real socket
+// (loopback listener) or a buffered memConn (in-process) — the relay is
+// transport-agnostic and relies only on net.Conn + half-close semantics.
+//
+// socks5Replies controls whether SOCKS5 protocol replies (ReplySuccess /
+// ReplyConnRefused / ReplyNotAllowed) are written to conn. The loopback SOCKS5
+// front-end (HandleTCPConnectWS) passes true: its peer is a real SOCKS5 client
+// that parses those reply bytes. The in-process tun2socks dialer passes false:
+// tun2socks established the TCP flow itself and expects conn to carry ONLY raw
+// application bytes — injecting the 10-byte SOCKS5 reply would prepend
+// `05 00 00 01 ...` to the stream and corrupt the very first read (manifesting
+// as "tls: first record does not look like a TLS handshake" / garbage downlink).
+// On the !socks5Replies path a failed CONNECT is signalled the raw-stream way:
+// the relay simply returns, the caller's defer closes the memConn, and the app
+// side observes EOF.
+func tunnelTCPStream(ctx context.Context, conn net.Conn, cl *client.Client, wst client.StreamTransport, destAddr string, srv *Server, socks5Replies bool) {
+	// reply writes a SOCKS5 protocol reply to conn only when the front-end is a
+	// real SOCKS5 client. No-op for the in-process (raw-stream) dialer.
+	reply := func(b []byte) {
+		if socks5Replies {
+			conn.Write(b)
+		}
 	}
 
 	// Tunnel path — считаем CONNECT. Block/Direct сюда не доходят (трафик
@@ -444,7 +484,7 @@ func HandleTCPConnectWS(ctx context.Context, conn net.Conn, cl *client.Client, w
 		// CONNECTs instantly, creating a cascade. Waiting lets them drain naturally.
 		if srv != nil && !srv.AcquireConnect(10*time.Second) {
 			slog.Warn("WS CONNECT throttled (semaphore full)", "dest", destAddr)
-			conn.Write(ReplyConnRefused)
+			reply(ReplyConnRefused)
 			return
 		}
 		acquiredSem = true
@@ -462,7 +502,7 @@ func HandleTCPConnectWS(ctx context.Context, conn net.Conn, cl *client.Client, w
 	incomingCh, regErr := cl.RegisterStream(streamID)
 	if regErr != nil {
 		slog.Warn("stream limit exceeded", "error", regErr)
-		conn.Write(ReplyConnRefused)
+		reply(ReplyConnRefused)
 		return
 	}
 	// CloseStream sends per-stream FIN to server so it frees the stream slot.
@@ -494,13 +534,13 @@ func HandleTCPConnectWS(ctx context.Context, conn net.Conn, cl *client.Client, w
 		}
 		session := client.StreamSession(wst, cl, streamID)
 		if session == nil {
-			conn.Write(ReplyConnRefused)
+			reply(ReplyConnRefused)
 			return
 		}
 		connectChunk := core.NewStreamConnectChunk(session.ID, session.NextSeqNum(), streamID, destAddr)
 		encrypted, err := session.EncryptChunk(connectChunk)
 		if err != nil {
-			conn.Write(ReplyConnRefused)
+			reply(ReplyConnRefused)
 			return
 		}
 		connectStart := time.Now()
@@ -508,18 +548,18 @@ func HandleTCPConnectWS(ctx context.Context, conn net.Conn, cl *client.Client, w
 		connectElapsed := time.Since(connectStart)
 		if err != nil {
 			slog.Warn("Split CONNECT failed", "dest", destAddr, "elapsed", connectElapsed, "err", err)
-			conn.Write(ReplyConnRefused)
+			reply(ReplyConnRefused)
 			return
 		}
 		respChunk, err := session.DecryptChunkSafe(encResp)
 		if err != nil {
 			slog.Warn("Split CONNECT decrypt failed", "dest", destAddr, "elapsed", connectElapsed, "err", err)
-			conn.Write(ReplyConnRefused)
+			reply(ReplyConnRefused)
 			return
 		}
 		if string(respChunk.Payload) != "CONNECT_OK" {
 			slog.Warn("Split CONNECT rejected", "dest", destAddr, "resp", string(respChunk.Payload), "elapsed", connectElapsed)
-			conn.Write(ReplyConnRefused)
+			reply(ReplyConnRefused)
 			return
 		}
 		slog.Info("Split CONNECT OK", "dest", destAddr, "stream", streamID, "elapsed", connectElapsed)
@@ -530,19 +570,19 @@ func HandleTCPConnectWS(ctx context.Context, conn net.Conn, cl *client.Client, w
 		// that blocks system VPN through CF CDN (matches VLESS+WS behavior).
 		session := client.StreamSession(wst, cl, streamID)
 		if session == nil {
-			conn.Write(ReplyConnRefused)
+			reply(ReplyConnRefused)
 			return
 		}
 
 		connectChunk := core.NewStreamConnectChunk(session.ID, session.NextSeqNum(), streamID, destAddr)
 		encrypted, err := session.EncryptChunk(connectChunk)
 		if err != nil {
-			conn.Write(ReplyConnRefused)
+			reply(ReplyConnRefused)
 			return
 		}
 		if err := client.StreamWriteControl(wst, streamID, encrypted); err != nil {
 			slog.Debug("WS CONNECT write failed", "dest", destAddr, "err", err)
-			conn.Write(ReplyConnRefused)
+			reply(ReplyConnRefused)
 			return
 		}
 
@@ -555,7 +595,7 @@ func HandleTCPConnectWS(ctx context.Context, conn net.Conn, cl *client.Client, w
 
 	// Reply SOCKS5 success immediately (optimistic for WS, confirmed for Split).
 	client.Trace("WS CONNECT sent", "dest", destAddr, "stream", streamID)
-	conn.Write(ReplySuccess)
+	reply(ReplySuccess)
 	// Task D5 (cold-start metrics): WS-multiplex CONNECT_OK fires the gauge
 	// on the first stream of the Connect cycle. sync.Once on Client guarantees
 	// idempotency across retries and concurrent CONNECTs.
@@ -574,6 +614,33 @@ func HandleTCPConnectWS(ctx context.Context, conn net.Conn, cl *client.Client, w
 
 	relayStart := time.Now()
 
+	// lastDownlinkNs tracks the most recent downlink frame arrival so the
+	// uplink goroutine's post-EOF grace timer is idle-aware: a long download
+	// that is still actively streaming the response body must NOT be cancelled
+	// just because the request (uplink) finished >15s ago. Stamped by the
+	// downlink goroutine on every received frame; read by waitForIdleOrCancel.
+	var lastDownlinkNs atomic.Int64
+	lastDownlinkNs.Store(relayStart.UnixNano())
+
+	// writeCloseDetector lets the in-process path distinguish a TCP half-close
+	// (appConn.CloseWrite — uplink done, downlink still live) from a full close
+	// (appConn.Close — real FIN). memConn satisfies it; real sockets (loopback)
+	// do not, so the loopback path keeps its idle-grace behavior unchanged.
+	type writeCloseDetector interface{ writeClosed() bool }
+	connWriteClosed, hasWriteCloseDetector := conn.(writeCloseDetector)
+
+	// fullCloseSignaler exposes a channel closed when the app end does a full
+	// Close (real FIN). The downlink goroutine selects on it so a full Close
+	// that arrives AFTER an earlier half-close (uplink goroutine already gone)
+	// still tears the relay down — the leak window left by removing idle-grace
+	// from the in-process path. nil for loopback (real sockets don't implement
+	// it), where the select case is simply never ready.
+	type fullCloseSignaler interface{ PeerFullCloseSignal() <-chan struct{} }
+	var peerFullClose <-chan struct{}
+	if fcs, ok := conn.(fullCloseSignaler); ok && !socks5Replies {
+		peerFullClose = fcs.PeerFullCloseSignal()
+	}
+
 	// Uplink: SOCKS client -> encrypt -> WS -> server
 	wg.Add(1)
 	go func() {
@@ -584,13 +651,46 @@ func HandleTCPConnectWS(ctx context.Context, conn net.Conn, cl *client.Client, w
 		for {
 			n, err := conn.Read(buf)
 			if err != nil {
-				slog.Info("uplink done", "dest", destAddr, "stream", streamID,
-					"bytes", total, "uploads", uploads, "elapsed", time.Since(relayStart).Round(time.Millisecond))
-				// Don't cancel immediately — give downlink time to receive the response.
-				select {
-				case <-time.After(15 * time.Second):
-				case <-ctx2.Done():
+				wclosed := false
+				if hasWriteCloseDetector {
+					wclosed = connWriteClosed.writeClosed()
 				}
+				slog.Info("uplink done", "dest", destAddr, "stream", streamID,
+					"bytes", total, "uploads", uploads, "elapsed", time.Since(relayStart).Round(time.Millisecond),
+					"err", err, "fullClose", wclosed)
+
+				// In-process tun2socks path: uplink EOF does NOT mean the stream
+				// is over. tun2socks does appConn.CloseWrite() (TCP half-close)
+				// as soon as the app finished sending its request — for an HTTP
+				// keep-alive connection the downlink is still live and must keep
+				// serving the response (and further pipelined requests). So we
+				// distinguish:
+				//   - half-close (writeClosed()==false): app sent its request and
+				//     went quiet but the connection is alive. The uplink goroutine
+				//     simply returns; the downlink goroutine keeps running. NO
+				//     idle-grace, NO cancel — tun2socks owns the TCP lifecycle in
+				//     TUN mode and will Close() on the real FIN.
+				//   - full close (writeClosed()==true): app did appConn.Close()
+				//     (real FIN). Cancel so the downlink goroutine, which may be
+				//     blocked on incomingCh, also exits and the stream tears down.
+				// The loopback SOCKS5 path (socks5Replies=true, real socket, no
+				// writeCloseDetector) keeps the idle-grace behavior: there a Read
+				// EOF means the client truly closed the socket.
+				if !socks5Replies && hasWriteCloseDetector {
+					if connWriteClosed.writeClosed() {
+						cancel() // full close → tear the whole stream down
+					}
+					// half-close → leave downlink running; just stop reading uplink
+					return
+				}
+
+				// Loopback path: idle-aware grace. The grace window resets on every
+				// downlink frame, so an actively-streaming download (e.g. `claude
+				// update`, npm/GitHub binaries) survives past 15s and is only torn
+				// down after genuine downlink silence. Fixed 15s here previously
+				// severed any download still in flight 15s after the request was
+				// sent — see proxy/socks5/idle_grace.go for the full rationale.
+				waitForIdleOrCancel(ctx2, &lastDownlinkNs, downlinkIdleGrace, downlinkIdlePoll)
 				cancel()
 				return
 			}
@@ -666,13 +766,19 @@ func HandleTCPConnectWS(ctx context.Context, conn net.Conn, cl *client.Client, w
 				}
 				total += len(data)
 				chunks++
+				// Refresh the idle-grace deadline: an actively-streaming
+				// download keeps the uplink goroutine's post-EOF grace from
+				// firing (fixes 15s mid-download cancellation).
+				lastDownlinkNs.Store(time.Now().UnixNano())
 				client.Stats.DownlinkBytes.Add(int64(len(data)))
 				if chunks <= 5 || chunks%100 == 0 {
 					client.Trace("downlink data", "dest", destAddr, "stream", streamID,
 						"chunk", chunks, "bytes", len(data), "totalBytes", total)
 				}
 				if _, err := conn.Write(data); err != nil {
-					slog.Warn("downlink write error", "dest", destAddr, "stream", streamID, "err", err)
+					slog.Warn("downlink write error", "dest", destAddr, "stream", streamID, "err", err,
+						"connectConfirmed", connectConfirmed, "downlinkBytes", total, "downlinkChunks", chunks,
+						"streamAgeMs", time.Since(relayStart).Milliseconds())
 					// Consumer (local SOCKS5 client) is gone. The uplink
 					// goroutine still sits in its 15s grace before
 					// canceling ctx2, during which the WS demux keeps
@@ -693,9 +799,21 @@ func HandleTCPConnectWS(ctx context.Context, conn net.Conn, cl *client.Client, w
 						}
 					}
 				}
+				// Bug #8: credit consumed bytes back so the server may send more.
+				cl.OnStreamConsumed(streamID, len(data))
+			case <-peerFullClose:
+				// In-process app did a full Close (real FIN), possibly AFTER an
+				// earlier half-close when the uplink goroutine had already
+				// returned. Tear the stream down. nil channel (loopback) never
+				// fires this case. peerFullClose only closes on appConn.Close,
+				// never on appConn.CloseWrite, so keep-alive half-close is unaffected.
+				slog.Info("downlink done (app full close)", "dest", destAddr, "stream", streamID,
+					"bytes", total, "chunks", chunks, "elapsed", time.Since(relayStart).Round(time.Millisecond))
+				return
 			case <-ctx2.Done():
 				slog.Info("downlink cancelled", "dest", destAddr, "stream", streamID,
-					"bytes", total, "chunks", chunks, "elapsed", time.Since(relayStart).Round(time.Millisecond))
+					"bytes", total, "chunks", chunks, "elapsed", time.Since(relayStart).Round(time.Millisecond),
+					"connectConfirmed", connectConfirmed, "ctxErr", ctx2.Err())
 				return
 			}
 		}
