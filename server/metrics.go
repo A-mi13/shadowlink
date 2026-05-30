@@ -393,6 +393,10 @@ type MetricsSnapshot struct {
 	WSReaderExitIOTimeout  uint64 `json:"ws_reader_exit_io_timeout"`
 	WSReaderExitLocalClose uint64 `json:"ws_reader_exit_local_close"`
 	WSReaderExitOther      uint64 `json:"ws_reader_exit_other"`
+	// Bug #8 (2026-05-30) — per-stream flow-control observability.
+	FlowWindowUpdatesRecv uint64 `json:"flow_window_updates_recv"`
+	UnknownFlag           uint64 `json:"unknown_flag"`
+	FlowSessionsActive    int64  `json:"flow_sessions_active"`
 	// Wave 2.1 (2026-05-17) — WS upgrade accepts on retired legacy paths.
 	WSPathLegacyHits uint64 `json:"ws_path_legacy_hits"`
 	// T1.7 (Phase 2) — BroadcastStreamClose drain SLA telemetry.
@@ -454,6 +458,9 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		WSReaderExitIOTimeout:              m.WSReaderExitIOTimeout.Load(),
 		WSReaderExitLocalClose:             m.WSReaderExitLocalClose.Load(),
 		WSReaderExitOther:                  m.WSReaderExitOther.Load(),
+		FlowWindowUpdatesRecv:              m.FlowWindowUpdatesRecv.Load(),
+		UnknownFlag:                        m.UnknownFlag.Load(),
+		FlowSessionsActive:                 m.FlowSessionsActive.Load(),
 		WSPathLegacyHits:                   m.WSPathLegacyHits.Load(),
 		BroadcastCloseDrainCount:           m.broadcastCloseDrainCount.Load(),
 		BroadcastCloseDrainSecondsLast:     float64(m.broadcastCloseDrainNanosLast.Load()) / 1e9,
@@ -678,4 +685,15 @@ func writePromMetrics(w http.ResponseWriter, s *MetricsSnapshot) {
 	fmt.Fprintf(w, "shadowlink_broadcast_close_dropped_total{reason=\"timeout\"} %d\n", s.BroadcastCloseDroppedTimeout)
 	fmt.Fprintf(w, "shadowlink_broadcast_close_dropped_total{reason=\"done\"} %d\n", s.BroadcastCloseDroppedDone)
 	fmt.Fprintf(w, "shadowlink_broadcast_close_dropped_total{reason=\"ctx_cancel\"} %d\n", s.BroadcastCloseDroppedCtxCancel)
+
+	// Bug #8 (2026-05-30) — per-stream flow-control canary observability.
+	fmt.Fprintf(w, "# HELP shadowlink_flow_window_updates_recv_total WINDOW_UPDATE frames received from clients (Bug #8 per-stream flow control)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_flow_window_updates_recv_total counter\n")
+	fmt.Fprintf(w, "shadowlink_flow_window_updates_recv_total %d\n", s.FlowWindowUpdatesRecv)
+	fmt.Fprintf(w, "# HELP shadowlink_unknown_flag_total Unknown chunk flags seen in the WS reader switch (Bug #8 observability)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_unknown_flag_total counter\n")
+	fmt.Fprintf(w, "shadowlink_unknown_flag_total %d\n", s.UnknownFlag)
+	fmt.Fprintf(w, "# HELP shadowlink_flow_sessions_active WS sessions with per-stream flow control negotiated ON (Bug #8)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_flow_sessions_active gauge\n")
+	fmt.Fprintf(w, "shadowlink_flow_sessions_active %d\n", s.FlowSessionsActive)
 }

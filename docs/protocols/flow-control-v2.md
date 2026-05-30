@@ -155,7 +155,7 @@ Teardown: `streamCredit.close()` + `wake()` при закрытии сессии
 | `shadowlink_flow_window_update_dropped_total` | counter | WINDOW\_UPDATE пропущен (контрольный канал полон), delta сохранена |
 | `shadowlink_flow_negotiation_timeout_total` | counter | Слотов, где ack не получен за 500 ms (старый сервер / off) |
 
-### Сервер (`server/metrics.go`, JSON snapshot `/metrics`)
+### Сервер (`server/metrics.go`, Prometheus `/metrics?format=prom` + JSON `/metrics`)
 
 | Поле | Тип | Значение |
 |---|---|---|
@@ -163,7 +163,7 @@ Teardown: `streamCredit.close()` + `wake()` при закрытии сессии
 | `UnknownFlag` | counter | Фреймы с неизвестным Flags байтом (defensive default) |
 | `FlowSessionsActive` | gauge | WS-сессий с активным flow control прямо сейчас |
 
-> Примечание: серверные flow-метрики присутствуют в `Metrics` struct, но пока не включены в `MetricsSnapshot` / Prometheus exposition (`writePromMetrics`). Доступны через JSON-эндпоинт при добавлении в `Snapshot()`.
+> Все три метрики экспортируются через Prometheus (`writePromMetrics`) и JSON snapshot (`Snapshot()`) — добавлены 2026-05-30 для канарейки Bug #8.
 
 ---
 
