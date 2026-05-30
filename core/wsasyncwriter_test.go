@@ -310,6 +310,33 @@ func TestWSAsyncWriter_EnqueueControlClosedWriter(t *testing.T) {
 	assert.ErrorIs(t, err, ErrWSWriterClosed)
 }
 
+func TestTryEnqueueControl_NonBlockingWhenFull(t *testing.T) {
+	// Writer with NO Run() goroutine draining → control fills then Try fails.
+	w := NewWSAsyncWriter(&fakeConnWriter{}, 1)
+	// control cap is fixed 64. Fill it without draining.
+	filled := 0
+	for i := 0; i < 64; i++ {
+		if !w.TryEnqueueControl(websocket.BinaryMessage, []byte("x")) {
+			break
+		}
+		filled++
+	}
+	if filled == 0 {
+		t.Fatal("expected at least some control frames to enqueue")
+	}
+	// Next Try must NOT block and must return false (channel full).
+	done := make(chan bool, 1)
+	go func() { done <- w.TryEnqueueControl(websocket.BinaryMessage, []byte("y")) }()
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("TryEnqueueControl returned true on full channel")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("TryEnqueueControl BLOCKED on full channel (must be non-blocking)")
+	}
+}
+
 func TestWSAsyncWriter_CloseUnblocksRun(t *testing.T) {
 	conn := &fakeConnWriter{}
 	w := NewWSAsyncWriter(conn, 8)

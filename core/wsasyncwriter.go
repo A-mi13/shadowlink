@@ -230,6 +230,29 @@ func (w *WSAsyncWriter) EnqueueControl(msgType int, data []byte) error {
 	}
 }
 
+// TryEnqueueControl is the non-blocking variant of EnqueueControl: it enqueues
+// a control frame if there is room and returns true, or returns false
+// immediately if the control channel is full or the writer is closed. Used by
+// the flow-control credit sender (Bug #8): a dropped WINDOW_UPDATE is harmless
+// because the next one carries the accumulated (additive) delta, so the sender
+// must NEVER block on a congested control channel (that would re-introduce the
+// B2 uplink deadlock).
+func (w *WSAsyncWriter) TryEnqueueControl(msgType int, data []byte) bool {
+	select {
+	case <-w.done:
+		return false
+	default:
+	}
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	select {
+	case w.control <- wsOutboundMsg{msgType: msgType, data: cp}:
+		return true
+	default:
+		return false
+	}
+}
+
 // Close signals the writer to stop. Idempotent. Run will return after
 // draining any frames currently buffered.
 func (w *WSAsyncWriter) Close() {
