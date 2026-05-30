@@ -59,6 +59,14 @@ type WebSocketTransport struct {
 	// backpressure and the default 30s means the slot freezes for 30s before
 	// the pool can route around the bad edge. Cross-check 2026-04-15 H6.
 	writeTimeout time.Duration
+
+	// Bug #8 flow control negotiation (per-WS-conn). flowDesiredWindow > 0 means
+	// the client advertises FLOWCTL in its first keepalive and synchronously
+	// reads the server's ack in UpgradeToWS. flowControlEnabled/flowWindow are
+	// set from that ack.
+	flowDesiredWindow  uint32
+	flowControlEnabled bool
+	flowWindow         uint32
 }
 
 // NewWebSocketTransport creates a transport that uses WebSocket for data relay.
@@ -313,7 +321,7 @@ func (t *WebSocketTransport) UpgradeToWS(token []byte, session *core.Session) er
 	// Pre-compute the first frame BEFORE Dial so the WriteMessage fires within
 	// a few ms of 101 — slow first frames are themselves a DPI signal and also
 	// give the server's 1500ms auth timeout room to spare.
-	firstFramePayload, err := t.buildFirstFramePayload(token, session)
+	firstFramePayload, err := t.buildFirstFramePayload(token, session, t.flowDesiredWindow)
 	if err != nil {
 		return fmt.Errorf("ws upgrade: first frame prep: %w", err)
 	}
@@ -518,6 +526,27 @@ func (t *WebSocketTransport) UpgradeToWS(token []byte, session *core.Session) er
 		return fmt.Errorf("ws upgrade: first frame send: %w", err)
 	}
 
+	// Bug #8 §4.5: synchronously read the server's FLOWCTL-ack BEFORE starting
+	// the async writer / slot reader. Only when we advertised a window — else
+	// the wire path is unchanged. The slot reader starts only after UpgradeToWS
+	// returns (connectSlot sets slotReady afterwards), so it won't race this read.
+	if t.flowDesiredWindow > 0 {
+		conn.SetReadDeadline(time.Now().Add(negotiationAckTimeout))
+		ackType, ackData, ackErr := conn.ReadMessage()
+		conn.SetReadDeadline(time.Time{})
+		if ackErr == nil && ackType == websocket.BinaryMessage {
+			if ackChunk, derr := session.DecryptChunkSafe(ackData); derr == nil && ackChunk.Flags == core.FlagAck {
+				if win, okFlow := parseFlowAckPayload(ackChunk.Payload); okFlow {
+					t.flowControlEnabled = true
+					t.flowWindow = win
+				}
+			}
+		}
+		if !t.flowControlEnabled {
+			Stats.FlowNegotiationTimeout.Add(1)
+		}
+	}
+
 	// Async writer with priority channels: CONNECT/FIN/keepalive use the
 	// control channel (drained first), data relay uses the data channel.
 	// This eliminates the writeMu bottleneck where 100 data goroutines
@@ -576,6 +605,11 @@ var bestEffortSessionFINHook func(token []byte, session *core.Session, body []by
 // conditions, but short enough that a stuck POST does not pin a goroutine
 // past the next reconnect attempt (reconnectLoop's slowest baseline is 5s).
 const bestEffortSessionFINTimeout = 2 * time.Second
+
+// negotiationAckTimeout is the deadline for reading the server's FLOWCTL-ack
+// synchronously in UpgradeToWS. Kept short: if the server doesn't support
+// flow control the read must not stall the upgrade path.
+const negotiationAckTimeout = 500 * time.Millisecond
 
 // sendBestEffortSessionFIN fires a best-effort POST containing a FIN chunk
 // for streamID=0 (session-level FIN semantic). C10 M5 (May audit,
@@ -681,17 +715,26 @@ func (t *WebSocketTransport) dispatchBestEffortSessionFIN(body []byte) {
 // authenticateFirstFrame path uses to validate the WS session post-upgrade.
 // FlagKeepalive is chosen because it's semantically idempotent — the server
 // rejects any other flag (Connect/Data/StreamOpen) on the first frame.
-func (t *WebSocketTransport) buildFirstFramePayload(token []byte, session *core.Session) ([]byte, error) {
+func (t *WebSocketTransport) buildFirstFramePayload(token []byte, session *core.Session, flowWindow uint32) ([]byte, error) {
 	keepalive := &core.Chunk{
 		SessionID: session.ID,
 		SeqNum:    session.NextSeqNum(),
 		Flags:     core.FlagKeepalive,
+	}
+	if flowWindow > 0 {
+		keepalive.Payload = core.BuildFlowCtlMarker(flowWindow) // inside AES-GCM (NH2)
 	}
 	encrypted, err := session.EncryptChunk(keepalive)
 	if err != nil {
 		return nil, err
 	}
 	return browser.BuildDataPayload(token, encrypted), nil
+}
+
+// parseFlowAckPayload reports whether a decrypted FlagAck chunk payload carries
+// the server's FLOWCTL confirmation and returns the effective window.
+func parseFlowAckPayload(payload []byte) (window uint32, ok bool) {
+	return core.ParseFlowCtlMarker(payload)
 }
 
 // SendChunk sends an encrypted chunk over WebSocket and reads response.

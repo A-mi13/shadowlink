@@ -3,6 +3,8 @@ package client
 import (
 	"context"
 	"testing"
+
+	"github.com/nixavpn/shadowlink/core"
 )
 
 // fakeTryControl implements TryControlPoolAware for the helper test.
@@ -153,5 +155,15 @@ func TestCreditSender_WatchdogFlushesStaleTail(t *testing.T) {
 	c.creditSenderTick(0.5)
 	if sentDelta != 400 {
 		t.Fatalf("watchdog should flush stale tail: sent %d, want 400", sentDelta)
+	}
+}
+
+func TestParseFlowAck_Recognizes(t *testing.T) {
+	win, ok := parseFlowAckPayload(core.BuildFlowCtlMarker(1 << 20))
+	if !ok || win != 1<<20 {
+		t.Fatalf("parseFlowAckPayload = (%d,%v), want (1MiB,true)", win, ok)
+	}
+	if _, ok := parseFlowAckPayload(nil); ok {
+		t.Fatal("nil ack must not parse as flow ack")
 	}
 }

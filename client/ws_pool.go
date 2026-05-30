@@ -336,6 +336,10 @@ type poolSlot struct {
 	// (zero value) and the OLD watchdog's deferred releaseSticky operates on
 	// its OWN captured *poolSlot — no cross-recycle counter desync (spec H2).
 	isSticky atomic.Bool
+
+	// Bug #8 flow control, negotiated per-slot (each slot = own core.Session).
+	flowControlEnabled bool
+	flowWindow         uint64
 }
 
 // slotFreshnessPenaltyWindow defines how long after a slot's last death
@@ -1048,6 +1052,8 @@ type WSPoolTransport struct {
 	// Zero = no meltdown observed yet (initial state). Read with Load;
 	// written with Store from emitMeltdownLog only.
 	recentMeltdownNs atomic.Int64
+
+	flowDesiredWindow uint64 // Bug #8: 0 → flow control off; else advertised window
 }
 
 // Compile-time assertions.
@@ -1660,6 +1666,7 @@ func (p *WSPoolTransport) connectSlot(ctx context.Context, idx int) error {
 	if idx == 0 {
 		wst.WarmupRequests() // Only warmup for first slot (looks natural)
 	}
+	wst.flowDesiredWindow = uint32(p.flowDesiredWindow) // 0 → off
 	// D3: ws upgrade now authenticates via a post-upgrade first frame built
 	// from the slot's session — Bearer header is gone.
 	if err := wst.UpgradeToWS(slot.token, slot.session); err != nil {
@@ -1668,6 +1675,10 @@ func (p *WSPoolTransport) connectSlot(ctx context.Context, idx int) error {
 	}
 
 	slot.transport = wst
+	if wst.flowControlEnabled {
+		slot.flowControlEnabled = true
+		slot.flowWindow = uint64(wst.flowWindow)
+	}
 	// Reset downstream byte counter — fresh TCP starts the TSPU 15-20KB budget over.
 	slot.downBytes.Store(0)
 	// Reset rotation deferral — fresh TCP, no pending rotation to honour.

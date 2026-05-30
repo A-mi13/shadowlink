@@ -101,7 +101,7 @@ func TestBuildFirstFramePayload_Shape(t *testing.T) {
 	}
 	session := core.NewSession(7, make([]byte, 32), make([]byte, 32))
 
-	payload, err := wst.buildFirstFramePayload(token, session)
+	payload, err := wst.buildFirstFramePayload(token, session, 0)
 	if err != nil {
 		t.Fatalf("buildFirstFramePayload: %v", err)
 	}
