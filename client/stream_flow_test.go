@@ -32,6 +32,16 @@ func TestTryStreamWriteControl_UsesPoolPath(t *testing.T) {
 	}
 }
 
+func TestTryStreamWriteControl_FalseWhenChannelFull(t *testing.T) {
+	f := &fakeTryControl{allowed: false}
+	if TryStreamWriteControl(f, 5, []byte("x")) {
+		t.Fatal("expected false when pool path rejects")
+	}
+	if !f.tried {
+		t.Fatal("pool TryWriteControlMessageForStream should still be called")
+	}
+}
+
 func TestTryStreamWriteControl_FalseWhenNotSupported(t *testing.T) {
 	var notSupported StreamTransport = &nopStreamTransport{}
 	if TryStreamWriteControl(notSupported, 1, []byte("x")) {
