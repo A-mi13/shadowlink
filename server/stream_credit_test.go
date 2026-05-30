@@ -68,6 +68,37 @@ func TestNegotiateFlowWindow(t *testing.T) {
 	}
 }
 
+func TestStreamCredit_TeardownWakesAllWaiters(t *testing.T) {
+	credits := map[uint16]*streamCredit{
+		1: newStreamCredit(0),
+		2: newStreamCredit(0),
+		3: newStreamCredit(0),
+	}
+	done := make(chan struct{})
+	results := make(chan int64, len(credits))
+	for id := range credits {
+		cr := credits[id]
+		go func() { results <- cr.waitForCredit(done) }()
+	}
+	time.Sleep(30 * time.Millisecond) // let waiters block in cond.Wait
+
+	// emulate session done-watcher teardown: close all credits
+	for _, cr := range credits {
+		cr.close()
+	}
+
+	for i := 0; i < len(credits); i++ {
+		select {
+		case got := <-results:
+			if got > 0 {
+				t.Fatalf("waiter returned %d, want <=0 on teardown", got)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("waiter not woken on teardown (goroutine leak)")
+		}
+	}
+}
+
 func TestStreamCredit_WaitReturnsWhenDoneClosed(t *testing.T) {
 	c := newStreamCredit(0)
 	doneCh := make(chan struct{})
