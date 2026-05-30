@@ -141,43 +141,43 @@ const firstFrameReadLimit = 8 * 1024
 // DoS hygiene: a tight 8 KiB read limit and 1500ms deadline apply only during
 // auth. On successful return, the caller (handleWebSocket) restores the normal
 // 256 KiB read limit and removes the deadline.
-func (h *Handler) authenticateFirstFrame(conn *websocket.Conn) *core.Session {
+func (h *Handler) authenticateFirstFrame(conn *websocket.Conn) (*core.Session, uint32) {
 	conn.SetReadLimit(firstFrameReadLimit)
 	conn.SetReadDeadline(time.Now().Add(firstFrameAuthTimeout))
 	defer conn.SetReadDeadline(time.Time{})
 
 	msgType, data, err := conn.ReadMessage()
 	if err != nil || msgType != websocket.BinaryMessage {
-		return nil
+		return nil, 0
 	}
 
 	tokenLen := h.sessionTokenSize()
 	if len(data) < tokenLen+core.MinChunk {
-		return nil
+		return nil, 0
 	}
 
 	session := h.findSessionByHint(data[:tokenLen])
 	if session == nil {
-		return nil
+		return nil, 0
 	}
 
 	chunk, err := session.DecryptChunkSafe(data[tokenLen:])
 	if err != nil {
-		return nil
+		return nil, 0
 	}
 	if !session.AcceptSeqNum(chunk.SeqNum) {
-		return nil
+		return nil, 0
 	}
 
 	if chunk.Flags != core.FlagKeepalive {
-		return nil
+		return nil, 0
 	}
 
 	h.tunnelsMu.RLock()
 	tunnel, ok := h.tunnels[session.ID]
 	h.tunnelsMu.RUnlock()
 	if !ok {
-		return nil
+		return nil, 0
 	}
 
 	// A3-S-HIGH-2 (2026-04-25): gate concurrent WS attaches. CAS prevents
@@ -186,7 +186,24 @@ func (h *Handler) authenticateFirstFrame(conn *websocket.Conn) *core.Session {
 	// rejection). Without this, an attacker holding a session token can
 	// race the legit client and starve seq-num space / inject CONNECTs.
 	if !tunnel.WSAttached.CompareAndSwap(false, true) {
-		return nil
+		return nil, 0
+	}
+
+	// Bug #8: read FLOWCTL marker from the (decrypted) keepalive payload and,
+	// if present & supported, emit a synchronous FLOWCTL-ack BEFORE the relay
+	// loop starts (the first keepalive never reaches the reader-loop).
+	var effectiveWindow uint32
+	if cw, okFlow := core.ParseFlowCtlMarker(chunk.Payload); okFlow {
+		effectiveWindow = negotiateFlowWindow(cw, uint32(h.flowMaxWindow))
+		if effectiveWindow > 0 {
+			ack := &core.Chunk{SessionID: session.ID, SeqNum: session.NextSeqNum(), Flags: core.FlagAck,
+				Payload: core.BuildFlowCtlMarker(effectiveWindow)}
+			if enc, encErr := session.EncryptChunk(ack); encErr == nil {
+				conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+				_ = conn.WriteMessage(websocket.BinaryMessage, enc)
+				conn.SetWriteDeadline(time.Time{})
+			}
+		}
 	}
 
 	// Refresh AttachedAt to the WS-attach moment. As of the 2026-05-18
@@ -199,7 +216,7 @@ func (h *Handler) authenticateFirstFrame(conn *websocket.Conn) *core.Session {
 	// without needing a separate field.
 	session.AttachedAt.Store(time.Now().UnixNano())
 
-	return session
+	return session, effectiveWindow
 }
 
 // fakeAckAndClose replies to a failed first-frame auth with a random binary
@@ -436,7 +453,7 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		h.metrics.WSPathLegacyHits.Add(1)
 	}
 
-	session := h.authenticateFirstFrame(conn)
+	session, flowWindow := h.authenticateFirstFrame(conn)
 	if session == nil {
 		h.fakeAckAndClose(conn)
 		return
@@ -460,14 +477,24 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	h.runWebSocketSession(conn, session)
+	h.runWebSocketSession(conn, session, flowWindow)
 }
 
 // runWebSocketSession runs the per-session WebSocket relay: async writer,
 // 20 s ping, pong-reset read deadlines, and the inbound dispatcher for
 // data/connect/fin/keepalive/udp chunks. Returns when either side closes
 // the connection.
-func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Session) {
+func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Session, flowWindow uint32) {
+	// Bug #8 flow control: flowWindow > 0 means client negotiated flow control
+	// and we sent back a FLOWCTL-ack with effectiveWindow in authenticateFirstFrame.
+	flowEnabled := flowWindow > 0
+	credits := make(map[uint16]*streamCredit)
+	creditsMu := &sync.Mutex{}
+	if flowEnabled {
+		h.metrics.FlowSessionsActive.Add(1)
+		defer h.metrics.FlowSessionsActive.Add(-1)
+	}
+
 	// Async write queue: decouples per-stream relay goroutines and CONNECT_OK
 	// responses from a slow underlying TCP send buffer (CF egress under load).
 	// Previously a single writeMu serialized every WriteMessage call, so a
@@ -629,6 +656,13 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 				streams[streamID] = pendingStream
 				streamsMu.Unlock()
 
+				// Bug #8: allocate per-stream credit bucket when flow control is active.
+				if flowEnabled {
+					creditsMu.Lock()
+					credits[streamID] = newStreamCredit(int64(flowWindow))
+					creditsMu.Unlock()
+				}
+
 				// ASYNC dial: SafeDial blocks up to 10s per target.
 				// P1-8 fix (final audit 2026-05-03): bind the dial context
 				// to the session's `done` channel so a client disconnect
@@ -748,10 +782,34 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 						streamsMu.Lock()
 						delete(streams, sid)
 						streamsMu.Unlock()
+						// Bug #8: close credit when relay exits (prevents waitForCredit leak).
+						if flowEnabled {
+							creditsMu.Lock()
+							if cr := credits[sid]; cr != nil {
+								cr.close()
+								delete(credits, sid)
+							}
+							creditsMu.Unlock()
+						}
 					}()
 					buf := make([]byte, 32768)
 					for {
-						n, err := tc.Read(buf)
+						limit := len(buf)
+						if flowEnabled {
+							creditsMu.Lock()
+							cr := credits[sid]
+							creditsMu.Unlock()
+							if cr != nil {
+								got := cr.waitForCredit(done)
+								if got <= 0 {
+									return
+								}
+								if int(got) < limit {
+									limit = int(got)
+								}
+							}
+						}
+						n, err := tc.Read(buf[:limit])
 						if n > 0 {
 							resp := core.NewStreamDataChunk(session.ID, session.NextSeqNum(), sid, buf[:n])
 							enc, encErr := session.EncryptChunk(resp)
@@ -761,6 +819,14 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 							}
 							if writeMsg(enc) != nil {
 								return
+							}
+							if flowEnabled {
+								creditsMu.Lock()
+								cr := credits[sid]
+								creditsMu.Unlock()
+								if cr != nil {
+									cr.consume(n)
+								}
 							}
 						}
 						if err != nil {
@@ -777,6 +843,15 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 					delete(streams, streamID)
 				}
 				streamsMu.Unlock()
+				// Bug #8: close credit when client signals FIN.
+				if flowEnabled {
+					creditsMu.Lock()
+					if cr := credits[streamID]; cr != nil {
+						cr.close()
+						delete(credits, streamID)
+					}
+					creditsMu.Unlock()
+				}
 
 			case core.FlagKeepalive:
 				ack := &core.Chunk{SessionID: session.ID, SeqNum: session.NextSeqNum(), Flags: core.FlagAck}
@@ -820,8 +895,36 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 						}
 					})
 				}
+
+			case core.FlagWindowUpdate:
+				// Bug #8: client returning credit → replenish the per-stream bucket.
+				wuStreamID, delta, perr := core.ParseWindowUpdate(chunk.Payload)
+				if perr != nil {
+					continue
+				}
+				creditsMu.Lock()
+				cr := credits[wuStreamID]
+				creditsMu.Unlock()
+				if cr != nil {
+					cr.add(delta, int64(flowWindow))
+				}
+				h.metrics.FlowWindowUpdatesRecv.Add(1)
+
+			default:
+				h.metrics.UnknownFlag.Add(1)
 			}
 		}
+	}()
+
+	// Bug #8: wake all waiting relay goroutines when session is torn down so
+	// they don't block forever in waitForCredit after done fires.
+	go func() {
+		<-done
+		creditsMu.Lock()
+		for _, cr := range credits {
+			cr.close()
+		}
+		creditsMu.Unlock()
 	}()
 
 	<-done

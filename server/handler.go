@@ -34,6 +34,11 @@ type Handler struct {
 	clientAuth   *ClientAuth
 	udpRelay     *UDPRelay
 
+	// flowMaxWindow caps the per-stream flow-control window the server grants
+	// (Bug #8). 0 → server does not offer flow control. Default 1 MiB set in
+	// NewHandler. Task 11 will expose this via Config.
+	flowMaxWindow uint64
+
 	// exemption caches recently-seen authenticated clientIDs and lets them
 	// bypass the per-IP rate-limit bucket on the data path / subsequent
 	// handshakes. Set once in NewHandler (default-on, opt out via
@@ -52,10 +57,6 @@ type Handler struct {
 	// pool because a 5-minute sliding window allowed only one handshake per
 	// client. Used only by the new body-prefix handshake path.
 	replayCache *core.ReplayCache
-
-	// liveBlog handles GET /blog/* and GET /_cdn/* reverse-proxy decoy (T1.3).
-	// Nil when feature is disabled (default).
-	liveBlog *LiveBlogHandler
 
 	// replayCacheMaxSize / replayCacheWindow expose the resolved replay-cache
 	// parameters (Config.ReplayCacheMaxSize / Config.ReplayCacheWindow with
@@ -228,7 +229,12 @@ func NewHandler(serverKey *core.KeyPair, config Config, decoyDir string) *Handle
 	h := &Handler{
 		serverKey:          serverKey,
 		sessions:           core.NewSessionManager(config.SessionTimeout),
-		decoy:              NewDecoyHandler(decoyDir, config.DomainDecoyMap),
+		decoy: NewDecoyHandlerV2(DecoyHandlerConfig{
+			DefaultDir:     decoyDir,
+			DomainMap:      config.DomainDecoyMap,
+			DomainPersona:  config.DomainPersonaMap,
+			DefaultPersona: config.DefaultDecoyPersona,
+		}),
 		config:             config,
 		metrics:            NewMetrics(),
 		rateLimiters:       NewRateLimitersWithConfig(hs, ws, useTokenBucket()),
@@ -240,17 +246,7 @@ func NewHandler(serverKey *core.KeyPair, config Config, decoyDir string) *Handle
 		tunnels:            make(map[uint32]*Tunnel),
 		exemption:          exempt,
 		safeDialFn:         SafeDial,
-	}
-
-	// T1.3: Wire live-blog reverse-proxy decoy when enabled. On config error,
-	// log and continue without live-blog — don't fail server startup.
-	if config.LiveBlog.Enabled {
-		lb, err := NewLiveBlogHandler(config.LiveBlog, h.decoy, h.metrics)
-		if err != nil {
-			slog.Warn("live_blog: disabled due to config error", "err", err)
-		} else {
-			h.liveBlog = lb
-		}
+		flowMaxWindow:      1 << 20, // 1 MiB default (Bug #8); Task 11 exposes via Config
 	}
 
 	// Eagerly populate the asymmetric decoy fixture used by the
@@ -362,7 +358,6 @@ func (h *Handler) buildResponse(session *core.Session, encrypted []byte, seqNum 
 // ServeHTTP routes requests after Phase A retire (2026-04-26):
 //
 //   - WebSocket upgrade           → handleWebSocket (first-frame auth)
-//   - LIVE-BLOG GET to /blog*     → handler from liveBlog (T1.3)
 //   - POST + application/json     → handleNewFormatPost (body-prefix only)
 //   - everything else             → decoy
 //
@@ -376,13 +371,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// WebSocket upgrade for full-duplex relay (Phase 1b).
 	if r.Header.Get("Upgrade") == "websocket" {
 		h.handleWebSocket(w, r)
-		return
-	}
-
-	// LIVE-BLOG (T1.3): unauthenticated GET to /blog* or /_cdn/* → serve
-	// reverse-proxied + brand-rewritten habr content.
-	if h.liveBlog != nil && r.Method == http.MethodGet && h.liveBlog.Matches(r.URL.Path) {
-		h.liveBlog.ServeHTTP(w, r)
 		return
 	}
 
@@ -1932,15 +1920,6 @@ func (h *Handler) StartCleanup(stop <-chan struct{}) {
 		}
 	}()
 
-	// T1.3: start live-blog canary watchdog when feature is enabled.
-	if h.liveBlog != nil {
-		ctx, cancel := context.WithCancel(context.Background())
-		go func() {
-			<-stop
-			cancel()
-		}()
-		go runCanaryLoop(ctx, h.liveBlog)
-	}
 }
 
 // encodeServerHello serializes ServerHello into bytes for transmission.

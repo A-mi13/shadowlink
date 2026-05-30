@@ -198,28 +198,15 @@ type Metrics struct {
 	WSReaderExitLocalClose atomic.Uint64
 	WSReaderExitOther      atomic.Uint64
 
-	// Live decoy (T1.3) — /blog/* and /_cdn/* reverse-proxy instrumentation.
-	DecoyLiveBlogRequests              atomic.Uint64
-	DecoyLiveBlogCacheHits             atomic.Uint64
-	DecoyLiveBlogCacheMisses           atomic.Uint64
-	DecoyLiveBlogUpstreamOK            atomic.Uint64
-	DecoyLiveBlogUpstreamErr           atomic.Uint64
-	DecoyLiveBlogUpstreamRateLimited   atomic.Uint64
-	DecoyLiveBlogStaleServed           atomic.Uint64
-	DecoyLiveBlogFallbackSPA           atomic.Uint64
-	DecoyLiveBlogRewritePanic          atomic.Uint64
-	DecoyLiveBlogRewriteDrift          atomic.Uint64
-	DecoyLiveBlogCanaryOK              atomic.Uint64
-	DecoyLiveBlogCanaryFetchFail       atomic.Uint64
-	DecoyLiveBlogCanaryLastHealthyUnix atomic.Int64 // unix seconds, 0 = never healthy
-	DecoyLiveBlogCDNHits               atomic.Uint64
-	DecoyLiveBlogCDNErrors             atomic.Uint64
-	// DecoyLiveBlogServeHTTPPanic counts panics caught by the outer
-	// defer-recover wrapper in LiveBlogHandler.ServeHTTP (A3-I-MED-4 closure).
-	// Should stay flat; any non-zero increment indicates a logic bug or
-	// unexpected nil deref reached the dispatch path.
-	DecoyLiveBlogServeHTTPPanic atomic.Uint64
-	backpressureActive          atomic.Bool
+	// Bug #8 flow-control metrics (Task 10).
+	// FlowWindowUpdatesRecv — WindowUpdate frames received from client (server credits returned).
+	// UnknownFlag — frames with an unrecognised Flags byte (defensive default counter).
+	// FlowSessionsActive — gauge: WS sessions that negotiated flow control (signed for delta Add).
+	FlowWindowUpdatesRecv atomic.Uint64
+	UnknownFlag           atomic.Uint64
+	FlowSessionsActive    atomic.Int64
+
+	backpressureActive atomic.Bool
 
 	// T1.7 (Phase 2, 2026-04-26) — BroadcastStreamClose drain instrumentation.
 	// Master spec exit criterion: P99 wall-clock < 2s for a 10k-tunnel drain.
@@ -408,23 +395,6 @@ type MetricsSnapshot struct {
 	WSReaderExitOther      uint64 `json:"ws_reader_exit_other"`
 	// Wave 2.1 (2026-05-17) — WS upgrade accepts on retired legacy paths.
 	WSPathLegacyHits uint64 `json:"ws_path_legacy_hits"`
-	// Live decoy (T1.3) — /blog/* and /_cdn/* reverse-proxy instrumentation.
-	DecoyLiveBlogRequests              uint64 `json:"decoy_live_blog_requests"`
-	DecoyLiveBlogCacheHits             uint64 `json:"decoy_live_blog_cache_hits"`
-	DecoyLiveBlogCacheMisses           uint64 `json:"decoy_live_blog_cache_misses"`
-	DecoyLiveBlogUpstreamOK            uint64 `json:"decoy_live_blog_upstream_ok"`
-	DecoyLiveBlogUpstreamErr           uint64 `json:"decoy_live_blog_upstream_err"`
-	DecoyLiveBlogUpstreamRateLimited   uint64 `json:"decoy_live_blog_upstream_rate_limited"`
-	DecoyLiveBlogStaleServed           uint64 `json:"decoy_live_blog_stale_served"`
-	DecoyLiveBlogFallbackSPA           uint64 `json:"decoy_live_blog_fallback_spa"`
-	DecoyLiveBlogRewritePanic          uint64 `json:"decoy_live_blog_rewrite_panic"`
-	DecoyLiveBlogRewriteDrift          uint64 `json:"decoy_live_blog_rewrite_drift"`
-	DecoyLiveBlogCanaryOK              uint64 `json:"decoy_live_blog_canary_ok"`
-	DecoyLiveBlogCanaryFetchFail       uint64 `json:"decoy_live_blog_canary_fetch_fail"`
-	DecoyLiveBlogCanaryLastHealthyUnix int64  `json:"decoy_live_blog_canary_last_healthy_unix"`
-	DecoyLiveBlogCDNHits               uint64 `json:"decoy_live_blog_cdn_hits"`
-	DecoyLiveBlogCDNErrors             uint64 `json:"decoy_live_blog_cdn_errors"`
-	DecoyLiveBlogServeHTTPPanic        uint64 `json:"decoy_live_blog_serve_http_panic"`
 	// T1.7 (Phase 2) — BroadcastStreamClose drain SLA telemetry.
 	BroadcastCloseDrainCount       uint64  `json:"broadcast_close_drain_count"`
 	BroadcastCloseDrainSecondsLast float64 `json:"broadcast_close_drain_seconds_last"`
@@ -485,22 +455,6 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		WSReaderExitLocalClose:             m.WSReaderExitLocalClose.Load(),
 		WSReaderExitOther:                  m.WSReaderExitOther.Load(),
 		WSPathLegacyHits:                   m.WSPathLegacyHits.Load(),
-		DecoyLiveBlogRequests:              m.DecoyLiveBlogRequests.Load(),
-		DecoyLiveBlogCacheHits:             m.DecoyLiveBlogCacheHits.Load(),
-		DecoyLiveBlogCacheMisses:           m.DecoyLiveBlogCacheMisses.Load(),
-		DecoyLiveBlogUpstreamOK:            m.DecoyLiveBlogUpstreamOK.Load(),
-		DecoyLiveBlogUpstreamErr:           m.DecoyLiveBlogUpstreamErr.Load(),
-		DecoyLiveBlogUpstreamRateLimited:   m.DecoyLiveBlogUpstreamRateLimited.Load(),
-		DecoyLiveBlogStaleServed:           m.DecoyLiveBlogStaleServed.Load(),
-		DecoyLiveBlogFallbackSPA:           m.DecoyLiveBlogFallbackSPA.Load(),
-		DecoyLiveBlogRewritePanic:          m.DecoyLiveBlogRewritePanic.Load(),
-		DecoyLiveBlogRewriteDrift:          m.DecoyLiveBlogRewriteDrift.Load(),
-		DecoyLiveBlogCanaryOK:              m.DecoyLiveBlogCanaryOK.Load(),
-		DecoyLiveBlogCanaryFetchFail:       m.DecoyLiveBlogCanaryFetchFail.Load(),
-		DecoyLiveBlogCanaryLastHealthyUnix: m.DecoyLiveBlogCanaryLastHealthyUnix.Load(),
-		DecoyLiveBlogCDNHits:               m.DecoyLiveBlogCDNHits.Load(),
-		DecoyLiveBlogCDNErrors:             m.DecoyLiveBlogCDNErrors.Load(),
-		DecoyLiveBlogServeHTTPPanic:        m.DecoyLiveBlogServeHTTPPanic.Load(),
 		BroadcastCloseDrainCount:           m.broadcastCloseDrainCount.Load(),
 		BroadcastCloseDrainSecondsLast:     float64(m.broadcastCloseDrainNanosLast.Load()) / 1e9,
 		BroadcastCloseDrainSecondsAvg: func() float64 {
@@ -703,70 +657,6 @@ func writePromMetrics(w http.ResponseWriter, s *MetricsSnapshot) {
 	fmt.Fprintf(w, "# HELP shadowlink_active_connections Connections currently resident\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_active_connections gauge\n")
 	fmt.Fprintf(w, "shadowlink_active_connections %d\n", s.ActiveConnections)
-
-	fmt.Fprintf(w, "# HELP decoy_live_blog_requests_total Total /blog/* and /_cdn/* requests dispatched to live-blog handler\n")
-	fmt.Fprintf(w, "# TYPE decoy_live_blog_requests_total counter\n")
-	fmt.Fprintf(w, "decoy_live_blog_requests_total %d\n", s.DecoyLiveBlogRequests)
-
-	fmt.Fprintf(w, "# HELP decoy_live_blog_cache_hits_total Requests served from LRU cache (fresh entry)\n")
-	fmt.Fprintf(w, "# TYPE decoy_live_blog_cache_hits_total counter\n")
-	fmt.Fprintf(w, "decoy_live_blog_cache_hits_total %d\n", s.DecoyLiveBlogCacheHits)
-
-	fmt.Fprintf(w, "# HELP decoy_live_blog_cache_misses_total Requests that missed the LRU cache and triggered upstream fetch\n")
-	fmt.Fprintf(w, "# TYPE decoy_live_blog_cache_misses_total counter\n")
-	fmt.Fprintf(w, "decoy_live_blog_cache_misses_total %d\n", s.DecoyLiveBlogCacheMisses)
-
-	fmt.Fprintf(w, "# HELP decoy_live_blog_upstream_ok_total Successful upstream fetches\n")
-	fmt.Fprintf(w, "# TYPE decoy_live_blog_upstream_ok_total counter\n")
-	fmt.Fprintf(w, "decoy_live_blog_upstream_ok_total %d\n", s.DecoyLiveBlogUpstreamOK)
-
-	fmt.Fprintf(w, "# HELP decoy_live_blog_upstream_err_total Failed upstream fetches (non-rate-limit errors)\n")
-	fmt.Fprintf(w, "# TYPE decoy_live_blog_upstream_err_total counter\n")
-	fmt.Fprintf(w, "decoy_live_blog_upstream_err_total %d\n", s.DecoyLiveBlogUpstreamErr)
-
-	fmt.Fprintf(w, "# HELP decoy_live_blog_upstream_rate_limited_total Upstream fetches dropped by the rate limiter\n")
-	fmt.Fprintf(w, "# TYPE decoy_live_blog_upstream_rate_limited_total counter\n")
-	fmt.Fprintf(w, "decoy_live_blog_upstream_rate_limited_total %d\n", s.DecoyLiveBlogUpstreamRateLimited)
-
-	fmt.Fprintf(w, "# HELP decoy_live_blog_stale_served_total Responses served from stale cache after upstream failure\n")
-	fmt.Fprintf(w, "# TYPE decoy_live_blog_stale_served_total counter\n")
-	fmt.Fprintf(w, "decoy_live_blog_stale_served_total %d\n", s.DecoyLiveBlogStaleServed)
-
-	fmt.Fprintf(w, "# HELP decoy_live_blog_fallback_spa_total Requests that fell back to static SPA decoy (no cache, upstream failed)\n")
-	fmt.Fprintf(w, "# TYPE decoy_live_blog_fallback_spa_total counter\n")
-	fmt.Fprintf(w, "decoy_live_blog_fallback_spa_total %d\n", s.DecoyLiveBlogFallbackSPA)
-
-	fmt.Fprintf(w, "# HELP decoy_live_blog_rewrite_panic_total HTMLRewriter panics recovered during response rewriting\n")
-	fmt.Fprintf(w, "# TYPE decoy_live_blog_rewrite_panic_total counter\n")
-	fmt.Fprintf(w, "decoy_live_blog_rewrite_panic_total %d\n", s.DecoyLiveBlogRewritePanic)
-
-	fmt.Fprintf(w, "# HELP decoy_live_blog_rewrite_drift_total HTMLRewriter drift events (rewrite output differs from template expectation)\n")
-	fmt.Fprintf(w, "# TYPE decoy_live_blog_rewrite_drift_total counter\n")
-	fmt.Fprintf(w, "decoy_live_blog_rewrite_drift_total %d\n", s.DecoyLiveBlogRewriteDrift)
-
-	fmt.Fprintf(w, "# HELP decoy_live_blog_canary_ok_total Canary watchdog successful article fetches\n")
-	fmt.Fprintf(w, "# TYPE decoy_live_blog_canary_ok_total counter\n")
-	fmt.Fprintf(w, "decoy_live_blog_canary_ok_total %d\n", s.DecoyLiveBlogCanaryOK)
-
-	fmt.Fprintf(w, "# HELP decoy_live_blog_canary_fetch_fail_total Canary watchdog failed article fetches\n")
-	fmt.Fprintf(w, "# TYPE decoy_live_blog_canary_fetch_fail_total counter\n")
-	fmt.Fprintf(w, "decoy_live_blog_canary_fetch_fail_total %d\n", s.DecoyLiveBlogCanaryFetchFail)
-
-	fmt.Fprintf(w, "# HELP decoy_live_blog_canary_last_healthy_unix Unix timestamp of the last successful canary fetch (0 = never)\n")
-	fmt.Fprintf(w, "# TYPE decoy_live_blog_canary_last_healthy_unix gauge\n")
-	fmt.Fprintf(w, "decoy_live_blog_canary_last_healthy_unix %d\n", s.DecoyLiveBlogCanaryLastHealthyUnix)
-
-	fmt.Fprintf(w, "# HELP decoy_live_blog_cdn_hits_total Successful /_cdn/* upstream fetches\n")
-	fmt.Fprintf(w, "# TYPE decoy_live_blog_cdn_hits_total counter\n")
-	fmt.Fprintf(w, "decoy_live_blog_cdn_hits_total %d\n", s.DecoyLiveBlogCDNHits)
-
-	fmt.Fprintf(w, "# HELP decoy_live_blog_cdn_errors_total Failed /_cdn/* upstream fetches\n")
-	fmt.Fprintf(w, "# TYPE decoy_live_blog_cdn_errors_total counter\n")
-	fmt.Fprintf(w, "decoy_live_blog_cdn_errors_total %d\n", s.DecoyLiveBlogCDNErrors)
-
-	fmt.Fprintf(w, "# HELP decoy_live_blog_serve_http_panic_total Panics caught by the LiveBlogHandler.ServeHTTP outer defer-recover (A3-I-MED-4)\n")
-	fmt.Fprintf(w, "# TYPE decoy_live_blog_serve_http_panic_total counter\n")
-	fmt.Fprintf(w, "decoy_live_blog_serve_http_panic_total %d\n", s.DecoyLiveBlogServeHTTPPanic)
 
 	// T1.7 (Phase 2) — BroadcastStreamClose drain SLA. Master spec exit
 	// criterion: P99 wall-clock < 2s for 10k tunnels. We export count/last/avg

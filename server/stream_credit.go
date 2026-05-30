@@ -2,6 +2,18 @@ package server
 
 import "sync"
 
+// negotiateFlowWindow returns the effective window = min(clientWindow,
+// serverMax), or 0 if the client did not advertise (clientWindow==0 → off).
+func negotiateFlowWindow(clientWindow, serverMax uint32) uint32 {
+	if clientWindow == 0 {
+		return 0
+	}
+	if clientWindow > serverMax {
+		return serverMax
+	}
+	return clientWindow
+}
+
 // stream_credit.go — server-side per-stream send credit (Bug #8). The WS
 // per-stream relay goroutine calls waitForCredit BEFORE reading the target
 // (websocket.go), so a stream with no credit simply doesn't read — the target

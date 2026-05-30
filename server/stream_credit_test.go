@@ -56,6 +56,18 @@ func TestStreamCredit_ConsumeAndClamp(t *testing.T) {
 	}
 }
 
+func TestNegotiateFlowWindow(t *testing.T) {
+	if got := negotiateFlowWindow(4<<20, 1<<20); got != 1<<20 {
+		t.Fatalf("negotiateFlowWindow(4M,1M) = %d, want 1M", got)
+	}
+	if got := negotiateFlowWindow(256<<10, 1<<20); got != 256<<10 {
+		t.Fatalf("got %d, want 256KiB", got)
+	}
+	if got := negotiateFlowWindow(0, 1<<20); got != 0 {
+		t.Fatalf("got %d, want 0", got)
+	}
+}
+
 func TestStreamCredit_WaitReturnsWhenDoneClosed(t *testing.T) {
 	c := newStreamCredit(0)
 	doneCh := make(chan struct{})

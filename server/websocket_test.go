@@ -36,6 +36,12 @@ func TestWSPingInterval_MedianBumped(t *testing.T) {
 	}
 }
 
+// wsAuthResult is the pair returned by authenticateFirstFrame (session + negotiated window).
+type wsAuthResult struct {
+	session    *core.Session
+	flowWindow uint32
+}
+
 // wsAuthHarness wires a single-shot httptest server that upgrades the request
 // and feeds authenticateFirstFrame with the resulting *websocket.Conn. The
 // result (or nil) is published on resCh. Callers drive the client side of the
@@ -43,21 +49,22 @@ func TestWSPingInterval_MedianBumped(t *testing.T) {
 type wsAuthHarness struct {
 	srv    *httptest.Server
 	wsURL  string
-	resCh  chan *core.Session
+	resCh  chan wsAuthResult
 	client *websocket.Conn
 }
 
 func newWSAuthHarness(t *testing.T, h *Handler) *wsAuthHarness {
 	t.Helper()
-	resCh := make(chan *core.Session, 1)
+	resCh := make(chan wsAuthResult, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := wsUpgrader.Upgrade(w, r, nil)
 		if err != nil {
-			resCh <- nil
+			resCh <- wsAuthResult{}
 			return
 		}
 		defer conn.Close()
-		resCh <- h.authenticateFirstFrame(conn)
+		sess, fw := h.authenticateFirstFrame(conn)
+		resCh <- wsAuthResult{session: sess, flowWindow: fw}
 	}))
 	return &wsAuthHarness{
 		srv:   srv,
@@ -86,8 +93,8 @@ func (ha *wsAuthHarness) close() {
 func (ha *wsAuthHarness) waitResult(t *testing.T, overall time.Duration) (*core.Session, bool) {
 	t.Helper()
 	select {
-	case s := <-ha.resCh:
-		return s, true
+	case r := <-ha.resCh:
+		return r.session, true
 	case <-time.After(overall):
 		return nil, false
 	}
