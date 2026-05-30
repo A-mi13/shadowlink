@@ -196,12 +196,23 @@ func (h *Handler) authenticateFirstFrame(conn *websocket.Conn) (*core.Session, u
 	if cw, okFlow := core.ParseFlowCtlMarker(chunk.Payload); okFlow {
 		effectiveWindow = negotiateFlowWindow(cw, uint32(h.flowMaxWindow))
 		if effectiveWindow > 0 {
+			ackSent := false
 			ack := &core.Chunk{SessionID: session.ID, SeqNum: session.NextSeqNum(), Flags: core.FlagAck,
 				Payload: core.BuildFlowCtlMarker(effectiveWindow)}
 			if enc, encErr := session.EncryptChunk(ack); encErr == nil {
 				conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-				_ = conn.WriteMessage(websocket.BinaryMessage, enc)
+				if werr := conn.WriteMessage(websocket.BinaryMessage, enc); werr == nil {
+					ackSent = true
+				}
 				conn.SetWriteDeadline(time.Time{})
+			}
+			// Fail-open: if the ack did not reach the client, the client will NOT
+			// enable flow control on its side (it never saw the ack). The server
+			// MUST match that — otherwise it would gate on credit the client never
+			// sends, stalling the stream after the first window. Disable flow for
+			// this session so the relay runs ungated (same as an old client).
+			if !ackSent {
+				effectiveWindow = 0
 			}
 		}
 	}
