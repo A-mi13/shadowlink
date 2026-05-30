@@ -152,6 +152,14 @@ type Client struct {
 	flowControlEnabled bool
 	flowWindow         uint64
 
+	// flowSendForTest, when non-nil, replaces the real WINDOW_UPDATE send in
+	// creditSenderTick (unit-test seam). Production path is nil.
+	flowSendForTest func(streamID uint16, delta uint32) bool
+	// flowTransport is the StreamTransport credit updates ride. Set when the
+	// pool/transport is wired; the sender resolves the stream's slot via it.
+	flowTransport StreamTransport
+	flowStop      chan struct{}
+
 	// Cold-start observability (Task D5, 2026-05-02 plan).
 	//
 	// connectStartUnixNano stores time.Now().UnixNano() at the start of

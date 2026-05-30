@@ -157,31 +157,24 @@ type statsRegistry struct {
 	// --- Rate-limit detection (Phase 2+) ---
 	RateLimitDetectedByBody   atomic.Uint64
 	RateLimitDetectedByHeader atomic.Uint64
-	// RateLimitDetectedFallback — no carrier signal extracted from response,
-	// but body starts with '<' (HTML decoy). Lifeline path: client applies
-	// default 90s cooldown to avoid tight reconnect loop. Non-zero rate
-	// suggests CDN is stripping both header and body marker — operational
-	// signal to investigate CF Transform Rules / Speed Brain settings.
-	RateLimitDetectedFallback atomic.Uint64
 
 	// === Phase 2 (2026-05-14) per-path rate-limit counters ===
 	// Split detection events by transport path so ops can triage "which gate is
 	// being throttled?" without guessing. The aggregate counters above
-	// (RateLimitDetectedBy{Body,Header,Fallback}) are preserved for back-compat
+	// (RateLimitDetectedBy{Body,Header}) are preserved for back-compat
 	// and always equal the sum of the corresponding per-path fields.
 	//
 	// "handshake" path: transport.go DirectTransport.SendHandshake /
-	//   SendHandshakeRaw — POST-only, detector runs Detect() (with lifeline).
+	//   SendHandshakeRaw — POST-only.
 	// "ws_upgrade" path: ws_transport.go WebSocketTransport.UpgradeToWS —
-	//   WS Dial response, detector runs DetectCarriersOnly() (no lifeline).
+	//   WS Dial response.
 	//
-	// Note: no RateLimitDetectedFallback_WS — the WS path uses
-	// DetectCarriersOnly which never fires the lifeline.
+	// Both paths run DetectCarriersOnly() — only a genuine Schema.org body
+	// marker or X-SL-RL header triggers a rate-limit signal.
 	RateLimitDetectedByBody_Handshake   atomic.Uint64
 	RateLimitDetectedByBody_WS          atomic.Uint64
 	RateLimitDetectedByHeader_Handshake atomic.Uint64
 	RateLimitDetectedByHeader_WS        atomic.Uint64
-	RateLimitDetectedFallback_Handshake atomic.Uint64
 
 	// --- WS reader/writer health (Phase −1 partial, full Phase 3+) ---
 	WSReaderExitsEOF     atomic.Uint64
@@ -277,6 +270,11 @@ type statsRegistry struct {
 	// indicates SOCKS consumer death races (most often local app closing
 	// TCP early) — see spec 2026-05-23.
 	StreamBufferOverflowsTotal atomic.Uint64
+
+	// Bug #8 flow control client-side counters.
+	FlowWindowUpdatesSent   atomic.Uint64
+	FlowWindowUpdateDropped atomic.Uint64 // TryEnqueueControl full → delta kept
+	FlowNegotiationTimeout  atomic.Uint64 // ack not received within negotiationAckTimeout
 
 	// DrainForceEvictedTotal — every time startDrain force-evicted an
 	// idle slotReady cell (streams==0) because claimFreeSlot returned -1
@@ -662,6 +660,9 @@ func WritePromMetrics(w io.Writer) {
 	fmt.Fprintf(w, "# HELP shadowlink_stream_buffer_overflows_total Frames dropped at RouteToStream because the per-stream buffered channel was full (consumer dead/slow)\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_stream_buffer_overflows_total counter\n")
 	fmt.Fprintf(w, "shadowlink_stream_buffer_overflows_total %d\n", Stats.StreamBufferOverflowsTotal.Load())
+	fmt.Fprintf(w, "shadowlink_flow_window_updates_sent_total %d\n", Stats.FlowWindowUpdatesSent.Load())
+	fmt.Fprintf(w, "shadowlink_flow_window_update_dropped_total %d\n", Stats.FlowWindowUpdateDropped.Load())
+	fmt.Fprintf(w, "shadowlink_flow_negotiation_timeout_total %d\n", Stats.FlowNegotiationTimeout.Load())
 
 	fmt.Fprintf(w, "# HELP shadowlink_slot_drain_force_evicted_active_total Emergency evictions of slotReady cells with active streams (over-aged drain target, no idle cell available)\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_slot_drain_force_evicted_active_total counter\n")

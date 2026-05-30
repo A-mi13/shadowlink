@@ -87,3 +87,54 @@ func TestOnStreamConsumed_UnknownStreamSafe(t *testing.T) {
 	c.streamFlow = map[uint16]*streamFlowState{}
 	c.OnStreamConsumed(999, 100) // no panic, no-op
 }
+
+func TestCreditSender_SendsAtThreshold(t *testing.T) {
+	c := &Client{}
+	c.flowControlEnabled = true
+	c.flowWindow = 1000
+	c.streamFlow = map[uint16]*streamFlowState{7: {window: 1000}}
+	c.streamFlow[7].pendingDelta.Store(600) // > 50% of 1000
+
+	sent := map[uint16]uint32{}
+	c.flowSendForTest = func(streamID uint16, delta uint32) bool {
+		sent[streamID] = delta
+		return true
+	}
+
+	c.creditSenderTick(0.5) // fixed threshold ratio for determinism
+	if sent[7] != 600 {
+		t.Fatalf("sent delta = %d, want 600", sent[7])
+	}
+	if got := c.streamFlow[7].pendingDelta.Load(); got != 0 {
+		t.Fatalf("pendingDelta after send = %d, want 0", got)
+	}
+}
+
+func TestCreditSender_BelowThresholdNoSend(t *testing.T) {
+	c := &Client{}
+	c.flowControlEnabled = true
+	c.flowWindow = 1000
+	c.streamFlow = map[uint16]*streamFlowState{7: {window: 1000}}
+	c.streamFlow[7].pendingDelta.Store(400) // < 50%
+
+	called := false
+	c.flowSendForTest = func(uint16, uint32) bool { called = true; return true }
+	c.creditSenderTick(0.5)
+	if called {
+		t.Fatal("should not send below threshold")
+	}
+}
+
+func TestCreditSender_KeepsDeltaOnSendFailure(t *testing.T) {
+	c := &Client{}
+	c.flowControlEnabled = true
+	c.flowWindow = 1000
+	c.streamFlow = map[uint16]*streamFlowState{7: {window: 1000}}
+	c.streamFlow[7].pendingDelta.Store(600)
+
+	c.flowSendForTest = func(uint16, uint32) bool { return false } // send failed
+	c.creditSenderTick(0.5)
+	if got := c.streamFlow[7].pendingDelta.Load(); got != 600 {
+		t.Fatalf("pendingDelta after failed send = %d, want 600 (kept)", got)
+	}
+}
