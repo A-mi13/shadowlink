@@ -601,6 +601,117 @@ func TestE2E_PreemptiveMigration_NoByteLoss(t *testing.T) {
 		"sha256 mismatch — bytes lost/reordered across the migration boundary")
 }
 
+// sendUplink writes one FlagData uplink frame (client→origin) for streamID on
+// this slot. The wire format mirrors the production client's uplink path
+// (proxy/socks5/tcp.go): a legacy NewStreamDataChunk ([streamID][data], NO
+// downSeq) — uplink is never seq-tagged because the client serializes it onto a
+// single slot at a time (the §5.3 uplink barrier holds it off the old slot until
+// a migration resolves, so it never splits across slots → no reordering needed).
+func (s *e2eSlot) sendUplink(t *testing.T, streamID uint16, data []byte) {
+	t.Helper()
+	chunk := core.NewStreamDataChunk(s.session.ID, s.session.NextSeqNum(), streamID, data)
+	s.sendChunk(t, chunk)
+}
+
+// readOriginExactly reads exactly n bytes from the origin server-side conn (what
+// the relay's uplink writes land on). It is the load-bearing assertion harness
+// for uplink-after-migration: every byte the client sent uplink must arrive here
+// in order. Fails the test if n bytes do not arrive within `within`.
+func readOriginExactly(t *testing.T, c net.Conn, n int, within time.Duration) []byte {
+	t.Helper()
+	out := make([]byte, 0, n)
+	buf := make([]byte, 32<<10)
+	c.SetReadDeadline(time.Now().Add(within))
+	defer c.SetReadDeadline(time.Time{})
+	for len(out) < n {
+		r, err := c.Read(buf)
+		if r > 0 {
+			out = append(out, buf[:r]...)
+		}
+		if err != nil {
+			break
+		}
+	}
+	return out
+}
+
+// TestE2E_UplinkAfterMigration_NoByteLoss is the load-bearing proof of BLOCKER
+// B1 (final review 2026-06-01): after a stream migrates from slot A to slot B,
+// UPLINK bytes (client→origin) sent on slot B must reach the origin. The bug:
+// the FlagData uplink branch routed through slot B's LOCAL per-session streams[]
+// map, which has no entry for a stream that CONNECTed on slot A → the bytes were
+// silently dropped. Downlink survived migration (registry-backed relayLoop), but
+// uplink had no registry-fallback (unlike WINDOW_UPDATE / StreamAck / FIN).
+//
+// The test sends uplink BEFORE migration (slot A → origin, proves the baseline
+// path works) and AFTER migration (slot B → origin, the regression). The origin
+// (a net.Pipe whose server side the test reads) must receive ALL uplink bytes in
+// order — asserted by sha256 over the full concatenation.
+//
+// WITHOUT the fix the post-migration uplink is dropped at server/websocket.go
+// (streams[sid]==nil on slot B) → readOriginExactly times out short → the length
+// + sha256 asserts fail. WITH the registry-fallback the bytes route to entry.tc
+// (the egress that survived the migration) and the origin receives them all.
+func TestE2E_UplinkAfterMigration_NoByteLoss(t *testing.T) {
+	ha := newE2EHarness(t, true)
+	const streamID = uint16(0x71)
+	const half = 64 << 10 // 64 KiB per phase (well under pendingBufMax flush + window)
+	const total = 2 * half
+	payload := deterministicPayload(total)
+	want := sha256.Sum256(payload)
+
+	slotA := ha.dialSlot(true, 1<<20)
+	defer slotA.close()
+	slotB := ha.dialSlot(true, 1<<20)
+	defer slotB.close()
+
+	reasm := newE2EReassembler()
+	proof, hasProof := slotA.connect(t, streamID, "origin:443", reasm)
+	require.True(t, hasProof, "migration CONNECT_OK must carry a proof")
+	origin := ha.waitOrigin(3 * time.Second)
+
+	// A background reader collects everything the relay writes uplink-ward to the
+	// origin (net.Pipe write blocks until read, so we MUST drain it concurrently
+	// or the relay's uplink write would deadlock).
+	gotCh := make(chan []byte, 1)
+	go func() { gotCh <- readOriginExactly(t, origin, total, 10*time.Second) }()
+
+	// PHASE 1: uplink on slot A (the origin/baseline path). Send in small pieces
+	// so the relay's uplink writer flushes them to the origin pipe.
+	for off := 0; off < half; off += 16 << 10 {
+		end := off + (16 << 10)
+		if end > half {
+			end = half
+		}
+		slotA.sendUplink(t, streamID, payload[off:end])
+	}
+
+	// Preemptive MIGRATE A→B (real wire control frame + real proof). After this
+	// the server has re-homed the stream's binding to slot B and (pre-fix) slot
+	// B's reader has no streams[streamID] entry for uplink.
+	ok, _, reason := slotB.sendMigrate(t, core.FlagMigrate, streamID, proof)
+	require.True(t, ok, "preemptive MIGRATE must succeed, reason=0x%02x", reason)
+
+	// PHASE 2: uplink on slot B (the regression path). These bytes can only reach
+	// the origin if the FlagData uplink branch falls back to the registry's
+	// relayEntry.tc when the local streams[] map misses.
+	for off := half; off < total; off += 16 << 10 {
+		end := off + (16 << 10)
+		if end > total {
+			end = total
+		}
+		slotB.sendUplink(t, streamID, payload[off:end])
+	}
+
+	got := <-gotCh
+	require.Equal(t, total, len(got),
+		"uplink byte loss across the migration boundary — post-migration client→origin bytes were dropped (BLOCKER B1)")
+	require.Greater(t, len(got), half,
+		"no uplink bytes arrived after the migration — test would be vacuous")
+	require.Equal(t, want, sha256.Sum256(got),
+		"uplink sha256 mismatch — bytes lost/reordered across the migration boundary")
+}
+
 // drainUntil pulls seq frames for streamID from slot into reasm until reasm.out
 // reaches atLeast in-order bytes or `within` elapses. It replenishes credit per
 // frame. It is the test-side pump that lets a phase's writes be fully observed

@@ -807,6 +807,40 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 				streamsMu.Unlock()
 				if s != nil && len(payload) > 0 {
 					s.Write(payload) // async — never blocks!
+				} else if s == nil && len(payload) > 0 && migrateEnabled && migrateClientID != "" {
+					// Bug #9 BLOCKER B1 (final review 2026-06-01) — uplink
+					// registry-fallback. The uplink (client→origin) is the only
+					// per-stream path that stayed on the local per-slot streams[]
+					// map after migration; downlink (relayLoop), WINDOW_UPDATE,
+					// StreamAck and FIN all already resolve via the registry. When a
+					// stream CONNECTed on slot A and then migrated to THIS slot B,
+					// streams[streamID] is empty here (the wsStream lives on slot A),
+					// so without this fallback the post-migration uplink was silently
+					// dropped → the application protocol hangs.
+					//
+					// Symmetric to FlagWindowUpdate (:~1242) / FlagStreamAck (:~1275)
+					// / FlagFin (:~1148): resolve the migrated relay by
+					// (clientID, streamID) and write the uplink directly to its egress
+					// conn (entry.tc) — the SAME net.Conn that was streams[sid].
+					// targetConn on slot A (websocket.go:401), which survives the slot
+					// rotation precisely so this can keep working.
+					//
+					// No reordering needed: the client's §5.3 uplink barrier
+					// (WaitStreamMigrateBarrier) holds the uplink goroutine off the OLD
+					// slot until the MIGRATE/RESUME resolves, so the client never sends
+					// uplink on slot A and slot B concurrently — uplink is serialized
+					// onto exactly one slot at a time. entry.tc has a single writer at
+					// any moment; relayLoop only READS the egress (half-duplex by
+					// direction) so there is no concurrent-write race. A blocking
+					// tc.Write here applies natural backpressure to the WS reader of
+					// this slot (same shape as wsStream's writer goroutine), and on
+					// error we leave teardown to the FIN / grace / dest-EOF paths.
+					if entry, ok := h.relayRegistry.find(migrateClientID, streamID); ok && entry.tc != nil {
+						if _, werr := entry.tc.Write(payload); werr != nil {
+							slog.Warn("WS uplink registry-fallback write failed",
+								"stream", streamID, "err", werr)
+						}
+					}
 				}
 
 			case core.FlagConnect:
