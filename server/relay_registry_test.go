@@ -86,3 +86,56 @@ func TestBoundedBuffer_AckEvictsUpToSeq(t *testing.T) {
 		t.Fatalf("after evictUpTo(2): %+v", frames)
 	}
 }
+
+func TestRelayRegistry_AddFindRemove(t *testing.T) {
+	r := newRelayRegistry()
+	e := &relayEntry{originClientID: "c1", globalStreamID: 42}
+	r.add("c1", 42, e)
+	got, ok := r.find("c1", 42)
+	if !ok || got != e {
+		t.Fatal("find did not return the added entry")
+	}
+	if _, ok := r.find("c2", 42); ok {
+		t.Fatal("cross-client collision on streamID")
+	}
+	r.remove("c1", 42)
+	if _, ok := r.find("c1", 42); ok {
+		t.Fatal("entry not removed")
+	}
+}
+
+func TestRelayState_SingleWinner_ResumeBeatsTimer(t *testing.T) {
+	var e relayEntry
+	e.state.Store(stOrphaned)
+	resumeWon := e.state.CompareAndSwap(stOrphaned, stActive)
+	timerWon := e.state.CompareAndSwap(stOrphaned, stClosing)
+	if !resumeWon || timerWon {
+		t.Fatalf("resume should win: resumeWon=%v timerWon=%v", resumeWon, timerWon)
+	}
+	if e.state.Load() != stActive {
+		t.Fatal("state not active after resume won")
+	}
+}
+
+func TestRelayState_SingleWinner_TimerBeatsResume(t *testing.T) {
+	var e relayEntry
+	e.state.Store(stOrphaned)
+	timerWon := e.state.CompareAndSwap(stOrphaned, stClosing)
+	resumeWon := e.state.CompareAndSwap(stOrphaned, stActive)
+	if !timerWon || resumeWon {
+		t.Fatalf("timer should win: timerWon=%v resumeWon=%v", timerWon, resumeWon)
+	}
+}
+
+func TestRelayRegistry_PerClientCount(t *testing.T) {
+	r := newRelayRegistry()
+	r.add("c1", 1, &relayEntry{})
+	r.add("c1", 2, &relayEntry{})
+	r.add("c2", 1, &relayEntry{})
+	if n := r.countForClient("c1"); n != 2 {
+		t.Fatalf("countForClient(c1) = %d, want 2", n)
+	}
+	if n := r.totalCount(); n != 3 {
+		t.Fatalf("totalCount = %d, want 3", n)
+	}
+}

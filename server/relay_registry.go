@@ -113,5 +113,68 @@ type relayEntry struct {
 	// FD accounting (F5).
 	holdsFD bool
 
+	// Bug#8 stream credit — lives here, survives migration (F9, §5.9).
+	credit *streamCredit
+
 	perEntryMu sync.Mutex
+}
+
+// relayRegistry holds relays keyed (clientID, globalStreamID), living
+// independently of any single WS session (§5.1). RWMutex guards the maps;
+// per-entry mutation uses relayEntry.perEntryMu / atomics.
+type relayRegistry struct {
+	mu       sync.RWMutex
+	byClient map[string]map[uint16]*relayEntry
+}
+
+func newRelayRegistry() *relayRegistry {
+	return &relayRegistry{byClient: make(map[string]map[uint16]*relayEntry)}
+}
+
+func (r *relayRegistry) add(clientID string, streamID uint16, e *relayEntry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m := r.byClient[clientID]
+	if m == nil {
+		m = make(map[uint16]*relayEntry)
+		r.byClient[clientID] = m
+	}
+	m[streamID] = e
+}
+
+func (r *relayRegistry) find(clientID string, streamID uint16) (*relayEntry, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if m := r.byClient[clientID]; m != nil {
+		e, ok := m[streamID]
+		return e, ok
+	}
+	return nil, false
+}
+
+func (r *relayRegistry) remove(clientID string, streamID uint16) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if m := r.byClient[clientID]; m != nil {
+		delete(m, streamID)
+		if len(m) == 0 {
+			delete(r.byClient, clientID)
+		}
+	}
+}
+
+func (r *relayRegistry) countForClient(clientID string) int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.byClient[clientID])
+}
+
+func (r *relayRegistry) totalCount() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	n := 0
+	for _, m := range r.byClient {
+		n += len(m)
+	}
+	return n
 }
