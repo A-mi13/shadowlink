@@ -1,11 +1,21 @@
 package server
 
 import (
+	"net"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"github.com/gorilla/websocket"
 
 	"github.com/nixavpn/shadowlink/core"
 )
+
+// websocketBinaryMessage aliases the gorilla BinaryMessage opcode so the relay
+// loop here uses the same value the rest of server/websocket.go enqueues with,
+// without repeating the import everywhere. WSAsyncWriter.Enqueue takes the WS
+// message type as its first argument.
+const websocketBinaryMessage = websocket.BinaryMessage
 
 // pendingDownFrame is one downlink chunk captured under its assigned downSeq.
 // Buffered either while there is no active binding (downBuffer) or as the
@@ -95,8 +105,10 @@ type relayEntry struct {
 	globalStreamID     uint16
 	originSessionNonce [16]byte
 
-	// Egress — survives slot changes.
-	tc interface{ Close() error } // net.Conn; minimal iface keeps the struct testable
+	// Egress — survives slot changes. net.Conn (not just Closer) because the
+	// relay loop now reads it directly (F4); migration moves the binding, not
+	// this conn.
+	tc net.Conn
 
 	// Dynamic binding to the active slot's crypto session+writer (NEW-5).
 	bound atomic.Pointer[binding]
@@ -203,4 +215,90 @@ func (e *relayEntry) resendTail() []pendingDownFrame {
 		return nil
 	}
 	return e.unackedTail.tailFrames()
+}
+
+// relayLoop is the per-stream egress→client pump for a migratable relay (F4).
+// Unlike the legacy inline relay in runWebSocketSession (which captured one
+// *core.Session by closure and died with its WS conn), this loop lives on the
+// *relayEntry and reads e.bound.Load() on EVERY frame. When a MIGRATE/RESUME
+// swaps the binding to a new slot's {session, writer} (Task 11), subsequent
+// frames are transparently encrypted under the new session and enqueued on the
+// new writer — the egress TCP conn (e.tc) is untouched. The loop is decoupled
+// from any single WS session's `done`; it exits only on egress read error,
+// credit close, or closeCh (the session-scoped channel that, for migratable
+// sessions, fires on full teardown rather than per-slot rotation).
+//
+// migrateEnabled selects the wire format: when true, frames carry a per-stream
+// monotonic downSeq (NewStreamDataChunkSeq, §3.1/F1) so the client reassembler
+// can reorder across a migration boundary; when false the loop uses the legacy
+// flat NewStreamDataChunk (no downSeq) — but in practice relayLoop is only ever
+// started for migrateEnabled sessions, so the false branch exists for symmetry
+// and direct unit-testing.
+func (e *relayEntry) relayLoop(migrateEnabled bool, closeCh <-chan struct{}) {
+	buf := make([]byte, 32768)
+	for {
+		limit := len(buf)
+		if e.credit != nil {
+			got := e.credit.waitForCredit(closeCh)
+			if got <= 0 {
+				// Credit closed (stream/session torn down) — exit the pump.
+				return
+			}
+			if int(got) < limit {
+				limit = int(got)
+			}
+		}
+
+		n, err := e.tc.Read(buf[:limit])
+		if n > 0 {
+			seq := e.downSeqCounter.Add(1)
+			frame := pendingDownFrame{seq: seq, data: append([]byte(nil), buf[:n]...)}
+
+			b := e.bound.Load()
+			if b == nil || b.session == nil || b.writer == nil {
+				// No active binding (grace window / pre-reassociate, §5.3): hold
+				// the frame in downBuffer so the next binding can flush it in
+				// order. Apply backpressure (don't consume credit, don't read
+				// faster) when the buffer is full.
+				e.perEntryMu.Lock()
+				ok := e.downBuffer.Push(frame)
+				e.perEntryMu.Unlock()
+				if !ok {
+					time.Sleep(2 * time.Millisecond)
+				}
+				continue
+			}
+
+			// Track as unacked-until-StreamAck so a slot-A death before ack can
+			// resend the tail on slot B (NEW-1, §5.3).
+			e.perEntryMu.Lock()
+			e.unackedTail.Push(frame)
+			e.perEntryMu.Unlock()
+
+			e.enqueueDownFrame(b, migrateEnabled, frame)
+			e.credit.consume(n)
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// enqueueDownFrame encrypts one downlink frame under the GIVEN binding's session
+// and enqueues it on that binding's writer. The binding is read once by the
+// caller (relayLoop) and passed in, so a concurrent migration cannot tear the
+// {session, writer} pair mid-encrypt (NEW-5: binding is an atomic pair).
+func (e *relayEntry) enqueueDownFrame(b *binding, migrateEnabled bool, f pendingDownFrame) {
+	var chunk *core.Chunk
+	if migrateEnabled {
+		chunk = core.NewStreamDataChunkSeq(b.session.ID, b.session.NextSeqNum(), e.globalStreamID, f.seq, f.data)
+	} else {
+		chunk = core.NewStreamDataChunk(b.session.ID, b.session.NextSeqNum(), e.globalStreamID, f.data)
+	}
+	enc, err := b.session.EncryptChunk(chunk)
+	core.PutBuffer(chunk.Payload)
+	if err != nil {
+		return
+	}
+	_ = b.writer.Enqueue(websocketBinaryMessage, enc)
 }

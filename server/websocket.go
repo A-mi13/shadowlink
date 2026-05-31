@@ -513,10 +513,12 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 	flowEnabled := flowWindow > 0
 	// Bug #9 §3.5: migrateEnabled reflects negotiateMigration() — both server
 	// config and client capability agreed. When false the relay stays on the
-	// legacy (non-migratable) path. The actual MIGRATE/RESUME handling is wired
-	// in later tasks (T9-T11); for now the flag is carried so the relay loop can
-	// branch on it without another signature change.
-	_ = migrateEnabled
+	// legacy (non-migratable) inline path (verbatim, zero behavior change). When
+	// true, the CONNECT path registers a *relayEntry in h.relayRegistry and runs
+	// the downlink on relayEntry.relayLoop (F4) — the egress conn survives a
+	// WS-slot migration. MIGRATE/RESUME/grace handling lands in Task 11; §5.2
+	// also means the per-stream watchdog must NOT close `tc` on `done` for
+	// migration sessions (the CONNECT branch returns before that watchdog).
 	credits := make(map[uint16]*streamCredit)
 	creditsMu := &sync.Mutex{}
 	if flowEnabled {
@@ -780,6 +782,64 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 					}
 					core.PutBuffer(resp.Payload)
 					slog.Info("WS CONNECT_OK sent", "stream", sid, "target", tgt)
+
+					// Bug #9 §5.1/§5.2 (F4, F11): for a migration-negotiated
+					// session, the downlink relay does NOT live inline here —
+					// it lives on a *relayEntry in h.relayRegistry, reads its
+					// binding dynamically every frame, and survives a WS-slot
+					// migration (the egress conn `tc` is moved, not the loop).
+					// The uplink (client→target) still flows through this
+					// session's reader-loop FlagData → s.Write(payload).
+					//
+					// We register under (clientID, sid): sid is the global
+					// per-client streamID from the CONNECT payload (F11) and
+					// clientID comes from the tunnel created at handshake.
+					if migrateEnabled {
+						var clientID string
+						h.tunnelsMu.RLock()
+						if t, ok := h.tunnels[session.ID]; ok {
+							clientID = t.ClientID
+						}
+						h.tunnelsMu.RUnlock()
+
+						entry := &relayEntry{
+							originClientID:     clientID,
+							globalStreamID:     sid,
+							originSessionNonce: session.MigrateNonce,
+							tc:                 tc,
+							downBuffer:         newBoundedBuffer(int(flowWindow)),
+							unackedTail:        newBoundedBuffer(int(flowWindow)),
+						}
+						entry.state.Store(stActive)
+						// Transfer the per-stream credit allocated at CONNECT
+						// (flowEnabled implies migrateEnabled — migration only
+						// negotiates when flow control did, see
+						// authenticateFirstFrame). The SAME *streamCredit object
+						// stays in `credits[sid]` so the reader-loop's
+						// FlagWindowUpdate handler still replenishes it, and on
+						// `entry.credit` so relayLoop gates on it. §5.9.
+						if flowEnabled {
+							creditsMu.Lock()
+							entry.credit = credits[sid]
+							creditsMu.Unlock()
+						}
+						entry.bound.Store(&binding{session: session, writer: writer})
+						h.relayRegistry.add(clientID, sid, entry)
+
+						// closeCh = session `done`: relayLoop exits when the
+						// credit is closed on session teardown (the <-done
+						// goroutine below closes every credit). Task 11 wires the
+						// orphan transition that detaches a relay from a dying
+						// slot WITHOUT killing the egress conn.
+						go entry.relayLoop(true /*migrateEnabled*/, done)
+
+						// The inline relay is replaced — this dial goroutine has
+						// nothing more to do. The wsStream `s` remains in
+						// `streams[sid]` for uplink; teardown of streams/credit
+						// for migration relays is handled by the session-level
+						// cleanup + Task 11 reassociate/grace logic.
+						return
+					}
 
 					// T3 P3 (audit 2026-05-03): bind relay lifetime to `done`.
 					// Без watchdog'а `tc.Read(buf)` блокируется до timeout'а
