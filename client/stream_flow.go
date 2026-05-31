@@ -203,6 +203,30 @@ func (c *Client) sendWindowUpdate(streamID uint16, delta uint32) bool {
 	return TryStreamWriteControl(c.flowTransport, streamID, enc)
 }
 
+// SendStreamAck builds and non-blockingly sends a FlagStreamAck for streamID
+// confirming in-order downlink delivery up to ackedDownSeq (Bug #9 §5.4). The
+// server uses it as a reassembler barrier to release the unacked resend tail.
+// Best-effort: returns true if enqueued. Rides the same control channel as
+// WINDOW_UPDATE (TryStreamWriteControl). Per-stream throttling is layered on
+// top in a later task (T15); this is the raw send.
+func (c *Client) SendStreamAck(wst StreamTransport, streamID uint16, ackedDownSeq uint64) bool {
+	session := StreamSession(wst, c, streamID)
+	if session == nil {
+		return false
+	}
+	chunk := &core.Chunk{
+		SessionID: session.ID,
+		SeqNum:    session.NextSeqNum(),
+		Flags:     core.FlagStreamAck,
+		Payload:   core.BuildStreamAckFrame(streamID, ackedDownSeq),
+	}
+	enc, err := session.EncryptChunk(chunk)
+	if err != nil {
+		return false
+	}
+	return TryStreamWriteControl(wst, streamID, enc)
+}
+
 // OnStreamConsumed records that n bytes were delivered to the app for streamID.
 // Add-only: never blocks, never sends (I3). No-op if flow control is disabled
 // or the stream has no flow state.

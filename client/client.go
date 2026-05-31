@@ -139,6 +139,13 @@ type Client struct {
 	streamChans   map[uint16]chan []byte // StreamID → incoming data from server
 	streamMu      sync.Mutex
 
+	// streamFramesChans carries seq-tagged downlink frames for streams that ride
+	// a migration-negotiated slot (Bug #9, §5.4). A stream registers EITHER this
+	// or streamChans — never both. The seq channel lets the downlink reassembler
+	// reorder frames that were split across an old (in-flight) and a new slot
+	// during migration. Guarded by streamMu (same lifecycle as streamChans).
+	streamFramesChans map[uint16]chan StreamFrame
+
 	// streamOverflow tracks per-stream RouteToStream drops so we emit a
 	// single aggregated INFO at UnregisterStream instead of N WARNs per
 	// drop. See spec 2026-05-23.
@@ -696,6 +703,40 @@ func (c *Client) NextStreamID() uint16 {
 	return c.streamCounter // fallback — all IDs used (shouldn't happen)
 }
 
+// StreamFrame is one seq-tagged downlink frame for a migration-negotiated
+// stream (Bug #9, §5.4). Seq is the server-assigned downSeq (monotonic from 1;
+// Seq==0 is a control frame — CONNECT_OK/FAIL — that bypasses the reassembler).
+// Data is the post-prefix payload (StreamID + downSeq already stripped).
+type StreamFrame struct {
+	Seq  uint64
+	Data []byte
+}
+
+// RegisterStreamSeq creates a seq-tagged channel for a migration-negotiated
+// stream. Mirrors RegisterStream but the element type is StreamFrame so the
+// downlink reassembler can reorder by downSeq. A stream uses EITHER the seq
+// channel (this) or the legacy []byte channel (RegisterStream), never both;
+// UnregisterStream cleans both maps. X-4: errors if max streams exceeded.
+func (c *Client) RegisterStreamSeq(streamID uint16) (chan StreamFrame, error) {
+	c.streamMu.Lock()
+	defer c.streamMu.Unlock()
+	if c.streamFramesChans == nil {
+		c.streamFramesChans = make(map[uint16]chan StreamFrame)
+	}
+	if len(c.streamChans)+len(c.streamFramesChans) >= maxClientStreams {
+		return nil, errors.New("max streams exceeded")
+	}
+	ch := make(chan StreamFrame, 512) // large buffer to avoid drops (matches legacy)
+	c.streamFramesChans[streamID] = ch
+	if c.flowControlEnabled {
+		if c.streamFlow == nil {
+			c.streamFlow = make(map[uint16]*streamFlowState)
+		}
+		c.streamFlow[streamID] = &streamFlowState{window: c.flowWindow}
+	}
+	return ch, nil
+}
+
 // RegisterStream creates a channel for receiving data on a stream.
 // X-4 fix: returns error if max concurrent streams exceeded.
 func (c *Client) RegisterStream(streamID uint16) (chan []byte, error) {
@@ -723,6 +764,7 @@ func (c *Client) RegisterStream(streamID uint16) (chan []byte, error) {
 func (c *Client) UnregisterStream(streamID uint16) {
 	c.streamMu.Lock()
 	delete(c.streamChans, streamID)
+	delete(c.streamFramesChans, streamID)
 	delete(c.streamFlow, streamID)
 	c.streamMu.Unlock()
 	c.flushBufferOverflow(streamID)
@@ -921,6 +963,9 @@ func (c *Client) PollVia(ctx context.Context, t Transport) error {
 func (c *Client) HasStream(streamID uint16) bool {
 	c.streamMu.Lock()
 	_, ok := c.streamChans[streamID]
+	if !ok {
+		_, ok = c.streamFramesChans[streamID]
+	}
 	c.streamMu.Unlock()
 	return ok
 }
@@ -936,6 +981,34 @@ func (c *Client) RouteToStream(streamID uint16, data []byte) {
 	if ch != nil {
 		select {
 		case ch <- data:
+		default:
+			c.recordBufferOverflow(streamID, len(data))
+		}
+	}
+}
+
+// isStreamControlMsg reports whether body is one of the legacy per-stream
+// control strings (CONNECT_OK / CONNECT_FAIL) the server emits via the flat
+// NewStreamDataChunk on a migration slot (Bug #9 §5.4). Used by the slot reader
+// to route control past the seq reassembler (as downSeq==0) instead of
+// misparsing the ASCII as a downSeq header. Exact-match only — keeps the
+// collision surface to the two literal strings.
+func isStreamControlMsg(body []byte) bool {
+	return string(body) == "CONNECT_OK" || string(body) == "CONNECT_FAIL"
+}
+
+// RouteToStreamSeq delivers a seq-tagged frame to a migration-negotiated
+// stream's channel (Bug #9, §5.4). Mirrors RouteToStream's non-blocking,
+// overflow-recording semantics — the downlink reassembler (not this funnel)
+// owns ordering. seq==0 carries control (CONNECT_OK/FAIL); the consumer routes
+// it past the reassembler.
+func (c *Client) RouteToStreamSeq(streamID uint16, seq uint64, data []byte) {
+	c.streamMu.Lock()
+	ch := c.streamFramesChans[streamID]
+	c.streamMu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- StreamFrame{Seq: seq, Data: data}:
 		default:
 			c.recordBufferOverflow(streamID, len(data))
 		}
@@ -1111,6 +1184,10 @@ func (c *Client) ResetStreams() {
 	for id, ch := range c.streamChans {
 		close(ch)
 		delete(c.streamChans, id)
+	}
+	for id, ch := range c.streamFramesChans {
+		close(ch)
+		delete(c.streamFramesChans, id)
 	}
 	c.streamMu.Unlock()
 

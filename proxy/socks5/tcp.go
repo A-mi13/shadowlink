@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -405,6 +406,174 @@ func HandleTCPConnectWSPerStream(ctx context.Context, conn net.Conn, cl *client.
 	wg.Wait()
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Bug #9 §5.4 — downlink reassembly (migration mode only).
+//
+// Under negotiated stream migration the server tags every FlagData downlink
+// frame with a monotonic per-stream downSeq. Frames that were in-flight on an
+// old slot at the moment of migration can race frames sent on the new slot, so
+// they may arrive out of order. The downlink goroutine therefore funnels frames
+// through a per-stream reassembler that re-orders by downSeq before conn.Write —
+// otherwise the app's TCP byte stream (TLS records, HTTP bodies) gets corrupted,
+// which is the exact symptom Bug #9 fixes. The legacy non-migration path is
+// untouched (see tunnelTCPStream's `if !migrate` branch).
+
+const (
+	reassemblyGapTimeoutDefault = 2 * time.Second // NEW-1: hole-fill backstop
+	reassemblyBufferDefault     = 4 << 20         // 4 MiB per-stream reorder cap
+)
+
+// reassemblyGapTimeout resolves the gap-timeout (env SHADOWLINK_REASSEMBLY_GAP_TIMEOUT,
+// a time.Duration string). Empty/invalid/<=0 → 2s default (NEW-1).
+func reassemblyGapTimeout() time.Duration {
+	v := strings.TrimSpace(os.Getenv("SHADOWLINK_REASSEMBLY_GAP_TIMEOUT"))
+	if v == "" {
+		return reassemblyGapTimeoutDefault
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return reassemblyGapTimeoutDefault
+	}
+	return d
+}
+
+// reassemblyMaxBufferedFromEnv resolves the per-stream reorder byte cap
+// (env SHADOWLINK_REASSEMBLY_BUFFER, bytes). Empty/invalid/<=0 → 4 MiB default.
+func reassemblyMaxBufferedFromEnv() int {
+	v := strings.TrimSpace(os.Getenv("SHADOWLINK_REASSEMBLY_BUFFER"))
+	if v == "" {
+		return reassemblyBufferDefault
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return reassemblyBufferDefault
+	}
+	return n
+}
+
+// downlinkReassemblyDeps carries the production hooks + tuning for
+// downlinkReassemblyLoop. All hooks are optional (nil-safe) so the loop can be
+// driven in isolation by tests. The loop owns ordering via the reassembler; the
+// hooks only observe / credit / control.
+type downlinkReassemblyDeps struct {
+	gapTimeout  time.Duration
+	maxBuffered int
+
+	// onControl handles a seq==0 control frame (CONNECT_OK / CONNECT_FAIL).
+	// Returns keepGoing=false to tear the stream down (CONNECT_FAIL).
+	onControl func(msg []byte) (keepGoing bool)
+	// onData is called after each successful conn.Write with the bytes written
+	// (idle-stamp + DownlinkBytes stat + OnStreamConsumed credit live here).
+	onData func(n int)
+	// onFlush is called after a non-empty in-order run flushed to conn, with the
+	// highest acked downSeq (reasm.expectedSeq-1) — sends the FlagStreamAck.
+	onFlush func(ackedDownSeq uint64)
+	// onWriteError is called when conn.Write fails; it drains incoming so the WS
+	// demux is never blocked on a full channel, then the loop returns.
+	onWriteError func()
+}
+
+// downlinkReassemblyLoop reads seq-tagged frames, reorders them by downSeq
+// through reasm, and writes the in-order runs to conn. It is the migration-mode
+// counterpart of the legacy downlink select-loop. peerFullClose may be nil
+// (loopback / tests). The loop returns (tearing the stream down) on:
+//   - incoming channel closed
+//   - reassembler overflow (degradation, NOT corruption)
+//   - gap timeout: an unfillable hole did not close within gapTimeout (NEW-1) —
+//     CRITICAL: this returns rather than hanging forever on a missing seq
+//   - conn.Write error (after draining incoming)
+//   - peerFullClose fires (app did a real FIN)
+func downlinkReassemblyLoop(
+	incoming <-chan client.StreamFrame,
+	conn net.Conn,
+	peerFullClose <-chan struct{},
+	dep downlinkReassemblyDeps,
+) {
+	reasm := newReassembler(dep.maxBuffered)
+
+	// Gap timer: armed only while a hole exists, disarmed the moment it closes.
+	// Created stopped so a closed/empty stream never trips a spurious timeout.
+	gapTimer := time.NewTimer(time.Hour)
+	if !gapTimer.Stop() {
+		<-gapTimer.C
+	}
+	gapArmed := false
+	// disarm drains the channel on a failed Stop so a fired-but-unread timer
+	// can't leak a stale tick into the next select iteration.
+	disarm := func() {
+		if gapArmed {
+			if !gapTimer.Stop() {
+				select {
+				case <-gapTimer.C:
+				default:
+				}
+			}
+			gapArmed = false
+		}
+	}
+
+	for {
+		select {
+		case f, ok := <-incoming:
+			if !ok {
+				disarm()
+				return // channel closed → stream over
+			}
+			// Control frame (seq==0): CONNECT_OK / CONNECT_FAIL, never reordered.
+			if f.Seq == 0 {
+				if dep.onControl != nil {
+					if !dep.onControl(f.Data) {
+						disarm()
+						return
+					}
+				}
+				continue
+			}
+			out, st := reasm.push(f.Seq, f.Data)
+			if st == reasmOverflow {
+				client.Stats.StreamReassemblyOverflow.Add(1)
+				disarm()
+				return // degradation: unfillable backlog past the byte cap
+			}
+			for _, d := range out {
+				if _, err := conn.Write(d); err != nil {
+					if dep.onWriteError != nil {
+						dep.onWriteError()
+					}
+					disarm()
+					return
+				}
+				if dep.onData != nil {
+					dep.onData(len(d))
+				}
+			}
+			if len(out) > 0 && dep.onFlush != nil {
+				// expectedSeq is the NEXT awaited seq; the highest delivered
+				// in-order seq is expectedSeq-1.
+				dep.onFlush(reasm.expectedSeq - 1)
+			}
+			// Arm/disarm the gap timer based on whether a hole now exists.
+			if reasm.hasGap() {
+				if !gapArmed {
+					gapTimer.Reset(dep.gapTimeout)
+					gapArmed = true
+				}
+			} else {
+				disarm()
+			}
+		case <-gapTimer.C:
+			// NEW-1: an unfillable hole. Break the stream rather than hang —
+			// a hung downlink goroutine would freeze the app's connection forever.
+			gapArmed = false
+			client.Stats.StreamReassemblyGapTimeout.Add(1)
+			return
+		case <-peerFullClose:
+			disarm()
+			return // app did a full Close (real FIN)
+		}
+	}
+}
+
 // HandleTCPConnectWS handles a SOCKS5 CONNECT command over WebSocket (full-duplex).
 // Each CONNECT gets a StreamID. All streams share one WS connection.
 // Server pushes data instantly -- no polling.
@@ -497,9 +666,25 @@ func tunnelTCPStream(ctx context.Context, conn net.Conn, cl *client.Client, wst 
 		}
 	}()
 
+	// Bug #9 §5.4: if the transport negotiated stream migration, this stream's
+	// downlink is seq-tagged and must run through the reassembler. We register a
+	// seq channel and take the migration downlink path; otherwise everything is
+	// byte-for-byte the legacy []byte channel + select-loop.
+	migrate := false
+	if me, ok := wst.(interface{ MigrationEnabled() bool }); ok {
+		migrate = me.MigrationEnabled()
+	}
+
 	// Allocate stream + register for incoming data
 	streamID := cl.NextStreamID()
-	incomingCh, regErr := cl.RegisterStream(streamID)
+	var incomingCh chan []byte
+	var incomingSeqCh chan client.StreamFrame
+	var regErr error
+	if migrate {
+		incomingSeqCh, regErr = cl.RegisterStreamSeq(streamID)
+	} else {
+		incomingCh, regErr = cl.RegisterStream(streamID)
+	}
 	if regErr != nil {
 		slog.Warn("stream limit exceeded", "error", regErr)
 		reply(ReplyConnRefused)
@@ -724,6 +909,88 @@ func tunnelTCPStream(ctx context.Context, conn net.Conn, cl *client.Client, wst 
 				}
 			}
 		}()
+
+		// Bug #9 §5.4 migration path: seq-tagged downlink runs through the
+		// reassembler so frames split across an old+new slot are re-ordered
+		// before conn.Write. The legacy path below is byte-for-byte unchanged.
+		if migrate {
+			dep := downlinkReassemblyDeps{
+				gapTimeout:  reassemblyGapTimeout(),
+				maxBuffered: reassemblyMaxBufferedFromEnv(),
+				onControl: func(msg []byte) bool {
+					// seq==0 control: CONNECT_OK / CONNECT_FAIL handling mirrors
+					// the legacy connectConfirmed branch.
+					if !connectConfirmed {
+						s := string(msg)
+						if s == "CONNECT_OK" {
+							connectConfirmed = true
+							if pt, ok := wst.(client.PendingTracker); ok {
+								pt.DecrPending(streamID)
+							}
+							client.Trace("WS CONNECT_OK (optimistic)", "dest", destAddr, "stream", streamID)
+							return true
+						}
+						if s == "CONNECT_FAIL" {
+							if pt, ok := wst.(client.PendingTracker); ok {
+								pt.DecrPending(streamID)
+							}
+							slog.Warn("WS CONNECT_FAIL (optimistic)", "dest", destAddr, "stream", streamID)
+							return false
+						}
+						// Unknown control before CONNECT_OK — treat as confirmed
+						// (shouldn't happen with seq==0 reserved for control).
+						connectConfirmed = true
+						if pt, ok := wst.(client.PendingTracker); ok {
+							pt.DecrPending(streamID)
+						}
+					}
+					return true
+				},
+				onData: func(n int) {
+					total += n
+					chunks++
+					lastDownlinkNs.Store(time.Now().UnixNano())
+					client.Stats.DownlinkBytes.Add(int64(n))
+					if chunks <= 5 || chunks%100 == 0 {
+						client.Trace("downlink data", "dest", destAddr, "stream", streamID,
+							"chunk", chunks, "bytes", n, "totalBytes", total)
+					}
+					// Bug #8: credit consumed bytes back so the server may send more.
+					cl.OnStreamConsumed(streamID, n)
+				},
+				onFlush: func(ackedDownSeq uint64) {
+					// FlagStreamAck barrier: tell the server it may release the
+					// resend tail up to ackedDownSeq (best-effort, throttled in T15).
+					cl.SendStreamAck(wst, streamID, ackedDownSeq)
+				},
+				onWriteError: func() {
+					slog.Warn("downlink write error", "dest", destAddr, "stream", streamID)
+					// Consumer (local SOCKS5 client / app) is gone. The uplink
+					// goroutine still sits in its grace before canceling ctx2,
+					// during which the WS demux keeps routing frames to this
+					// stream. Drain inline (blocking, like the legacy path) so the
+					// demux is never blocked on a full channel; return when ctx2
+					// is cancelled or the channel closes. RouteToStreamSeq is
+					// itself non-blocking (records overflow), so a transient full
+					// channel degrades rather than deadlocks.
+					for {
+						select {
+						case _, ok := <-incomingSeqCh:
+							if !ok {
+								return
+							}
+						case <-ctx2.Done():
+							return
+						}
+					}
+				},
+			}
+			downlinkReassemblyLoop(incomingSeqCh, conn, peerFullClose, dep)
+			slog.Info("downlink done (migration)", "dest", destAddr, "stream", streamID,
+				"bytes", total, "chunks", chunks, "elapsed", time.Since(relayStart).Round(time.Millisecond))
+			return
+		}
+
 		for {
 			select {
 			case data, ok := <-incomingCh:

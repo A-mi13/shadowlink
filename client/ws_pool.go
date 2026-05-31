@@ -1099,6 +1099,16 @@ type WSPoolTransport struct {
 	recentMeltdownNs atomic.Int64
 
 	flowDesiredWindow uint64 // Bug #8: 0 → flow control off; else advertised window
+
+	// migrateEnabled is set true once ANY slot negotiates Bug #9 stream
+	// migration (FLOWCTL V2 marker, migrate bit). Atomic so slotReaderWithClient
+	// (per-slot goroutines) and the SOCKS5 front-end (MigrationEnabled accessor)
+	// read it lock-free. Pool-wide because all slots in a pool talk to the same
+	// server with the same negotiated capability — once on, the downlink wire
+	// format is seq-tagged for FlagData frames (§5.4). Write-once-true in
+	// connectSlot; never flipped back to false (a server that drops the
+	// capability mid-pool would be a protocol violation).
+	migrateEnabled atomic.Bool
 }
 
 // Compile-time assertions.
@@ -1769,6 +1779,12 @@ func (p *WSPoolTransport) connectSlot(ctx context.Context, idx int) error {
 		slot.flowControlEnabled = true
 		slot.flowWindow = uint64(wst.flowWindow)
 		p.client.EnableFlowControl(uint64(wst.flowWindow), p)
+	}
+	// Bug #9 §5.4: latch pool-wide migration once a slot negotiated it. Sets the
+	// downlink wire format to seq-tagged (slotReaderWithClient routes FlagData
+	// via RouteToStreamSeq) and lets the SOCKS5 front-end register seq channels.
+	if wst.flowMigrateEnabled {
+		p.migrateEnabled.Store(true)
 	}
 	// Reset downstream byte counter — fresh TCP starts the TSPU 15-20KB budget over.
 	slot.downBytes.Store(0)
@@ -2813,8 +2829,33 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 			e.lastWriteNs.Store(time.Now().UnixNano())
 		}
 
+		// Bug #9 §5.4: under negotiated migration the FlagData downlink wire
+		// format is seq-tagged ([streamID(2)][downSeq(8)][data]) so the client
+		// reassembler can reorder frames split across an old+new slot. FlagUDP
+		// is NOT seq-tagged (datagram, no ordering contract) — it stays on the
+		// legacy []byte path in both modes. Legacy (non-migration) FlagData also
+		// stays byte-for-byte on RouteToStream(chunk.Payload[2:]).
 		if chunk.Flags == core.FlagUDP {
 			cl.RouteToStream(streamID, chunk.Payload)
+		} else if p.migrateEnabled.Load() {
+			// Bug #9 §5.4: on a migration slot the FlagData downlink mixes two
+			// shapes — relay DATA is seq-tagged ([streamID][downSeq(8)][data],
+			// downSeq>=1) but CONNECT_OK/FAIL control is still emitted by the
+			// server's CONNECT handler as the legacy flat [streamID][string]
+			// (no downSeq). We disambiguate by exact-matching the two known
+			// control strings on the post-streamID payload and routing them as
+			// seq==0 control (the downlink loop's control path). This is also
+			// forward-compatible: if the server later seq-tags control with
+			// downSeq==0, ParseStreamDataSeq yields seq==0 and the same control
+			// path runs. NEW-2: ParseStreamDataSeq enforces len>=10 and never
+			// panics; a frame too short / unparseable on a migration slot is a
+			// protocol violation — drop rather than corrupt the byte stream.
+			body := chunk.Payload[2:]
+			if isStreamControlMsg(body) {
+				cl.RouteToStreamSeq(streamID, 0, body)
+			} else if sid, downSeq, sdata, perr := core.ParseStreamDataSeq(chunk.Payload); perr == nil {
+				cl.RouteToStreamSeq(sid, downSeq, sdata)
+			}
 		} else {
 			cl.RouteToStream(streamID, chunk.Payload[2:])
 		}
@@ -3176,3 +3217,9 @@ func (p *WSPoolTransport) HealthySlots() int {
 // vocabulary so SOCKS5 UDP ASSOCIATE gating (C12 F6) reads naturally:
 // `if pool.ReadyCount() < udpMinReadySlots { fail }`.
 func (p *WSPoolTransport) ReadyCount() int { return p.HealthySlots() }
+
+// MigrationEnabled reports whether this pool negotiated Bug #9 stream migration
+// (any slot's FLOWCTL V2 ack carried the migrate bit). When true the downlink
+// wire format is seq-tagged (§5.4) and the SOCKS5 front-end must register
+// streams via RegisterStreamSeq + run the downlink reassembler. Lock-free.
+func (p *WSPoolTransport) MigrationEnabled() bool { return p.migrateEnabled.Load() }

@@ -276,6 +276,14 @@ type statsRegistry struct {
 	FlowWindowUpdateDropped atomic.Uint64 // TryEnqueueControl full → delta kept
 	FlowNegotiationTimeout  atomic.Uint64 // ack not received within negotiationAckTimeout
 
+	// Bug #9 §5.4 downlink-reassembler client-side counters.
+	// StreamReassemblyOverflow: per-stream reassembler buffered past its byte cap
+	// (unfillable gap grew the pending set) → stream broken (degradation).
+	// StreamReassemblyGapTimeout: a downlink hole did not close within the gap
+	// timeout → stream broken instead of hanging (NEW-1).
+	StreamReassemblyOverflow   atomic.Uint64
+	StreamReassemblyGapTimeout atomic.Uint64
+
 	// DrainForceEvictedTotal — every time startDrain force-evicted an
 	// idle slotReady cell (streams==0) because claimFreeSlot returned -1
 	// (slice fully occupied). Spec 2026-05-20 §2.2.3 (slice-full
@@ -669,6 +677,13 @@ func WritePromMetrics(w io.Writer) {
 	fmt.Fprintf(w, "# HELP shadowlink_flow_negotiation_timeout_total Flow-control negotiation acks not received within the timeout (old server / off) (Bug #8)\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_flow_negotiation_timeout_total counter\n")
 	fmt.Fprintf(w, "shadowlink_flow_negotiation_timeout_total %d\n", Stats.FlowNegotiationTimeout.Load())
+
+	fmt.Fprintf(w, "# HELP shadowlink_stream_reassembly_overflow_total Migration downlink reassembler exceeded its per-stream byte cap; stream broken (Bug #9)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_stream_reassembly_overflow_total counter\n")
+	fmt.Fprintf(w, "shadowlink_stream_reassembly_overflow_total %d\n", Stats.StreamReassemblyOverflow.Load())
+	fmt.Fprintf(w, "# HELP shadowlink_stream_reassembly_gap_timeout_total Migration downlink hole did not close within the gap timeout; stream broken instead of hung (Bug #9, NEW-1)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_stream_reassembly_gap_timeout_total counter\n")
+	fmt.Fprintf(w, "shadowlink_stream_reassembly_gap_timeout_total %d\n", Stats.StreamReassemblyGapTimeout.Load())
 
 	fmt.Fprintf(w, "# HELP shadowlink_slot_drain_force_evicted_active_total Emergency evictions of slotReady cells with active streams (over-aged drain target, no idle cell available)\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_slot_drain_force_evicted_active_total counter\n")
