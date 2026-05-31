@@ -125,7 +125,16 @@ type relayEntry struct {
 	// FD accounting (F5). holdsFD is true once admitOrphan has charged this
 	// entry against the registry's orphan FD budget; evictIdleOrphan / the grace
 	// timer decrement the budget only for entries that actually hold it.
-	holdsFD bool
+	//
+	// Atomic (not plain bool) because the charge (admitOrphan, on the WS-death
+	// cleanup goroutine) and the release (releaseOrphanFD, which may run on a
+	// concurrent RESUME goroutine the instant the entry becomes stOrphaned-
+	// reachable) touch it from different goroutines. The charge is now ordered
+	// BEFORE the stActive→stOrphaned publish (see websocket.go cleanup), so by
+	// the time a RESUME can win CAS(stOrphaned→stActive) and call releaseOrphanFD
+	// the flag is already true and atomically visible — no lost decrement, no
+	// data race.
+	holdsFD atomic.Bool
 
 	// destClosed (F13): set by relayLoop when the egress TCP read hit EOF/err
 	// WHILE the entry was orphaned (no live binding). A subsequent RESUME flushes
@@ -301,6 +310,16 @@ func (r *relayRegistry) totalCount() int {
 // holding the orphaned relays it now has, given the caps?" and charges the FD
 // budget when it says yes.
 //
+// ORDERING (FD-race fix, T12 quality review): the WS-death cleanup now calls
+// admitOrphan while `e` is still stActive — i.e. BEFORE toOrphaned publishes the
+// stOrphaned state that makes the entry reachable by a concurrent RESUME. The
+// charge (orphanedFDInUse+1, holdsFD=true) therefore completes before any RESUME
+// can win CAS(stOrphaned→stActive) and call releaseOrphanFD, closing the window
+// where releaseOrphanFD observed holdsFD==false and skipped the decrement (a
+// bounded FD-counter leak). admitOrphan's decision does NOT depend on e's own
+// state: the caps are evaluated against the live map count, and evictIdleOrphan
+// excludes `e` via the except arg — so charging while e is stActive is sound.
+//
 // Decision order:
 //  1. FD budget exhausted (orphanFDBudget<=0, or in-use already at the budget)
 //     → reject. A zero budget (tests / fail-safe) always rejects.
@@ -340,19 +359,24 @@ func (r *relayRegistry) admitOrphan(clientID string, e *relayEntry) bool {
 	}
 
 	r.orphanedFDInUse.Add(1)
-	e.holdsFD = true
+	e.holdsFD.Store(true)
 	return true
 }
 
 // releaseOrphanFD returns the entry's charged FD-budget slot exactly once and
 // clears holdsFD so any later teardown path (grace timer, eviction) won't
 // double-decrement (Task 12, F5). Called when an orphan is reclaimed by a
-// RESUME (back to stActive) or torn down. The holdsFD flag is set/cleared only
-// under the single-winner state transitions, so concurrent callers cannot both
-// observe holdsFD==true for the same entry.
+// RESUME (back to stActive) or torn down.
+//
+// Concurrency: the clear is an atomic CompareAndSwap(true→false), so even if two
+// teardown paths race (e.g. a RESUME's release and a losing grace-timer, or an
+// evict and a RESUME) exactly ONE observes the true→false transition and
+// decrements the budget. This no longer leans on the single-winner state CAS to
+// serialize the read-modify-write — the FD charge is ordered before the
+// stActive→stOrphaned publish, so a RESUME that wins the state CAS is guaranteed
+// to see holdsFD==true here and reclaim the slot.
 func (r *relayRegistry) releaseOrphanFD(e *relayEntry) {
-	if e.holdsFD {
-		e.holdsFD = false
+	if e.holdsFD.CompareAndSwap(true, false) {
 		r.orphanedFDInUse.Add(-1)
 	}
 }

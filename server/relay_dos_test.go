@@ -2,6 +2,7 @@ package server
 
 import (
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -48,14 +49,14 @@ func TestOrphanAdmit_EvictsIdleWhenPerClientFull(t *testing.T) {
 	// evicted and the new admit succeeds.
 	old := &relayEntry{originClientID: "c1", globalStreamID: 1, tc: discardConn()}
 	old.state.Store(stOrphaned)
-	old.holdsFD = true
+	old.holdsFD.Store(true)
 	old.lastDownlinkNs.Store(time.Now().Add(-5 * time.Second).UnixNano()) // idle
 	r.add("c1", 1, old)
 	r.admitOrphan("c1", old)
 
 	recent := &relayEntry{originClientID: "c1", globalStreamID: 2}
 	recent.state.Store(stOrphaned)
-	recent.holdsFD = true
+	recent.holdsFD.Store(true)
 	recent.lastDownlinkNs.Store(time.Now().UnixNano())
 	r.add("c1", 2, recent)
 	r.admitOrphan("c1", recent)
@@ -110,6 +111,83 @@ func TestEviction_PicksIdleOrphanedLRU(t *testing.T) {
 	}
 	if _, ok := r.find("c1", 2); !ok {
 		t.Fatal("newer idle orphan should survive single eviction")
+	}
+}
+
+// TestOrphanFD_ChargeThenResumeReleases pins the FD-counter invariant that the
+// T12 quality-review fix targets: after a relay is charged against the FD budget
+// (admitOrphan) and then reclaimed by a RESUME (releaseOrphanFD), the budget
+// counter returns to zero. A leaked charge here is the bounded FD-leak the fix
+// closes.
+func TestOrphanFD_ChargeThenResumeReleases(t *testing.T) {
+	r := newRelayRegistry()
+	r.setLimits(100, 100, 100)
+	e := &relayEntry{originClientID: "c1", globalStreamID: 1, tc: discardConn()}
+	// Charge while stActive (mirrors the production order: admit BEFORE publish).
+	e.state.Store(stActive)
+	r.add("c1", 1, e)
+	if !r.admitOrphan("c1", e) {
+		t.Fatal("admit should succeed with full budget")
+	}
+	if got := r.orphanedFDInUse.Load(); got != 1 {
+		t.Fatalf("after admit orphanedFDInUse=%d, want 1", got)
+	}
+	if !e.holdsFD.Load() {
+		t.Fatal("admit must set holdsFD")
+	}
+	// Publish stOrphaned, then a RESUME flips it back and releases the FD.
+	if !e.toOrphaned(time.Now().UnixNano()) {
+		t.Fatal("toOrphaned should win")
+	}
+	if !e.state.CompareAndSwap(stOrphaned, stActive) {
+		t.Fatal("RESUME CAS should win")
+	}
+	r.releaseOrphanFD(e)
+	if got := r.orphanedFDInUse.Load(); got != 0 {
+		t.Fatalf("after resume release orphanedFDInUse=%d, want 0 (leak!)", got)
+	}
+	if e.holdsFD.Load() {
+		t.Fatal("releaseOrphanFD must clear holdsFD")
+	}
+}
+
+// TestOrphanFD_ConcurrentReleaseDecrementsOnce drives the exact race the fix
+// guards: the FD is charged (under stActive, before publish) and then two
+// teardown paths — a RESUME-side release and a grace-timer-side release — fire
+// concurrently. The atomic CompareAndSwap in releaseOrphanFD must let exactly
+// one decrement through, so the counter lands on 0 (never -1, never +stuck).
+// Run with -race to also catch the data race on the old plain-bool holdsFD.
+func TestOrphanFD_ConcurrentReleaseDecrementsOnce(t *testing.T) {
+	for iter := 0; iter < 200; iter++ {
+		r := newRelayRegistry()
+		r.setLimits(100, 100, 100)
+		e := &relayEntry{originClientID: "c1", globalStreamID: 1, tc: discardConn()}
+		e.state.Store(stActive)
+		r.add("c1", 1, e)
+		if !r.admitOrphan("c1", e) {
+			t.Fatal("admit should succeed")
+		}
+		e.toOrphaned(time.Now().UnixNano())
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		// Path 1: RESUME wins state CAS then releases.
+		go func() {
+			defer wg.Done()
+			if e.state.CompareAndSwap(stOrphaned, stActive) {
+				r.releaseOrphanFD(e)
+			}
+		}()
+		// Path 2: a losing grace timer also tries to release (idempotent CAS).
+		go func() {
+			defer wg.Done()
+			r.releaseOrphanFD(e)
+		}()
+		wg.Wait()
+
+		if got := r.orphanedFDInUse.Load(); got != 0 {
+			t.Fatalf("iter %d: orphanedFDInUse=%d, want 0 (double or lost decrement)", iter, got)
+		}
 	}
 }
 

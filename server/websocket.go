@@ -1183,41 +1183,72 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 	if migrateEnabled && migrateClientID != "" {
 		now := time.Now().UnixNano()
 		for _, e := range h.relayRegistry.entriesForSession(migrateClientID, session) {
-			if e.toOrphaned(now) {
-				// Bug #9 Task 12 (F5/F6, §5.5): admission gate BEFORE holding the
-				// egress conn open through the grace window. An orphaned relay
-				// pins a real socket with no WS behind it — the DoS surface caps
-				// (per-client / global / FD budget) decide whether we may keep it.
-				// If rejected (or no caps configured), close the egress now instead
-				// of holding it — graceful degradation: the stream dies rather than
-				// letting a peer pin sockets by spraying CONNECT-then-kill-WS.
-				if !h.relayRegistry.admitOrphan(migrateClientID, e) {
-					if e.state.CompareAndSwap(stOrphaned, stClosing) {
-						h.relayRegistry.remove(e.originClientID, e.globalStreamID)
-						if e.tc != nil {
-							e.tc.Close()
-						}
-						cond := e.bufCondOf()
-						e.perEntryMu.Lock()
-						cond.Broadcast()
-						e.perEntryMu.Unlock()
-					}
-					continue
-				}
-				// Wake a relay loop that may be blocked on a full downBuffer with
-				// no binding so it re-evaluates (it stays buffering during grace,
-				// but the broadcast prevents a stale park if the buffer later
-				// frees via ack-eviction). Then arm the grace teardown timer.
-				// Broadcast UNDER perEntryMu for consistency with reassociate /
-				// grace-timer / onStreamAck (closes any lost-wakeup window).
-				cond := e.bufCondOf()
-				e.perEntryMu.Lock()
-				cond.Broadcast()
-				e.perEntryMu.Unlock()
-				h.relayRegistry.launchGraceTimer(e, migrateGracePeriod, func() {
-					h.metrics.MigrateGraceExpired.Add(1)
-				})
+			// FD-race fix (T12 quality review): CHARGE the orphan FD budget BEFORE
+			// publishing stOrphaned. While the entry is still stActive a concurrent
+			// RESUME cannot reclaim it (RESUME requires CAS stOrphaned→stActive), so
+			// the holdsFD/orphanedFDInUse charge below completes before any RESUME
+			// can run releaseOrphanFD. This closes the race where RESUME observed
+			// holdsFD==false (charge not yet written) and skipped the decrement,
+			// leaking the FD counter for the lifetime of the resumed relay.
+			//
+			// admitOrphan's decision is independent of e's own state (caps counted
+			// against the live map, e excluded from its own eviction), so charging
+			// while e is stActive is sound. Only entries still bound to THIS dying
+			// session reach here (entriesForSession), and each is processed once.
+			if e.state.Load() != stActive {
+				// Already migrated away / torn down between the snapshot and now —
+				// not ours to orphan.
+				continue
 			}
+
+			// Bug #9 Task 12 (F5/F6, §5.5): admission gate BEFORE holding the egress
+			// conn open through the grace window. An orphaned relay pins a real
+			// socket with no WS behind it — the DoS surface caps (per-client /
+			// global / FD budget) decide whether we may keep it. If rejected (or no
+			// caps configured), close the egress now instead of holding it —
+			// graceful degradation: the stream dies rather than letting a peer pin
+			// sockets by spraying CONNECT-then-kill-WS. The reject path moves the
+			// entry stActive→stClosing directly (never publishing stOrphaned), so a
+			// rejected entry is never reachable by RESUME and never a zombie.
+			if !h.relayRegistry.admitOrphan(migrateClientID, e) {
+				if e.state.CompareAndSwap(stActive, stClosing) {
+					h.relayRegistry.remove(e.originClientID, e.globalStreamID)
+					if e.tc != nil {
+						e.tc.Close()
+					}
+					cond := e.bufCondOf()
+					e.perEntryMu.Lock()
+					cond.Broadcast()
+					e.perEntryMu.Unlock()
+				}
+				continue
+			}
+
+			// Admitted (FD charged). Now publish stOrphaned so a RESUME on another
+			// slot can pick the relay up. toOrphaned should always win here (the
+			// entry was verified stActive above and only this cleanup goroutine
+			// touches an stActive entry bound to a dead session), but if it somehow
+			// lost the CAS we must release the FD we just charged to avoid leaking
+			// the counter, and skip arming the grace timer (someone else owns the
+			// entry now).
+			if !e.toOrphaned(now) {
+				h.relayRegistry.releaseOrphanFD(e)
+				continue
+			}
+
+			// Wake a relay loop that may be blocked on a full downBuffer with no
+			// binding so it re-evaluates (it stays buffering during grace, but the
+			// broadcast prevents a stale park if the buffer later frees via
+			// ack-eviction). Then arm the grace teardown timer. Broadcast UNDER
+			// perEntryMu for consistency with reassociate / grace-timer /
+			// onStreamAck (closes any lost-wakeup window).
+			cond := e.bufCondOf()
+			e.perEntryMu.Lock()
+			cond.Broadcast()
+			e.perEntryMu.Unlock()
+			h.relayRegistry.launchGraceTimer(e, migrateGracePeriod, func() {
+				h.metrics.MigrateGraceExpired.Add(1)
+			})
 		}
 	}
 
