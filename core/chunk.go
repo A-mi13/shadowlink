@@ -21,6 +21,9 @@ const (
 	FlagUDP          byte = 0x08 // payload = [StreamID(2)] + [UDP data]
 	FlagStreamOpen   byte = 0x09 // client requests a streaming POST response (server→client download channel)
 	FlagWindowUpdate byte = 0x0A // payload = [StreamID(2)] + [delta(4)] per-stream flow-control credit
+	FlagMigrate      byte = 0x0B // payload = [globalStreamID(2 BE)] + [proof(32)] — preemptive migration (§3.2)
+	FlagResume       byte = 0x0C // payload = [globalStreamID(2 BE)] + [proof(32)] — reactive resume from grace
+	FlagStreamAck    byte = 0x0D // payload = [globalStreamID(2 BE)] + [ackedDownSeq(8 BE)] — reassembler barrier (§3.3)
 )
 
 const (
@@ -318,4 +321,45 @@ func NewKeepaliveChunk(sessID, seq uint32) *Chunk {
 // ParseStreamID expectations on the server side.
 func NewConnectChunk(sessID, seq uint32, target string) *Chunk {
 	return NewStreamConnectChunk(sessID, seq, 0, target)
+}
+
+// BuildMigrateFrame builds the payload for a FlagMigrate / FlagResume control
+// chunk: [globalStreamID(2 BE)] + [proof(32)]. proof is an opaque HMAC token
+// (see core/migrate.go); this function does not interpret it. §3.3.
+func BuildMigrateFrame(streamID uint16, proof [32]byte) []byte {
+	p := make([]byte, 2+32)
+	binary.BigEndian.PutUint16(p[0:2], streamID)
+	copy(p[2:], proof[:])
+	return p
+}
+
+// ParseMigrateFrame extracts streamID and proof from a FlagMigrate/FlagResume
+// payload. Errors (never panics) on payload shorter than 34 bytes.
+func ParseMigrateFrame(payload []byte) (streamID uint16, proof [32]byte, err error) {
+	if len(payload) < 34 {
+		return 0, proof, fmt.Errorf("migrate frame too short: %d < 34", len(payload))
+	}
+	streamID = binary.BigEndian.Uint16(payload[0:2])
+	copy(proof[:], payload[2:34])
+	return streamID, proof, nil
+}
+
+// BuildStreamAckFrame builds the payload for a FlagStreamAck chunk:
+// [globalStreamID(2 BE)] + [ackedDownSeq(8 BE)]. §3.3.
+func BuildStreamAckFrame(streamID uint16, ackedDownSeq uint64) []byte {
+	p := make([]byte, 2+8)
+	binary.BigEndian.PutUint16(p[0:2], streamID)
+	binary.BigEndian.PutUint64(p[2:10], ackedDownSeq)
+	return p
+}
+
+// ParseStreamAckFrame extracts streamID and ackedDownSeq from a FlagStreamAck
+// payload. Errors (never panics) on payload shorter than 10 bytes.
+func ParseStreamAckFrame(payload []byte) (streamID uint16, ackedDownSeq uint64, err error) {
+	if len(payload) < 10 {
+		return 0, 0, fmt.Errorf("stream ack frame too short: %d < 10", len(payload))
+	}
+	streamID = binary.BigEndian.Uint16(payload[0:2])
+	ackedDownSeq = binary.BigEndian.Uint64(payload[2:10])
+	return streamID, ackedDownSeq, nil
 }
