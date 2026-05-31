@@ -18,6 +18,31 @@ import (
 type streamEntry struct {
 	slotIdx     int
 	lastWriteNs atomic.Int64
+
+	// migrating coordinates Bug #9 stream migration (Task 17, F10). Set true
+	// (CAS false→true) by the single owner of a move — either the preemptive
+	// MIGRATE watchdog (migrateStream, T16) or the reactive RESUME-on-slot-death
+	// path (resumeStreamOnDeath, T17) — and cleared on the move's outcome
+	// (OK / FAIL / timeout / no-send).
+	//
+	// Three consumers read it:
+	//   - The SOCKS5 uplink goroutine (proxy/socks5/tcp.go) holds an uplink
+	//     barrier (§5.3): while migrating it stops writing to the old slot so
+	//     no uplink data races ahead of the MIGRATE/RESUME and de-syncs the
+	//     server's per-stream sequence. The write resumes once the flag clears
+	//     (the binding now points at the new slot) or the bounded timeout
+	//     elapses.
+	//   - drain teardown / handleSlotDeath skip the stream-chan close for a
+	//     migrating stream — the in-flight move owns the stream's fate.
+	//   - allStreamsIdle / snapshotDrainStreams classify a migrating stream as
+	//     NOT active, so the sticky backstop does not extend a drain on a
+	//     stream that is already leaving the slot.
+	//
+	// CAS false→true is the single-winner gate: if migrateStream and
+	// handleSlotDeath both target the same stream, exactly one wins the CAS and
+	// performs the wire send; the loser observes migrating==true and stands down
+	// (no double-send, no close of a stream another goroutine is moving).
+	migrating atomic.Bool
 }
 
 // newStreamEntry constructs a fully-initialized entry: slotIdx pinned,
@@ -77,7 +102,11 @@ func snapshotDrainStreams(p *WSPoolTransport, slotIdx int, now time.Time) drainS
 			ageMs = 0
 		}
 
-		if ageMs >= idleThresholdMs {
+		// Bug #9 F10: a migrating stream is leaving this slot via an in-flight
+		// MIGRATE/RESUME, so it must not count as active — otherwise the sticky
+		// backstop would extend the drain on a stream that is already moving
+		// off. Classify it with the idle bucket regardless of wire age.
+		if ageMs >= idleThresholdMs || e.migrating.Load() {
 			snap.idleAge30sCount++
 		} else {
 			snap.activeCount++
@@ -130,6 +159,13 @@ func allStreamsIdle(p *WSPoolTransport, slotIdx int, threshold time.Duration, no
 			return true
 		}
 		found = true
+		// Bug #9 F10: a migrating stream is leaving this slot — do NOT let it
+		// hold the drain open. Skip it from the active check (treat as idle) so
+		// allStreamsIdle can return true once every remaining stream is either
+		// truly idle or migrating away.
+		if e.migrating.Load() {
+			return true
+		}
 		age := nowNs - e.lastWriteNs.Load()
 		// Clock-skew handling (spec §2.1 R2-L4): age < 0 means clock
 		// regressed. Conservative — treat as active. No telemetry

@@ -1181,6 +1181,13 @@ type WSPoolTransport struct {
 	// unit test's AfterFunc timers fire in milliseconds instead of seconds.
 	// Zero → use migrationSpread().
 	migrateSpreadOverride time.Duration
+
+	// migrateSendHook, when non-nil, replaces the real sendMigrate wire
+	// round-trip used by BOTH the preemptive watchdog (migrateStream, T16) and
+	// the reactive RESUME-on-slot-death path (resumeStreamOnDeath, T17). Lets a
+	// unit test script the migrateResult (OK/FAIL/timeout) without a live slot or
+	// crypto session. Production leaves it nil → callers invoke p.sendMigrate.
+	migrateSendHook func(streamID uint16, kind byte, targetIdx int) migrateResult
 }
 
 // migrateHysteresisThreshold is the number of consecutive MIGRATE/RESUME
@@ -3242,12 +3249,16 @@ func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int, cause slotDeathCa
 	// chan gives SOCKS5 readers an immediate, synchronous signal.
 	// streamMap.Delete BEFORE close(ch) keeps the no-underflow invariant
 	// (see ReleaseStream's LoadAndDelete semantics).
-	p.streamMap.Range(func(key, value any) bool {
-		e, ok := value.(*streamEntry)
-		if !ok || e.slotIdx != idx {
-			return true
-		}
-		streamID := key.(uint16)
+	//
+	// Bug #9 Task 17 (RESUME-on-slot-death, §5.5): when the pool negotiated
+	// stream migration, a sudden slot death no longer unconditionally breaks
+	// its active streams. For each recoverable stream we first try a grace
+	// RESUME onto a live slot; only on a confirmed failure (no live target,
+	// RESUME_FAIL/timeout, or an already-migrating stream another goroutine is
+	// moving) do we fall through to the legacy chan-close. closeStream is the
+	// shared teardown that preserves the Delete-before-close invariant.
+	migrationOn := p.migrateEnabled.Load()
+	closeStream := func(streamID uint16) {
 		p.streamMap.Delete(streamID)
 		cl.streamMu.Lock()
 		if ch, ok := cl.streamChans[streamID]; ok {
@@ -3255,6 +3266,27 @@ func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int, cause slotDeathCa
 			delete(cl.streamChans, streamID)
 		}
 		cl.streamMu.Unlock()
+	}
+	p.streamMap.Range(func(key, value any) bool {
+		e, ok := value.(*streamEntry)
+		if !ok || e.slotIdx != idx {
+			return true
+		}
+		streamID := key.(uint16)
+
+		if migrationOn {
+			switch p.resumeStreamOnDeath(cl, streamID, e, idx) {
+			case resumeOutcomeKept:
+				// Stream survived (RESUME_OK → re-pointed to a live slot) or is
+				// mid-move under another goroutine (migrating flag set). Do NOT
+				// close its chan and do NOT delete its (re-pointed) entry.
+				return true
+			case resumeOutcomeBreak:
+				// No live slot / RESUME failed — fall through to legacy close.
+			}
+		}
+
+		closeStream(streamID)
 		return true
 	})
 
@@ -3302,6 +3334,81 @@ func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int, cause slotDeathCa
 		p.slots[idx] = nil
 		p.reserveMu.Unlock()
 	}
+}
+
+// resumeOutcome is the verdict resumeStreamOnDeath returns to the
+// handleSlotDeath teardown loop.
+type resumeOutcome int
+
+const (
+	// resumeOutcomeKept — the stream survived the slot death (RESUME_OK
+	// re-pointed it to a live slot) or is mid-move under another goroutine
+	// (its migrating flag is set). The teardown loop MUST NOT close its chan
+	// or delete its (possibly re-pointed) entry.
+	resumeOutcomeKept resumeOutcome = iota
+	// resumeOutcomeBreak — no live target, RESUME failed, or RESUME was not
+	// attempted. The teardown loop closes the chan (legacy degradation).
+	resumeOutcomeBreak
+)
+
+// resumeStreamOnDeath attempts a grace RESUME of one stream off a dying slot
+// (deadIdx) onto a live slot (Bug #9 Task 17, §5.5 — the SUDDEN-cut path that
+// lets a stream survive an unexpected slot death). Called from handleSlotDeath's
+// teardown loop for every active stream of the dead slot when migration is
+// negotiated.
+//
+// Coordination with the preemptive watchdog (T16 migrateStream):
+//   - If the stream's migrating flag is already set, a MIGRATE/RESUME is in
+//     flight under another goroutine — that goroutine owns the stream's fate.
+//     We return resumeOutcomeKept (do NOT close, do NOT delete) so we never
+//     double-send or close a chan another goroutine is moving. The in-flight
+//     move resolves on its own slot's reader; if it ultimately fails the stream
+//     breaks then, which is acceptable (the slot is gone either way).
+//   - Otherwise we CAS migrating false→true to claim the move (single winner),
+//     pick a live target, and send a FlagResume. The flag is cleared on a
+//     FAIL/timeout (stream breaks) and stays cleared-by-rebind on OK (the fresh
+//     entry has migrating=false).
+//
+// The RESUME rides the LIVE TARGET slot's transport (slotForMigrate(targetIdx)),
+// NOT the dead slot's broken socket — sendMigrate encrypts under the target
+// session.
+func (p *WSPoolTransport) resumeStreamOnDeath(cl *Client, streamID uint16, e *streamEntry, deadIdx int) resumeOutcome {
+	// Already moving under another goroutine — keep, do not touch.
+	if e.migrating.Load() {
+		return resumeOutcomeKept
+	}
+
+	// Pick any live slot != the dead one. selectYoungTargetSlot returns the
+	// youngest slotReady slot, which has the most runway before its own
+	// lifecycle event — same target policy as the preemptive path.
+	targetIdx, ok := p.selectYoungTargetSlot(deadIdx)
+	if !ok {
+		// No live slot to re-home onto — legacy degradation (close the chan).
+		return resumeOutcomeBreak
+	}
+
+	// Single-winner CAS. Lost race → another goroutine claimed the move; keep.
+	if !e.migrating.CompareAndSwap(false, true) {
+		return resumeOutcomeKept
+	}
+
+	res := p.sendMigrateOrHook(streamID, core.FlagResume, targetIdx)
+	if res.kind != migrateResultOK {
+		// Server refused / no reply — the stream cannot be re-homed. Release the
+		// flag and tell the loop to break (close) it.
+		e.migrating.Store(false)
+		Stats.MigrateResumeOnDeathFail.Add(1)
+		return resumeOutcomeBreak
+	}
+
+	// RESUME_OK: re-point the binding to the live slot and transfer the per-slot
+	// counter (inc target, dec the dead slot — the subsequent streams.Store(0)
+	// on the dead slot is harmless, the stream already left). The fresh entry
+	// installed by rebind has migrating=false, releasing the uplink barrier so
+	// the next uplink write routes to the live target slot.
+	p.rebindStreamToSlot(streamID, targetIdx)
+	Stats.MigrateResumeOnDeathOK.Add(1)
+	return resumeOutcomeKept
 }
 
 // Close shuts down all slots.

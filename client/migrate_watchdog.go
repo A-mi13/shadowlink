@@ -233,6 +233,27 @@ func (p *WSPoolTransport) migrateStream(streamID uint16) {
 	if !ok {
 		return
 	}
+
+	// Bug #9 Task 17, F10 single-winner gate: claim the move via CAS false→true.
+	// If the flag is already set, another goroutine (a second watchdog timer, or
+	// the slot-death RESUME path) owns this stream's move — stand down to avoid a
+	// double MIGRATE/double counter-transfer. The uplink barrier (§5.3) keys off
+	// this flag, so it raises the moment we win the CAS and falls the moment we
+	// resolve the outcome below.
+	if !e.migrating.CompareAndSwap(false, true) {
+		return
+	}
+	// Clear on FAIL/timeout/no-send (stream stays put). On OK the rebind below
+	// replaces the entry with a fresh one (migrating=false by default), so we
+	// only need to clear on the not-OK paths — guarded so a successful rebind
+	// does not resurrect a stale flag on the old entry.
+	moved := false
+	defer func() {
+		if !moved {
+			e.migrating.Store(false)
+		}
+	}()
+
 	agingIdx := e.slotIdx
 
 	targetIdx, ok := p.selectYoungTargetSlot(agingIdx)
@@ -240,7 +261,7 @@ func (p *WSPoolTransport) migrateStream(streamID uint16) {
 		return // no younger slot to move onto — leave the stream put
 	}
 
-	res := p.sendMigrate(p.client, streamID, core.FlagMigrate, targetIdx)
+	res := p.sendMigrateOrHook(streamID, core.FlagMigrate, targetIdx)
 	if res.kind != migrateResultOK {
 		// FAIL / timeout / no-send → degrade gracefully, stream stays on agingIdx.
 		return
@@ -249,7 +270,11 @@ func (p *WSPoolTransport) migrateStream(streamID uint16) {
 	// Server accepted the move: re-bind the stream to the target slot AND
 	// transfer the per-slot active-stream counter so the aging slot frees
 	// cleanly. See rebindStreamToSlot for the counter-transfer invariant.
+	// rebindStreamToSlot Stores a fresh streamEntry(targetIdx) with
+	// migrating=false — the move is done, the uplink barrier on the OLD entry is
+	// released and subsequent writes route to the new slot.
 	p.rebindStreamToSlot(streamID, targetIdx)
+	moved = true
 }
 
 // rebindStreamToSlot moves streamID's streamMap binding onto targetIdx and

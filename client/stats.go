@@ -302,6 +302,14 @@ type statsRegistry struct {
 	// trigger surfaces.
 	MigrateScheduled atomic.Uint64
 
+	// MigrateResumeOnDeathOK / Fail: outcomes of the reactive RESUME-on-slot-death
+	// path (Bug #9 Task 17, §5.5). OK = a stream survived a sudden slot death by
+	// re-homing onto a live slot; Fail = no live target or the server refused, so
+	// the stream broke (legacy degradation). Full migration telemetry lands in
+	// Task 19; these are the minimum the slot-death path surfaces.
+	MigrateResumeOnDeathOK   atomic.Uint64
+	MigrateResumeOnDeathFail atomic.Uint64
+
 	// DrainForceEvictedTotal — every time startDrain force-evicted an
 	// idle slotReady cell (streams==0) because claimFreeSlot returned -1
 	// (slice fully occupied). Spec 2026-05-20 §2.2.3 (slice-full

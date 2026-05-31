@@ -849,6 +849,12 @@ func tunnelTCPStream(ctx context.Context, conn net.Conn, cl *client.Client, wst 
 		buf := make([]byte, 32768) // large buffer -- let OS batch
 		total := 0
 		uploads := 0
+		// uplinkSession is this goroutine's PRIVATE view of the stream's session.
+		// It starts as the captured `session` and is re-resolved only here after
+		// the migrate barrier (Bug #9 §5.3) — never write back to the shared
+		// `session`, which the downlink goroutine reads concurrently (a shared
+		// reassignment would be a data race).
+		uplinkSession := session
 		for {
 			n, err := conn.Read(buf)
 			if err != nil {
@@ -894,8 +900,21 @@ func tunnelTCPStream(ctx context.Context, conn net.Conn, cl *client.Client, wst 
 			total += n
 			uploads++
 			client.Stats.UplinkBytes.Add(int64(n))
-			chunk := core.NewStreamDataChunk(session.ID, session.NextSeqNum(), streamID, buf[:n])
-			enc, encErr := session.EncryptChunk(chunk)
+			// Bug #9 §5.3 uplink barrier: if a MIGRATE/RESUME for this stream is
+			// in flight, hold the uplink off the OLD slot until the move resolves
+			// (bounded by the ack window). Without this, uplink bytes can land on
+			// the aging slot AFTER the server has re-homed the stream, de-syncing
+			// the per-stream sequence. session must be re-read AFTER the barrier:
+			// a successful migration re-pointed the stream to the new slot, so the
+			// uplink chunk must be sealed under the new slot's session.
+			if mb, ok := wst.(interface{ WaitStreamMigrateBarrier(streamID uint16) }); ok {
+				mb.WaitStreamMigrateBarrier(streamID)
+				if s := client.StreamSession(wst, cl, streamID); s != nil {
+					uplinkSession = s
+				}
+			}
+			chunk := core.NewStreamDataChunk(uplinkSession.ID, uplinkSession.NextSeqNum(), streamID, buf[:n])
+			enc, encErr := uplinkSession.EncryptChunk(chunk)
 			core.PutBuffer(chunk.Payload) // release pooled payload after encryption
 			if encErr != nil {
 				slog.Warn("uplink encrypt error", "dest", destAddr, "err", encErr)

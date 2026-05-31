@@ -185,6 +185,72 @@ func (p *WSPoolTransport) sendMigrate(cl *Client, streamID uint16, kind byte, ta
 	}
 }
 
+// migrateBarrierPollInterval is the poll cadence of the uplink barrier's
+// bounded wait loop. Short enough that a freed barrier resumes uplink with
+// negligible added latency; long enough not to busy-spin.
+const migrateBarrierPollInterval = 2 * time.Millisecond
+
+// WaitStreamMigrateBarrier implements the §5.3 uplink barrier: while streamID's
+// entry is migrating (a MIGRATE/RESUME is in flight), the SOCKS5 uplink
+// goroutine must NOT write to the OLD slot — uplink bytes that race ahead of the
+// MIGRATE would land on the aging slot after the server has already re-homed the
+// stream, de-syncing the per-stream sequence. This call blocks until the flag
+// clears (the binding now points at the new slot, so the next StreamWrite routes
+// there) OR a bounded timeout (migrateAckTimeout) elapses.
+//
+// Bounded BY DESIGN: a stuck migration (server never acks → sendMigrate times
+// out → flag cleared by migrateStream's defer) clears the flag within
+// migrateAckTimeout anyway, but the barrier caps its own wait independently so a
+// lost flag-clear (future bug) can never wedge the uplink goroutine forever. On
+// timeout the write proceeds against whatever slot the binding currently names —
+// graceful degradation, identical to the pre-Task-17 behavior (no barrier).
+//
+// Fast path (the overwhelming common case — no migration in flight): a single
+// streamMap.Load + atomic Bool Load, then return. No allocation, no timer.
+func (p *WSPoolTransport) WaitStreamMigrateBarrier(streamID uint16) {
+	// Cheap pre-check: only migration-negotiated pools ever set the flag.
+	if !p.migrateEnabled.Load() {
+		return
+	}
+	v, ok := p.streamMap.Load(streamID)
+	if !ok {
+		return
+	}
+	e, ok := v.(*streamEntry)
+	if !ok || !e.migrating.Load() {
+		return // fast path: not migrating
+	}
+
+	deadline := time.Now().Add(p.migrateAckTimeoutEffective())
+	for e.migrating.Load() {
+		if time.Now().After(deadline) {
+			return // bounded — never block past the ack window
+		}
+		time.Sleep(migrateBarrierPollInterval)
+		// Re-resolve the entry: a successful rebind replaces it with a fresh
+		// (migrating=false) entry, so the loaded `e` is stale after a move
+		// completes. Reload so we observe the new entry's cleared flag.
+		v, ok = p.streamMap.Load(streamID)
+		if !ok {
+			return // stream gone (slot death broke it) — stop waiting
+		}
+		if ne, ok := v.(*streamEntry); ok {
+			e = ne
+		}
+	}
+}
+
+// sendMigrateOrHook routes through the test hook when one is installed, else
+// performs the real sendMigrate wire round-trip. Both the preemptive watchdog
+// (migrateStream) and the reactive slot-death path (resumeStreamOnDeath) call
+// through here so a single hook intercepts every migration send in tests.
+func (p *WSPoolTransport) sendMigrateOrHook(streamID uint16, kind byte, targetIdx int) migrateResult {
+	if p.migrateSendHook != nil {
+		return p.migrateSendHook(streamID, kind, targetIdx)
+	}
+	return p.sendMigrate(p.client, streamID, kind, targetIdx)
+}
+
 // resolveMigrateReplyPayload parses a MIGRATE/RESUME reply payload and resolves
 // the pending ack for its streamID. Splitting decrypt (handleMigrateReplyFrame)
 // from parse keeps the resolve path unit-testable with a raw payload.
