@@ -246,9 +246,69 @@ func (p *WSPoolTransport) migrateStream(streamID uint16) {
 		return
 	}
 
-	// Server accepted the move: re-bind the stream to the target slot so all
-	// subsequent uplink writes and routing target the new slot. newStreamEntry
-	// stamps lastWriteNs=now (fresh activity), which is correct — the stream
-	// just had wire activity (the MIGRATE round-trip).
+	// Server accepted the move: re-bind the stream to the target slot AND
+	// transfer the per-slot active-stream counter so the aging slot frees
+	// cleanly. See rebindStreamToSlot for the counter-transfer invariant.
+	p.rebindStreamToSlot(streamID, targetIdx)
+}
+
+// rebindStreamToSlot moves streamID's streamMap binding onto targetIdx and
+// transfers the per-slot active-stream counter (poolSlot.streams) from the
+// stream's CURRENT slot to targetIdx, preserving the strict Assign(+1)/
+// Release(-1) invariant that AssignStream/ReleaseStream maintain (ws_pool.go
+// §2451/§2538). Without the counter transfer the aging slot stays "occupied"
+// (streams.Load()>0) after the stream has left — maybeRotateSlot/startDrain
+// then keep deferring its rotation on phantom active streams (the opposite of
+// what migration is for), and the target slot is undercounted so a later
+// ReleaseStream of the migrated stream decrements without a paired increment
+// and can drive its counter negative.
+//
+// Counter-transfer ordering (no window where the stream is "nowhere" or
+// "double-counted long"):
+//  1. inc target  — target is accounted before we publish the new binding,
+//     so a concurrent snapshot never sees the moved stream on a slot whose
+//     counter is still 0.
+//  2. Store(newStreamEntry(targetIdx)) — re-bind. newStreamEntry stamps
+//     lastWriteNs=now (the MIGRATE round-trip just had wire activity).
+//  3. dec source — only AFTER the re-bind. Between (1) and (3) the stream is
+//     transiently counted on both slots (over-count by one for ~ns), never
+//     under-counted; over-counting cannot trip a negative or a premature
+//     free, whereas a momentary 0 on the target could.
+//
+// Edge cases:
+//   - Stream already gone (concurrent slot death / ReleaseStream): the Load
+//     misses → no-op, we never touch a counter we didn't own.
+//   - Stream already on targetIdx (race / repeat migration): no-op, so we
+//     never double-increment the target or decrement a foreign slot.
+//   - Source decrement uses the slotIdx read from the live streamMap entry
+//     (NOT the agingIdx the watchdog planned against) — between scheduling
+//     the AfterFunc and this call the stream may have migrated again or moved,
+//     so we decrement exactly the slot the stream is leaving.
+//   - handleSlotDeath does streams.Store(0) on death and Deletes the entry
+//     first; if it ran concurrently our Load would miss (entry gone) → no-op,
+//     so our Add never fights its Store.
+func (p *WSPoolTransport) rebindStreamToSlot(streamID uint16, targetIdx int) {
+	v, ok := p.streamMap.Load(streamID)
+	if !ok {
+		return // stream already released / slot died — nothing to transfer
+	}
+	e, ok := v.(*streamEntry)
+	if !ok {
+		return
+	}
+	srcIdx := e.slotIdx
+	if srcIdx == targetIdx {
+		return // already bound to target (race / repeat) — avoid double-count
+	}
+
+	// (1) inc target before publishing the binding.
+	if targetIdx >= 0 && targetIdx < len(p.slots) && p.slots[targetIdx] != nil {
+		p.slots[targetIdx].streams.Add(1)
+	}
+	// (2) re-bind so subsequent uplink writes / routing target the new slot.
 	p.streamMap.Store(streamID, newStreamEntry(targetIdx))
+	// (3) dec the slot the stream actually left.
+	if srcIdx >= 0 && srcIdx < len(p.slots) && p.slots[srcIdx] != nil {
+		p.slots[srcIdx].streams.Add(-1)
+	}
 }

@@ -231,3 +231,98 @@ func TestScheduleSlotMigration_Idempotent(t *testing.T) {
 		t.Fatalf("each stream must be migrated exactly once, got %v", calls)
 	}
 }
+
+// TestMigrateStream_TransfersSlotCounter is the T16 IMPORTANT fix: on a
+// successful migration re-bind, the per-slot active-stream counter must move
+// from the aging slot to the target so the aging slot frees cleanly
+// (streams==0) and the target is correctly accounted (streams==1). A missed
+// transfer leaves the aging slot phantom-occupied (rotation deferred forever)
+// and undercounts the target (later Release goes negative).
+func TestMigrateStream_TransfersSlotCounter(t *testing.T) {
+	p := &WSPoolTransport{poolSize: 2}
+	p.slots = make([]*poolSlot, 2)
+	for i := range p.slots {
+		p.slots[i] = &poolSlot{index: i}
+	}
+
+	// Stream lives on the aging slot 0 exactly as AssignStream would leave it:
+	// streamMap entry bound to slot 0 AND slot 0's counter at 1.
+	p.streamMap.Store(uint16(7), newStreamEntry(0))
+	p.slots[0].streams.Store(1)
+	p.slots[1].streams.Store(0)
+
+	// Re-bind onto target slot 1 (the success-path action of migrateStream).
+	p.rebindStreamToSlot(7, 1)
+
+	if got := p.slots[0].streams.Load(); got != 0 {
+		t.Fatalf("aging slot 0 streams = %d, want 0 (must free after migration)", got)
+	}
+	if got := p.slots[1].streams.Load(); got != 1 {
+		t.Fatalf("target slot 1 streams = %d, want 1 (must be accounted after migration)", got)
+	}
+	// Binding must point at the target now.
+	v, ok := p.streamMap.Load(uint16(7))
+	if !ok {
+		t.Fatal("stream entry missing after re-bind")
+	}
+	if e := v.(*streamEntry); e.slotIdx != 1 {
+		t.Fatalf("stream slotIdx = %d, want 1 after re-bind", e.slotIdx)
+	}
+
+	// A subsequent ReleaseStream of the migrated stream must land the target
+	// back at 0 — proving the +1/-1 invariant held across the migration.
+	p.ReleaseStream(7)
+	if got := p.slots[1].streams.Load(); got != 0 {
+		t.Fatalf("target slot 1 streams = %d after Release, want 0 (paired inc/dec)", got)
+	}
+	if got := p.slots[0].streams.Load(); got != 0 {
+		t.Fatalf("aging slot 0 streams = %d after Release, want 0 (must not go negative)", got)
+	}
+}
+
+// TestMigrateStream_TransferCounter_EdgeCases covers the no-op edges: a stream
+// that is already gone (concurrent slot death / Release) must not decrement a
+// foreign slot, and a stream already bound to the target must not double-count.
+func TestMigrateStream_TransferCounter_EdgeCases(t *testing.T) {
+	p := &WSPoolTransport{poolSize: 2}
+	p.slots = make([]*poolSlot, 2)
+	for i := range p.slots {
+		p.slots[i] = &poolSlot{index: i}
+	}
+
+	// Edge 1: stream not in the map (already released / slot died before the
+	// migration timer fired). rebind must be a clean no-op — no counter touched.
+	p.slots[0].streams.Store(0)
+	p.slots[1].streams.Store(0)
+	p.rebindStreamToSlot(99, 1)
+	if got := p.slots[0].streams.Load(); got != 0 {
+		t.Fatalf("slot 0 streams = %d after no-op rebind of absent stream, want 0", got)
+	}
+	if got := p.slots[1].streams.Load(); got != 0 {
+		t.Fatalf("slot 1 streams = %d after no-op rebind of absent stream, want 0 (no phantom inc)", got)
+	}
+
+	// Edge 2: stream already on the target slot (race / repeat migration onto
+	// the same slot). Must be a no-op so the target is not double-incremented
+	// and the source (== target) is not decremented below its real count.
+	p.streamMap.Store(uint16(5), newStreamEntry(1))
+	p.slots[1].streams.Store(1)
+	p.rebindStreamToSlot(5, 1)
+	if got := p.slots[1].streams.Load(); got != 1 {
+		t.Fatalf("target slot 1 streams = %d after repeat rebind, want 1 (no double-count)", got)
+	}
+
+	// Edge 3: between scheduling and firing, the stream moved to a DIFFERENT
+	// slot than the watchdog planned. The decrement must hit the slot the
+	// stream actually left (read from the live entry), never go negative.
+	p.streamMap.Store(uint16(8), newStreamEntry(1)) // actually on slot 1 now
+	p.slots[1].streams.Store(1)
+	p.slots[0].streams.Store(0)
+	p.rebindStreamToSlot(8, 0) // migrate onto slot 0
+	if got := p.slots[1].streams.Load(); got != 0 {
+		t.Fatalf("slot 1 (real source) streams = %d, want 0 (decremented the slot stream left)", got)
+	}
+	if got := p.slots[0].streams.Load(); got != 1 {
+		t.Fatalf("slot 0 (target) streams = %d, want 1", got)
+	}
+}
