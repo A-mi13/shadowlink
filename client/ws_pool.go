@@ -1114,11 +1114,12 @@ type WSPoolTransport struct {
 	//
 	// pendingMigrateAcks maps streamID → chan migrateResult. sendMigrate
 	// registers a buffered (cap 1) chan before enqueuing the frame; the slot
-	// reader resolves it via handleMigrateReplyFrame when a MIGRATE_OK/FAIL
-	// arrives. sendMigrate races the resolve against migrateAckTimeout — exactly
-	// one of {reply, timeout} wins (the chan is removed from the map under
-	// LoadAndDelete so a late reply after a timeout is dropped, never delivered
-	// to a closed/garbage chan). One in-flight MIGRATE per streamID at a time.
+	// reader resolves it via resolveMigrateReplyPayload when a MIGRATE_OK/FAIL
+	// reply arrives (after decrypting the chunk with FlagMigrate/FlagResume).
+	// sendMigrate races the resolve against migrateAckTimeout — exactly one of
+	// {reply, timeout} wins (the chan is removed from the map under LoadAndDelete
+	// so a late reply after a timeout is dropped, never delivered to a
+	// closed/garbage chan). One in-flight MIGRATE per streamID at a time.
 	pendingMigrateAcks sync.Map // map[uint16]chan migrateResult
 
 	// consecutiveMigrateTimeouts counts MIGRATE/RESUME attempts that timed out

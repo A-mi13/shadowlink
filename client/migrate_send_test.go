@@ -136,7 +136,7 @@ func TestStreamProofStorage(t *testing.T) {
 func TestSendMigrate_OKResolvesPending(t *testing.T) {
 	const streamID = uint16(0x1234)
 	const targetIdx = 1
-	p, tr, sess := newMigrateTestPool(t, streamID, targetIdx)
+	p, tr, _ := newMigrateTestPool(t, streamID, targetIdx)
 
 	cl := &Client{}
 	var proof [32]byte
@@ -164,19 +164,11 @@ func TestSendMigrate_OKResolvesPending(t *testing.T) {
 		}
 	}
 
-	// Synthesize the server's MIGRATE_OK reply on the target slot's session.
+	// Synthesize the server's MIGRATE_OK reply payload (as the slot reader
+	// would have after decrypting a chunk with FlagMigrate/FlagResume).
 	const resumeSeq = uint64(987)
-	reply := &core.Chunk{
-		SessionID: sess.ID,
-		SeqNum:    sess.NextSeqNum(),
-		Flags:     core.FlagMigrate,
-		Payload:   core.BuildMigrateOK(streamID, resumeSeq),
-	}
-	enc, err := sess.EncryptChunk(reply)
-	if err != nil {
-		t.Fatalf("encrypt reply: %v", err)
-	}
-	p.handleMigrateReplyFrame(targetIdx, enc)
+	replyPayload := core.BuildMigrateOK(streamID, resumeSeq)
+	p.resolveMigrateReplyPayload(replyPayload)
 
 	select {
 	case res := <-resCh:

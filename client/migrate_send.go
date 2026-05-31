@@ -11,8 +11,8 @@ import (
 // sendMigrate transmits a MIGRATE (preemptive, §5.3) or RESUME (reactive, §5.5)
 // control frame for a stream onto a TARGET slot (the slot the stream is moving
 // TO) and awaits the server's MIGRATE_OK/FAIL reply. The reply rides the new
-// slot's downlink and is recognised by slotReaderWithClient, which hands it to
-// handleMigrateReplyFrame → resolveMigrateReply, resolving the pending chan.
+// slot's downlink and is decrypted by slotReaderWithClient, which hands the
+// payload to resolveMigrateReplyPayload, resolving the pending chan.
 //
 // Concurrency contract (no leak / no double-resolve):
 //   - sendMigrate registers exactly one buffered(1) chan per streamID under
@@ -183,26 +183,6 @@ func (p *WSPoolTransport) sendMigrate(cl *Client, streamID uint16, kind byte, ta
 		p.noteMigrateTimeout()
 		return migrateResult{kind: migrateResultTimeout}
 	}
-}
-
-// handleMigrateReplyFrame is called by the slot reader for a MIGRATE/RESUME
-// reply frame (chunk.Flags == FlagMigrate || FlagResume) received on slot
-// targetIdx. It decrypts under the slot's session, parses the OK/FAIL status,
-// and resolves the matching pending ack. Best-effort: a frame for an unknown
-// stream (already timed out / never sent) is silently dropped.
-func (p *WSPoolTransport) handleMigrateReplyFrame(targetIdx int, raw []byte) {
-	if targetIdx < 0 || targetIdx >= len(p.slots) {
-		return
-	}
-	slot := p.slots[targetIdx]
-	if slot == nil || slot.session == nil {
-		return
-	}
-	chunk, err := slot.session.DecryptChunkSafe(raw)
-	if err != nil {
-		return
-	}
-	p.resolveMigrateReplyPayload(chunk.Payload)
 }
 
 // resolveMigrateReplyPayload parses a MIGRATE/RESUME reply payload and resolves
