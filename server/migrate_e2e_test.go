@@ -752,6 +752,92 @@ func TestE2E_DoubleMigration_ABC_OrderPreserved(t *testing.T) {
 	require.Equal(t, uint64(0), uint64(len(reasm.pending)), "reassembler left a hole (gap) at end")
 }
 
+// TestE2E_MigrationLargeTransfer_CreditReplenished is the load-bearing proof of
+// the Bug #9 NEW-4 credit-replenishment fix (T20-finding). It drives a transfer
+// LARGER than 2×window (the streamCredit clamp) ACROSS a preemptive migration so
+// the only way the download can finish is if the WINDOW_UPDATE frames the client
+// sends ON SLOT B actually replenish the migrated relay's credit.
+//
+// The bug: at CONNECT the per-stream credit was shared into BOTH slot A's
+// `credits[sid]` map AND entry.credit (same object). After migrating to slot B,
+// the client's WINDOW_UPDATE frames arrive on slot B's reader loop, which looked
+// up `credits[wuStreamID]` in slot B's OWN (empty for this sid) credits map →
+// nil → no replenishment. entry.credit (gated on by relayLoop) therefore drained
+// to 0 and the relay parked forever in waitForCredit. A transfer ≤ 2×window
+// (the clamp ceiling) could still finish on the inherited credit (which is why
+// the other e2e tests, all ≤ 2×window, never caught it); a transfer > 2×window
+// hangs.
+//
+// With the fix (cross-slot registry lookup in the FlagWindowUpdate handler) the
+// WINDOW_UPDATE on slot B finds the relayEntry via h.relayRegistry.find and tops
+// up entry.credit, so the >2×window transfer completes and sha256 matches.
+//
+// WITHOUT the fix this test HANGS (relay parked) until the 30s deadline trips a
+// require failure — i.e. it is a true red→green proof.
+func TestE2E_MigrationLargeTransfer_CreditReplenished(t *testing.T) {
+	ha := newE2EHarness(t, true)
+	const streamID = uint16(0x88)
+	// Small window so the 2×window credit clamp (=512 KiB) is far below the
+	// total: the post-migration download CANNOT complete on the credit inherited
+	// at the migration boundary — it must be replenished by slot-B WINDOW_UPDATEs.
+	const window = 256 << 10  // 256 KiB → clamp ceiling 512 KiB
+	const total = 3 << 20     // 3 MiB ≫ 2×window
+	payload := deterministicPayload(total)
+	want := sha256.Sum256(payload)
+
+	slotA := ha.dialSlot(true, window)
+	defer slotA.close()
+	slotB := ha.dialSlot(true, window)
+	defer slotB.close()
+
+	reasm := newE2EReassembler()
+	proof, hasProof := slotA.connect(t, streamID, "origin:443", reasm)
+	require.True(t, hasProof, "migration CONNECT_OK must carry a proof")
+	origin := &pacedOrigin{conn: ha.waitOrigin(3 * time.Second)}
+
+	// PHASE 1: stream a small first chunk (< window) on slot A and drain it there,
+	// sending WINDOW_UPDATEs so the relay keeps reading. This makes the migration
+	// bisect a genuinely in-flight stream.
+	const onAChunk = 128 << 10 // 128 KiB, comfortably under the window
+	go origin.writePhase(0, onAChunk, payload)
+	drainUntil(t, slotA, streamID, reasm, onAChunk, 10*time.Second)
+	require.GreaterOrEqual(t, len(reasm.out), onAChunk, "phase-1 bytes must land on A before migration")
+	bytesOnA := len(reasm.out)
+
+	// Preemptive MIGRATE to slot B (real wire control frame + real proof).
+	ok, _, reason := slotB.sendMigrate(t, core.FlagMigrate, streamID, proof)
+	require.True(t, ok, "preemptive MIGRATE must succeed, reason=0x%02x", reason)
+
+	// PHASE 2: stream the WHOLE remainder (≈ 2.875 MiB) — far more than the
+	// 512 KiB credit clamp. The relay can only keep reading the origin if slot-B
+	// WINDOW_UPDATEs replenish entry.credit. Run the origin write concurrently
+	// because net.Pipe writes block on the relay reads (which themselves block on
+	// credit) — so the writer can only make progress as credit is replenished.
+	go func() {
+		origin.writePhase(onAChunk, total, payload)
+		origin.closeEOF()
+	}()
+
+	// Drain slot B with per-frame WINDOW_UPDATEs (drainData calls windowUpdate per
+	// frame). WITHOUT the fix the relay stalls after ~512 KiB and reasm.out never
+	// reaches total → the loop exhausts the 30s deadline and the require below
+	// fails. WITH the fix the credit is topped up and the full 3 MiB arrives.
+	deadline := time.Now().Add(30 * time.Second)
+	for len(reasm.out) < total && time.Now().Before(deadline) {
+		slotB.drainData(streamID, reasm, 500*time.Millisecond, 2*time.Second)
+		if len(reasm.out) < total {
+			slotA.drainData(streamID, reasm, 50*time.Millisecond, 200*time.Millisecond)
+		}
+	}
+
+	require.Equal(t, total, len(reasm.out),
+		"download stalled across the migration boundary — slot-B WINDOW_UPDATE did not replenish the migrated relay credit (Bug #9 NEW-4 regression)")
+	require.Greater(t, len(reasm.out), bytesOnA,
+		"no bytes arrived after the migration — test would be vacuous")
+	require.Equal(t, want, sha256.Sum256(reasm.out),
+		"sha256 mismatch — bytes lost/reordered across the migration boundary")
+}
+
 // TestE2E_Compat_NewClientOldServer: server StreamMigrationEnabled=false →
 // capability off → the legacy relay path runs; a plain download works and the
 // CONNECT_OK carries NO proof (no migration). The migrate-capability bit the

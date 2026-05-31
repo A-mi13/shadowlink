@@ -1131,6 +1131,41 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 					}
 					creditsMu.Unlock()
 				}
+				// Part 1b (Bug #9 NEW-4 followup) — registry teardown on FIN. A
+				// FlagFin is the client's DEFINITIVE both-directions-done signal for
+				// the stream, so unlike the dest-EOF path (which cannot tell whether
+				// the uplink is still live) this IS the right moment to permanently
+				// retire a migratable relay and free its registry slot + egress FD.
+				// The FIN may arrive on ANY slot (origin or a slot the stream
+				// migrated to), so we resolve the relay through the registry rather
+				// than the local credits map. Single-winner teardown (shared CAS
+				// authority with the grace timer / idle-evict): only the goroutine
+				// that wins state→stClosing closes the reader (which closes the
+				// shared credit, unparking relayLoop), closes the egress tc, frees
+				// the FD budget, and removes the entry — so a concurrent grace timer
+				// or RESUME never double-tears-down. If the CAS loses, that other
+				// path already owns the teardown and we leave it alone.
+				if migrateEnabled && migrateClientID != "" {
+					if entry, ok := h.relayRegistry.find(migrateClientID, streamID); ok {
+						prev := entry.state.Load()
+						if (prev == stActive || prev == stOrphaned) &&
+							entry.state.CompareAndSwap(prev, stClosing) {
+							h.relayRegistry.remove(entry.originClientID, entry.globalStreamID)
+							entry.closeReader()
+							if entry.tc != nil {
+								entry.tc.Close()
+							}
+							h.relayRegistry.releaseOrphanFD(entry)
+							// Wake a relay loop parked on a full downBuffer so it
+							// re-checks stClosing and exits without leaving a
+							// half-assigned seq (same lost-wakeup close as grace-timer).
+							cond := entry.bufCondOf()
+							entry.perEntryMu.Lock()
+							cond.Broadcast()
+							entry.perEntryMu.Unlock()
+						}
+					}
+				}
 
 			case core.FlagKeepalive:
 				ack := &core.Chunk{SessionID: session.ID, SeqNum: session.NextSeqNum(), Flags: core.FlagAck}
@@ -1184,6 +1219,31 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 				creditsMu.Lock()
 				cr := credits[wuStreamID]
 				creditsMu.Unlock()
+				// Bug #9 NEW-4 (T20-finding) — cross-slot credit replenishment.
+				// The per-stream credit is a SINGLE object that lives on the
+				// relayEntry (entry.credit) and is gated on by relayLoop. At
+				// CONNECT it was also placed in the ORIGIN slot's `credits[sid]`
+				// map. After a stream migrates to another slot, the client's
+				// WINDOW_UPDATE frames arrive on the NEW slot's reader loop, whose
+				// local `credits` map has no entry for this sid (the stream was
+				// registered on the origin slot). Without finding the credit by its
+				// real owner the relay's credit would drain to 0 and the egress
+				// pump would park forever in waitForCredit after one window — any
+				// transfer larger than the 2×window clamp would hang mid-flight.
+				//
+				// The registry is the single source of truth for a migratable
+				// relay's credit: look the entry up by (clientID, sid) and top up
+				// entry.credit directly. This works no matter which slot the
+				// WINDOW_UPDATE landed on (origin slot before migration, or any
+				// later slot), because the credit object is shared and the registry
+				// outlives any single WS slot. Legacy (non-migration) flow control
+				// is untouched: migrateClientID=="" sessions never enter this
+				// branch and replenish via the local credits map exactly as before.
+				if cr == nil && migrateEnabled && migrateClientID != "" {
+					if entry, ok := h.relayRegistry.find(migrateClientID, wuStreamID); ok {
+						cr = entry.credit
+					}
+				}
 				if cr != nil {
 					cr.add(delta, int64(flowWindow))
 				}

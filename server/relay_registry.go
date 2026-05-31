@@ -608,6 +608,23 @@ func (e *relayEntry) relayLoop(migrateEnabled bool, closeCh <-chan struct{}) {
 			if e.state.Load() == stOrphaned {
 				e.destClosed.Store(true)
 			}
+			// Part 1b (Bug #9 NEW-4 followup) — eager registry/FD release on a
+			// NORMAL dest EOF over a LIVE binding is intentionally NOT done here.
+			// TODO(bug9-1b): A relay whose downlink (dest→client) hit EOF on a
+			// still-stActive slot leaves its relayEntry in the registry (and its
+			// egress tc open) until the WS session dies, when entriesForSession
+			// orphans it and the grace timer removes it. That is a bounded,
+			// short-lived egress leak — NOT data loss, NOT a credit hang. We do
+			// NOT close tc / remove the entry on this path because the egress TCP
+			// is BIDIRECTIONAL: a dest read-EOF (download finished) does not imply
+			// the uplink (client→dest, routed via streams[sid].Write on the reader
+			// loop) is finished — a request body may still be uploading. Closing tc
+			// or removing the registry entry here would break that half-open
+			// uplink and would also race MIGRATE/RESUME/grace single-winner CAS.
+			// A correct eager release needs a half-close-aware teardown (CloseRead
+			// on tc, keep the write half, remove from registry only once BOTH
+			// directions are done) tracked separately; the leak self-heals on
+			// session teardown so it is not shippable-blocking.
 			return
 		}
 	}
