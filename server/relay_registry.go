@@ -236,6 +236,7 @@ func (r *relayRegistry) totalCount() int {
 // onStreamAck releases the not-yet-acked tail up to ackedSeq (FlagStreamAck
 // barrier, §5.4). Called under perEntryMu by the FlagStreamAck handler.
 func (e *relayEntry) onStreamAck(ackedSeq uint64) {
+	cond := e.bufCondOf()
 	e.perEntryMu.Lock()
 	if e.unackedTail != nil {
 		e.unackedTail.evictUpTo(ackedSeq)
@@ -243,6 +244,11 @@ func (e *relayEntry) onStreamAck(ackedSeq uint64) {
 	if e.downBuffer != nil {
 		e.downBuffer.evictUpTo(ackedSeq)
 	}
+	// The evictions above may have freed space in a full downBuffer. A relay
+	// loop parked on the full buffer (cond.Wait) won't re-check on its own —
+	// Broadcast UNDER the held perEntryMu (same lost-wakeup-window close as
+	// reassociate/grace-timer) so it re-evaluates and resumes buffering.
+	cond.Broadcast()
 	e.perEntryMu.Unlock()
 }
 
@@ -467,7 +473,7 @@ func (r *relayRegistry) launchGraceTimer(e *relayEntry, grace time.Duration, onE
 		if e.tc != nil {
 			e.tc.Close()
 		}
-		// Wake a relay loop blocked in bufferDownFrameBlocking so it re-checks
+		// Wake a relay loop blocked in routeDownFrame so it re-checks
 		// state==stClosing and exits without assigning a seq. Broadcast UNDER
 		// perEntryMu to close the lost-wakeup window against the loop's
 		// check-state-then-Wait sequence (same reasoning as reassociate).

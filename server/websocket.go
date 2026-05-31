@@ -1183,7 +1183,12 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 				// no binding so it re-evaluates (it stays buffering during grace,
 				// but the broadcast prevents a stale park if the buffer later
 				// frees via ack-eviction). Then arm the grace teardown timer.
-				e.bufCondOf().Broadcast()
+				// Broadcast UNDER perEntryMu for consistency with reassociate /
+				// grace-timer / onStreamAck (closes any lost-wakeup window).
+				cond := e.bufCondOf()
+				e.perEntryMu.Lock()
+				cond.Broadcast()
+				e.perEntryMu.Unlock()
 				h.relayRegistry.launchGraceTimer(e, migrateGracePeriod, func() {
 					h.metrics.MigrateGraceExpired.Add(1)
 				})
