@@ -139,3 +139,43 @@ func TestRelayRegistry_PerClientCount(t *testing.T) {
 		t.Fatalf("totalCount = %d, want 3", n)
 	}
 }
+
+func TestRelayEntry_AckEvictsTail(t *testing.T) {
+	e := &relayEntry{unackedTail: newBoundedBuffer(1 << 20)}
+	e.unackedTail.Push(pendingDownFrame{seq: 1, data: []byte("a")})
+	e.unackedTail.Push(pendingDownFrame{seq: 2, data: []byte("b")})
+	e.unackedTail.Push(pendingDownFrame{seq: 3, data: []byte("c")})
+	e.onStreamAck(2)
+	if e.unackedTail.byteLen() != 1 {
+		t.Fatalf("unackedTail bytes = %d, want 1 (only seq3)", e.unackedTail.byteLen())
+	}
+}
+
+func TestRelayEntry_ResendTailReturnsUnackedInOrder(t *testing.T) {
+	e := &relayEntry{unackedTail: newBoundedBuffer(1 << 20)}
+	e.unackedTail.Push(pendingDownFrame{seq: 5, data: []byte("e")})
+	e.unackedTail.Push(pendingDownFrame{seq: 6, data: []byte("f")})
+	frames := e.resendTail()
+	if len(frames) != 2 || frames[0].seq != 5 || frames[1].seq != 6 {
+		t.Fatalf("resendTail order: %+v", frames)
+	}
+	if e.unackedTail.byteLen() == 0 {
+		t.Fatal("resendTail must not empty the buffer")
+	}
+}
+
+func TestRelayEntry_DownSeqNeverResetOnReassociate(t *testing.T) {
+	e := &relayEntry{}
+	for i := 0; i < 4; i++ {
+		e.downSeqCounter.Add(1)
+	}
+	before := e.downSeqCounter.Load()
+	sB := core.NewSession(2, make([]byte, 32), make([]byte, 32))
+	e.bound.Store(&binding{session: sB, writer: core.NewWSAsyncWriter(nil, 8)})
+	if e.downSeqCounter.Load() != before {
+		t.Fatal("downSeqCounter changed on reassociate — NEW-3 invariant broken")
+	}
+	if next := e.downSeqCounter.Add(1); next != before+1 {
+		t.Fatalf("post-reassociate next seq = %d, want %d", next, before+1)
+	}
+}

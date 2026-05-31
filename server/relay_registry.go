@@ -178,3 +178,29 @@ func (r *relayRegistry) totalCount() int {
 	}
 	return n
 }
+
+// onStreamAck releases the not-yet-acked tail up to ackedSeq (FlagStreamAck
+// barrier, §5.4). Called under perEntryMu by the FlagStreamAck handler.
+func (e *relayEntry) onStreamAck(ackedSeq uint64) {
+	e.perEntryMu.Lock()
+	if e.unackedTail != nil {
+		e.unackedTail.evictUpTo(ackedSeq)
+	}
+	if e.downBuffer != nil {
+		e.downBuffer.evictUpTo(ackedSeq)
+	}
+	e.perEntryMu.Unlock()
+}
+
+// resendTail returns the unacked tail (seq order) so the relay-loop can
+// re-enqueue it on the NEW binding when slot A died before acking (NEW-1,
+// §5.3). Does NOT clear the buffer — the frames stay pending until B acks
+// them. Caller resends under the same perEntryMu it holds.
+func (e *relayEntry) resendTail() []pendingDownFrame {
+	e.perEntryMu.Lock()
+	defer e.perEntryMu.Unlock()
+	if e.unackedTail == nil {
+		return nil
+	}
+	return e.unackedTail.tailFrames()
+}
