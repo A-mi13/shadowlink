@@ -269,6 +269,36 @@ func NewHandler(serverKey *core.KeyPair, config Config, decoyDir string) *Handle
 		relayRegistry: newRelayRegistry(),
 	}
 
+	// Bug #9 Task 12 (F5/F6): configure orphan DoS caps. An orphaned relay holds
+	// a real egress socket through the grace window with no WS behind it, so the
+	// caps bound that resource:
+	//   per-client = MaxConnsPerClient — a client never legitimately migrates
+	//     more streams at once than its connection cap.
+	//   total      = MaxClients * MaxConnsPerClient — global ceiling.
+	//   fdBudget   = ~half the RLIMIT_NOFILE soft limit (orphans are transient;
+	//     leave the other half for live sessions + listeners). On Windows dev
+	//     readFDSoftLimit()==0 → fall back to `total` so the cap still applies.
+	// Env-tunability lands in Task 18 (§4.3); these are safe defaults.
+	{
+		perClient := int(config.MaxConnsPerClient)
+		if perClient <= 0 {
+			perClient = 8
+		}
+		maxClients := config.MaxClients
+		if maxClients <= 0 {
+			maxClients = 100
+		}
+		total := maxClients * perClient
+		fdBudget := total
+		if soft := readFDSoftLimit(); soft > 0 {
+			fdBudget = int(soft / 2)
+			if fdBudget < perClient {
+				fdBudget = perClient // never below a single client's working set
+			}
+		}
+		h.relayRegistry.setLimits(perClient, total, fdBudget)
+	}
+
 	// Eagerly populate the asymmetric decoy fixture used by the
 	// failClosedToDecoy timing pipeline so the first hot-path call does
 	// not pay cold-RNG keypair-generation cost under sync.Once mutex —

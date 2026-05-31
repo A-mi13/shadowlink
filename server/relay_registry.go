@@ -122,8 +122,26 @@ type relayEntry struct {
 	downBuffer     *boundedBuffer // buffered while no binding / during grace
 	unackedTail    *boundedBuffer // sent-on-A-but-unacked tail (NEW-1)
 
-	// FD accounting (F5).
+	// FD accounting (F5). holdsFD is true once admitOrphan has charged this
+	// entry against the registry's orphan FD budget; evictIdleOrphan / the grace
+	// timer decrement the budget only for entries that actually hold it.
 	holdsFD bool
+
+	// destClosed (F13): set by relayLoop when the egress TCP read hit EOF/err
+	// WHILE the entry was orphaned (no live binding). A subsequent RESUME flushes
+	// the remaining downBuffer and then signals end-of-stream to the client so a
+	// dest-closed-during-grace stream is not left hanging. The flush+FIN marker
+	// itself is finalized in the resume path; this flag is the durable record
+	// that the destination is gone.
+	destClosed atomic.Bool
+
+	// lastDownlinkNs (F6 idleness): unix-nanos timestamp of the most recent
+	// downlink frame routed for this stream. evictIdleOrphan uses it to pick the
+	// least-recently-used IDLE orphan — a relay that has not pushed data for at
+	// least evictIdleThreshold is a safe eviction target (a recently-active
+	// orphan is mid-transfer and likely to RESUME). Updated on the relay-loop's
+	// downlink path.
+	lastDownlinkNs atomic.Int64
 
 	// Bug#8 stream credit — lives here, survives migration (F9, §5.9).
 	credit *streamCredit
@@ -159,10 +177,53 @@ func (e *relayEntry) bufCondOf() *sync.Cond {
 type relayRegistry struct {
 	mu       sync.RWMutex
 	byClient map[string]map[uint16]*relayEntry
+
+	// Task 12 (F5/F6) — orphan DoS caps. An orphaned relay holds a real egress
+	// socket open with no WS behind it (the grace window); without caps a peer
+	// can spray CONNECTs then kill the WS to pin sockets. setLimits configures:
+	//   maxOrphanedPerClient — most orphaned relays a single client may hold.
+	//   maxOrphanedTotal     — global ceiling across all clients.
+	//   orphanFDBudget       — max orphaned egress conns held at once, derived
+	//                          from RLIMIT_NOFILE (or maxOrphanedTotal on Windows
+	//                          dev where readFDSoftLimit()==0).
+	// Written once via setLimits before any concurrent use; read-only thereafter
+	// (no lock needed for the int fields — same write-once contract as the
+	// startRotation lifecycle fields in client/connmanager.go).
+	maxOrphanedPerClient int
+	maxOrphanedTotal     int
+	orphanFDBudget       int
+	evictIdleThreshold   time.Duration
+
+	// orphanedFDInUse counts orphaned relays currently holding the FD budget.
+	// Mutated atomically by admitOrphan (+1) and evictIdleOrphan / grace-timer
+	// teardown (-1) so the budget check needs no registry lock.
+	orphanedFDInUse atomic.Int64
+
+	// Self-contained observability. Task 18 (§4.3) surfaces these through the
+	// global server Metrics text/JSON exporters; for now they let tests and ops
+	// reason about the gate without coupling the registry to *Metrics.
+	orphanFDRejected     atomic.Uint64 // admitOrphan rejected on FD budget
+	orphanedEvictedLimit atomic.Uint64 // idle orphans evicted to enforce a cap
 }
+
+const defaultEvictIdleThreshold = 2 * time.Second
 
 func newRelayRegistry() *relayRegistry {
 	return &relayRegistry{byClient: make(map[string]map[uint16]*relayEntry)}
+}
+
+// setLimits configures the orphan DoS caps (Task 12, F5/F6). fdBudget is the
+// caller-supplied FD ceiling; pass readFDSoftLimit() (minus a headroom margin)
+// from production wiring. A zero/negative fdBudget means "never hold an orphan"
+// (admitOrphan always rejects) — used by tests and as a fail-safe. Call once
+// before the registry is shared across goroutines.
+func (r *relayRegistry) setLimits(perClient, total, fdBudget int) {
+	r.maxOrphanedPerClient = perClient
+	r.maxOrphanedTotal = total
+	r.orphanFDBudget = fdBudget
+	if r.evictIdleThreshold <= 0 {
+		r.evictIdleThreshold = defaultEvictIdleThreshold
+	}
 }
 
 func (r *relayRegistry) add(clientID string, streamID uint16, e *relayEntry) {
@@ -231,6 +292,153 @@ func (r *relayRegistry) totalCount() int {
 		n += len(m)
 	}
 	return n
+}
+
+// admitOrphan is the admission gate the WS-death cleanup calls before deciding
+// to HOLD an orphaned relay's egress conn open through the grace window
+// (Task 12, F5/F6, §5.5). The relay was already registered at CONNECT, so the
+// entry `e` is present in the map; admitOrphan answers "may this client keep
+// holding the orphaned relays it now has, given the caps?" and charges the FD
+// budget when it says yes.
+//
+// Decision order:
+//  1. FD budget exhausted (orphanFDBudget<=0, or in-use already at the budget)
+//     → reject. A zero budget (tests / fail-safe) always rejects.
+//  2. Per-client cap exceeded → try evictIdleOrphan(clientID); if still over the
+//     cap (no idle orphan to reclaim) → reject.
+//  3. Global cap exceeded → try evictIdleOrphan("") (any client); if still over
+//     → reject.
+//  4. Otherwise charge the FD budget (+1), mark e.holdsFD, accept.
+//
+// Counting semantics: the caps are compared with `>` against the live map count
+// (which INCLUDES e). With maxOrphanedPerClient=N, the Nth held orphan is
+// allowed (count==N) and the (N+1)th (count==N+1) triggers eviction/reject.
+// Returns true if the relay may be held; false means the caller must close the
+// egress tc immediately (graceful degradation, §5.5).
+func (r *relayRegistry) admitOrphan(clientID string, e *relayEntry) bool {
+	if r.orphanFDBudget <= 0 {
+		r.orphanFDRejected.Add(1)
+		return false
+	}
+	if int(r.orphanedFDInUse.Load()) >= r.orphanFDBudget {
+		r.orphanFDRejected.Add(1)
+		return false
+	}
+
+	if r.maxOrphanedPerClient > 0 && r.countForClient(clientID) > r.maxOrphanedPerClient {
+		r.evictIdleOrphanExcept(clientID, e)
+		if r.countForClient(clientID) > r.maxOrphanedPerClient {
+			return false
+		}
+	}
+
+	if r.maxOrphanedTotal > 0 && r.totalCount() > r.maxOrphanedTotal {
+		r.evictIdleOrphanExcept("", e)
+		if r.totalCount() > r.maxOrphanedTotal {
+			return false
+		}
+	}
+
+	r.orphanedFDInUse.Add(1)
+	e.holdsFD = true
+	return true
+}
+
+// releaseOrphanFD returns the entry's charged FD-budget slot exactly once and
+// clears holdsFD so any later teardown path (grace timer, eviction) won't
+// double-decrement (Task 12, F5). Called when an orphan is reclaimed by a
+// RESUME (back to stActive) or torn down. The holdsFD flag is set/cleared only
+// under the single-winner state transitions, so concurrent callers cannot both
+// observe holdsFD==true for the same entry.
+func (r *relayRegistry) releaseOrphanFD(e *relayEntry) {
+	if e.holdsFD {
+		e.holdsFD = false
+		r.orphanedFDInUse.Add(-1)
+	}
+}
+
+// evictIdleOrphan reclaims the single least-recently-used IDLE orphaned relay
+// to make room under the caps (Task 12, F6). scope!="" restricts the search to
+// that clientID; "" searches globally. It NEVER touches an stActive entry (an
+// active stream is mid-transfer) and NEVER touches an orphan that pushed data
+// within evictIdleThreshold (a recently-active orphan is likely to RESUME).
+//
+// Mechanism mirrors launchGraceTimer's teardown so the two never race a
+// double-close: the winning CompareAndSwap(stOrphaned→stClosing) is the single
+// authority to close+remove an entry. We snapshot the victim under RLock, drop
+// the registry lock, then CAS; only the CAS winner closes tc, removes the entry,
+// decrements the FD budget, broadcasts bufCond (so a relay loop blocked in
+// routeDownFrame sees stClosing and exits), and ticks the counter. Lock order
+// is registry.mu (released) → per-entry CAS / perEntryMu — identical to Task 11,
+// no inversion.
+func (r *relayRegistry) evictIdleOrphan(scope string) {
+	r.evictIdleOrphanExcept(scope, nil)
+}
+
+// evictIdleOrphanExcept is evictIdleOrphan with one entry excluded from the
+// candidate set — used by admitOrphan so the relay being admitted (whose
+// lastDownlink is still zero, i.e. trivially "idle") is never chosen as its own
+// eviction victim. except==nil makes it behave exactly like evictIdleOrphan.
+func (r *relayRegistry) evictIdleOrphanExcept(scope string, except *relayEntry) {
+	now := time.Now().UnixNano()
+	threshold := r.evictIdleThreshold
+	if threshold <= 0 {
+		threshold = defaultEvictIdleThreshold
+	}
+	cutoff := now - int64(threshold)
+
+	r.mu.RLock()
+	var victim *relayEntry
+	var oldest int64
+	consider := func(e *relayEntry) {
+		if e == except {
+			return // never evict the entry currently being admitted
+		}
+		if e.state.Load() != stOrphaned {
+			return // never evict stActive / already-stClosing
+		}
+		last := e.lastDownlinkNs.Load()
+		if last > cutoff {
+			return // recently active — not idle
+		}
+		if victim == nil || last < oldest {
+			victim = e
+			oldest = last
+		}
+	}
+	if scope != "" {
+		for _, e := range r.byClient[scope] {
+			consider(e)
+		}
+	} else {
+		for _, m := range r.byClient {
+			for _, e := range m {
+				consider(e)
+			}
+		}
+	}
+	r.mu.RUnlock()
+
+	if victim == nil {
+		return
+	}
+	// Single-winner teardown (shared CAS authority with the grace timer).
+	if !victim.state.CompareAndSwap(stOrphaned, stClosing) {
+		return // grace timer / RESUME already moved it
+	}
+	r.remove(victim.originClientID, victim.globalStreamID)
+	if victim.tc != nil {
+		victim.tc.Close()
+	}
+	r.releaseOrphanFD(victim)
+	// Wake any relay loop parked on a full downBuffer so it re-checks stClosing
+	// and exits without leaving a half-assigned seq. Broadcast UNDER perEntryMu
+	// closes the lost-wakeup window (same reasoning as reassociate / grace timer).
+	cond := victim.bufCondOf()
+	victim.perEntryMu.Lock()
+	cond.Broadcast()
+	victim.perEntryMu.Unlock()
+	r.orphanedEvictedLimit.Add(1)
 }
 
 // onStreamAck releases the not-yet-acked tail up to ackedSeq (FlagStreamAck
@@ -321,9 +529,21 @@ func (e *relayEntry) relayLoop(migrateEnabled bool, closeCh <-chan struct{}) {
 			if b != nil {
 				e.enqueueDownFrame(b, migrateEnabled, frame)
 			}
+			// F6 idleness: stamp the last-downlink clock so evictIdleOrphan can
+			// distinguish a mid-transfer orphan (recently pushed data — likely to
+			// RESUME) from a stalled one (safe to reclaim under cap pressure).
+			e.lastDownlinkNs.Store(time.Now().UnixNano())
 			e.credit.consume(n)
 		}
 		if err != nil {
+			// F13: egress closed/errored. If this happened while the relay was
+			// orphaned (no live WS behind it), record that the destination is
+			// gone so a later RESUME flushes the remaining downBuffer and then
+			// signals end-of-stream rather than leaving the client hanging. For a
+			// still-active relay the normal teardown handles it.
+			if e.state.Load() == stOrphaned {
+				e.destClosed.Store(true)
+			}
 			return
 		}
 	}
@@ -473,6 +693,9 @@ func (r *relayRegistry) launchGraceTimer(e *relayEntry, grace time.Duration, onE
 		if e.tc != nil {
 			e.tc.Close()
 		}
+		// Task 12 (F5): release the FD budget this entry charged at admitOrphan
+		// so a grace-expired relay frees its slot for the next orphan.
+		r.releaseOrphanFD(e)
 		// Wake a relay loop blocked in routeDownFrame so it re-checks
 		// state==stClosing and exits without assigning a seq. Broadcast UNDER
 		// perEntryMu to close the lost-wakeup window against the loop's
