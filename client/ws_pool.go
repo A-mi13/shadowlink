@@ -418,6 +418,29 @@ func slotStaggerOffset(idx int) time.Duration {
 	return base + jitter
 }
 
+// keepaliveDefaultBase is the default base interval for the per-pool
+// keepalive loop (Bug #9). The loop samples
+// JitteredIntervalLogNormal(keepaliveDefaultBase, keepaliveSigma), which is
+// truncated to [base/2, base*2] = [2.5s, 10s]. The 10s upper bound is the
+// worst-case silence a quiet slot can experience between keepalive frames;
+// it stays under the ~10-15s silent-cut window observed for direct-mode
+// bare-origin TCP under the РФ TSPU (field log: close 1006 with
+// last_write_age_ms=10000-15000). Was 20s (window [10s, 40s]) before Bug #9.
+//
+// Why not lower (e.g. 3s)? A real idle browser keep-alive WS pings every
+// ~15-30s; 5s±jitter is already more frequent than a real browser, so going
+// lower buys little headroom against the cut while drifting further from the
+// browser-mimicry baseline. Why not a fixed 5s? Anti-DPI requires a
+// non-periodic, heavy-tailed cadence (NEW-1 / final-audit-2026-05-03 P1-3) —
+// we keep the log-normal jitter and only shrink the base.
+const keepaliveDefaultBase = 5 * time.Second
+
+// keepaliveSigma is the log-normal sigma for the keepalive sampler. 0.5 is
+// the project-standard "moderate" jitter (see jitter.go) — preserved from the
+// pre-Bug #9 keepalive so the anti-DPI cadence shape is unchanged; only the
+// base shrank.
+const keepaliveSigma = 0.5
+
 // reconnectJitterWindow defines how long after a meltdown event the
 // reconnect path applies per-slot handshake jitter. Beyond this window
 // (steady-state single-slot rotation), reconnects fire at their normal
@@ -977,6 +1000,28 @@ type WSPoolTransport struct {
 	writeTimeout time.Duration // per-frame write deadline (0 → 30s WSAsyncWriter default)
 	staggerDelay time.Duration // initial/reconnect slot startup spacing (0 → no stagger)
 
+	// keepaliveBase is the base interval for the per-pool keepalive loop.
+	// The loop samples JitteredIntervalLogNormal(keepaliveBase, 0.5), which
+	// is truncated to [base/2, base*2] — so the MAX silence window a healthy
+	// quiet slot can experience between two keepalive frames is keepaliveBase*2.
+	//
+	// Bug #9 (2026-05-31): a quiet long-lived stream (user waiting 5+ min for
+	// an AI agent reply — almost no bytes in either direction) left its slot
+	// silent. A direct-mode TCP to the bare origin IP is cut by the РФ TSPU /
+	// a stateful middlebox after only ~10-15s of silence (field log:
+	// close 1006 with last_write_age_ms=10000-15000). The slot then reconnects
+	// with a 5-9s backoff and the stream — whose channel is force-closed in
+	// handleSlotDeath — dies and does NOT migrate to a surviving slot, so the
+	// session "не восстанавливается". Root cause = keepalive too rare: base was
+	// 20s → window [10s, 40s], routinely exceeding the cut threshold.
+	//
+	// Fix: base default 5s → window [2.5s, 10s]. Max gap 10s stays under the
+	// observed ~10-15s cut. Jitter (sigma 0.5 log-normal) is PRESERVED — anti-DPI
+	// requires a non-periodic, heavy-tailed cadence (NEW-1 / final-audit P1-3);
+	// we only shrink the base, we do NOT go to a fixed period. Field-tunable via
+	// SHADOWLINK_KEEPALIVE_INTERVAL without a redeploy.
+	keepaliveBase time.Duration
+
 	// Meltdown protection: when multiple slots die within a short window
 	// (usually CF punishing an aggressive burst), pause reconnect loops so CF
 	// can "cool down" instead of immediately spinning up replacement slots
@@ -1129,6 +1174,15 @@ type WSPoolConfig struct {
 	// millisecond and trip burst/rate-limit heuristics.
 	StaggerDelay time.Duration
 
+	// KeepaliveInterval is the base interval for the per-pool keepalive loop.
+	// 0 → default (keepaliveDefaultBase = 5s). The loop samples
+	// JitteredIntervalLogNormal(KeepaliveInterval, 0.5), truncated to
+	// [base/2, base*2], so the worst-case silence window on a quiet slot is
+	// KeepaliveInterval*2. Keep it under the middlebox/TSPU silent-cut window
+	// (~10-15s observed for direct-mode bare-origin TCP — Bug #9). Field-tune
+	// via SHADOWLINK_KEEPALIVE_INTERVAL.
+	KeepaliveInterval time.Duration
+
 	// Meltdown protection parameters. All default to sensible values if zero.
 	MeltdownWindow    time.Duration // how long "recent death" lasts (default 5s)
 	MeltdownThreshold int           // N deaths in window triggers cooldown (default = ceil(size/2), min 2)
@@ -1244,6 +1298,16 @@ func NewWSPoolTransport(cl *Client, cfg WSPoolConfig) *WSPoolTransport {
 	if stickyMaxTotalBytes <= 0 {
 		stickyMaxTotalBytes = 256 * 1024 * 1024 // 256 MiB
 	}
+	// Bug #9 keepalive interval. 0 → default 5s (window [2.5s, 10s] under the
+	// log-normal sampler). Clamp negative/garbage to the default too. We do NOT
+	// allow an arbitrarily large value to silently re-introduce the bug, but we
+	// also don't hard-cap — operators tuning UP (e.g. a server known to tolerate
+	// longer silence, or a viaCF path with a friendlier idle timeout) is a valid
+	// field decision; the default is the safe floor.
+	keepaliveBase := cfg.KeepaliveInterval
+	if keepaliveBase <= 0 {
+		keepaliveBase = keepaliveDefaultBase
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &WSPoolTransport{
 		poolSize:          cfg.Size,
@@ -1268,6 +1332,7 @@ func NewWSPoolTransport(cl *Client, cfg WSPoolConfig) *WSPoolTransport {
 		client:            cl,
 		writeTimeout:      cfg.WriteTimeout,
 		staggerDelay:      cfg.StaggerDelay,
+		keepaliveBase:     keepaliveBase,
 		meltdownWindow:    cfg.MeltdownWindow,
 		meltdownThreshold: cfg.MeltdownThreshold,
 		meltdownCooldown:  cfg.MeltdownCooldown,
@@ -1513,21 +1578,44 @@ func (p *WSPoolTransport) emitHealthSummary() {
 }
 
 // keepaliveLoop sends FlagKeepalive to every healthy slot at a jittered
-// ~20s cadence. The base interval prevents Cloudflare Proxy Write Timeout
-// (30s) and Idle Timeout (900s) from killing long-lived WebSocket
-// connections; the log-normal jitter (final-audit-2026-05-03 P1-3,
-// upgraded from uniform ±30% NEW-1 fix) destroys the FFT-visible
-// periodic peak AND defeats ML classifiers that distinguish flat-band
-// uniform jitter from heavy-tailed real-world inter-frame jitter.
+// cadence centered on p.keepaliveBase (default 5s → window [2.5s, 10s]).
+//
+// Two jobs:
+//  1. Keep a long-lived but QUIET slot alive. A direct-mode TCP to the bare
+//     origin IP is cut by the РФ TSPU / a stateful middlebox after only
+//     ~10-15s of silence (Bug #9). Keeping the keepalive gap under that
+//     window stops the silent-cut from ever firing — which matters because
+//     a slot death force-closes its streams (handleSlotDeath) and the stream
+//     does NOT migrate, so a quiet AI-agent session would die unrecoverably.
+//     The old 20s base (window up to 40s) routinely lost this race.
+//  2. Keep CF's Proxy Write Timeout (30s) and Idle Timeout (900s) from
+//     reaping the WS — trivially satisfied by the much tighter window.
+//
+// The log-normal jitter (final-audit-2026-05-03 P1-3, upgraded from uniform
+// ±30% NEW-1 fix) is PRESERVED — it destroys the FFT-visible periodic peak and
+// defeats ML classifiers that distinguish flat-band uniform jitter from
+// heavy-tailed real-world inter-frame jitter. Bug #9 only shrank the base.
 func (p *WSPoolTransport) keepaliveLoop() {
 	for {
 		select {
 		case <-p.ctx.Done():
 			return
-		case <-time.After(JitteredIntervalLogNormal(20*time.Second, 0.5)):
+		case <-time.After(p.nextKeepaliveDelay()):
 			p.sendKeepaliveToAllSlots()
 		}
 	}
+}
+
+// nextKeepaliveDelay samples the next keepalive interval from the log-normal
+// jitter sampler centered on p.keepaliveBase. Extracted so the Bug #9
+// max-silence-window invariant can be unit-tested deterministically without
+// driving the goroutine loop.
+func (p *WSPoolTransport) nextKeepaliveDelay() time.Duration {
+	base := p.keepaliveBase
+	if base <= 0 {
+		base = keepaliveDefaultBase
+	}
+	return JitteredIntervalLogNormal(base, keepaliveSigma)
 }
 
 func (p *WSPoolTransport) sendKeepaliveToAllSlots() {

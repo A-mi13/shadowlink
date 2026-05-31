@@ -463,6 +463,13 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 				}
 				stickyMaxTotalBytes := int64(envIntDefault("SHADOWLINK_STICKY_MAX_TOTAL_BYTES", 256*1024*1024))
 				stickyMaxSlots := envIntDefault("SHADOWLINK_STICKY_MAX_SLOTS", 0)
+				// Bug #9 (2026-05-31): keepalive base. Window = [base/2, base*2]
+				// under the log-normal sampler, so base=5s caps the worst-case
+				// silence on a quiet slot at 10s — under the ~10-15s direct-mode
+				// silent-cut window of the РФ TSPU. Was effectively 20s (window up
+				// to 40s) before the fix, which let quiet AI-agent streams die
+				// unrecoverably. Field-tunable without redeploy; 0/unset → 5s.
+				keepaliveInterval := envDurationDefault("SHADOWLINK_KEEPALIVE_INTERVAL", 5*time.Second)
 
 				pool := client.NewWSPoolTransport(e.cl, client.WSPoolConfig{
 					Size:                poolSize,
@@ -477,6 +484,7 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 					MaxSlotAge:          maxSlotAge,
 					WriteTimeout:        writeTimeout,
 					StaggerDelay:        staggerDelay,
+					KeepaliveInterval:   keepaliveInterval,
 					GracefulDrain:       gracefulDrain,
 					DrainHardCap:        drainHardCap,
 					DrainIdleThreshold:  drainIdleThreshold,
