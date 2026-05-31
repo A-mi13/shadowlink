@@ -155,6 +155,19 @@ type relayEntry struct {
 	// Bug#8 stream credit — lives here, survives migration (F9, §5.9).
 	credit *streamCredit
 
+	// closeCh is the relay's OWN lifetime signal (§5.5): closed exactly once when
+	// the relay is PERMANENTLY torn down (grace-expiry, idle-eviction, admit-
+	// reject, or full session teardown) — NOT on a per-slot WS death. relayLoop
+	// gates its credit wait and teardown on this channel, so the egress pump
+	// survives a slot rotation/death and keeps reading the egress into downBuffer
+	// during the grace window (spec §5.5: "relay-goroutine тормозит чтение …
+	// (tc.Read не вызывается)" — i.e. the loop stays alive, applying backpressure,
+	// rather than exiting with the slot it was created on). Created lazily by
+	// closeChOf; closed idempotently by closeReader.
+	closeCh     chan struct{}
+	closeChOnce sync.Once
+	closeOnce   sync.Once
+
 	perEntryMu sync.Mutex
 
 	// bufCond signals the relay loop when downBuffer frees up (a binding was
@@ -178,6 +191,32 @@ func (e *relayEntry) bufCondOf() *sync.Cond {
 		e.bufCond = sync.NewCond(&e.perEntryMu)
 	})
 	return e.bufCond
+}
+
+// closeChOf returns the relay's permanent-teardown channel, creating it once on
+// first use. Lazy so the many relayEntry literals (tests + production) need not
+// each wire it. relayLoop receives the channel returned here.
+func (e *relayEntry) closeChOf() chan struct{} {
+	e.closeChOnce.Do(func() {
+		e.closeCh = make(chan struct{})
+	})
+	return e.closeCh
+}
+
+// closeReader signals permanent teardown of the relay: it closes the relay's
+// own lifetime channel (waking relayLoop's credit wait) and closes the stream
+// credit (Bug#8) so a relay loop parked in waitForCredit unblocks and exits.
+// Idempotent — safe to call from the grace timer, idle-evict, admit-reject, and
+// the session-teardown paths, which may race. The egress tc itself is closed by
+// the caller (it must survive the orphan window, so closeReader does NOT touch
+// it).
+func (e *relayEntry) closeReader() {
+	e.closeOnce.Do(func() {
+		close(e.closeChOf())
+		if e.credit != nil {
+			e.credit.close()
+		}
+	})
 }
 
 // relayRegistry holds relays keyed (clientID, globalStreamID), living
@@ -451,6 +490,7 @@ func (r *relayRegistry) evictIdleOrphanExcept(scope string, except *relayEntry) 
 		return // grace timer / RESUME already moved it
 	}
 	r.remove(victim.originClientID, victim.globalStreamID)
+	victim.closeReader()
 	if victim.tc != nil {
 		victim.tc.Close()
 	}
@@ -714,6 +754,11 @@ func (r *relayRegistry) launchGraceTimer(e *relayEntry, grace time.Duration, onE
 		}
 		// Winner: tear down the orphaned relay.
 		r.remove(e.originClientID, e.globalStreamID)
+		// Permanent teardown: stop the egress pump (closeCh + credit) so the
+		// relayLoop exits, THEN close the egress tc. Ordering closeReader before
+		// tc.Close is not strictly required (the loop also exits on tc read error)
+		// but makes the intent explicit and unblocks a credit-parked loop.
+		e.closeReader()
 		if e.tc != nil {
 			e.tc.Close()
 		}

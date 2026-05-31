@@ -395,6 +395,27 @@ func (s *wsStream) Close() {
 	})
 }
 
+// CloseKeepTarget tears down the stream's uplink writer goroutine and frees
+// pending buffers but does NOT close targetConn (Bug #9 §5.5). It is used during
+// session teardown for a migratable relay that was orphaned: the egress conn
+// (== s.targetConn == relayEntry.tc) must SURVIVE the dying WS session so a
+// reactive RESUME on another slot can keep reading it. Ownership of the egress
+// transfers to the relayEntry's lifecycle (grace timer / closeReader). The
+// closeOnce is consumed here so a later plain Close() on the same stream is a
+// no-op and cannot close the preserved egress.
+func (s *wsStream) CloseKeepTarget() {
+	s.closeOnce.Do(func() {
+		close(s.done)
+		s.mu.Lock()
+		for _, b := range s.pendingBuf {
+			core.PutBuffer(b)
+		}
+		s.pendingBuf = nil
+		s.mu.Unlock()
+		// Intentionally NOT closing s.targetConn — the relayEntry owns it now.
+	})
+}
+
 // handleWebSocket dispatches a WebSocket upgrade request. Two pre-upgrade
 // gates run cheaply before Hijack: the URL must be in the WS whitelist
 // (IsAllowedWSPath) and the client IP must be under its WSUpgrade rate
@@ -982,12 +1003,20 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 						entry.bound.Store(&binding{session: session, writer: writer})
 						h.relayRegistry.add(clientID, sid, entry)
 
-						// closeCh = session `done`: relayLoop exits when the
-						// credit is closed on session teardown (the <-done
-						// goroutine below closes every credit). Task 11 wires the
-						// orphan transition that detaches a relay from a dying
-						// slot WITHOUT killing the egress conn.
-						go entry.relayLoop(true /*migrateEnabled*/, done)
+						// Bug #9 §5.5 (T20 e2e fix): the relay pump's lifetime is
+						// the ENTRY's own closeCh, NOT this slot's `done`. If it
+						// were bound to `done`, a sudden slot-A death would close
+						// `done`, close the credit, and kill the egress pump — so a
+						// reactive grace-RESUME onto slot B would find the egress no
+						// longer being read and could only deliver bytes buffered
+						// BEFORE the death (the rest of the download silently lost).
+						// The spec (§5.5) requires the relay-goroutine to STAY ALIVE
+						// across a slot death, keep reading the egress into
+						// downBuffer (applying backpressure when full), so RESUME can
+						// drain the buffer AND continue. entry.closeReader() is the
+						// single permanent-teardown signal (grace-expiry, evict,
+						// admit-reject, full session FIN).
+						go entry.relayLoop(true /*migrateEnabled*/, entry.closeChOf())
 
 						// The inline relay is replaced — this dial goroutine has
 						// nothing more to do. The wsStream `s` remains in
@@ -1195,10 +1224,23 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 
 	// Bug #8: wake all waiting relay goroutines when session is torn down so
 	// they don't block forever in waitForCredit after done fires.
+	//
+	// Bug #9 §5.5 (T20 e2e fix): for a migration-negotiated session we must NOT
+	// close the credit of a stream whose relay survives this slot's death — that
+	// credit is the SAME object as entry.credit and closing it would kill the
+	// egress pump the grace-RESUME relies on. Skip any sid that still has a relay
+	// in the registry under this clientID; its credit is now owned by the entry
+	// lifecycle (closeReader on grace-expiry / evict / RESUME-fail). Non-migration
+	// sessions (migrateClientID == "") close every credit exactly as before.
 	go func() {
 		<-done
 		creditsMu.Lock()
-		for _, cr := range credits {
+		for sid, cr := range credits {
+			if migrateClientID != "" {
+				if _, ok := h.relayRegistry.find(migrateClientID, sid); ok {
+					continue // migratable relay owns this credit's lifetime
+				}
+			}
 			cr.close()
 		}
 		creditsMu.Unlock()
@@ -1250,6 +1292,9 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 			if !h.relayRegistry.admitOrphan(migrateClientID, e) {
 				if e.state.CompareAndSwap(stActive, stClosing) {
 					h.relayRegistry.remove(e.originClientID, e.globalStreamID)
+					// Permanent teardown: stop the egress pump (closeCh + credit)
+					// then close the egress. The relay will not be RESUMEd.
+					e.closeReader()
 					if e.tc != nil {
 						e.tc.Close()
 					}
@@ -1289,9 +1334,21 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 		}
 	}
 
-	// Cleanup all streams
+	// Cleanup all streams. Bug #9 §5.5 (T20 e2e fix): a migratable relay that was
+	// just orphaned (live entry still in the registry under this clientID) owns
+	// its egress conn (== wsStream.targetConn) for the grace window — a plain
+	// s.Close() here would close that egress and silently break a reactive
+	// RESUME's continued downlink. For those streams we tear down only the uplink
+	// writer (CloseKeepTarget) and leave the egress to the relayEntry lifecycle
+	// (grace timer / closeReader). All other streams close fully as before.
 	streamsMu.Lock()
-	for _, s := range streams {
+	for sid, s := range streams {
+		if migrateEnabled && migrateClientID != "" {
+			if _, ok := h.relayRegistry.find(migrateClientID, sid); ok {
+				s.CloseKeepTarget()
+				continue
+			}
+		}
 		s.Close()
 	}
 	streamsMu.Unlock()
