@@ -1109,6 +1109,61 @@ type WSPoolTransport struct {
 	// connectSlot; never flipped back to false (a server that drops the
 	// capability mid-pool would be a protocol violation).
 	migrateEnabled atomic.Bool
+
+	// ── Bug #9 Task 15: MIGRATE/RESUME send + ack-await + hysteresis ──────────
+	//
+	// pendingMigrateAcks maps streamID → chan migrateResult. sendMigrate
+	// registers a buffered (cap 1) chan before enqueuing the frame; the slot
+	// reader resolves it via handleMigrateReplyFrame when a MIGRATE_OK/FAIL
+	// arrives. sendMigrate races the resolve against migrateAckTimeout — exactly
+	// one of {reply, timeout} wins (the chan is removed from the map under
+	// LoadAndDelete so a late reply after a timeout is dropped, never delivered
+	// to a closed/garbage chan). One in-flight MIGRATE per streamID at a time.
+	pendingMigrateAcks sync.Map // map[uint16]chan migrateResult
+
+	// consecutiveMigrateTimeouts counts MIGRATE/RESUME attempts that timed out
+	// back-to-back. At >=migrateHysteresisThreshold it flips migrateCapable
+	// false (the server stopped acking — stop trying and let streams hard-break
+	// rather than stall 1.5s each). Reset to 0 on any OK reply or a fresh
+	// handshake (resetMigrateHysteresis, called from connectSlot on negotiate).
+	consecutiveMigrateTimeouts atomic.Int32
+
+	// migrateCapable gates whether sendMigrate even attempts. Set true when a
+	// slot negotiates migration (connectSlot); dropped to false by the
+	// hysteresis. Distinct from migrateEnabled (the pool-wide wire-format flag,
+	// never flipped back): migrateCapable is a runtime health bit that recovers
+	// on the next successful handshake.
+	migrateCapable atomic.Bool
+
+	// migrateAckTimeoutOverride lets a unit test shorten the 1500ms ack window
+	// so timeout tests don't sleep. Zero → use the migrateAckTimeout const.
+	migrateAckTimeoutOverride time.Duration
+}
+
+// migrateHysteresisThreshold is the number of consecutive MIGRATE/RESUME
+// timeouts that disables migration capability (§3.5). Three keeps a single
+// transient hiccup from disabling the feature while still reacting fast to a
+// server that genuinely stopped acking.
+const migrateHysteresisThreshold = 3
+
+// migrateResultKind discriminates the outcome of a MIGRATE/RESUME ack-await.
+type migrateResultKind int
+
+const (
+	migrateResultOK      migrateResultKind = iota // server replied OK
+	migrateResultFail                             // server replied FAIL (proof/grace/limit)
+	migrateResultTimeout                          // no reply within the ack window
+	migrateResultNoSend                           // could not even enqueue (no proof / dead slot)
+)
+
+// migrateResult is the outcome of sendMigrate. resumeDownSeq is meaningful only
+// for migrateResultOK (the seq up to which the old slot's in-flight tail must
+// be awaited before new-slot data is treated as continuous, §3.4). reason is
+// the server's failure code for migrateResultFail (core.MigrateReason*).
+type migrateResult struct {
+	kind          migrateResultKind
+	resumeDownSeq uint64
+	reason        byte
 }
 
 // Compile-time assertions.
@@ -1785,6 +1840,10 @@ func (p *WSPoolTransport) connectSlot(ctx context.Context, idx int) error {
 	// via RouteToStreamSeq) and lets the SOCKS5 front-end register seq channels.
 	if wst.flowMigrateEnabled {
 		p.migrateEnabled.Store(true)
+		// Task 15: a fresh negotiated handshake re-arms migration capability and
+		// clears the timeout hysteresis — the server is alive and acked FLOWCTL,
+		// so any prior "stopped acking" verdict is stale.
+		p.resetMigrateHysteresis()
 	}
 	// Reset downstream byte counter — fresh TCP starts the TSPU 15-20KB budget over.
 	slot.downBytes.Store(0)
@@ -2797,6 +2856,16 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 
 		chunk, err := session.DecryptChunkSafe(data)
 		if err != nil {
+			continue
+		}
+
+		// Bug #9 Task 15: a MIGRATE/RESUME reply rides the NEW slot's downlink
+		// with chunk.Flags == FlagMigrate/FlagResume and a status-byte payload
+		// (NOT the [streamID][...] data shape — branching before the streamID
+		// parse below keeps the reply payload from being misread as a streamID
+		// header). Resolve the pending ack and consume the frame.
+		if chunk.Flags == core.FlagMigrate || chunk.Flags == core.FlagResume {
+			p.resolveMigrateReplyPayload(chunk.Payload)
 			continue
 		}
 

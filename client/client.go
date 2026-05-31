@@ -146,6 +146,26 @@ type Client struct {
 	// during migration. Guarded by streamMu (same lifecycle as streamChans).
 	streamFramesChans map[uint16]chan StreamFrame
 
+	// streamProof stores the per-stream migration proof token (Bug #9 Task 15,
+	// §4.1). The server hands it to the client opaque-and-encrypted on the
+	// CONNECT_OK control frame for a migration-negotiated stream; the client
+	// replays it verbatim in every MIGRATE/RESUME for that stream. Guarded by
+	// streamMu (same lifecycle as streamChans). Cleared in UnregisterStream so a
+	// closed stream leaves no secret behind.
+	streamProof map[uint16][32]byte
+
+	// streamAckLast records the last time a FlagStreamAck was emitted for a
+	// stream, used by sendStreamAckThrottled to coalesce a burst of in-order
+	// flushes into one wire frame (§3.3, F3 DPI hygiene). Guarded by
+	// streamAckMu (a dedicated mutex — the downlink reassembly goroutine calls
+	// this on every flush and must not contend with streamMu's broader scope).
+	streamAckLast map[uint16]int64 // streamID → unix nanos of last ack send
+	streamAckMu   sync.Mutex
+
+	// streamAckSendForTest replaces the real SendStreamAck in
+	// sendStreamAckThrottled (unit-test seam). Production path is nil.
+	streamAckSendForTest func(streamID uint16, ackedDownSeq uint64) bool
+
 	// streamOverflow tracks per-stream RouteToStream drops so we emit a
 	// single aggregated INFO at UnregisterStream instead of N WARNs per
 	// drop. See spec 2026-05-23.
@@ -766,7 +786,11 @@ func (c *Client) UnregisterStream(streamID uint16) {
 	delete(c.streamChans, streamID)
 	delete(c.streamFramesChans, streamID)
 	delete(c.streamFlow, streamID)
+	delete(c.streamProof, streamID)
 	c.streamMu.Unlock()
+	c.streamAckMu.Lock()
+	delete(c.streamAckLast, streamID)
+	c.streamAckMu.Unlock()
 	c.flushBufferOverflow(streamID)
 }
 
@@ -993,8 +1017,129 @@ func (c *Client) RouteToStream(streamID uint16, data []byte) {
 // to route control past the seq reassembler (as downSeq==0) instead of
 // misparsing the ASCII as a downSeq header. Exact-match only — keeps the
 // collision surface to the two literal strings.
+//
+// Bug #9 Task 15: a migration-negotiated CONNECT_OK additionally carries the
+// 32-byte stream proof appended after the marker ("CONNECT_OK"+proof, 42 bytes).
+// isStreamControlMsg now also accepts that extended form so the slot reader
+// routes it as control (seq==0). Use parseConnectOKProof to extract the proof.
+// The legacy exact-match "CONNECT_OK"/"CONNECT_FAIL" stays byte-for-byte valid
+// (a non-migration server, or migration server replying to a non-migration
+// stream, still emits the bare marker).
 func isStreamControlMsg(body []byte) bool {
-	return string(body) == "CONNECT_OK" || string(body) == "CONNECT_FAIL"
+	s := string(body)
+	if s == "CONNECT_OK" || s == "CONNECT_FAIL" {
+		return true
+	}
+	// Extended CONNECT_OK+proof (Task 15): "CONNECT_OK" prefix + exactly 32
+	// proof bytes. The fixed total length (10+32) keeps this unambiguous vs a
+	// seq-tagged data frame (those carry downSeq>=1 and route via
+	// ParseStreamDataSeq, not here).
+	_, ok := parseConnectOKProof(body)
+	return ok
+}
+
+// connectOKMarker is the control marker the server prefixes to a migration
+// CONNECT_OK before the 32-byte proof. Kept as a single source of truth so the
+// server-side append and the client-side parse cannot drift.
+const connectOKMarker = "CONNECT_OK"
+
+// ParseConnectOKProof is the exported entrypoint for the SOCKS5 downlink
+// control handler (proxy/socks5) to extract a migration CONNECT_OK proof.
+func ParseConnectOKProof(body []byte) (proof [32]byte, ok bool) {
+	return parseConnectOKProof(body)
+}
+
+// parseConnectOKProof reports whether body is a migration CONNECT_OK carrying a
+// proof — "CONNECT_OK" followed by exactly 32 proof bytes — and returns the
+// proof. A bare "CONNECT_OK" (legacy / non-migration stream) returns ok=false:
+// there is no proof to capture, only the connect confirmation.
+func parseConnectOKProof(body []byte) (proof [32]byte, ok bool) {
+	const want = len(connectOKMarker) + 32
+	if len(body) != want {
+		return proof, false
+	}
+	if string(body[:len(connectOKMarker)]) != connectOKMarker {
+		return proof, false
+	}
+	copy(proof[:], body[len(connectOKMarker):])
+	return proof, true
+}
+
+// StoreStreamProof records the migration proof token for streamID (Bug #9
+// Task 15). Idempotent; a later store overwrites (a stream's proof is stable
+// for its lifetime — overwrite only happens on a benign re-CONNECT_OK).
+func (c *Client) StoreStreamProof(streamID uint16, proof [32]byte) {
+	c.streamMu.Lock()
+	if c.streamProof == nil {
+		c.streamProof = make(map[uint16][32]byte)
+	}
+	c.streamProof[streamID] = proof
+	c.streamMu.Unlock()
+}
+
+// StreamProof returns the stored migration proof for streamID. ok is false if
+// no proof was ever stored (a non-migration stream, or one whose CONNECT_OK
+// has not yet arrived) — callers MUST NOT send MIGRATE/RESUME without it, since
+// the server verifies it in constant time and a zero proof fails closed.
+func (c *Client) StreamProof(streamID uint16) (proof [32]byte, ok bool) {
+	c.streamMu.Lock()
+	proof, ok = c.streamProof[streamID]
+	c.streamMu.Unlock()
+	return proof, ok
+}
+
+// streamAckThrottleInterval is the minimum gap between two FlagStreamAck sends
+// for one stream (Bug #9 Task 15, F3). The server uses StreamAck purely as a
+// reassembler barrier to release its resend tail — it does NOT need one ack per
+// downlink frame, so we coalesce a burst into the first send and let subsequent
+// flushes within the window ride on the next periodic ack. A forced flush
+// (after MIGRATE_OK, to immediately unblock the server's tail) bypasses this.
+const streamAckThrottleInterval = 50 * time.Millisecond
+
+// SendStreamAckThrottled is the exported entrypoint for the SOCKS5 downlink
+// reassembly loop (proxy/socks5). See sendStreamAckThrottled.
+func (c *Client) SendStreamAckThrottled(wst StreamTransport, streamID uint16, ackedDownSeq uint64, forced bool) {
+	c.sendStreamAckThrottled(wst, streamID, ackedDownSeq, forced)
+}
+
+// sendStreamAckThrottled emits a FlagStreamAck for streamID confirming in-order
+// delivery up to ackedDownSeq, coalescing bursts (§3.3). It sends iff:
+//   - this is the first ack for the stream (no prior timestamp), OR
+//   - at least streamAckThrottleInterval elapsed since the last send, OR
+//   - forced is true (post-MIGRATE_OK barrier release).
+//
+// Non-blocking and best-effort — a dropped ack is recovered by the next flush.
+// The wst is the stream's current transport; nil is tolerated for the test seam.
+func (c *Client) sendStreamAckThrottled(wst StreamTransport, streamID uint16, ackedDownSeq uint64, forced bool) {
+	nowNs := time.Now().UnixNano()
+	c.streamAckMu.Lock()
+	if c.streamAckLast == nil {
+		c.streamAckLast = make(map[uint16]int64)
+	}
+	last, seen := c.streamAckLast[streamID]
+	if !forced && seen && nowNs-last < int64(streamAckThrottleInterval) {
+		c.streamAckMu.Unlock()
+		return // coalesce: within the throttle window, skip this ack
+	}
+	c.streamAckLast[streamID] = nowNs
+	c.streamAckMu.Unlock()
+
+	if c.streamAckSendForTest != nil {
+		c.streamAckSendForTest(streamID, ackedDownSeq)
+		return
+	}
+	c.SendStreamAck(wst, streamID, ackedDownSeq)
+}
+
+// forceStreamAckClockForTest overrides the last-ack timestamp for a stream so a
+// unit test can simulate the throttle window elapsing without sleeping.
+func (c *Client) forceStreamAckClockForTest(streamID uint16, at time.Time) {
+	c.streamAckMu.Lock()
+	if c.streamAckLast == nil {
+		c.streamAckLast = make(map[uint16]int64)
+	}
+	c.streamAckLast[streamID] = at.UnixNano()
+	c.streamAckMu.Unlock()
 }
 
 // RouteToStreamSeq delivers a seq-tagged frame to a migration-negotiated

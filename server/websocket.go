@@ -894,13 +894,43 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 					// Activate: set target conn, flush buffered data, start writer.
 					s.Activate(tc)
 
-					// Send CONNECT_OK (client may already be relaying — that's OK)
-					resp := core.NewStreamDataChunk(session.ID, session.NextSeqNum(), sid, []byte("CONNECT_OK"))
+					// Bug #9 §4.1 (Task 15): for a migration-negotiated session we
+					// resolve the clientID up-front so we can both (a) append the
+					// stream proof to CONNECT_OK and (b) register the relay below.
+					// The proof = HMAC(perClientKey, clientID‖sid‖MigrateNonce) is
+					// EXACTLY what handleMigrateOrResume re-derives and verifies in
+					// constant time — the client cannot forge it, it only replays
+					// the opaque token. Sending it on CONNECT_OK (encrypted under
+					// the session) is what makes any later MIGRATE/RESUME verifiable;
+					// without this the whole migration path dies at bad_proof.
+					var clientID string
+					if migrateEnabled {
+						h.tunnelsMu.RLock()
+						if t, ok := h.tunnels[session.ID]; ok {
+							clientID = t.ClientID
+						}
+						h.tunnelsMu.RUnlock()
+					}
+
+					// Send CONNECT_OK (client may already be relaying — that's OK).
+					// Wire convention (Task 15): legacy / non-migration → the bare
+					// "CONNECT_OK" marker (10 bytes), preserved byte-for-byte so the
+					// client's exact-match isStreamControlMsg keeps working.
+					// Migration → "CONNECT_OK"+proof(32) (42 bytes); the client
+					// detects the proof by fixed total length + marker prefix
+					// (parseConnectOKProof) and still routes it as a seq==0 control.
+					connectBody := []byte("CONNECT_OK")
+					if migrateEnabled {
+						perClientKey := core.DeriveServerPerClientKey(h.migrateMasterKey(), clientID)
+						proof := core.ComputeStreamProof(perClientKey, clientID, sid, session.MigrateNonce)
+						connectBody = append(connectBody, proof[:]...)
+					}
+					resp := core.NewStreamDataChunk(session.ID, session.NextSeqNum(), sid, connectBody)
 					if enc, err := session.EncryptChunk(resp); err == nil {
 						writeMsg(enc)
 					}
 					core.PutBuffer(resp.Payload)
-					slog.Info("WS CONNECT_OK sent", "stream", sid, "target", tgt)
+					slog.Info("WS CONNECT_OK sent", "stream", sid, "target", tgt, "migrate", migrateEnabled)
 
 					// Bug #9 §5.1/§5.2 (F4, F11): for a migration-negotiated
 					// session, the downlink relay does NOT live inline here —
@@ -912,15 +942,9 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 					//
 					// We register under (clientID, sid): sid is the global
 					// per-client streamID from the CONNECT payload (F11) and
-					// clientID comes from the tunnel created at handshake.
+					// clientID (resolved above) comes from the tunnel created at
+					// handshake.
 					if migrateEnabled {
-						var clientID string
-						h.tunnelsMu.RLock()
-						if t, ok := h.tunnels[session.ID]; ok {
-							clientID = t.ClientID
-						}
-						h.tunnelsMu.RUnlock()
-
 						entry := &relayEntry{
 							originClientID:     clientID,
 							globalStreamID:     sid,

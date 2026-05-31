@@ -284,6 +284,19 @@ type statsRegistry struct {
 	StreamReassemblyOverflow   atomic.Uint64
 	StreamReassemblyGapTimeout atomic.Uint64
 
+	// Bug #9 Task 15 — client MIGRATE/RESUME send-side counters. (Full client
+	// migration metrics land in Task 19; these are the minimum the send path
+	// needs to surface ack-await outcomes.)
+	//   MigrateAttempt: a MIGRATE/RESUME frame was enqueued and we began ack-await.
+	//   MigrateOK / MigrateFail: server replied OK / FAIL within the window.
+	//   MigrateTimeout: no reply within migrateAckTimeout → stream degraded.
+	//   MigrateCapabilityDropped: 3 consecutive timeouts tripped the hysteresis.
+	MigrateAttempt           atomic.Uint64
+	MigrateOK                atomic.Uint64
+	MigrateFail              atomic.Uint64
+	MigrateTimeout           atomic.Uint64
+	MigrateCapabilityDropped atomic.Uint64
+
 	// DrainForceEvictedTotal — every time startDrain force-evicted an
 	// idle slotReady cell (streams==0) because claimFreeSlot returned -1
 	// (slice fully occupied). Spec 2026-05-20 §2.2.3 (slice-full

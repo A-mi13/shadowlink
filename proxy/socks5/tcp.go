@@ -935,7 +935,22 @@ func tunnelTCPStream(ctx context.Context, conn net.Conn, cl *client.Client, wst 
 				maxBuffered: reassemblyMaxBufferedFromEnv(),
 				onControl: func(msg []byte) bool {
 					// seq==0 control: CONNECT_OK / CONNECT_FAIL handling mirrors
-					// the legacy connectConfirmed branch.
+					// the legacy connectConfirmed branch. Bug #9 Task 15: a
+					// migration CONNECT_OK carries the 32-byte stream proof
+					// ("CONNECT_OK"+proof) — capture it into per-stream storage so
+					// a later MIGRATE/RESUME can replay it. The proof is the ONLY
+					// thing that makes migration verifiable server-side.
+					if proof, ok := client.ParseConnectOKProof(msg); ok {
+						cl.StoreStreamProof(streamID, proof)
+						if !connectConfirmed {
+							connectConfirmed = true
+							if pt, ok := wst.(client.PendingTracker); ok {
+								pt.DecrPending(streamID)
+							}
+							client.Trace("WS CONNECT_OK+proof (optimistic)", "dest", destAddr, "stream", streamID)
+						}
+						return true
+					}
 					if !connectConfirmed {
 						s := string(msg)
 						if s == "CONNECT_OK" {
@@ -976,8 +991,10 @@ func tunnelTCPStream(ctx context.Context, conn net.Conn, cl *client.Client, wst 
 				},
 				onFlush: func(ackedDownSeq uint64) {
 					// FlagStreamAck barrier: tell the server it may release the
-					// resend tail up to ackedDownSeq (best-effort, throttled in T15).
-					cl.SendStreamAck(wst, streamID, ackedDownSeq)
+					// resend tail up to ackedDownSeq. Throttled (Task 15, F3): a
+					// burst of in-order flushes coalesces into one wire frame —
+					// the server uses the ack purely as a barrier, not per-frame.
+					cl.SendStreamAckThrottled(wst, streamID, ackedDownSeq, false)
 				},
 				onWriteError: func() {
 					slog.Warn("downlink write error", "dest", destAddr, "stream", streamID)
