@@ -58,3 +58,43 @@ func TestNewControlFlagValues(t *testing.T) {
 			FlagMigrate, FlagResume, FlagStreamAck)
 	}
 }
+
+func TestNewStreamDataChunkSeq_RoundTrip(t *testing.T) {
+	data := []byte("hello-world-payload")
+	c := NewStreamDataChunkSeq(7, 99, 0xABCD, 42, data)
+	if c.Flags != FlagData {
+		t.Fatalf("flags = %#x, want FlagData", c.Flags)
+	}
+	// payload = streamID(2) + downSeq(8) + data
+	if len(c.Payload) != 2+8+len(data) {
+		t.Fatalf("payload len = %d, want %d", len(c.Payload), 2+8+len(data))
+	}
+	gotID, gotSeq, gotData, err := ParseStreamDataSeq(c.Payload)
+	if err != nil {
+		t.Fatalf("ParseStreamDataSeq: %v", err)
+	}
+	if gotID != 0xABCD || gotSeq != 42 {
+		t.Errorf("got id=%#x seq=%d", gotID, gotSeq)
+	}
+	if string(gotData) != string(data) {
+		t.Errorf("data mismatch: %q", gotData)
+	}
+	PutBuffer(c.Payload) // pooled backing, like NewStreamDataChunk
+}
+
+func TestParseStreamDataSeq_TooShort(t *testing.T) {
+	// 9 bytes < 10 (2 streamID + 8 seq) → error, NOT a misparse.
+	if _, _, _, err := ParseStreamDataSeq(make([]byte, 9)); err == nil {
+		t.Fatal("expected error on 9-byte seq payload")
+	}
+}
+
+func TestParseStreamDataSeq_EmptyData(t *testing.T) {
+	// exactly 10 bytes = streamID + seq, zero data — valid (control-sized data chunk).
+	c := NewStreamDataChunkSeq(1, 1, 5, 1, nil)
+	id, seq, data, err := ParseStreamDataSeq(c.Payload)
+	if err != nil || id != 5 || seq != 1 || len(data) != 0 {
+		t.Fatalf("got id=%d seq=%d data=%v err=%v", id, seq, data, err)
+	}
+	PutBuffer(c.Payload)
+}

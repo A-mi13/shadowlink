@@ -200,6 +200,41 @@ func NewStreamDataChunk(sessID, seq uint32, streamID uint16, payload []byte) *Ch
 	return &Chunk{SessionID: sessID, SeqNum: seq, Flags: FlagData, Payload: p}
 }
 
+// NewStreamDataChunkSeq creates a data chunk carrying a per-stream monotonic
+// downlink sequence number (Bug #9 §3.1, F1). Payload format:
+//   [StreamID(2 BE)] + [downSeq(8 BE)] + [data]
+//
+// downSeq is assigned by the SERVER relay-loop (relayEntry.downSeqCounter,
+// §5.1) and survives slot migration — it is the ordering key the client-side
+// reassembler uses (§5.4). downSeq==0 is RESERVED for control chunks
+// (CONNECT_OK/FAIL) which use the legacy NewStreamDataChunk; the first real
+// data chunk is downSeq==1 (NEW-2).
+//
+// Like NewStreamDataChunk the returned Payload uses a pooled backing array;
+// callers MUST release it via core.PutBuffer(chunk.Payload) after encrypting.
+func NewStreamDataChunkSeq(sessID, seq uint32, streamID uint16, downSeq uint64, payload []byte) *Chunk {
+	pSize := 2 + 8 + len(payload)
+	pBuf := GetBuffer(pSize)
+	p := pBuf[:pSize]
+	binary.BigEndian.PutUint16(p[0:2], streamID)
+	binary.BigEndian.PutUint64(p[2:10], downSeq)
+	copy(p[10:], payload)
+	return &Chunk{SessionID: sessID, SeqNum: seq, Flags: FlagData, Payload: p}
+}
+
+// ParseStreamDataSeq extracts streamID, downSeq and data from a seq-format
+// data payload (§3.1). Errors (never panics) on payload shorter than 10 bytes
+// — the client guard MUST reject such frames rather than misparse them as the
+// legacy [StreamID(2)]+[data] format (NEW-2, see ws_pool guard <10).
+func ParseStreamDataSeq(payload []byte) (streamID uint16, downSeq uint64, data []byte, err error) {
+	if len(payload) < 10 {
+		return 0, 0, nil, fmt.Errorf("seq data payload too short: %d < 10", len(payload))
+	}
+	streamID = binary.BigEndian.Uint16(payload[0:2])
+	downSeq = binary.BigEndian.Uint64(payload[2:10])
+	return streamID, downSeq, payload[10:], nil
+}
+
 // NewStreamConnectChunk creates a CONNECT chunk for a specific stream.
 // Payload format: [StreamID(2 bytes)] + [target "host:port"]
 func NewStreamConnectChunk(sessID, seq uint32, streamID uint16, target string) *Chunk {
