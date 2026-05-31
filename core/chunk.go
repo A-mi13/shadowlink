@@ -11,14 +11,14 @@ import (
 
 // Chunk flags per spec section 3.
 const (
-	FlagData       byte = 0x01
-	FlagAck        byte = 0x02
-	FlagPadding    byte = 0x03
-	FlagKeepalive  byte = 0x04
-	FlagFin        byte = 0x05
-	FlagControl    byte = 0x06
-	FlagConnect    byte = 0x07 // payload = target address "host:port"
-	FlagUDP        byte = 0x08 // payload = [StreamID(2)] + [UDP data]
+	FlagData         byte = 0x01
+	FlagAck          byte = 0x02
+	FlagPadding      byte = 0x03
+	FlagKeepalive    byte = 0x04
+	FlagFin          byte = 0x05
+	FlagControl      byte = 0x06
+	FlagConnect      byte = 0x07 // payload = target address "host:port"
+	FlagUDP          byte = 0x08 // payload = [StreamID(2)] + [UDP data]
 	FlagStreamOpen   byte = 0x09 // client requests a streaming POST response (server→client download channel)
 	FlagWindowUpdate byte = 0x0A // payload = [StreamID(2)] + [delta(4)] per-stream flow-control credit
 )

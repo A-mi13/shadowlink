@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -175,115 +174,6 @@ func TestApplyTo_ZeroValuesNotOverridden(t *testing.T) {
 	assert.True(t, cfg.UseInflatedResponses)
 }
 
-func TestLoadConfigFile_LiveBlog(t *testing.T) {
-	yamlContent := `
-live_blog:
-  enabled: true
-  upstream: "https://example.com"
-  cache_ttl: "30m"
-`
-	f, err := os.CreateTemp("", "sl-liveblog-*.yaml")
-	require.NoError(t, err)
-	defer os.Remove(f.Name())
-	_, err = f.WriteString(yamlContent)
-	require.NoError(t, err)
-	f.Close()
-
-	fc, err := LoadConfigFile(f.Name())
-	require.NoError(t, err)
-
-	require.NotNil(t, fc.LiveBlog)
-	require.NotNil(t, fc.LiveBlog.Enabled)
-	assert.True(t, *fc.LiveBlog.Enabled)
-	assert.Equal(t, "https://example.com", fc.LiveBlog.Upstream)
-	assert.Equal(t, "30m", fc.LiveBlog.CacheTTL)
-
-	cfg := DefaultConfig()
-	fc.ApplyTo(&cfg)
-
-	assert.True(t, cfg.LiveBlog.Enabled)
-	assert.Equal(t, "https://example.com", cfg.LiveBlog.Upstream)
-	assert.Equal(t, 30*time.Minute, cfg.LiveBlog.CacheTTL)
-}
-
-func TestApplyTo_LiveBlogPartialOverride(t *testing.T) {
-	// Only Enabled set — other fields stay at zero (caller applies defaults separately)
-	enabled := true
-	fc := &FileConfig{
-		LiveBlog: &FileLiveBlogConfig{
-			Enabled: &enabled,
-		},
-	}
-	cfg := DefaultConfig()
-	fc.ApplyTo(&cfg)
-
-	assert.True(t, cfg.LiveBlog.Enabled)
-	// Fields not set in YAML remain zero (DefaultConfig has zero LiveBlog)
-	assert.Equal(t, "", cfg.LiveBlog.Upstream)
-}
-
-func TestApplyTo_LiveBlogDurationParsing(t *testing.T) {
-	enabled := false
-	rps := 2.5
-	burst := 10
-	maxBody := 1024 * 1024
-	cdnBody := 8 * 1024 * 1024
-	maxEntries := 200
-	fc := &FileConfig{
-		LiveBlog: &FileLiveBlogConfig{
-			Enabled:           &enabled,
-			CacheTTL:          "2h",
-			CacheStaleGrace:   "48h",
-			UpstreamTimeout:   "5s",
-			CanaryInterval:    "10m",
-			UpstreamRPS:       &rps,
-			UpstreamBurst:     &burst,
-			MaxBodyBytes:      &maxBody,
-			CDNMaxBodyBytes:   &cdnBody,
-			CacheMaxEntries:   &maxEntries,
-			TargetBrand:       "MyBrand",
-			TargetLogoPath:    "/logo.svg",
-			TargetTitleSuffix: " — MyBrand",
-			CanaryArticleID:   "123456",
-			CDNUpstream:       "https://cdn.example.com",
-		},
-	}
-	cfg := DefaultConfig()
-	fc.ApplyTo(&cfg)
-
-	assert.False(t, cfg.LiveBlog.Enabled)
-	assert.Equal(t, 2*time.Hour, cfg.LiveBlog.CacheTTL)
-	assert.Equal(t, 48*time.Hour, cfg.LiveBlog.CacheStaleGrace)
-	assert.Equal(t, 5*time.Second, cfg.LiveBlog.UpstreamTimeout)
-	assert.Equal(t, 10*time.Minute, cfg.LiveBlog.CanaryInterval)
-	assert.Equal(t, 2.5, cfg.LiveBlog.UpstreamRPS)
-	assert.Equal(t, 10, cfg.LiveBlog.UpstreamBurst)
-	assert.Equal(t, 1024*1024, cfg.LiveBlog.MaxBodyBytes)
-	assert.Equal(t, 8*1024*1024, cfg.LiveBlog.CDNMaxBodyBytes)
-	assert.Equal(t, 200, cfg.LiveBlog.CacheMaxEntries)
-	assert.Equal(t, "MyBrand", cfg.LiveBlog.TargetBrand)
-	assert.Equal(t, "/logo.svg", cfg.LiveBlog.TargetLogoPath)
-	assert.Equal(t, " — MyBrand", cfg.LiveBlog.TargetTitleSuffix)
-	assert.Equal(t, "123456", cfg.LiveBlog.CanaryArticleID)
-	assert.Equal(t, "https://cdn.example.com", cfg.LiveBlog.CDNUpstream)
-}
-
-func TestApplyTo_LiveBlogInvalidDurationIgnored(t *testing.T) {
-	// Invalid duration strings must be silently ignored — field stays zero
-	enabled := true
-	fc := &FileConfig{
-		LiveBlog: &FileLiveBlogConfig{
-			Enabled:  &enabled,
-			CacheTTL: "not-a-duration",
-		},
-	}
-	cfg := DefaultConfig()
-	fc.ApplyTo(&cfg)
-
-	assert.True(t, cfg.LiveBlog.Enabled)
-	assert.Equal(t, time.Duration(0), cfg.LiveBlog.CacheTTL) // zero — not overridden
-}
-
 // helperLoadConfig is a test-local convenience: load YAML and apply to DefaultConfig.
 func helperLoadConfig(t *testing.T, content string) Config {
 	t.Helper()
@@ -348,6 +238,92 @@ func writeAndLoadExpectError(t *testing.T, content, wantSubstr string) {
 	}
 	if !strings.Contains(err.Error(), wantSubstr) {
 		t.Errorf("error should mention %q: %v", wantSubstr, err)
+	}
+}
+
+// --- Phase G (decoy behavioral coverage): per-host {directory, persona} ---
+
+func TestFileConfig_DomainDecoyMap_NewFormat(t *testing.T) {
+	yamlData := `listen: ":443"
+domain_decoy_map:
+  "datacanvases.com":
+    directory: "/var/www/saas-landing"
+    persona: "saas"
+  "myblog.io":
+    directory: "/var/www/tech-blog"
+    persona: "blog"
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(yamlData), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfigFile(path)
+	if err != nil {
+		t.Fatalf("LoadConfigFile: %v", err)
+	}
+	if got := cfg.DomainDecoyMap["datacanvases.com"]; got != "/var/www/saas-landing" {
+		t.Errorf("datacanvases.com dir = %q, want /var/www/saas-landing", got)
+	}
+	if got := cfg.DomainPersonaMap["datacanvases.com"]; got != "saas" {
+		t.Errorf("datacanvases.com persona = %q, want saas", got)
+	}
+	if got := cfg.DomainPersonaMap["myblog.io"]; got != "blog" {
+		t.Errorf("myblog.io persona = %q, want blog", got)
+	}
+}
+
+func TestFileConfig_DomainDecoyMap_LegacyFormat(t *testing.T) {
+	yamlData := `listen: ":443"
+domain_decoy_map:
+  "host1": "/var/www/saas-landing"
+  "host2": "/var/www/tech-blog"
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(yamlData), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfigFile(path)
+	if err != nil {
+		t.Fatalf("LoadConfigFile: %v", err)
+	}
+	if got := cfg.DomainDecoyMap["host1"]; got != "/var/www/saas-landing" {
+		t.Errorf("legacy: host1 dir = %q, want /var/www/saas-landing", got)
+	}
+	if len(cfg.DomainPersonaMap) > 0 {
+		t.Errorf("legacy format must not populate DomainPersonaMap, got %v", cfg.DomainPersonaMap)
+	}
+}
+
+// TestFileConfig_ApplyTo_PropagatesPersonaMap is the wire-up guard for the
+// Phase G end-to-end YAML→handler path. Without ApplyTo copying
+// DomainPersonaMap into Config, NewDecoyHandlerV2 in handler.go would receive
+// nil DomainPersona for every host and silently fall back to the default
+// persona — defeating the whole new-YAML-format change. This test fails fast
+// if the ApplyTo copy is ever dropped.
+func TestFileConfig_ApplyTo_PropagatesPersonaMap(t *testing.T) {
+	fc := &FileConfig{
+		DomainDecoyMap: map[string]string{
+			"saas.example.com": "/var/www/saas-landing",
+			"blog.example.com": "/var/www/tech-blog",
+		},
+		DomainPersonaMap: map[string]string{
+			"saas.example.com": "saas",
+			"blog.example.com": "blog",
+		},
+	}
+	cfg := &Config{}
+	fc.ApplyTo(cfg)
+
+	if got := cfg.DomainPersonaMap["saas.example.com"]; got != "saas" {
+		t.Errorf("Config.DomainPersonaMap[\"saas.example.com\"] = %q, want %q", got, "saas")
+	}
+	if got := cfg.DomainPersonaMap["blog.example.com"]; got != "blog" {
+		t.Errorf("Config.DomainPersonaMap[\"blog.example.com\"] = %q, want %q", got, "blog")
+	}
+	if len(cfg.DomainPersonaMap) != 2 {
+		t.Errorf("Config.DomainPersonaMap size = %d, want 2", len(cfg.DomainPersonaMap))
 	}
 }
 

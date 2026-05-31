@@ -95,7 +95,8 @@ func TestCreditSender_SendsAtThreshold(t *testing.T) {
 	c.flowControlEnabled = true
 	c.flowWindow = 1000
 	c.streamFlow = map[uint16]*streamFlowState{7: {window: 1000}}
-	c.streamFlow[7].pendingDelta.Store(600) // > 50% of 1000
+	// 40000 >= creditFlushFloor (32768) — eager floor triggers.
+	c.streamFlow[7].pendingDelta.Store(40000)
 
 	sent := map[uint16]uint32{}
 	c.flowSendForTest = func(streamID uint16, delta uint32) bool {
@@ -103,9 +104,9 @@ func TestCreditSender_SendsAtThreshold(t *testing.T) {
 		return true
 	}
 
-	c.creditSenderTick(0.5) // fixed threshold ratio for determinism
-	if sent[7] != 600 {
-		t.Fatalf("sent delta = %d, want 600", sent[7])
+	c.creditSenderTick(0.5) // thresholdRatio no longer gates; kept for signature compat
+	if sent[7] != 40000 {
+		t.Fatalf("sent delta = %d, want 40000", sent[7])
 	}
 	if got := c.streamFlow[7].pendingDelta.Load(); got != 0 {
 		t.Fatalf("pendingDelta after send = %d, want 0", got)
@@ -132,12 +133,13 @@ func TestCreditSender_KeepsDeltaOnSendFailure(t *testing.T) {
 	c.flowControlEnabled = true
 	c.flowWindow = 1000
 	c.streamFlow = map[uint16]*streamFlowState{7: {window: 1000}}
-	c.streamFlow[7].pendingDelta.Store(600)
+	// 40000 >= creditFlushFloor (32768) — eager floor triggers and attempts send.
+	c.streamFlow[7].pendingDelta.Store(40000)
 
 	c.flowSendForTest = func(uint16, uint32) bool { return false } // send failed
 	c.creditSenderTick(0.5)
-	if got := c.streamFlow[7].pendingDelta.Load(); got != 600 {
-		t.Fatalf("pendingDelta after failed send = %d, want 600 (kept)", got)
+	if got := c.streamFlow[7].pendingDelta.Load(); got != 40000 {
+		t.Fatalf("pendingDelta after failed send = %d, want 40000 (kept)", got)
 	}
 }
 

@@ -163,13 +163,17 @@ func TestSendHandshake_RateLimitedByHeader_LegacyServer(t *testing.T) {
 	}
 }
 
-// TestSendHandshake_RateLimitedByLifeline_CFStripsEverything — worst-case P0.
-// CF strips both the X-SL-RL header AND the body marker (or the decoy template
-// has no marker). Body is plain HTML. Detector lifeline fires with default 90s.
-func TestSendHandshake_RateLimitedByLifeline_CFStripsEverything(t *testing.T) {
-	Stats.RateLimitDetectedFallback.Store(0)
-	HandshakeDecoyReceived.Store(0)
-
+// TestSendHandshake_PlainDecoy_NotRateLimited — 2026-05-29 lifeline fix.
+//
+// A plain HTML decoy with NO X-SL-RL header and NO body marker (exactly what
+// the server emits for max_clients / protocol_unknown / auth_fail via
+// failClosedToDecoyWithReason) must NOT be classified as rate-limited. The old
+// behaviour fired the HTML lifeline here and returned ErrRateLimited with a 90s
+// fallback cooldown — the false-positive that degraded the pool in the field
+// (pl1: server rejected 0 handshakes / emitted 0 sentinels, client applied 48
+// fallback cooldowns). After switching the handshake path to DetectCarriersOnly,
+// a markerless decoy surfaces as an ordinary error, NOT ErrRateLimited.
+func TestSendHandshake_PlainDecoy_NotRateLimited(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// No header, no body marker — just a plain HTML decoy page.
 		w.Header().Set("Content-Type", "text/html")
@@ -193,32 +197,10 @@ func TestSendHandshake_RateLimitedByLifeline_CFStripsEverything(t *testing.T) {
 
 	_, sendErr := tr.SendHandshake(t.Context(), hello)
 
-	if sendErr == nil {
-		t.Fatal("expected error from SendHandshake (lifeline should fire on HTML body), got nil")
-	}
-	if !errors.Is(sendErr, ErrRateLimited) {
-		t.Errorf("errors.Is(err, ErrRateLimited) = false; got: %v", sendErr)
-	}
-
-	var rlErr *RateLimitError
-	if !errors.As(sendErr, &rlErr) {
-		t.Fatalf("errors.As(*RateLimitError) failed; got: %v", sendErr)
-	}
-	if rlErr.Signal == nil {
-		t.Fatal("RateLimitError.Signal is nil")
-	}
-	if rlErr.Signal.Carrier != "fallback" {
-		t.Errorf("Signal.Carrier: got %q, want \"fallback\"", rlErr.Signal.Carrier)
-	}
-	if rlErr.Signal.RefillIn.Seconds() != 90 {
-		t.Errorf("Signal.RefillIn: got %v, want 90s", rlErr.Signal.RefillIn)
-	}
-
-	if Stats.RateLimitDetectedFallback.Load() == 0 {
-		t.Error("Stats.RateLimitDetectedFallback must be non-zero after lifeline detection")
-	}
-	if HandshakeDecoyReceived.Load() == 0 {
-		t.Error("HandshakeDecoyReceived must be non-zero after lifeline detection")
+	// SendHandshake must still error (an HTML decoy is not a valid ServerHello),
+	// but it MUST NOT be a rate-limit error — that was the false-positive bug.
+	if errors.Is(sendErr, ErrRateLimited) {
+		t.Fatalf("plain decoy must NOT be classified as rate-limited, got ErrRateLimited: %v", sendErr)
 	}
 }
 
@@ -229,7 +211,6 @@ func TestSendHandshake_RateLimitedByLifeline_CFStripsEverything(t *testing.T) {
 func TestSendHandshake_NormalResponse_NoRateLimit(t *testing.T) {
 	Stats.RateLimitDetectedByBody.Store(0)
 	Stats.RateLimitDetectedByHeader.Store(0)
-	Stats.RateLimitDetectedFallback.Store(0)
 
 	// Minimal valid-looking JSON body (not a real ServerHello — we just need the
 	// transport to pass the RL check and reach "return respBytes, nil").
@@ -273,8 +254,5 @@ func TestSendHandshake_NormalResponse_NoRateLimit(t *testing.T) {
 	}
 	if Stats.RateLimitDetectedByHeader.Load() != 0 {
 		t.Errorf("RateLimitDetectedByHeader ticked on normal response: %d", Stats.RateLimitDetectedByHeader.Load())
-	}
-	if Stats.RateLimitDetectedFallback.Load() != 0 {
-		t.Errorf("RateLimitDetectedFallback ticked on normal response: %d", Stats.RateLimitDetectedFallback.Load())
 	}
 }

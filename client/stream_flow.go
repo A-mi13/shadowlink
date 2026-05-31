@@ -76,6 +76,16 @@ type streamFlowState struct {
 const (
 	creditSenderInterval = 8 * time.Millisecond // tick cadence (cheap)
 	creditWatchdogNs     = int64(200 * time.Millisecond)
+
+	// creditFlushFloor — minimum accumulated consumed bytes before the sender
+	// emits a WINDOW_UPDATE. Eager sliding-window return (HTTP/2-style): we flush
+	// credit as the app consumes it, NOT after hoarding a fraction of the window.
+	// 32 KiB ≈ a few chunks — small enough that the server's `available` is
+	// replenished continuously (no 242ms credit-stall / "zубцами" downlink that
+	// left the slot idle and got it reaped with close 1006), large enough to
+	// coalesce per-frame updates (avoids one tiny uplink frame per 12KiB chunk —
+	// DPI hygiene). Independent of window size.
+	creditFlushFloor = 32 * 1024
 )
 
 // startCreditSender launches the single per-client credit-sender goroutine.
@@ -141,15 +151,19 @@ func (c *Client) creditSenderTick(thresholdRatio float64) {
 		if d == 0 {
 			continue
 		}
-		threshold := uint64(float64(it.st.window) * thresholdRatio)
-		// Watchdog fires only after at least one successful send (lastSentNs != 0);
-		// this prevents new streams (lastSentNs=0) from triggering a watchdog-send
-		// even when d < threshold (would break TestCreditSender_BelowThresholdNoSend).
+		// Eager flush: emit WINDOW_UPDATE once the app has consumed at least
+		// creditFlushFloor bytes, OR the watchdog fires for a stale tail. Do NOT
+		// wait for a fraction of the window — that hoarding caused the server to
+		// stall in waitForCredit (~242ms/block, window-independent floor) and the
+		// downlink to flow in bursts, leaving the WS slot idle long enough to be
+		// reaped with close 1006 mid-download. thresholdRatio param is retained
+		// for the watchdog/test seam but no longer gates the floor.
 		lastNs := it.st.lastSentNs.Load()
 		stale := lastNs != 0 && nowNs-lastNs >= creditWatchdogNs
-		if d < threshold && !stale {
+		if d < creditFlushFloor && !stale {
 			continue
 		}
+		_ = thresholdRatio // retained for signature/test compatibility
 		// Take the current delta atomically; only zero it if the send succeeds.
 		if it.st.pendingDelta.CompareAndSwap(d, 0) {
 			if c.sendWindowUpdate(it.id, uint32(d)) {

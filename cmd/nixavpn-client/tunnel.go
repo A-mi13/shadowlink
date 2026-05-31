@@ -40,6 +40,12 @@ type Tunnel struct {
 	bypassEnabled  bool
 	bypassOverride *bypassroute.AdminOverride
 
+	// inProcessDialer, when set, replaces the loopback SOCKS5 dialer as the
+	// tunnel-bound inner dialer (Bug #5) — TUN traffic relays through the WS
+	// transport in-process, with no loopback socket per flow (no Windows
+	// ephemeral port exhaustion). Nil → fall back to proxy.NewSocks5 (loopback).
+	inProcessDialer proxy.Dialer
+
 	mu      sync.Mutex
 	started bool
 
@@ -65,6 +71,15 @@ func (t *Tunnel) WithNarrowEscape(narrow bool) *Tunnel {
 func (t *Tunnel) WithBypass(enabled bool, override *bypassroute.AdminOverride) *Tunnel {
 	t.bypassEnabled = enabled
 	t.bypassOverride = override
+	return t
+}
+
+// WithInProcessDialer sets the in-process tun2socks dialer (Bug #5). When set,
+// installBypassDialer uses it as the tunnel-bound inner dialer instead of a
+// loopback SOCKS5 dialer — eliminating Windows ephemeral port exhaustion. Pass
+// nil (or don't call) to keep the loopback path.
+func (t *Tunnel) WithInProcessDialer(d proxy.Dialer) *Tunnel {
+	t.inProcessDialer = d
 	return t
 }
 
@@ -302,11 +317,21 @@ func (t *Tunnel) installBypassDialer() error {
 	if err != nil {
 		return fmt.Errorf("load bypass trie: %w", err)
 	}
-	socks, err := proxy.NewSocks5(t.socksAddr, t.proxyUser, t.proxyPass)
-	if err != nil {
-		return fmt.Errorf("build socks5 dialer: %w", err)
+	// Inner (tunnel-bound) dialer: in-process when available (Bug #5 — no
+	// loopback socket per flow → no Windows ephemeral port exhaustion),
+	// otherwise the legacy loopback SOCKS5 dialer.
+	var inner proxy.Dialer
+	if t.inProcessDialer != nil {
+		inner = t.inProcessDialer
+		slog.Info("in-process dialer активирован (без loopback SOCKS5 на data-path)")
+	} else {
+		socks, err := proxy.NewSocks5(t.socksAddr, t.proxyUser, t.proxyPass)
+		if err != nil {
+			return fmt.Errorf("build socks5 dialer: %w", err)
+		}
+		inner = socks
 	}
-	bypass := bypassroute.NewBypassDialer(socks, resolved).
+	bypass := bypassroute.NewBypassDialer(inner, resolved).
 		WithMetrics(client.Stats.IncBypassMatch, client.Stats.IncBypassMiss)
 	t2tunnel.T().SetDialer(bypass)
 	slog.Info("bypass routing активирован",

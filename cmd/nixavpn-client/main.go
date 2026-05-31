@@ -220,6 +220,14 @@ func main() {
 		tun = NewTunnel(eng.SOCKSAddr(), cfg.ProxyUser, cfg.ProxyPass, serverIPs).
 			WithBypass(bypassOn, override).
 			WithNarrowEscape(narrowEscape)
+		// Bug #5: prefer the engine's in-process dialer (no loopback socket per
+		// flow → no Windows ephemeral port exhaustion). Optional interface —
+		// only ShadowLink implements it; VLESS falls back to loopback SOCKS5.
+		if p, ok := eng.(InProcessDialerProvider); ok {
+			if d := p.InProcessDialer(); d != nil {
+				tun = tun.WithInProcessDialer(d)
+			}
+		}
 		if err := tun.Start(); err != nil {
 			fmt.Fprintf(os.Stderr, "ошибка запуска TUN-туннеля: %v\n", err)
 			_ = eng.Close()

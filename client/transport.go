@@ -375,16 +375,27 @@ func (t *DirectTransport) SendHandshake(ctx context.Context, hello *core.ClientH
 		return nil, err
 	}
 
-	// Run the dual-carrier detector chain: body marker → header → lifeline fallback.
-	// This replaces the old header-only check (X-SL-RL) and catches the P0 case
-	// where CF strips the header but the decoy body still carries the rl-state marker.
-	// Task D5 (cold-start metrics): IncHandshakeDecoyReceived is called at the
-	// detection site — independent from RateLimitedFromServer (per-cool-down).
+	// Run the marker-only detector chain: body marker → header. No HTML
+	// lifeline fallback here.
+	//
+	// Rationale (2026-05-29 false-positive fix): the lifeline ("HTML body +
+	// no X-SL-RL → assume rate-limited, 90s cooldown") cannot tell a genuine
+	// rate-limit decoy from a PLAIN decoy. The server emits plain decoys for
+	// max_clients / protocol_unknown / auth_fail with NO X-SL-RL header and NO
+	// Schema.org rl-state marker (failClosedToDecoyWithReason), identical on
+	// the wire to a real decoy page. Only a true rate-limit decoy carries an
+	// explicit marker (failClosedToDecoyRateLimitedV2 sets X-SL-RL + body
+	// marker). Field data (pl1, 14.6h): server rejected 0 handshakes / emitted
+	// 0 sentinels, yet the lifeline fired 48× on max_clients decoys, each a 90s
+	// self-imposed cooldown that degraded the pool. DetectCarriersOnly mirrors
+	// the WS path (ws_transport.go), which dropped the lifeline for the same
+	// reason. A real server-directed rate-limit (explicit marker) is still
+	// detected; a markerless decoy now surfaces as a regular network error.
 	// fhttp.Header is map[string][]string identical in layout to net/http.Header;
 	// the DetectionContext only reads the "X-SL-RL" header, so a shallow copy suffices.
 	stdResp := &stdhttp.Response{Header: stdhttp.Header(resp.Header)}
 	detCtx := &DetectionContext{Response: stdResp, BodyHead: respBytes, Path: "handshake"}
-	if sig := t.rlDetector.Detect(detCtx); sig != nil {
+	if sig := t.rlDetector.DetectCarriersOnly(detCtx); sig != nil {
 		IncHandshakeDecoyReceived()
 		return nil, &RateLimitError{Signal: sig}
 	}
@@ -486,15 +497,22 @@ func (t *DirectTransport) SendHandshakeRaw(ctx context.Context, payload []byte) 
 		}
 	}
 
-	// Phase 2.2 (2026-05-14): check for rate-limit signal via detector chain
-	// before the HTML body guard, so a rl-state marker in the decoy body is
-	// surfaced as ErrRateLimited rather than a generic httpStatusError.
-	// SendHandshakeRaw is used by the D4 probe flow — rate-limit detection here
-	// prevents the probe from misclassifying a rate-limit decoy as a MITM page.
+	// Phase 2.2 (2026-05-14): check for rate-limit signal via the marker-only
+	// detector chain before the HTML body guard, so a rl-state marker in the
+	// decoy body is surfaced as ErrRateLimited rather than a generic
+	// httpStatusError. SendHandshakeRaw is used by the D4 probe flow.
+	//
+	// 2026-05-29: switched Detect → DetectCarriersOnly (drop HTML lifeline).
+	// Here the lifeline was doubly wrong: a markerless HTML decoy is exactly the
+	// MITM/decoy case the explicit isHTMLBody guard below is designed to catch
+	// (Status=200 → probe MITM hard-fail). Letting the lifeline pre-empt it as
+	// rate-limit hid genuine decoy/MITM responses behind a 90s cooldown. Only a
+	// real rate-limit decoy (explicit X-SL-RL or body marker) is reported as
+	// ErrRateLimited; a markerless decoy falls through to the HTML guard.
 	// fhttp.Header is map[string][]string; DetectionContext only reads "X-SL-RL".
 	stdRespRaw := &stdhttp.Response{Header: stdhttp.Header(resp.Header)}
 	detCtx := &DetectionContext{Response: stdRespRaw, BodyHead: respBytes, Path: "handshake"}
-	if sig := t.rlDetector.Detect(detCtx); sig != nil {
+	if sig := t.rlDetector.DetectCarriersOnly(detCtx); sig != nil {
 		IncHandshakeDecoyReceived()
 		return nil, &RateLimitError{Signal: sig}
 	}

@@ -2678,45 +2678,6 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 			return
 		}
 
-		// Preemptive byte-based rotation. budget = 0 → feature disabled
-		// (viaCF mode). See poolSlot.byteBudget docstring for the jitter
-		// rationale and the "sample once per (re)connect" invariant.
-		budget := slot.byteBudget.Load()
-		if budget > 0 {
-			// Always advance the counter (even if we don't rotate here) so a
-			// future read sees the correct total.
-			total := slot.downBytes.Add(int64(len(data)))
-			// Rate floor (Bug #4): even if the byte budget is exhausted, do not
-			// rotate until the slot has lived at least the min interval. Prevents
-			// the high-throughput rotation storm where a fast download burns the
-			// budget in a fraction of a second and the pool thrashes. The budget
-			// counter keeps accumulating; the rotation just waits for the time
-			// floor. The age budget (rotationWatchdog) remains the upper bound.
-			if total >= budget && byteBudgetRotationAllowed(time.Since(slotStart), p.byteBudgetMinInterval) {
-				if p.gracefulDrain {
-					// Graceful path: startDrain transitions the slot to
-					// slotDraining and spawns parallel reserve reconnect.
-					// The reader MUST keep reading downlink frames — exiting
-					// here would starve active streams on this slot for up
-					// to drainHardCap (90s) until the drainWatchdog tears
-					// down the transport. The watchdog bumps the slot
-					// generation before handleSlotDeath; this reader then
-					// exits cleanly via shouldExitReader (gen mismatch) or
-					// a read error from the closed conn.
-					//
-					// startDrain is idempotent via tryMarkDraining CAS, but
-					// resetting downBytes to 0 avoids triggering startDrain
-					// on every subsequent read (log spam) until teardown.
-					p.startDrain(cl, idx, "byte_budget")
-					slot.downBytes.Store(0)
-					continue
-				}
-				if p.maybeRotateSlot(cl, idx, slot, "byte_budget", msgCount, slotStart, total) {
-					return
-				}
-			}
-		}
-
 		// Age-based rotation lives in rotationWatchdog (pool-level
 		// goroutine), NOT here. The reader-side check would only fire when
 		// data arrives — on a slot that's gone idle just past the kill
@@ -2768,6 +2729,53 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 			cl.RouteToStream(streamID, chunk.Payload)
 		} else {
 			cl.RouteToStream(streamID, chunk.Payload[2:])
+		}
+
+		// Preemptive byte-based rotation — checked AFTER the frame is
+		// decrypted and routed to its stream (above). CRITICAL: this block
+		// MUST come after RouteToStream. Previously it sat BEFORE decrypt
+		// and did `continue` on the budget-tripping frame, DROPPING that
+		// already-read downlink frame — a hole in the stream's TCP byte
+		// sequence that corrupted the app's TLS record stream
+		// (SEC_E_DECRYPT_FAILURE / broken download). The frame that trips
+		// the budget is now delivered first.
+		// budget = 0 → feature disabled (viaCF mode). See poolSlot.byteBudget
+		// docstring for jitter rationale and the "sample once per (re)connect"
+		// invariant.
+		if budget := slot.byteBudget.Load(); budget > 0 {
+			// Advance the per-slot downlink counter. data is the raw WS
+			// frame just read; len(data) is the wire size — same value the
+			// old code used at the top of the loop.
+			total := slot.downBytes.Add(int64(len(data)))
+			// Rate floor (Bug #4): even if the byte budget is exhausted, do
+			// not rotate until the slot has lived at least the min interval.
+			// Prevents the high-throughput rotation storm where a fast
+			// download burns the budget in a fraction of a second and the
+			// pool thrashes. The age budget (rotationWatchdog) remains the
+			// upper bound.
+			if total >= budget && byteBudgetRotationAllowed(time.Since(slotStart), p.byteBudgetMinInterval) {
+				if p.gracefulDrain {
+					// Graceful path: startDrain transitions the slot to
+					// slotDraining and spawns parallel reserve reconnect on a
+					// SEPARATE goroutine (NOT inline — inline blocks this reader
+					// from serving its own active stream's downlink). The slot
+					// keeps reading/routing downlink for its sticky streams until
+					// drainWatchdog natural-finish. Reset downBytes before
+					// dispatch so subsequent reads don't spawn a second
+					// startDrain before the slot flips to slotDraining;
+					// startDrain is idempotent via tryMarkDraining CAS. Guard on
+					// slotReady to minimize duplicate dispatches.
+					if slot.getState() == slotReady {
+						slot.downBytes.Store(0)
+						go p.startDrain(cl, idx, "byte_budget")
+					}
+					// NO continue/return — the frame is already delivered; just
+					// loop to the next ReadMessage. The slotDraining slot keeps
+					// serving downlink.
+				} else if p.maybeRotateSlot(cl, idx, slot, "byte_budget", msgCount, slotStart, total) {
+					return
+				}
+			}
 		}
 	}
 }

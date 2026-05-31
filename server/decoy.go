@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // DecoyHandler serves a static website to unauthenticated requests.
@@ -26,6 +27,56 @@ type DecoyHandler struct {
 	// perDirServers caches precomputed http.FileServer per unique directory
 	// referenced by domainMap. Built once in NewDecoyHandler.
 	perDirServers map[string]http.Handler
+
+	// NEW: per-host persona (spec §2.4)
+	domainPersona  map[string]string
+	defaultPersona string
+}
+
+// DecoyHandlerConfig — persona-aware config for NewDecoyHandlerV2.
+// Backwards compat: DomainPersona == nil → every host gets DefaultPersona.
+type DecoyHandlerConfig struct {
+	DefaultDir     string
+	DomainMap      map[string]string
+	DomainPersona  map[string]string
+	DefaultPersona string
+}
+
+// NewDecoyHandlerV2 — persona-aware constructor. Wraps NewDecoyHandler.
+func NewDecoyHandlerV2(cfg DecoyHandlerConfig) *DecoyHandler {
+	d := NewDecoyHandler(cfg.DefaultDir, cfg.DomainMap)
+	d.domainPersona = cfg.DomainPersona
+	d.defaultPersona = cfg.DefaultPersona
+	if d.defaultPersona == "" {
+		d.defaultPersona = "saas"
+	}
+	return d
+}
+
+// resolvePersona returns the persona for a request Host.
+func (d *DecoyHandler) resolvePersona(host string) string {
+	if d.domainPersona != nil {
+		h := host
+		if i := indexByte(h, ':'); i >= 0 {
+			h = h[:i]
+		}
+		if p, ok := d.domainPersona[h]; ok && p != "" {
+			return p
+		}
+	}
+	if d.defaultPersona != "" {
+		return d.defaultPersona
+	}
+	return "saas"
+}
+
+func indexByte(s string, c byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
 }
 
 // NewDecoyHandler creates a handler serving static files from defaultDir.
@@ -83,24 +134,150 @@ func buildDirServer(dir string) (handler http.Handler, dirOK bool) {
 	return http.HandlerFunc(defaultDecoyPage), false
 }
 
-// ServeHTTP serves the decoy site with proper headers matching a real web server.
-// Selects the directory via Host header → domainMap lookup; falls back to defaultDir.
+// ServeHTTP serves decoy with persona-specific headers + custom 404. Spec §2.4.
 func (d *DecoyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Add headers that a real nginx/caddy would send
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("X-Frame-Options", "SAMEORIGIN")
-	w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+	persona := d.resolvePersona(r.Host)
+	switch persona {
+	case "blog":
+		setBlogHeaders(w)
+	case "utility":
+		setUtilityHeaders(w)
+	case "saas":
+		fallthrough
+	default:
+		setSaaSHeaders(w)
+	}
 
+	dir := d.defaultDir
 	server := d.defaultServer
 	if d.domainMap != nil {
-		dir := resolveDecoyDir(r.Host, d.domainMap, d.defaultDir)
-		if dir != d.defaultDir {
-			if srv, ok := d.perDirServers[dir]; ok {
+		resolved := resolveDecoyDir(r.Host, d.domainMap, d.defaultDir)
+		if resolved != d.defaultDir {
+			if srv, ok := d.perDirServers[resolved]; ok {
 				server = srv
+				dir = resolved
 			}
 		}
 	}
-	server.ServeHTTP(w, r)
+
+	// Linear-style SPA fallback: paths without a file extension (e.g. /pricing,
+	// /about) are React Router routes — on reload FileServer would 404 because
+	// no such file exists on disk. Serve index.html with 200 instead so the
+	// SPA can take over routing client-side. Asset paths (foo.png, bar.css)
+	// keep the 404 path through fourOhFourWrapper → custom 404.html.
+	//
+	// Detection: a request path "looks like asset" if its last segment contains
+	// a dot. /api/foo → SPA fallback (no dot), /foo.png → asset → real 404.
+	// /api/foo.json → asset (treat as real 404). Root "/" is handled by
+	// FileServer itself (serves index.html for "/"), so we don't intercept it.
+	wrap := &fourOhFourWrapper{
+		ResponseWriter:  w,
+		custom404Path:   filepath.Join(dir, "404.html"),
+		spaFallbackPath: filepath.Join(dir, "index.html"),
+		isSPARoute:      isSPARoute(r.URL.Path),
+	}
+	server.ServeHTTP(wrap, r)
+}
+
+// isSPARoute returns true if the path looks like a SPA route (no file ext in
+// the last segment) — should serve index.html on 404 instead of custom 404.html.
+// Empty path or "/" → false (root is handled by FileServer directly).
+func isSPARoute(p string) bool {
+	if p == "" || p == "/" {
+		return false
+	}
+	last := p
+	if i := strings.LastIndex(p, "/"); i >= 0 {
+		last = p[i+1:]
+	}
+	// If last segment is empty (trailing slash), still treat as SPA route.
+	if last == "" {
+		return true
+	}
+	// A dot in the last segment = file extension = real asset.
+	return !strings.Contains(last, ".")
+}
+
+func setSaaSHeaders(w http.ResponseWriter) {
+	h := w.Header()
+	h.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload")
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("X-Frame-Options", "SAMEORIGIN")
+	h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+	h.Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'self'")
+}
+
+func setBlogHeaders(w http.ResponseWriter) {
+	h := w.Header()
+	h.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload")
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("X-Frame-Options", "SAMEORIGIN")
+	h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+	h.Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self'")
+}
+
+func setUtilityHeaders(w http.ResponseWriter) {
+	h := w.Header()
+	h.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload")
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("X-Frame-Options", "SAMEORIGIN")
+	h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+}
+
+// fourOhFourWrapper intercepts WriteHeader(404) from the FileServer and serves
+// either index.html (SPA fallback, 200) or custom 404.html (real asset 404).
+// Spec §2.4 + post-Wave-1-3 SPA reload fix.
+type fourOhFourWrapper struct {
+	http.ResponseWriter
+	custom404Path   string
+	spaFallbackPath string
+	isSPARoute      bool
+	intercepted     bool
+}
+
+func (w *fourOhFourWrapper) WriteHeader(status int) {
+	if status == http.StatusNotFound && !w.intercepted {
+		w.intercepted = true
+
+		// SPA route reload: /pricing, /about etc. → serve index.html with 200
+		// so React Router takes over. Real assets (foo.png) → custom 404 below.
+		if w.isSPARoute {
+			body, err := os.ReadFile(w.spaFallbackPath)
+			if err == nil {
+				w.ResponseWriter.Header().Set("Content-Type", "text/html; charset=utf-8")
+				if w.ResponseWriter.Header().Get("Cache-Control") == "" {
+					w.ResponseWriter.Header().Set("Cache-Control", "no-cache, must-revalidate")
+				}
+				w.ResponseWriter.WriteHeader(http.StatusOK)
+				_, _ = w.ResponseWriter.Write(body)
+				return
+			}
+			// index.html missing — fall through to 404 path below.
+		}
+
+		body, err := os.ReadFile(w.custom404Path)
+		if err != nil {
+			w.ResponseWriter.WriteHeader(status)
+			return
+		}
+		w.ResponseWriter.Header().Set("Content-Type", "text/html; charset=utf-8")
+		// Don't overwrite Cache-Control if persona setter already chose one.
+		if w.ResponseWriter.Header().Get("Cache-Control") == "" {
+			w.ResponseWriter.Header().Set("Cache-Control", "public, max-age=300")
+		}
+		w.ResponseWriter.WriteHeader(http.StatusNotFound)
+		_, _ = w.ResponseWriter.Write(body)
+		return
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *fourOhFourWrapper) Write(b []byte) (int, error) {
+	if w.intercepted {
+		// Suppress FileServer's default body since we already wrote custom.
+		return len(b), nil
+	}
+	return w.ResponseWriter.Write(b)
 }
 
 // HasContent returns true if the decoy has actual content to serve.

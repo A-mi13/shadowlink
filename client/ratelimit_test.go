@@ -232,10 +232,9 @@ func TestHeaderCarrier_Detect_NoHeader(t *testing.T) {
 
 // ---- RateLimitDetector tests ----
 
-func newTestDetector() (*RateLimitDetector, *atomic.Uint64, *atomic.Uint64, *atomic.Uint64) {
+func newTestDetector() (*RateLimitDetector, *atomic.Uint64, *atomic.Uint64) {
 	byBody := new(atomic.Uint64)
 	byHeader := new(atomic.Uint64)
-	byFallback := new(atomic.Uint64)
 	d := &RateLimitDetector{
 		carriers: []RateLimitCarrier{
 			BodyMarkerCarrier{},
@@ -243,9 +242,8 @@ func newTestDetector() (*RateLimitDetector, *atomic.Uint64, *atomic.Uint64, *ato
 		},
 		DetectedByBody:   byBody,
 		DetectedByHeader: byHeader,
-		DetectedFallback: byFallback,
 	}
-	return d, byBody, byHeader, byFallback
+	return d, byBody, byHeader
 }
 
 func TestRateLimitDetector_BodyWins(t *testing.T) {
@@ -259,8 +257,8 @@ func TestRateLimitDetector_BodyWins(t *testing.T) {
 	resp := makeResponseWithHeader("X-SL-RL", "v1;bucket=handshake;refill_in=10;burst_left=1;exempt=0")
 	ctx := &DetectionContext{Response: resp, BodyHead: body}
 
-	d, byBody, byHeader, _ := newTestDetector()
-	sig := d.Detect(ctx)
+	d, byBody, byHeader := newTestDetector()
+	sig := d.DetectCarriersOnly(ctx)
 	if sig == nil {
 		t.Fatal("expected signal")
 	}
@@ -285,8 +283,8 @@ func TestRateLimitDetector_HeaderFallback(t *testing.T) {
 		BodyHead: []byte(`{"status":"ok"}`), // JSON body — no HTML, no body marker
 	}
 
-	d, byBody, byHeader, byFallback := newTestDetector()
-	sig := d.Detect(ctx)
+	d, byBody, byHeader := newTestDetector()
+	sig := d.DetectCarriersOnly(ctx)
 	if sig == nil {
 		t.Fatal("expected signal")
 	}
@@ -302,41 +300,6 @@ func TestRateLimitDetector_HeaderFallback(t *testing.T) {
 	if byHeader.Load() != 1 {
 		t.Errorf("DetectedByHeader: got %d, want 1", byHeader.Load())
 	}
-	if byFallback.Load() != 0 {
-		t.Errorf("DetectedFallback: got %d, want 0", byFallback.Load())
-	}
-}
-
-func TestRateLimitDetector_LifelineFallback(t *testing.T) {
-	// Both body marker stripped, header stripped, but response is HTML
-	// → lifeline fallback: 90s cooldown
-	htmlBody := []byte(`<!DOCTYPE html><html><body>Rate limited</body></html>`)
-	resp := &http.Response{Header: make(http.Header)} // no X-SL-RL
-	ctx := &DetectionContext{
-		Response: resp,
-		BodyHead: htmlBody,
-	}
-
-	d, byBody, byHeader, byFallback := newTestDetector()
-	sig := d.Detect(ctx)
-	if sig == nil {
-		t.Fatal("expected lifeline signal")
-	}
-	if sig.Carrier != "fallback" {
-		t.Errorf("Carrier: got %q, want fallback", sig.Carrier)
-	}
-	if sig.RefillIn != 90*time.Second {
-		t.Errorf("RefillIn: got %v, want 90s", sig.RefillIn)
-	}
-	if sig.Bucket != "unknown_via_fallback" {
-		t.Errorf("Bucket: got %q, want unknown_via_fallback", sig.Bucket)
-	}
-	if byBody.Load() != 0 || byHeader.Load() != 0 {
-		t.Errorf("body/header counters should be 0, got body=%d header=%d", byBody.Load(), byHeader.Load())
-	}
-	if byFallback.Load() != 1 {
-		t.Errorf("DetectedFallback: got %d, want 1", byFallback.Load())
-	}
 }
 
 func TestRateLimitDetector_NotRateLimited(t *testing.T) {
@@ -346,12 +309,12 @@ func TestRateLimitDetector_NotRateLimited(t *testing.T) {
 		Response: resp,
 		BodyHead: []byte(`{"events":[],"status":"ok"}`),
 	}
-	d, byBody, byHeader, byFallback := newTestDetector()
-	sig := d.Detect(ctx)
+	d, byBody, byHeader := newTestDetector()
+	sig := d.DetectCarriersOnly(ctx)
 	if sig != nil {
 		t.Errorf("expected nil, got %+v", sig)
 	}
-	if byBody.Load() != 0 || byHeader.Load() != 0 || byFallback.Load() != 0 {
+	if byBody.Load() != 0 || byHeader.Load() != 0 {
 		t.Error("no counters should be incremented for non-RL response")
 	}
 }
@@ -413,7 +376,6 @@ func newTestDetectorWithStats() (*RateLimitDetector, *statsRegistry) {
 		},
 		DetectedByBody:   &stats.RateLimitDetectedByBody,
 		DetectedByHeader: &stats.RateLimitDetectedByHeader,
-		DetectedFallback: &stats.RateLimitDetectedFallback,
 		metrics:          stats,
 	}
 	return d, stats
@@ -429,7 +391,7 @@ func TestRateLimitDetector_PerPathCounters_BodyHandshake(t *testing.T) {
 	d, stats := newTestDetectorWithStats()
 
 	ctx := &DetectionContext{BodyHead: body, Path: "handshake"}
-	sig := d.Detect(ctx)
+	sig := d.DetectCarriersOnly(ctx)
 	if sig == nil {
 		t.Fatal("expected signal")
 	}
@@ -475,7 +437,7 @@ func TestRateLimitDetector_PerPathCounters_HeaderHandshake(t *testing.T) {
 	d, stats := newTestDetectorWithStats()
 
 	ctx := &DetectionContext{Response: resp, BodyHead: []byte(`{"ok":true}`), Path: "handshake"}
-	sig := d.Detect(ctx)
+	sig := d.DetectCarriersOnly(ctx)
 	if sig == nil {
 		t.Fatal("expected signal")
 	}
@@ -511,29 +473,6 @@ func TestRateLimitDetector_PerPathCounters_HeaderWS(t *testing.T) {
 	}
 }
 
-func TestRateLimitDetector_PerPathCounters_FallbackHandshake(t *testing.T) {
-	// Lifeline fallback + Path="handshake" → aggregate +1 AND _Handshake +1.
-	// No Fallback_WS counter exists (WS path uses DetectCarriersOnly, no lifeline).
-	htmlBody := []byte(`<!DOCTYPE html><html><body>Rate limited</body></html>`)
-	resp := &http.Response{Header: make(http.Header)}
-	d, stats := newTestDetectorWithStats()
-
-	ctx := &DetectionContext{Response: resp, BodyHead: htmlBody, Path: "handshake"}
-	sig := d.Detect(ctx)
-	if sig == nil {
-		t.Fatal("expected lifeline signal")
-	}
-	if sig.Carrier != "fallback" {
-		t.Errorf("Carrier: got %q, want fallback", sig.Carrier)
-	}
-	if stats.RateLimitDetectedFallback.Load() != 1 {
-		t.Errorf("aggregate fallback counter: got %d, want 1", stats.RateLimitDetectedFallback.Load())
-	}
-	if stats.RateLimitDetectedFallback_Handshake.Load() != 1 {
-		t.Errorf("fallback_Handshake counter: got %d, want 1", stats.RateLimitDetectedFallback_Handshake.Load())
-	}
-}
-
 func TestRateLimitDetector_PerPathCounters_EmptyPath_AggregateOnly(t *testing.T) {
 	// Empty path (back-compat / test mode via newTestDetector) — aggregate ticks,
 	// per-path counters do NOT increment (metrics=nil in newTestDetector).
@@ -542,8 +481,8 @@ func TestRateLimitDetector_PerPathCounters_EmptyPath_AggregateOnly(t *testing.T)
 		BodyHead: []byte(`{"ok":true}`),
 		// Path intentionally omitted
 	}
-	d, byBody, byHeader, _ := newTestDetector()
-	sig := d.Detect(ctx)
+	d, byBody, byHeader := newTestDetector()
+	sig := d.DetectCarriersOnly(ctx)
 	if sig == nil {
 		t.Fatal("expected signal")
 	}

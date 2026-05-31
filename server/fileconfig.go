@@ -6,27 +6,54 @@ import (
 	"os"
 	"runtime"
 	"strings"
-	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
+// domainDecoyEntry — новый YAML формат per-host (Phase G, spec §8.2):
+//
+//	domain_decoy_map:
+//	  "host.example.com":
+//	    directory: "/var/www/saas-landing"
+//	    persona: "saas"
+//
+// Поле раскрывается в `FileConfig.DomainDecoyMap` (host→directory) и
+// `FileConfig.DomainPersonaMap` (host→persona). Legacy формат
+// (`host: directory` строкой) тоже поддерживается — см. LoadConfigFile.
+type domainDecoyEntry struct {
+	Directory string `yaml:"directory"`
+	Persona   string `yaml:"persona"`
+}
+
 // FileConfig holds all server configuration fields from a YAML file.
 // Pointer fields distinguish "not set" from zero value, allowing CLI flags to override.
 type FileConfig struct {
-	Listen            string               `yaml:"listen"`
-	Cert              string               `yaml:"cert"`
-	Key               string               `yaml:"key"`
-	ServerKey         string               `yaml:"server_key"`
-	Decoy             string               `yaml:"decoy"`
-	DomainDecoyMap    map[string]string    `yaml:"domain_decoy_map,omitempty"`
+	Listen    string `yaml:"listen"`
+	Cert      string `yaml:"cert"`
+	Key       string `yaml:"key"`
+	ServerKey string `yaml:"server_key"`
+	Decoy     string `yaml:"decoy"`
+
+	// DomainDecoyMap — host→directory map, заполняется в LoadConfigFile из
+	// RawDomainDecoyMap. Поддерживается ОБА YAML формата: legacy single-line
+	// (`"host": "/dir"`) и Phase G v2 (`"host": {directory, persona}`).
+	DomainDecoyMap map[string]string `yaml:"-"`
+
+	// DomainPersonaMap — host→persona map. Заполняется ТОЛЬКО для нового
+	// формата; для legacy format остаётся nil. Phase G (spec §8.2).
+	DomainPersonaMap map[string]string `yaml:"-"`
+
+	// RawDomainDecoyMap — сырой узел YAML под ключом `domain_decoy_map`.
+	// LoadConfigFile делает try-new-then-legacy decode и наполняет два поля
+	// выше. Здесь хранится для интероп: пустой узел = поле отсутствует.
+	RawDomainDecoyMap yaml.Node `yaml:"domain_decoy_map,omitempty"`
+
 	MaxClients        *int                 `yaml:"max_clients"`
 	MaxConns          *int                 `yaml:"max_conns"`
 	ChunkSize         *int                 `yaml:"chunk_size"`
 	BehindProxy       *bool                `yaml:"behind_proxy"`
 	Management        *MgmtConfig          `yaml:"management"`
 	Mimicry           *MimicryConfig       `yaml:"mimicry"`
-	LiveBlog          *FileLiveBlogConfig  `yaml:"live_blog"`
 	BlockDomains      []string             `yaml:"block_domains"`
 	AuthorizedClients []string             `yaml:"authorized_clients"`
 	RateLimit         *FileRateLimitConfig `yaml:"rate_limit"`
@@ -62,29 +89,6 @@ type FileRateLimitConfig struct {
 type FileRateLimitBucketSpec struct {
 	Burst        *int `yaml:"burst"`
 	RefillPerMin *int `yaml:"refill_per_min"`
-}
-
-// FileLiveBlogConfig holds live-blog decoy settings from YAML.
-// Duration fields are strings because YAML time.Duration parsing is awkward —
-// they are converted via time.ParseDuration in ApplyTo.
-// Pointer fields distinguish "not set" from zero value.
-type FileLiveBlogConfig struct {
-	Enabled           *bool    `yaml:"enabled"`
-	Upstream          string   `yaml:"upstream"`
-	CDNUpstream       string   `yaml:"cdn_upstream"`
-	CacheTTL          string   `yaml:"cache_ttl"`
-	CacheMaxEntries   *int     `yaml:"cache_max_entries"`
-	CacheStaleGrace   string   `yaml:"cache_stale_grace"`
-	UpstreamRPS       *float64 `yaml:"upstream_rps"`
-	UpstreamBurst     *int     `yaml:"upstream_burst"`
-	UpstreamTimeout   string   `yaml:"upstream_timeout"`
-	MaxBodyBytes      *int     `yaml:"max_body_bytes"`
-	CDNMaxBodyBytes   *int     `yaml:"cdn_max_body_bytes"`
-	CanaryArticleID   string   `yaml:"canary_article_id"`
-	CanaryInterval    string   `yaml:"canary_interval"`
-	TargetBrand       string   `yaml:"target_brand"`
-	TargetLogoPath    string   `yaml:"target_logo_path"`
-	TargetTitleSuffix string   `yaml:"target_title_suffix"`
 }
 
 // MgmtConfig holds management API configuration from the YAML file.
@@ -129,9 +133,29 @@ type MimicryConfig struct {
 	PreambleCountMax *int `yaml:"preamble_count_max"`
 }
 
+// hasNewFormatEntry возвращает true, если хотя бы одна запись содержит
+// non-empty Directory — индикатор нового Phase G формата. Legacy формат
+// (`"host": "/dir"` плоской строкой) при попытке decode в map[string]domainDecoyEntry
+// либо сразу падает (тип mismatch), либо даёт все-пустые struct'ы.
+func hasNewFormatEntry(m map[string]domainDecoyEntry) bool {
+	for _, v := range m {
+		if v.Directory != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // LoadConfigFile reads and parses a YAML config file into FileConfig.
 // C-1 fix: warns if file permissions are too open on Unix systems.
 // C-2 fix: expands ${ENV_VAR} references in sensitive fields after parsing.
+//
+// Phase G (spec §8.2): `domain_decoy_map` декодируется через RawDomainDecoyMap
+// (yaml.Node) — пробуем новый формат `{directory, persona}` per host, fallback
+// на legacy `host: directory`. Backwards compat: оба формата поддерживаются;
+// сосуществовать в одном файле нельзя — выбирается тот, который успешно
+// декодируется первым (новый, если хоть одна запись имеет non-empty
+// `directory`).
 func LoadConfigFile(path string) (*FileConfig, error) {
 	warnInsecurePermissions(path)
 
@@ -142,6 +166,28 @@ func LoadConfigFile(path string) (*FileConfig, error) {
 	var fc FileConfig
 	if err := yaml.Unmarshal(data, &fc); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
+	}
+
+	// Phase G post-process: domain_decoy_map — try new-format first, legacy fallback.
+	if fc.RawDomainDecoyMap.Kind != 0 {
+		newFmt := make(map[string]domainDecoyEntry)
+		if err := fc.RawDomainDecoyMap.Decode(&newFmt); err == nil && hasNewFormatEntry(newFmt) {
+			fc.DomainDecoyMap = make(map[string]string, len(newFmt))
+			fc.DomainPersonaMap = make(map[string]string, len(newFmt))
+			for host, entry := range newFmt {
+				fc.DomainDecoyMap[host] = entry.Directory
+				if entry.Persona != "" {
+					fc.DomainPersonaMap[host] = entry.Persona
+				}
+			}
+		} else {
+			oldFmt := make(map[string]string)
+			if err := fc.RawDomainDecoyMap.Decode(&oldFmt); err != nil {
+				return nil, fmt.Errorf("parse domain_decoy_map (tried new and legacy formats): %w", err)
+			}
+			fc.DomainDecoyMap = oldFmt
+			fc.DomainPersonaMap = nil
+		}
 	}
 
 	// C-2: expand env vars in sensitive fields
@@ -268,6 +314,13 @@ func (fc *FileConfig) ApplyTo(cfg *Config) {
 	if len(fc.DomainDecoyMap) > 0 {
 		cfg.DomainDecoyMap = fc.DomainDecoyMap
 	}
+	// Phase G — propagate persona map so NewDecoyHandlerV2 in handler.go can
+	// route per-host responses through the right persona setters. Without this
+	// copy the YAML parser populates DomainPersonaMap but the handler never sees
+	// it — silent fallback to default persona for every host.
+	if len(fc.DomainPersonaMap) > 0 {
+		cfg.DomainPersonaMap = fc.DomainPersonaMap
+	}
 	if fc.MaxClients != nil {
 		cfg.MaxClients = *fc.MaxClients
 	}
@@ -307,65 +360,6 @@ func (fc *FileConfig) ApplyTo(cfg *Config) {
 	cfg.UseInflatedResponses = true
 	if fc.Mimicry != nil && fc.Mimicry.Inflation != nil {
 		cfg.UseInflatedResponses = *fc.Mimicry.Inflation
-	}
-	if fc.LiveBlog != nil {
-		lb := &cfg.LiveBlog
-		if fc.LiveBlog.Enabled != nil {
-			lb.Enabled = *fc.LiveBlog.Enabled
-		}
-		if fc.LiveBlog.Upstream != "" {
-			lb.Upstream = fc.LiveBlog.Upstream
-		}
-		if fc.LiveBlog.CDNUpstream != "" {
-			lb.CDNUpstream = fc.LiveBlog.CDNUpstream
-		}
-		if fc.LiveBlog.CacheTTL != "" {
-			if d, err := time.ParseDuration(fc.LiveBlog.CacheTTL); err == nil {
-				lb.CacheTTL = d
-			}
-		}
-		if fc.LiveBlog.CacheMaxEntries != nil {
-			lb.CacheMaxEntries = *fc.LiveBlog.CacheMaxEntries
-		}
-		if fc.LiveBlog.CacheStaleGrace != "" {
-			if d, err := time.ParseDuration(fc.LiveBlog.CacheStaleGrace); err == nil {
-				lb.CacheStaleGrace = d
-			}
-		}
-		if fc.LiveBlog.UpstreamRPS != nil {
-			lb.UpstreamRPS = *fc.LiveBlog.UpstreamRPS
-		}
-		if fc.LiveBlog.UpstreamBurst != nil {
-			lb.UpstreamBurst = *fc.LiveBlog.UpstreamBurst
-		}
-		if fc.LiveBlog.UpstreamTimeout != "" {
-			if d, err := time.ParseDuration(fc.LiveBlog.UpstreamTimeout); err == nil {
-				lb.UpstreamTimeout = d
-			}
-		}
-		if fc.LiveBlog.MaxBodyBytes != nil {
-			lb.MaxBodyBytes = *fc.LiveBlog.MaxBodyBytes
-		}
-		if fc.LiveBlog.CDNMaxBodyBytes != nil {
-			lb.CDNMaxBodyBytes = *fc.LiveBlog.CDNMaxBodyBytes
-		}
-		if fc.LiveBlog.CanaryArticleID != "" {
-			lb.CanaryArticleID = fc.LiveBlog.CanaryArticleID
-		}
-		if fc.LiveBlog.CanaryInterval != "" {
-			if d, err := time.ParseDuration(fc.LiveBlog.CanaryInterval); err == nil {
-				lb.CanaryInterval = d
-			}
-		}
-		if fc.LiveBlog.TargetBrand != "" {
-			lb.TargetBrand = fc.LiveBlog.TargetBrand
-		}
-		if fc.LiveBlog.TargetLogoPath != "" {
-			lb.TargetLogoPath = fc.LiveBlog.TargetLogoPath
-		}
-		if fc.LiveBlog.TargetTitleSuffix != "" {
-			lb.TargetTitleSuffix = fc.LiveBlog.TargetTitleSuffix
-		}
 	}
 	if fc.RateLimit != nil {
 		rl := &cfg.RateLimit

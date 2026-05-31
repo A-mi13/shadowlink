@@ -124,12 +124,13 @@ func TestUpgradeToWSFailure_SendsBestEffortFin(t *testing.T) {
 	if chunk.Flags != core.FlagFin {
 		t.Errorf("expected FlagFin, got 0x%02x", chunk.Flags)
 	}
-	if len(chunk.Payload) < 2 {
-		t.Fatalf("FIN payload too short: %d", len(chunk.Payload))
-	}
-	streamID := uint16(chunk.Payload[0])<<8 | uint16(chunk.Payload[1])
-	if streamID != 0 {
-		t.Errorf("expected streamID=0 (session-level FIN), got %d", streamID)
+	// Session-wide FIN must carry a payload shorter than 2 bytes so the server
+	// routes it to handleFin (release session), not handleStreamFin. The old
+	// code used NewStreamFinChunk(...,0) — a 2-byte payload — which silently
+	// landed on the per-stream branch and never released the session
+	// (latent bug fixed 2026-05-29 via NewSessionFinChunk).
+	if len(chunk.Payload) >= 2 {
+		t.Fatalf("session FIN payload must be <2 bytes to route session-wide, got len=%d", len(chunk.Payload))
 	}
 }
 

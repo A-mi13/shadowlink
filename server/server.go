@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/nixavpn/shadowlink/core"
@@ -30,6 +31,12 @@ type Server struct {
 	mgmtSrv  *http.Server // Management API server (optional)
 	listener net.Listener
 	stopCh   chan struct{}
+
+	// connIdle tracks which connections are currently counted as idle in
+	// Metrics.IdleConnections. Keyed by net.Conn; value present ⇒ this conn
+	// contributed a +1. Used by connStateHook for exact (non-negative)
+	// accounting — see its doc-comment.
+	connIdle sync.Map // map[net.Conn]struct{}
 }
 
 // New creates a ShadowLink server from config.
@@ -171,30 +178,41 @@ func (s *Server) startPlain() error {
 //
 // Transitions emitted by net/http: New → Active → Idle → Active → Idle
 // → … → Closed (or Hijacked for WS upgrades). The hook receives only the
-// new state, not the previous one, so we use the simple approximation:
+// new state, not the previous one.
 //
-//	Idle                 → +1
-//	Active|Closed|Hijacked → -1
+// Exact accounting (2026-05-29 fix): we track per-connection idle membership
+// in s.connIdle so the gauge counts true transitions only:
 //
-// Under steady state this stays accurate. During ramp, the gauge can
-// briefly dip below zero (e.g. Active fires for a New conn that never
-// went through Idle); atomic.Int64 is signed, so the negative spike is
-// recoverable. The strict variant would need a sync.Map[conn]state to
-// detect "was previously Idle", which is more correct but allocates a
-// map entry per connection — not worth the cost for a memory-pressure
-// gauge that ops alerts on as a smoothed average.
+//	enter Idle (not already counted)        → +1, mark counted
+//	leave Idle (Active|Closed|Hijacked)     → -1, only if previously counted
+//
+// The earlier approximation (Idle→+1, Active|Closed|Hijacked→-1 unconditionally)
+// drove the gauge deeply negative: a connection that goes New→Active→Closed
+// without ever idling — the common single-handshake-POST case — emitted two -1s
+// and no +1. On pl1 this accumulated to IdleConnections=-1178, masking the real
+// idle pool size for ops. Tracking membership makes never-idle connections net
+// zero and keeps the gauge ≥ 0.
+//
+// Cost: one sync.Map entry per CURRENTLY-IDLE connection (deleted on leave),
+// not one per lifetime connection — bounded by the live idle keep-alive pool.
 //
 // Wave 2.3 (2026-05-17): introduced alongside IdleTimeout 60s→300s, so
 // ops can correlate idle pool size against the wider window's RAM cost.
-func (s *Server) connStateHook(_ net.Conn, st http.ConnState) {
+func (s *Server) connStateHook(conn net.Conn, st http.ConnState) {
 	if s.handler == nil || s.handler.metrics == nil {
 		return
 	}
 	switch st {
 	case http.StateIdle:
-		s.handler.metrics.IdleConnections.Add(1)
+		// Count this conn as idle only on the first transition into Idle.
+		if _, loaded := s.connIdle.LoadOrStore(conn, struct{}{}); !loaded {
+			s.handler.metrics.IdleConnections.Add(1)
+		}
 	case http.StateActive, http.StateClosed, http.StateHijacked:
-		s.handler.metrics.IdleConnections.Add(-1)
+		// Decrement only if this conn was previously counted as idle.
+		if _, existed := s.connIdle.LoadAndDelete(conn); existed {
+			s.handler.metrics.IdleConnections.Add(-1)
+		}
 	}
 }
 

@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+
+	"github.com/xjasonlyu/tun2socks/v2/proxy"
 )
 
 // Engine — абстракция VPN-протокола.
@@ -16,6 +18,16 @@ type Engine interface {
 	Name() string
 	// Close закрывает соединение и останавливает SOCKS5.
 	Close() error
+}
+
+// InProcessDialerProvider — опциональный интерфейс (Bug #5). Engine, который его
+// реализует, отдаёт in-process tun2socks dialer: TUN-трафик туннелируется через
+// WS напрямую in-process, без loopback-сокета к SOCKS5 (устраняет Windows
+// ephemeral port exhaustion на высокой скорости). Реализован только
+// *ShadowLinkEngine; VLESS его не реализует и продолжает работать через loopback.
+// Возвращает nil если dialer недоступен (например движок ещё не Connect'нут).
+type InProcessDialerProvider interface {
+	InProcessDialer() proxy.Dialer
 }
 
 // NewEngine создаёт engine по имени протокола.

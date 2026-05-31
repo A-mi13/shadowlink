@@ -152,18 +152,7 @@ WantedBy=multi-user.target
 - **Client auth** — DONE. `server/ratelimit.go` implements whitelist mode via `authorized_clients` in YAML config. Empty list = open mode (testing). Management API allows runtime sync.
 - **LeakGuard** — DONE. `client/leakguard/` — DNS leak prevention, IPv6 disable, kill switch (Darwin/Linux/Windows).
 - **SOCKS5 UDP ASSOCIATE** — DONE. UDP tunneling for system VPN mode. С 2026-05-02 (May audit C12 F6) handler `proxy/socks5/udp.go::HandleUDPAssociateWS` сначала проверяет `client.PoolReadiness.ReadyCount()` — если ready slots < `udpMinReadySlots` (=2), запрос отклоняется с SOCKS5 reply 0x03 (network unreachable) до создания UDP listener'а. Single-WS transports (без `PoolReadiness`) проходят без проверки. Цель — не давать UDP relay привязаться к слоту, который никогда не recover'ит при cascade failure.
-
-## Live Decoy (T1.3) — `/blog/*` rebranded habr proxy
-
-Feature-flagged via `live_blog.enabled` in server YAML (default off).
-See `shadowlink/docs/protocols/live-decoy.md` for full ops notes.
-
-Key metric invariants (ops dashboard):
-- `decoy_live_blog_canary_ok_total` should tick once per `canary_interval` (default 15 min).
-- `decoy_live_blog_rewrite_drift_total` stays flat — increment indicates habr changed its HTML and the rewriter missed a transform.
-- `decoy_live_blog_upstream_err_total` / `_requests_total` ratio stays below 10%.
-
-Rollback: flip `live_blog.enabled: false` and `systemctl restart shadowlink`. Feature is fully additive; disabling restores the exact pre-T1.3 decoy behavior.
+- **Live Decoy (T1.3) — RETIRED 2026-05-28**: habr-mirror reverse-proxy decoy removed. Replaced by the per-persona decoy behavioral coverage wave (saas/blog/utility templates).
 
 ## T1.4 Data-Path V1 Closure — DEFAULT ON (2026-04-26)
 
@@ -471,8 +460,7 @@ by DirectTransport when no fingerprint UA passed) was Chrome/131 via
 hidden fourth Chrome major in wire surface count.
 
 Server-side consistency cleanup (not wire-visible to TSPU):
-`server/handler.go` `exportClientConfig` and `server/live_blog.go`
-upstream proxy use Chrome/133 too.
+`server/handler.go` `exportClientConfig` uses Chrome/133 too.
 
 ### Tests added
 

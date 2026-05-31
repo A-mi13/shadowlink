@@ -16,12 +16,21 @@ package client
 // # Fix chain
 //   - Phase 1 (server):   emits body marker in Schema.org JSON-LD identifier
 //   - Phase 2.1:          RateLimitDetector + carrier interfaces
-//   - Phase 2.2 (client): detector reads body marker FIRST, header SECOND,
-//     lifeline (90s default) THIRD — even if CF strips both
+//   - Phase 2.2 (client): detector reads body marker FIRST, header SECOND
+//
+// The body marker is the key: it rides inside the HTML body, so CF's
+// header-stripping policy (the original P0 trigger) cannot remove it. A genuine
+// server rate-limit is therefore always detectable via the body marker even
+// when X-SL-RL is gone.
+//
+// 2026-05-29: the HTML lifeline ("markerless HTML → assume rate-limited, 90s")
+// was REMOVED from the handshake path (transport.go now uses DetectCarriersOnly,
+// matching the WS path). It produced false positives on ordinary decoys
+// (max_clients/protocol_unknown) — see TestP0Regression_MarkerlessHTMLIsNotRateLimit.
 //
 // Tests below are end-to-end: each drives the full SendHandshake path via an
-// httptest.Server, not just the detector unit logic. The four scenarios are
-// named after the exact production failure mode they guard against.
+// httptest.Server, not just the detector unit logic. They are named after the
+// exact production failure mode they guard against.
 
 import (
 	"errors"
@@ -255,20 +264,30 @@ func TestP0Regression_LegacyHeaderFormat(t *testing.T) {
 	}
 }
 
-// TestP0Regression_LifelineWhenEverythingStripped is the APOCALYPTIC scenario:
-// CF strips BOTH X-SL-RL AND the body marker. Body is plain HTML decoy without
-// Schema.org JSON-LD. Lifeline activates: 90s default cooldown, bucket=unknown_via_fallback.
+// TestP0Regression_MarkerlessHTMLIsNotRateLimit — 2026-05-29 lifeline removal.
 //
-// This is the worst-case safety net. Even if the Phase 1 body marker and the
-// header are both gone, the client must NOT fall through to exponential backoff
-// and must NOT interpret this as a normal error that grows the attempt counter.
-func TestP0Regression_LifelineWhenEverythingStripped(t *testing.T) {
-	Stats.RateLimitDetectedFallback.Store(0)
-	HandshakeDecoyReceived.Store(0)
-
+// History: the HTML lifeline was added as a "safety net" for the case where CF
+// strips BOTH X-SL-RL and the body marker. In practice it could not tell a
+// stripped rate-limit decoy from an ordinary markerless decoy (max_clients,
+// protocol_unknown) or even an unrelated JSON-LD page (e.g. a Product schema).
+// Field evidence (pl1, 2026-05-29): the server rejected 0 handshakes and emitted
+// 0 sentinels, yet the lifeline fired 48× on plain max_clients decoys, each a
+// 90s self-imposed cooldown that degraded the WS pool into a feedback loop.
+//
+// The original P0 (CF strips the X-SL-RL header) is already covered WITHOUT the
+// lifeline by the Phase 1 body marker, which rides inside the HTML body and is
+// not subject to CF's header-stripping policy — see
+// TestP0Regression_BodyMarkerSurvivesCFHeaderStrip. So removing the lifeline
+// does not reopen the P0: a genuine rate-limit still carries the body marker.
+//
+// This test pins the corrected contract: a markerless HTML response (no X-SL-RL,
+// no rl-state body marker — including an unrelated Product JSON-LD page) must
+// NOT be classified as rate-limited. It still errors (it isn't a valid
+// ServerHello), but not with ErrRateLimited.
+func TestP0Regression_MarkerlessHTMLIsNotRateLimit(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// CF strips everything. Client sees 200 + HTML with no rate-limit signal.
-		// Could also be a JSON-LD page with unrelated schema (e.g. ProductPage).
+		// Markerless HTML: a plain decoy or an unrelated JSON-LD page. No
+		// rate-limit signal of any kind.
 		w.Header().Set("Content-Type", "text/html")
 		w.WriteHeader(http.StatusOK)
 		_, _ = fmt.Fprint(w, `<!DOCTYPE html><html><head>
@@ -284,34 +303,9 @@ func TestP0Regression_LifelineWhenEverythingStripped(t *testing.T) {
 
 	_, sendErr := tr.SendHandshake(t.Context(), hello)
 
-	if sendErr == nil {
-		t.Fatal("expected ErrRateLimited from SendHandshake (lifeline must fire on HTML body), got nil")
-	}
-	if !errors.Is(sendErr, ErrRateLimited) {
-		t.Errorf("errors.Is(err, ErrRateLimited) = false; want true; got: %v", sendErr)
-	}
-
-	var rlErr *RateLimitError
-	if !errors.As(sendErr, &rlErr) {
-		t.Fatalf("errors.As(*RateLimitError) failed; got: %v", sendErr)
-	}
-	if rlErr.Signal == nil {
-		t.Fatal("RateLimitError.Signal must not be nil")
-	}
-	if rlErr.Signal.Carrier != "fallback" {
-		t.Errorf("Signal.Carrier: got %q, want %q", rlErr.Signal.Carrier, "fallback")
-	}
-	if rlErr.Signal.Bucket != "unknown_via_fallback" {
-		t.Errorf("Signal.Bucket: got %q, want %q", rlErr.Signal.Bucket, "unknown_via_fallback")
-	}
-	if rlErr.Signal.RefillIn.Seconds() != 90 {
-		t.Errorf("Signal.RefillIn: got %v, want 90s (lifeline default)", rlErr.Signal.RefillIn)
-	}
-	if Stats.RateLimitDetectedFallback.Load() == 0 {
-		t.Error("Stats.RateLimitDetectedFallback must be non-zero after lifeline detection")
-	}
-	if HandshakeDecoyReceived.Load() == 0 {
-		t.Error("HandshakeDecoyReceived must be non-zero — lifeline fires on HTML decoy")
+	// Must error (not a valid ServerHello), but MUST NOT be a rate-limit error.
+	if errors.Is(sendErr, ErrRateLimited) {
+		t.Fatalf("markerless HTML must NOT be classified as rate-limited, got ErrRateLimited: %v", sendErr)
 	}
 }
 
