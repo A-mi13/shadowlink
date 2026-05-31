@@ -71,10 +71,22 @@ func TestCleanupNewbornOrphans_TwoPhase_NoLockHeldDuringIO(t *testing.T) {
 	var maxStall int64 // nanoseconds
 	var probeReads atomic.Int64
 	var wg sync.WaitGroup
+	// readerStarted closes after the reader has completed its first Get(),
+	// proving the Go scheduler has actually run the goroutine. Without this
+	// barrier, on a fully CPU-saturated host the reader can fail to get a
+	// single time slice before the (sub-10ms) sweep finishes and stop is set,
+	// yielding probeReads=0 — a test artifact (scheduler starvation), NOT the
+	// legacy lock-held regression. The barrier guarantees the reader is live
+	// and interleaving with the sweep. It does not mask the legacy bug: under
+	// the single-write-lock implementation the reader still completes this
+	// first Get() before the sweep grabs the write lock, then blocks inside
+	// Get() for the whole sweep, so its read count stays O(1).
+	readerStarted := make(chan struct{})
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		last := time.Now()
+		first := true
 		for !stop.Load() {
 			_, _ = sm.Get(probeID)
 			probeReads.Add(1)
@@ -83,8 +95,13 @@ func TestCleanupNewbornOrphans_TwoPhase_NoLockHeldDuringIO(t *testing.T) {
 				atomic.StoreInt64(&maxStall, d)
 			}
 			last = cur
+			if first {
+				first = false
+				close(readerStarted)
+			}
 		}
 	}()
+	<-readerStarted
 
 	// Run cleanup. With two-phase fix this should NOT stall the reader
 	// for hundreds of ms even with N=10000 candidates.
@@ -106,17 +123,40 @@ func TestCleanupNewbornOrphans_TwoPhase_NoLockHeldDuringIO(t *testing.T) {
 	t.Logf("sweep elapsed=%v, evicted=%d, probe reads during sweep=%d, max reader stall=%v",
 		sweepElapsed, len(evicted), probeReads.Load(), time.Duration(maxStall))
 
-	// Pre-fix bound: maxStall ≈ sweepElapsed (reader pinned for the whole sweep).
-	// Post-fix bound: maxStall << sweepElapsed (reader sees only per-candidate gaps).
-	// We require maxStall to be strictly less than half of sweepElapsed —
-	// that's a generous threshold that only fails if the lock is held for
-	// most of the sweep duration.
-	require.Less(t, time.Duration(maxStall), sweepElapsed/2,
-		"reader stall (%v) too close to total sweep elapsed (%v) — write lock likely held over full scan",
-		time.Duration(maxStall), sweepElapsed)
-	// Reader must have made forward progress during the sweep.
-	require.Greater(t, probeReads.Load(), int64(10),
-		"reader made <10 reads during sweep — write lock starved the reader (legacy bug)")
+	// The two-phase invariant we lock in is STRUCTURAL (reader throughput),
+	// not wall-clock (max stall). Rationale for dropping the timing assert:
+	//
+	//   The original `maxStall < sweepElapsed/2` check was inherently flaky.
+	//   maxStall records the largest gap between two consecutive Get() calls,
+	//   and that gap captures ANY pause of the reader goroutine — most often
+	//   OS scheduler preemption (observed 4-10ms stalls on a loaded host),
+	//   which has nothing to do with lock contention. Critically, the whole
+	//   sweep of 10000 sessions completes in only single-digit milliseconds
+	//   (measured 3.7-12ms), so a single scheduler preemption is the SAME
+	//   order of magnitude as the entire sweep. No fixed fraction of
+	//   sweepElapsed can separate "lock held across the sweep" (the legacy
+	//   bug) from "reader was briefly descheduled" (benign jitter) when both
+	//   live in the same few-millisecond band — even `maxStall < sweepElapsed`
+	//   false-fails when the reader's final post-sweep gap happens to equal
+	//   the sweep duration. Wall-clock timing is the wrong instrument here.
+	//
+	// The honest, jitter-immune invariant is reader THROUGHPUT. Under the
+	// two-phase fix the write lock is released between every one of the 10000
+	// candidates, so the reader interleaves tens of thousands of Get() calls
+	// (measured 21000-33000). Under the legacy single-write-lock bug the
+	// reader is pinned for the ENTIRE sweep and can complete only O(1) Get()
+	// calls — one just before the sweep grabs the lock, one just after it
+	// releases. We require >> N/10 (= 1000) reads: that floor sits orders of
+	// magnitude above the legacy O(1) ceiling, so it still catches the
+	// regression, yet it is unaffected by CPU load — once scheduled, the
+	// reader races through Get() far faster than the sweep deletes sessions,
+	// so the read count stays in the tens of thousands regardless of timing.
+	require.Greater(t, probeReads.Load(), int64(N/10),
+		"reader made only %d reads during the sweep of %d candidates — "+
+			"under two-phase the reader should interleave tens of thousands of "+
+			"Get() calls; a count this low means the write lock was held across "+
+			"the entire scan (legacy single-lock regression)",
+		probeReads.Load(), N)
 }
 
 // TestCleanupNewbornOrphans_TwoPhase_RaceFreeAttachBetweenPhases verifies
