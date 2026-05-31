@@ -283,6 +283,13 @@ type statsRegistry struct {
 	// timeout → stream broken instead of hanging (NEW-1).
 	StreamReassemblyOverflow   atomic.Uint64
 	StreamReassemblyGapTimeout atomic.Uint64
+	// StreamReassemblyBufferedBytes (gauge, Task 19): most-recent total bytes
+	// held out-of-order across all active reassemblers. A persistently high
+	// reading means downlink holes are common (frequent migration mid-stream
+	// or reordering on the WS path); it's the leading indicator before an
+	// overflow/gap-timeout teardown actually fires. Stored as the latest
+	// observed snapshot — last writer wins, like FirstStreamMS.
+	StreamReassemblyBufferedBytes atomic.Int64
 
 	// Bug #9 Task 15 — client MIGRATE/RESUME send-side counters. (Full client
 	// migration metrics land in Task 19; these are the minimum the send path
@@ -710,6 +717,39 @@ func WritePromMetrics(w io.Writer) {
 	fmt.Fprintf(w, "# HELP shadowlink_stream_reassembly_gap_timeout_total Migration downlink hole did not close within the gap timeout; stream broken instead of hung (Bug #9, NEW-1)\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_stream_reassembly_gap_timeout_total counter\n")
 	fmt.Fprintf(w, "shadowlink_stream_reassembly_gap_timeout_total %d\n", Stats.StreamReassemblyGapTimeout.Load())
+	fmt.Fprintf(w, "# HELP shadowlink_stream_reassembly_buffered_bytes Bytes currently held out-of-order across all downlink reassemblers (most recent observation) (Bug #9)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_stream_reassembly_buffered_bytes gauge\n")
+	fmt.Fprintf(w, "shadowlink_stream_reassembly_buffered_bytes %d\n", Stats.StreamReassemblyBufferedBytes.Load())
+
+	// Bug #9 MIGRATE/RESUME client send-side + watchdog + slot-death telemetry.
+	// Counters defined incrementally across Tasks 15-17; Task 19 surfaces them
+	// in the exposition so the pl1 canary can observe migration health
+	// (attempt → ok/fail/timeout funnel, capability-drop hysteresis trips,
+	// preemptive schedules, and reactive resume outcomes).
+	fmt.Fprintf(w, "# HELP shadowlink_migrate_attempt_total MIGRATE/RESUME frames enqueued and entering ack-await (Bug #9)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_migrate_attempt_total counter\n")
+	fmt.Fprintf(w, "shadowlink_migrate_attempt_total %d\n", Stats.MigrateAttempt.Load())
+	fmt.Fprintf(w, "# HELP shadowlink_migrate_ok_total MIGRATE/RESUME acks that returned OK within the window (Bug #9)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_migrate_ok_total counter\n")
+	fmt.Fprintf(w, "shadowlink_migrate_ok_total %d\n", Stats.MigrateOK.Load())
+	fmt.Fprintf(w, "# HELP shadowlink_migrate_fail_total MIGRATE/RESUME acks that returned FAIL within the window (Bug #9)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_migrate_fail_total counter\n")
+	fmt.Fprintf(w, "shadowlink_migrate_fail_total %d\n", Stats.MigrateFail.Load())
+	fmt.Fprintf(w, "# HELP shadowlink_migrate_timeout_total MIGRATE/RESUME ack-await expired without a reply; stream degraded (Bug #9)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_migrate_timeout_total counter\n")
+	fmt.Fprintf(w, "shadowlink_migrate_timeout_total %d\n", Stats.MigrateTimeout.Load())
+	fmt.Fprintf(w, "# HELP shadowlink_migrate_capability_dropped_total Consecutive migrate timeouts tripped the hysteresis; migration capability dropped (Bug #9)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_migrate_capability_dropped_total counter\n")
+	fmt.Fprintf(w, "shadowlink_migrate_capability_dropped_total %d\n", Stats.MigrateCapabilityDropped.Load())
+	fmt.Fprintf(w, "# HELP shadowlink_migrate_scheduled_total Preemptive (stream, slot) migrations armed by the age-watchdog (Bug #9)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_migrate_scheduled_total counter\n")
+	fmt.Fprintf(w, "shadowlink_migrate_scheduled_total %d\n", Stats.MigrateScheduled.Load())
+	fmt.Fprintf(w, "# HELP shadowlink_migrate_resume_on_death_ok_total Streams that survived a sudden slot death by re-homing onto a live slot (Bug #9)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_migrate_resume_on_death_ok_total counter\n")
+	fmt.Fprintf(w, "shadowlink_migrate_resume_on_death_ok_total %d\n", Stats.MigrateResumeOnDeathOK.Load())
+	fmt.Fprintf(w, "# HELP shadowlink_migrate_resume_on_death_fail_total Streams that broke on a sudden slot death (no live target or server refused) (Bug #9)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_migrate_resume_on_death_fail_total counter\n")
+	fmt.Fprintf(w, "shadowlink_migrate_resume_on_death_fail_total %d\n", Stats.MigrateResumeOnDeathFail.Load())
 
 	fmt.Fprintf(w, "# HELP shadowlink_slot_drain_force_evicted_active_total Emergency evictions of slotReady cells with active streams (over-aged drain target, no idle cell available)\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_slot_drain_force_evicted_active_total counter\n")
