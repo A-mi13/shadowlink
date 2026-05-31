@@ -94,6 +94,16 @@ type Session struct {
 	// NewSession directly). Set once at handshake completion; read-only after.
 	// See core/mimicry_session.go for the contract. T2.4 (Phase 3 Plan A).
 	MimicrySession *MimicrySession
+
+	// MigrateNonce is a 16-byte crypto/rand nonce stamped at session creation.
+	// It is the per-device binding discriminator for Bug #9 stream-migration
+	// proof-of-ownership (§4.1, F2): the stream secret is
+	// HMAC(serverPerClientKey, clientID‖globalStreamID‖MigrateNonce). A second
+	// device of the same clientID cannot read this nonce (it travels only inside
+	// the encrypted CONNECT reply of the originating session), so it cannot
+	// forge a proof for a stream it does not own. MUST be crypto/rand — NEVER
+	// derived from session.ID (sequential, guessable). Read-only after creation.
+	MigrateNonce [16]byte
 }
 
 // newGCM creates an AES-GCM cipher from a key.
@@ -113,7 +123,7 @@ func newGCM(key []byte) (cipher.AEAD, error) {
 // Does NOT initialize cached GCM ciphers — use SessionManager.Create() for that.
 func NewSession(id uint32, sendKey, recvKey []byte) *Session {
 	now := time.Now()
-	return &Session{
+	s := &Session{
 		ID:           id,
 		SendKey:      sendKey,
 		RecvKey:      recvKey,
@@ -121,6 +131,10 @@ func NewSession(id uint32, sendKey, recvKey []byte) *Session {
 		CreatedAt:    now,
 		lastRekey:    now,
 	}
+	// Bug #9 §4.1: per-session migration nonce from crypto/rand. A zero nonce
+	// would only make migration proofs unverifiable (fail-closed), never insecure.
+	_, _ = rand.Read(s.MigrateNonce[:])
+	return s
 }
 
 // NextSeqNum returns the next sequence number for sending.
