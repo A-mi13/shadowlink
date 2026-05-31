@@ -296,6 +296,11 @@ type statsRegistry struct {
 	MigrateFail              atomic.Uint64
 	MigrateTimeout           atomic.Uint64
 	MigrateCapabilityDropped atomic.Uint64
+	// MigrateScheduled: count of (stream, slot) preemptive migrations the
+	// age-watchdog armed via scheduleSlotMigration (Bug #9 Task 16). Full
+	// migration telemetry lands in Task 19; this is the minimum the watchdog
+	// trigger surfaces.
+	MigrateScheduled atomic.Uint64
 
 	// DrainForceEvictedTotal — every time startDrain force-evicted an
 	// idle slotReady cell (streams==0) because claimFreeSlot returned -1

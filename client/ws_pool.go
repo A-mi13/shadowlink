@@ -340,6 +340,35 @@ type poolSlot struct {
 	// Bug #8 flow control, negotiated per-slot (each slot = own core.Session).
 	flowControlEnabled bool
 	flowWindow         uint64
+
+	// migrationThresholdNs is the per-slot, per-session age (nanoseconds) at
+	// which the rotation watchdog begins preemptively MIGRATING this slot's
+	// active streams onto a younger slot (Bug #9 Task 16, F7 §5.6). Sampled
+	// ONCE in connectSlot as base × U(0.7, 1.0) where base = migrationThresholdBase()
+	// (default 60s). Distinct from the byte-budget rotation and from
+	// staggerOffsetNs age-rotation: migration moves streams to a fresh slot
+	// while the aging slot's TCP is still healthy, so a long-lived download
+	// survives the rotation instead of breaking.
+	//
+	// Why per-slot jitter (not a fixed 60s for every slot): a deterministic
+	// threshold would make every slot start migrating at the same wall-clock
+	// offset from its connect time — an FFT-visible periodicity. U(0.7,1.0)
+	// smears the migration onset across an 18s band per slot.
+	//
+	// Why max ×1.0 (not ×1.0 + headroom): the observed TSPU cut window on a
+	// bare origin is ~90s; capping the effective threshold at base (60s) keeps
+	// a 30s margin to actually migrate the streams BEFORE the middlebox freezes
+	// the aging TCP. 0 = migration trigger disabled for this slot.
+	migrationThresholdNs atomic.Int64
+
+	// migrationScheduled is set true (CAS) the first time the watchdog schedules
+	// migration of this slot's active streams. It makes scheduleSlotMigration
+	// idempotent — the watchdog ticks every 5s and would otherwise re-arm a
+	// fresh batch of time.AfterFunc timers on every tick while the slot stays
+	// above its threshold. Lives on poolSlot (not keyed by index) so a recycled
+	// cell's NEW *poolSlot starts with migrationScheduled=false (zero value);
+	// reset explicitly in connectSlot on (re)connect.
+	migrationScheduled atomic.Bool
 }
 
 // slotFreshnessPenaltyWindow defines how long after a slot's last death
@@ -1139,6 +1168,19 @@ type WSPoolTransport struct {
 	// migrateAckTimeoutOverride lets a unit test shorten the 1500ms ack window
 	// so timeout tests don't sleep. Zero → use the migrateAckTimeout const.
 	migrateAckTimeoutOverride time.Duration
+
+	// ── Bug #9 Task 16: age-watchdog migration scheduling test hooks ──────────
+	//
+	// migrateStreamHook, when non-nil, replaces the real migrateStream wire
+	// round-trip in scheduleSlotMigration's per-stream timers. Lets a unit test
+	// observe scheduling/idempotency without a live slot. Production leaves it
+	// nil (the AfterFunc calls p.migrateStream directly).
+	migrateStreamHook func(streamID uint16)
+
+	// migrateSpreadOverride shortens the U(0,spread) per-stream offset so a
+	// unit test's AfterFunc timers fire in milliseconds instead of seconds.
+	// Zero → use migrationSpread().
+	migrateSpreadOverride time.Duration
 }
 
 // migrateHysteresisThreshold is the number of consecutive MIGRATE/RESUME
@@ -1544,6 +1586,23 @@ func (p *WSPoolTransport) rotationWatchdogSweep() {
 		if started == 0 {
 			continue // not yet connected; connectSlot hasn't stamped it
 		}
+
+		// Bug #9 Task 16: preemptive stream migration. When the slot crosses its
+		// per-session migration threshold (sampled base × U(0.7,1.0), default
+		// 60s) AND the pool can migrate AND the slot still carries active
+		// streams, schedule each active stream to MIGRATE onto a younger slot
+		// with an independent U(0,spread) delay (NOT a burst — F7 §5.6). This is
+		// ADDITIVE to the age/byte rotation below: the aging slot keeps serving
+		// until its streams drain or it hits the (later) age-rotation threshold,
+		// but its long-lived downloads get moved off BEFORE the ~90s TSPU cut
+		// window freezes the TCP. Idempotent per slot via migrationScheduled.
+		if migThresh := slot.migrationThresholdNs.Load(); migThresh > 0 &&
+			nowNs-started >= migThresh &&
+			p.MigrateCapable() &&
+			slot.streams.Load() > 0 {
+			p.scheduleSlotMigration(idx, slot)
+		}
+
 		// Per-slot age threshold = max-age + per-session frozen grid jitter.
 		effectiveMaxAge := p.maxSlotAge.Nanoseconds() + slot.staggerOffsetNs.Load()
 		if nowNs-started < effectiveMaxAge {
@@ -1864,6 +1923,14 @@ func (p *WSPoolTransport) connectSlot(ctx context.Context, idx int) error {
 	// docstring. Stored as nanoseconds (int64) so the watchdog can do raw
 	// arithmetic with maxSlotAge.Nanoseconds().
 	slot.staggerOffsetNs.Store(int64(slotStaggerOffset(idx)))
+	// Bug #9 Task 16: sample THIS connection's preemptive-migration threshold
+	// once and freeze it (base × U(0.7,1.0)). Per-slot jitter smears the
+	// migration onset so the pool's slots don't all begin migrating at the same
+	// offset from connect (FFT-visible periodicity). Reset the per-slot
+	// scheduling gate so a recycled cell re-arms cleanly — the OLD watchdog's
+	// timers operate on the OLD *poolSlot, the NEW slot starts un-scheduled.
+	slot.migrationThresholdNs.Store(sampleMigrationThreshold(migrationThresholdBase()))
+	slot.migrationScheduled.Store(false)
 	// Stamp the slot's startup time — both the reader's local age check and
 	// the pool-level rotation watchdog goroutine read this. Set BEFORE
 	// setState(slotReady) so the watchdog never observes a ready slot with
