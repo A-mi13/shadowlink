@@ -398,3 +398,77 @@ func ParseStreamAckFrame(payload []byte) (streamID uint16, ackedDownSeq uint64, 
 	ackedDownSeq = binary.BigEndian.Uint64(payload[2:10])
 	return streamID, ackedDownSeq, nil
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// MIGRATE/RESUME server reply convention (§3.4, Bug #9 Task 11).
+//
+// The server replies to a client MIGRATE/RESUME on the NEW slot using the SAME
+// flag it received (FlagMigrate → MIGRATE_OK/FAIL, FlagResume → RESUME_OK/FAIL).
+// The reply payload's FIRST byte is a status discriminator so the client can
+// tell OK from FAIL without a second flag:
+//
+//	OK   : [status=0x01][globalStreamID(2 BE)][resumeDownSeq(8 BE)]   (11 bytes)
+//	FAIL : [status=0x00][globalStreamID(2 BE)][reasonCode(1)]         (4 bytes)
+//
+// resumeDownSeq is the highest downSeq the server assigned BEFORE the binding
+// switched — the client waits for the old slot's in-flight tail up to this seq,
+// then accepts data from the new slot as continuous (§3.4). The client parser
+// (Task 15) reads byte 0 to branch. RESUME_OK's bufferedFromSeq (§3.4) is folded
+// into resumeDownSeq here for v1 — Task 15 may split it if the reassembler needs
+// it separately; documented so the convention is unambiguous now.
+const (
+	MigrateReplyFail byte = 0x00
+	MigrateReplyOK   byte = 0x01
+)
+
+// MIGRATE/RESUME failure reason codes (§3.4). Short codes keep the reply
+// indistinguishable in length across reasons and feed the metric/log labels.
+const (
+	MigrateReasonNotFound     byte = 0x01
+	MigrateReasonBadProof     byte = 0x02
+	MigrateReasonGraceExpired byte = 0x03
+	MigrateReasonLimit        byte = 0x04
+	MigrateReasonDestClosed   byte = 0x05
+)
+
+// BuildMigrateOK builds the OK reply payload: [0x01][streamID(2)][resumeDownSeq(8)].
+func BuildMigrateOK(streamID uint16, resumeDownSeq uint64) []byte {
+	p := make([]byte, 1+2+8)
+	p[0] = MigrateReplyOK
+	binary.BigEndian.PutUint16(p[1:3], streamID)
+	binary.BigEndian.PutUint64(p[3:11], resumeDownSeq)
+	return p
+}
+
+// BuildMigrateFail builds the FAIL reply payload: [0x00][streamID(2)][reason(1)].
+func BuildMigrateFail(streamID uint16, reason byte) []byte {
+	p := make([]byte, 1+2+1)
+	p[0] = MigrateReplyFail
+	binary.BigEndian.PutUint16(p[1:3], streamID)
+	p[3] = reason
+	return p
+}
+
+// ParseMigrateReply parses a MIGRATE/RESUME reply payload. ok reports the
+// status byte; on ok it returns streamID + resumeDownSeq; on !ok it returns
+// streamID + reason in the resumeDownSeq's low byte position via reason.
+// Errors (never panics) on a malformed/short payload.
+func ParseMigrateReply(payload []byte) (ok bool, streamID uint16, resumeDownSeq uint64, reason byte, err error) {
+	if len(payload) < 4 {
+		return false, 0, 0, 0, fmt.Errorf("migrate reply too short: %d < 4", len(payload))
+	}
+	switch payload[0] {
+	case MigrateReplyOK:
+		if len(payload) < 11 {
+			return false, 0, 0, 0, fmt.Errorf("migrate OK reply too short: %d < 11", len(payload))
+		}
+		streamID = binary.BigEndian.Uint16(payload[1:3])
+		resumeDownSeq = binary.BigEndian.Uint64(payload[3:11])
+		return true, streamID, resumeDownSeq, 0, nil
+	case MigrateReplyFail:
+		streamID = binary.BigEndian.Uint16(payload[1:3])
+		return false, streamID, 0, payload[3], nil
+	default:
+		return false, 0, 0, 0, fmt.Errorf("migrate reply: unknown status byte 0x%02x", payload[0])
+	}
+}

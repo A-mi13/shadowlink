@@ -503,6 +503,105 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	h.runWebSocketSession(conn, session, flowWindow, migrateEnabled)
 }
 
+// migrateGracePeriod is how long the server keeps an orphaned relay alive
+// after its WS slot dies, waiting for a RESUME on a live slot (§5.5, default
+// 8s). The env override (SHADOWLINK_MIGRATE_GRACE) and Config field land in
+// Task 18 (§7); the const default carries the behaviour until then.
+const migrateGracePeriod = 8 * time.Second
+
+// handleMigrateOrResume processes a FlagMigrate (preemptive, §5.3) or FlagResume
+// (reactive, §5.5) control frame. It runs on the reader goroutine of the NEW
+// slot's WS session, so `session`/`writer` are that slot's binding.
+//
+// Flow (single-winner, F8):
+//  1. Parse [globalStreamID][proof]; bad parse → silently drop (probe hygiene).
+//  2. Find the relayEntry; absent → MIGRATE_FAIL(not_found).
+//  3. Verify the HMAC stream proof in constant time against the relay's
+//     originSessionNonce (§4.1). Mismatch → FAIL(bad_proof). This is what binds
+//     a stream to the session that created it: a second device with the same
+//     clientID cannot forge the proof without that session's nonce.
+//  4. RESUME only: CAS(stOrphaned → stActive). If it fails the grace timer
+//     already won (entry is closing/closed) → FAIL(grace_expired). MIGRATE
+//     skips the CAS — the entry is still stActive (slot A is alive).
+//  5. reassociate onto this slot's binding, draining downBuffer (and, for
+//     RESUME where slot A is known-dead, resending the unacked tail). Reply
+//     OK with resumeDownSeq.
+func (h *Handler) handleMigrateOrResume(flag byte, payload []byte, clientID string, session *core.Session, writer *core.WSAsyncWriter, migrateEnabled bool) {
+	sid, proof, perr := core.ParseMigrateFrame(payload)
+	if perr != nil {
+		return // malformed — drop without a reply (probe hygiene)
+	}
+
+	entry, ok := h.relayRegistry.find(clientID, sid)
+	if !ok {
+		h.metrics.MigrateFail.Add(1)
+		h.enqueueMigrateFail(session, writer, flag, sid, core.MigrateReasonNotFound)
+		return
+	}
+
+	// §4.1: recompute the per-client key from the server master key (stateless)
+	// and verify the proof against the relay's origin session nonce in constant
+	// time (F12 — crypto/hmac.Equal inside VerifyStreamProof, never bytes.Equal).
+	perClientKey := core.DeriveServerPerClientKey(h.migrateMasterKey(), clientID)
+	if !core.VerifyStreamProof(proof, perClientKey, clientID, sid, entry.originSessionNonce) {
+		h.metrics.MigrateFail.Add(1)
+		h.enqueueMigrateFail(session, writer, flag, sid, core.MigrateReasonBadProof)
+		return
+	}
+
+	aDead := flag == core.FlagResume
+	if flag == core.FlagResume {
+		// Single-winner vs the grace timer: only one of {RESUME, timer} may flip
+		// the state. If CAS fails the timer already moved the entry to stClosing
+		// (and closed tc / removed it) — the relay is gone, RESUME is too late.
+		if !entry.state.CompareAndSwap(stOrphaned, stActive) {
+			h.metrics.MigrateFail.Add(1)
+			h.enqueueMigrateFail(session, writer, flag, sid, core.MigrateReasonGraceExpired)
+			return
+		}
+	}
+
+	resumeSeq := entry.reassociate(session, writer, migrateEnabled, aDead)
+	if flag == core.FlagResume {
+		h.metrics.ResumeOK.Add(1)
+	} else {
+		h.metrics.MigrateOK.Add(1)
+	}
+	h.enqueueMigrateOK(session, writer, flag, sid, resumeSeq)
+}
+
+// migrateMasterKey returns the 32-byte server master-key material used to derive
+// per-client migration keys (§4.1). Per spec it is "the same material used for
+// the rest of the server crypto" — the server's static X25519 private key. It is
+// never sent on the wire; the client only ever replays the opaque streamSecret
+// the server handed it (encrypted) at CONNECT, so the client does not need it.
+func (h *Handler) migrateMasterKey() []byte {
+	if h.serverKey == nil {
+		return make([]byte, 32) // fail-closed: VerifyStreamProof will reject
+	}
+	return h.serverKey.Private
+}
+
+// enqueueMigrateOK / enqueueMigrateFail build, encrypt under the NEW slot's
+// session, and enqueue the MIGRATE/RESUME reply on the new slot's writer. The
+// reply reuses the inbound flag (FlagMigrate/FlagResume) with a status-byte
+// payload (§3.4 convention, core.BuildMigrateOK/Fail). Client parse: Task 15.
+func (h *Handler) enqueueMigrateOK(session *core.Session, writer *core.WSAsyncWriter, flag byte, sid uint16, resumeDownSeq uint64) {
+	chunk := &core.Chunk{SessionID: session.ID, SeqNum: session.NextSeqNum(), Flags: flag,
+		Payload: core.BuildMigrateOK(sid, resumeDownSeq)}
+	if enc, err := session.EncryptChunk(chunk); err == nil {
+		_ = writer.Enqueue(websocket.BinaryMessage, enc)
+	}
+}
+
+func (h *Handler) enqueueMigrateFail(session *core.Session, writer *core.WSAsyncWriter, flag byte, sid uint16, reason byte) {
+	chunk := &core.Chunk{SessionID: session.ID, SeqNum: session.NextSeqNum(), Flags: flag,
+		Payload: core.BuildMigrateFail(sid, reason)}
+	if enc, err := session.EncryptChunk(chunk); err == nil {
+		_ = writer.Enqueue(websocket.BinaryMessage, enc)
+	}
+}
+
 // runWebSocketSession runs the per-session WebSocket relay: async writer,
 // 20 s ping, pong-reset read deadlines, and the inbound dispatcher for
 // data/connect/fin/keepalive/udp chunks. Returns when either side closes
@@ -524,6 +623,21 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 	if flowEnabled {
 		h.metrics.FlowSessionsActive.Add(1)
 		defer h.metrics.FlowSessionsActive.Add(-1)
+	}
+
+	// Bug #9 §5.3/§5.5: for a migration-negotiated session, resolve the clientID
+	// once up front so the MIGRATE/RESUME/StreamAck handlers below can key the
+	// relayRegistry without re-locking tunnelsMu per frame. The clientID is the
+	// account identity established at handshake (same value the CONNECT path
+	// registers relays under). For non-migration sessions this stays "" and the
+	// handlers below are never reached (the client won't send those flags).
+	var migrateClientID string
+	if migrateEnabled {
+		h.tunnelsMu.RLock()
+		if t, ok := h.tunnels[session.ID]; ok {
+			migrateClientID = t.ClientID
+		}
+		h.tunnelsMu.RUnlock()
 	}
 
 	// Async write queue: decouples per-stream relay goroutines and CONNECT_OK
@@ -1004,6 +1118,33 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 				}
 				h.metrics.FlowWindowUpdatesRecv.Add(1)
 
+			case core.FlagMigrate, core.FlagResume:
+				// Bug #9 §5.3 (preemptive MIGRATE) / §5.5 (reactive RESUME).
+				// The client presents [globalStreamID][proof]; we verify the
+				// HMAC proof (§4.1, constant-time), CAS the state for RESUME
+				// (single-winner vs the grace timer), reassociate the relay onto
+				// THIS slot's {session, writer}, and reply OK/FAIL on this slot.
+				// Only ever reached for migration-negotiated sessions.
+				if !migrateEnabled {
+					continue
+				}
+				h.handleMigrateOrResume(chunk.Flags, chunk.Payload, migrateClientID, session, writer, migrateEnabled)
+
+			case core.FlagStreamAck:
+				// Bug #9 §5.4: client confirms it has delivered downlink up to
+				// ackedDownSeq in order → server may release the unacked tail of
+				// that stream (frees the resend buffer).
+				if !migrateEnabled {
+					continue
+				}
+				sid, ackedSeq, aerr := core.ParseStreamAckFrame(chunk.Payload)
+				if aerr != nil {
+					continue
+				}
+				if entry, ok := h.relayRegistry.find(migrateClientID, sid); ok {
+					entry.onStreamAck(ackedSeq)
+				}
+
 			default:
 				h.metrics.UnknownFlag.Add(1)
 			}
@@ -1022,6 +1163,33 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 	}()
 
 	<-done
+
+	// Bug #9 §5.5: WS-conn death for a migration session. For every relayEntry
+	// still BOUND TO THIS session (i.e. the stream was NOT preemptively migrated
+	// to another live slot — if it had been, its binding now points elsewhere
+	// and we must leave it alone), transition it to orphaned and arm the grace
+	// timer. We DO NOT close its egress tc here (that is the whole point of F4 —
+	// the egress survives the slot so a RESUME on another slot can pick it up).
+	// Streams already moved to another slot keep running there untouched.
+	//
+	// Ordering note: this runs BEFORE the streams[] cleanup below. The migration
+	// CONNECT path stored the relay's tc on the relayEntry (not in streams[]),
+	// so closing streams[] does not touch the egress conns of migratable relays.
+	if migrateEnabled && migrateClientID != "" {
+		now := time.Now().UnixNano()
+		for _, e := range h.relayRegistry.entriesForSession(migrateClientID, session) {
+			if e.toOrphaned(now) {
+				// Wake a relay loop that may be blocked on a full downBuffer with
+				// no binding so it re-evaluates (it stays buffering during grace,
+				// but the broadcast prevents a stale park if the buffer later
+				// frees via ack-eviction). Then arm the grace teardown timer.
+				e.bufCondOf().Broadcast()
+				h.relayRegistry.launchGraceTimer(e, migrateGracePeriod, func() {
+					h.metrics.MigrateGraceExpired.Add(1)
+				})
+			}
+		}
+	}
 
 	// Cleanup all streams
 	streamsMu.Lock()

@@ -213,6 +213,17 @@ type Metrics struct {
 	FlowStreamCreditWaitsTotal  atomic.Uint64
 	FlowStreamCreditWaitMsTotal atomic.Uint64
 
+	// Bug #9 stream-migration counters (Task 11). The FULL metric table —
+	// including the {reason}-labelled fail counters, the orphaned-relays gauge,
+	// the FD-budget rejections, and Prometheus/Snapshot exposition — lands in
+	// Task 18 (§4.3). These four are added now so the MIGRATE/RESUME/grace
+	// handlers can tick something without breaking the build; they are plain
+	// atomic counters, not yet exported via the text/JSON snapshots.
+	MigrateOK           atomic.Uint64 // successful preemptive MIGRATE reassociations
+	ResumeOK            atomic.Uint64 // successful reactive RESUME reassociations (from grace)
+	MigrateFail         atomic.Uint64 // MIGRATE/RESUME rejected (not_found|bad_proof|grace_expired)
+	MigrateGraceExpired atomic.Uint64 // grace window elapsed without a RESUME → relay closed
+
 	backpressureActive atomic.Bool
 
 	// T1.7 (Phase 2, 2026-04-26) — BroadcastStreamClose drain instrumentation.

@@ -129,6 +129,28 @@ type relayEntry struct {
 	credit *streamCredit
 
 	perEntryMu sync.Mutex
+
+	// bufCond signals the relay loop when downBuffer frees up (a binding was
+	// reassociated and drained the buffer) so a relay loop that blocked on a
+	// full downBuffer during the no-binding window can resume — the lazy-seq /
+	// blocking-backpressure machinery that closes the Task 10 quality-review
+	// gap (no seq assigned until a frame is guaranteed stored, NEW-1). Created
+	// lazily by bufCondOf so the many relayEntry literals (production + tests)
+	// don't each have to wire it; it is always backed by perEntryMu.
+	bufCond     *sync.Cond
+	bufCondOnce sync.Once
+}
+
+// bufCondOf returns the entry's downBuffer condition variable, creating it once
+// on first use bound to perEntryMu. Safe for concurrent first-callers via the
+// sync.Once. The relay loop, reassociate, and the grace timer all funnel
+// buffer-availability signalling through this single cond so a blocked loop is
+// woken exactly when space appears or the stream is torn down.
+func (e *relayEntry) bufCondOf() *sync.Cond {
+	e.bufCondOnce.Do(func() {
+		e.bufCond = sync.NewCond(&e.perEntryMu)
+	})
+	return e.bufCond
 }
 
 // relayRegistry holds relays keyed (clientID, globalStreamID), living
@@ -173,6 +195,26 @@ func (r *relayRegistry) remove(clientID string, streamID uint16) {
 			delete(r.byClient, clientID)
 		}
 	}
+}
+
+// entriesForSession returns the relayEntries under clientID whose CURRENT
+// binding is sess — i.e. relays still bound to the dying WS session, which must
+// be orphaned (§5.5). Relays that were preemptively migrated to another slot
+// have a binding pointing at a different session and are excluded (left running
+// on their new slot). Snapshots the slice under RLock so the caller mutates
+// each entry's state without holding the registry lock (lock order: registry
+// RLock released before per-entry CAS — avoids deadlock with the grace timer's
+// registry.remove, §5.1).
+func (r *relayRegistry) entriesForSession(clientID string, sess *core.Session) []*relayEntry {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []*relayEntry
+	for _, e := range r.byClient[clientID] {
+		if b := e.bound.Load(); b != nil && b.session == sess {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 func (r *relayRegistry) countForClient(clientID string) int {
@@ -251,37 +293,192 @@ func (e *relayEntry) relayLoop(migrateEnabled bool, closeCh <-chan struct{}) {
 
 		n, err := e.tc.Read(buf[:limit])
 		if n > 0 {
-			seq := e.downSeqCounter.Add(1)
-			frame := pendingDownFrame{seq: seq, data: append([]byte(nil), buf[:n]...)}
+			data := append([]byte(nil), buf[:n]...)
 
-			b := e.bound.Load()
-			if b == nil || b.session == nil || b.writer == nil {
-				// No active binding (grace window / pre-reassociate, §5.3): hold
-				// the frame in downBuffer so the next binding can flush it in
-				// order. Apply backpressure (don't consume credit, don't read
-				// faster) when the buffer is full.
-				e.perEntryMu.Lock()
-				ok := e.downBuffer.Push(frame)
-				e.perEntryMu.Unlock()
-				if !ok {
-					time.Sleep(2 * time.Millisecond)
-				}
-				continue
+			// CRITICAL (Task 10 quality-review gate, NEW-1): the downSeq is
+			// assigned EXACTLY ONCE per frame, and ONLY once the frame is
+			// guaranteed to be either sent under a live binding or stored in
+			// downBuffer. The legacy code took the seq before checking the
+			// binding, so a drop-on-full downBuffer left a hole in the seq
+			// sequence — a permanent reassembler stall on the client ("does not
+			// recover"). routeDownFrame makes the whole decision (assign seq,
+			// store-or-send) atomically under perEntryMu, blocking on full-buffer
+			// backpressure (we stop reading the egress; the site's window
+			// collapses; no byte dropped). It returns the binding+frame to send
+			// directly, or nil if the frame was buffered / the stream torn down.
+			b, frame, alive := e.routeDownFrame(data, closeCh)
+			if !alive {
+				// Stream torn down while blocked (closeCh fired or stClosing) —
+				// exit the pump without leaving a half-assigned seq.
+				return
 			}
-
-			// Track as unacked-until-StreamAck so a slot-A death before ack can
-			// resend the tail on slot B (NEW-1, §5.3).
-			e.perEntryMu.Lock()
-			e.unackedTail.Push(frame)
-			e.perEntryMu.Unlock()
-
-			e.enqueueDownFrame(b, migrateEnabled, frame)
+			if b != nil {
+				e.enqueueDownFrame(b, migrateEnabled, frame)
+			}
 			e.credit.consume(n)
 		}
 		if err != nil {
 			return
 		}
 	}
+}
+
+// routeDownFrame is the single, fully-serialized decision point for one
+// downlink frame (NEW-1, Task 10 quality-review gate). Under perEntryMu it:
+//
+//  1. Tears down promptly if the stream is closing / closeCh fired (returns
+//     alive=false; NO seq is assigned — the counter stays gapless).
+//  2. If a binding is live AND downBuffer is empty → assigns the next seq,
+//     records the frame in unackedTail (resend-on-A-death tail, §5.3), and
+//     returns (binding, frame) so the caller sends it directly. The send
+//     itself happens OUTSIDE the lock (caller) to avoid holding perEntryMu
+//     across encrypt/enqueue.
+//  3. Otherwise (no binding, OR binding present but downBuffer non-empty —
+//     i.e. there are still buffered frames that MUST go out first to preserve
+//     order) → assigns the next seq and pushes into downBuffer. If the buffer
+//     is full it blocks on bufCond (backpressure) until reassociate drains it
+//     or the stream is torn down. reassociate is the sole drainer of
+//     downBuffer, so the loop never races a partial drain: a frame is either
+//     fully buffered (to be flushed by reassociate in seq order) or fully sent
+//     on the fast path when the buffer is verified empty.
+//
+// Returns (binding, frame, true) to send directly; (nil, _, true) when the
+// frame was buffered; (nil, _, false) on teardown.
+func (e *relayEntry) routeDownFrame(data []byte, closeCh <-chan struct{}) (*binding, pendingDownFrame, bool) {
+	cond := e.bufCondOf()
+	e.perEntryMu.Lock()
+	defer e.perEntryMu.Unlock()
+	for {
+		select {
+		case <-closeCh:
+			return nil, pendingDownFrame{}, false
+		default:
+		}
+		if e.state.Load() == stClosing {
+			return nil, pendingDownFrame{}, false
+		}
+
+		b := e.bound.Load()
+		bufferEmpty := e.downBuffer.byteLen() == 0
+		if b != nil && b.session != nil && b.writer != nil && bufferEmpty {
+			// Fast path: send directly under the current binding. Assign the seq
+			// here (under the lock) so it stays strictly ordered with any
+			// concurrent buffering decision.
+			seq := e.downSeqCounter.Add(1)
+			frame := pendingDownFrame{seq: seq, data: data}
+			// Track for resend on slot-A death before ack (NEW-1, §5.3). Bounded
+			// by one flow window; the credit gate guarantees in-flight ≤ window
+			// so this push always fits.
+			e.unackedTail.Push(frame)
+			return b, frame, true
+		}
+
+		// Buffer path: no binding, or buffered frames still pending (order must
+		// be preserved). Assign the seq only once the frame is accepted into the
+		// buffer, so a full buffer never creates a gap.
+		seq := e.downSeqCounter.Load() + 1
+		if e.downBuffer.Push(pendingDownFrame{seq: seq, data: data}) {
+			e.downSeqCounter.Store(seq)
+			return nil, pendingDownFrame{}, true
+		}
+		// Buffer full — block (backpressure) until reassociate drains it or the
+		// stream is torn down. cond.Wait releases perEntryMu while parked.
+		cond.Wait()
+	}
+}
+
+// reassociate switches the entry to a new (session, writer) pair, drains any
+// downlink buffered during the no-binding window onto the new binding in seq
+// order, and — when slot A is known-dead (aDead, §5.3) — resends the still-
+// unacked tail on the new binding. downSeqCounter is NEVER reset (NEW-3): the
+// counter is monotonic across every migration. Returns resumeDownSeq = the
+// highest seq assigned before the binding switched, so the client knows how far
+// the old slot's in-flight tail extends (§3.4 MIGRATE_OK).
+//
+// Concurrency: the binding is published with one atomic Store of the consistent
+// {session, writer} pair (NEW-5) so the relay loop can never observe a torn
+// pair. The buffer is drained under perEntryMu (held only for the snapshot, not
+// for the enqueue) to avoid holding the lock across encrypt/enqueue. After the
+// store + drain we Broadcast bufCond so a relay loop that blocked on a full
+// downBuffer during the no-binding window wakes, sees the now-non-nil binding /
+// freed buffer, and resumes — no deadlock because reassociate does not hold
+// perEntryMu while enqueuing.
+func (e *relayEntry) reassociate(sess *core.Session, w *core.WSAsyncWriter, migrateEnabled bool, aDead bool) uint64 {
+	resumeDownSeq := e.downSeqCounter.Load()
+	b := &binding{session: sess, writer: w}
+	e.bound.Store(b)
+
+	cond := e.bufCondOf()
+	e.perEntryMu.Lock()
+	buffered := e.downBuffer.drainAll()
+	var resend []pendingDownFrame
+	if aDead {
+		resend = e.unackedTail.tailFrames()
+	}
+	// Broadcast UNDER perEntryMu so the wakeup can't be lost: a relay loop that
+	// observed a full buffer is either (a) still holding perEntryMu about to
+	// Wait — it will Wait and this Broadcast (serialized after its Wait by the
+	// mutex) wakes it, or (b) already in Wait — Broadcast wakes it. Either way
+	// it re-checks under the lock and finds the drained (empty) buffer. Closing
+	// the lost-wakeup window is why drainAll + Broadcast share one lock hold.
+	cond.Broadcast()
+	e.perEntryMu.Unlock()
+
+	// Drain buffered-during-no-binding first, then resend the unacked tail. The
+	// client reassembler dedups by f.seq < expectedSeq (§5.4) so a frame that
+	// arrived on both A (in-flight) and B (resend) is idempotent.
+	for _, f := range buffered {
+		e.enqueueDownFrame(b, migrateEnabled, f)
+	}
+	for _, f := range resend {
+		e.enqueueDownFrame(b, migrateEnabled, f)
+	}
+	return resumeDownSeq
+}
+
+// toOrphaned transitions an active entry to orphaned and stamps the clock.
+// Returns false if the entry was not active (already orphaned/closing) — the
+// single-winner CAS guarantees exactly one caller performs the transition.
+func (e *relayEntry) toOrphaned(now int64) bool {
+	if e.state.CompareAndSwap(stActive, stOrphaned) {
+		e.orphanedAt.Store(now)
+		return true
+	}
+	return false
+}
+
+// launchGraceTimer arms the grace window for an orphaned relay. After `grace`
+// elapses it tries CAS(stOrphaned → stClosing). If it WINS (no RESUME arrived),
+// it closes the egress tc, removes the entry from the registry, broadcasts
+// bufCond (so a relay loop blocked on a full downBuffer with no binding exits),
+// and ticks the grace-expired metric if supplied. If it LOSES (a RESUME already
+// flipped the entry back to stActive), it does nothing — F8: a losing timer must
+// never tear down a reassociated relay. The timer runs in its own goroutine so
+// the caller (WS-session cleanup) is not blocked.
+func (r *relayRegistry) launchGraceTimer(e *relayEntry, grace time.Duration, onExpire func()) {
+	go func() {
+		time.Sleep(grace)
+		if !e.state.CompareAndSwap(stOrphaned, stClosing) {
+			// RESUME (or another transition) already moved the entry — no-op.
+			return
+		}
+		// Winner: tear down the orphaned relay.
+		r.remove(e.originClientID, e.globalStreamID)
+		if e.tc != nil {
+			e.tc.Close()
+		}
+		// Wake a relay loop blocked in bufferDownFrameBlocking so it re-checks
+		// state==stClosing and exits without assigning a seq. Broadcast UNDER
+		// perEntryMu to close the lost-wakeup window against the loop's
+		// check-state-then-Wait sequence (same reasoning as reassociate).
+		cond := e.bufCondOf()
+		e.perEntryMu.Lock()
+		cond.Broadcast()
+		e.perEntryMu.Unlock()
+		if onExpire != nil {
+			onExpire()
+		}
+	}()
 }
 
 // enqueueDownFrame encrypts one downlink frame under the GIVEN binding's session
