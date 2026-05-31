@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"runtime"
 	"strings"
@@ -213,16 +214,43 @@ type Metrics struct {
 	FlowStreamCreditWaitsTotal  atomic.Uint64
 	FlowStreamCreditWaitMsTotal atomic.Uint64
 
-	// Bug #9 stream-migration counters (Task 11). The FULL metric table —
-	// including the {reason}-labelled fail counters, the orphaned-relays gauge,
-	// the FD-budget rejections, and Prometheus/Snapshot exposition — lands in
-	// Task 18 (§4.3). These four are added now so the MIGRATE/RESUME/grace
-	// handlers can tick something without breaking the build; they are plain
-	// atomic counters, not yet exported via the text/JSON snapshots.
+	// Bug #9 stream-migration counters. Task 11 added the four core counters
+	// (MigrateOK/ResumeOK/MigrateFail/MigrateGraceExpired) so the MIGRATE/RESUME/
+	// grace handlers had something to tick; Task 18 finalizes the §4.3 table by
+	// adding the {reason}-labelled fail breakdown, the tail-resend instrumentation,
+	// and the registry-sourced orphan gauge/rejection counters (surfaced via
+	// AttachRelayRegistry — see below), plus the text/JSON exposition that Task 11
+	// deferred.
+	//
+	// MigrateFail is the AGGREGATE (every MIGRATE/RESUME rejection ticks it,
+	// regardless of reason) — kept for at-a-glance dashboards and because Task 11
+	// tests pin it. The three MigrateFail{NotFound,BadProof,GraceExpired} counters
+	// are the per-reason breakdown; each fail site ticks BOTH the aggregate and the
+	// matching reason counter so `MigrateFail == sum(reason counters)` holds.
 	MigrateOK           atomic.Uint64 // successful preemptive MIGRATE reassociations
 	ResumeOK            atomic.Uint64 // successful reactive RESUME reassociations (from grace)
-	MigrateFail         atomic.Uint64 // MIGRATE/RESUME rejected (not_found|bad_proof|grace_expired)
+	MigrateFail         atomic.Uint64 // MIGRATE/RESUME rejected (aggregate of the three reasons below)
 	MigrateGraceExpired atomic.Uint64 // grace window elapsed without a RESUME → relay closed
+
+	// Per-reason MIGRATE/RESUME fail breakdown (Task 18, §4.3).
+	MigrateFailNotFound     atomic.Uint64 // relay not in registry for (clientID, streamID)
+	MigrateFailBadProof     atomic.Uint64 // HMAC stream-proof verification failed
+	MigrateFailGraceExpired atomic.Uint64 // RESUME lost CAS to the grace timer (relay already closed)
+
+	// Tail-resend instrumentation (Task 18, §4.3 / §5.3). MigrateTailResent counts
+	// frames re-enqueued on the new binding when slot A died before acking;
+	// MigrateTailBufferedBytes is a gauge of bytes currently held in unacked tails
+	// across all relays (signed for delta Add as tails fill/evict).
+	MigrateTailResent        atomic.Uint64
+	MigrateTailBufferedBytes atomic.Int64
+
+	// relayReg, when non-nil, is the live relay registry whose self-contained
+	// orphan counters (orphanedFDInUse gauge, orphanFDRejected, orphanedEvictedLimit)
+	// the Snapshot reads directly — avoiding a duplicate count. Set once via
+	// AttachRelayRegistry in NewHandler after the registry is constructed; read-only
+	// thereafter (atomic.Pointer for the publish/read happens-before edge). When nil
+	// (unit tests that build a bare *Metrics) the orphan series snapshot as zero.
+	relayReg atomic.Pointer[relayRegistry]
 
 	backpressureActive atomic.Bool
 
@@ -316,6 +344,18 @@ func NewMetrics() *Metrics {
 		startTime:   time.Now(),
 		decoyServed: make([]atomic.Uint64, len(AllDecoyReasons)),
 	}
+}
+
+// AttachRelayRegistry publishes the live relay registry so Snapshot can read its
+// self-contained orphan counters directly (Bug #9 Task 18, §4.3). The registry
+// owns orphanedFDInUse (the OrphanedRelaysActive gauge), orphanFDRejected, and
+// orphanedEvictedLimit; reading them here avoids a duplicate count on the hot
+// admit/evict paths. Called once in NewHandler; nil-safe.
+func (m *Metrics) AttachRelayRegistry(reg *relayRegistry) {
+	if m == nil {
+		return
+	}
+	m.relayReg.Store(reg)
 }
 
 // decoyReasonIndex returns the slot index for a DecoyReason in the decoyServed
@@ -418,6 +458,23 @@ type MetricsSnapshot struct {
 	// Bug #8 credit-wait canary (MEDIUM-2, 2026-05-30).
 	FlowStreamCreditWaitsTotal  uint64 `json:"flow_stream_credit_waits_total"`
 	FlowStreamCreditWaitMsTotal uint64 `json:"flow_stream_credit_wait_ms_total"`
+	// Bug #9 (2026-05-31) — stream-migration observability (§4.3). MigrateFail is
+	// the aggregate; the three *Fail* fields are the per-reason breakdown.
+	// OrphanedRelaysActive / OrphanFDBudgetRejected / OrphanedEvictedLimit are
+	// sourced from the relay registry (orphanedFDInUse / orphanFDRejected /
+	// orphanedEvictedLimit) via the attached registry — single source of truth.
+	MigrateOK                uint64 `json:"migrate_ok"`
+	ResumeOK                 uint64 `json:"resume_ok"`
+	MigrateFail              uint64 `json:"migrate_fail"`
+	MigrateFailNotFound      uint64 `json:"migrate_fail_not_found"`
+	MigrateFailBadProof      uint64 `json:"migrate_fail_bad_proof"`
+	MigrateFailGraceExpired  uint64 `json:"migrate_fail_grace_expired"`
+	MigrateGraceExpired      uint64 `json:"migrate_grace_expired"`
+	MigrateTailResent        uint64 `json:"migrate_tail_resent"`
+	MigrateTailBufferedBytes int64  `json:"migrate_tail_buffered_bytes"`
+	OrphanedRelaysActive     int64  `json:"orphaned_relays_active"`
+	OrphanFDBudgetRejected   uint64 `json:"orphan_fd_budget_rejected"`
+	OrphanedEvictedLimit     uint64 `json:"orphaned_evicted_limit"`
 	// Wave 2.1 (2026-05-17) — WS upgrade accepts on retired legacy paths.
 	WSPathLegacyHits uint64 `json:"ws_path_legacy_hits"`
 	// T1.7 (Phase 2) — BroadcastStreamClose drain SLA telemetry.
@@ -441,6 +498,17 @@ type MetricsSnapshot struct {
 func (m *Metrics) Snapshot() MetricsSnapshot {
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
+
+	// Bug #9 Task 18: orphan series come from the attached relay registry (single
+	// source of truth — the registry mutates these on the admit/evict hot paths).
+	// nil registry (bare-*Metrics unit tests) snapshots them as zero.
+	var orphanActive int64
+	var orphanFDRejected, orphanEvicted uint64
+	if reg := m.relayReg.Load(); reg != nil {
+		orphanActive = reg.orphanedFDInUse.Load()
+		orphanFDRejected = reg.orphanFDRejected.Load()
+		orphanEvicted = reg.orphanedEvictedLimit.Load()
+	}
 
 	return MetricsSnapshot{
 		ActiveClients:                      m.ActiveClients.Load(),
@@ -484,6 +552,18 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		FlowSessionsActive:                 m.FlowSessionsActive.Load(),
 		FlowStreamCreditWaitsTotal:         m.FlowStreamCreditWaitsTotal.Load(),
 		FlowStreamCreditWaitMsTotal:        m.FlowStreamCreditWaitMsTotal.Load(),
+		MigrateOK:                          m.MigrateOK.Load(),
+		ResumeOK:                           m.ResumeOK.Load(),
+		MigrateFail:                        m.MigrateFail.Load(),
+		MigrateFailNotFound:                m.MigrateFailNotFound.Load(),
+		MigrateFailBadProof:                m.MigrateFailBadProof.Load(),
+		MigrateFailGraceExpired:            m.MigrateFailGraceExpired.Load(),
+		MigrateGraceExpired:                m.MigrateGraceExpired.Load(),
+		MigrateTailResent:                  m.MigrateTailResent.Load(),
+		MigrateTailBufferedBytes:           m.MigrateTailBufferedBytes.Load(),
+		OrphanedRelaysActive:               orphanActive,
+		OrphanFDBudgetRejected:             orphanFDRejected,
+		OrphanedEvictedLimit:               orphanEvicted,
 		WSPathLegacyHits:                   m.WSPathLegacyHits.Load(),
 		BroadcastCloseDrainCount:           m.broadcastCloseDrainCount.Load(),
 		BroadcastCloseDrainSecondsLast:     float64(m.broadcastCloseDrainNanosLast.Load()) / 1e9,
@@ -566,7 +646,7 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // Prometheus exposition format: handshake totals, body-prefix path hits,
 // active clients/connections, and live-decoy instrumentation. The full
 // picture is still available via the default JSON response.
-func writePromMetrics(w http.ResponseWriter, s *MetricsSnapshot) {
+func writePromMetrics(w io.Writer, s *MetricsSnapshot) {
 	fmt.Fprintf(w, "# HELP shadowlink_handshakes_total Total handshakes across all paths\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_handshakes_total counter\n")
 	fmt.Fprintf(w, "shadowlink_handshakes_total %d\n", s.HandshakesTotal)
@@ -731,4 +811,54 @@ func writePromMetrics(w http.ResponseWriter, s *MetricsSnapshot) {
 	fmt.Fprintf(w, "# HELP shadowlink_flow_stream_credit_wait_ms_total Total milliseconds the per-stream relay spent blocked in waitForCredit; high value = credit starvation\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_flow_stream_credit_wait_ms_total counter\n")
 	fmt.Fprintf(w, "shadowlink_flow_stream_credit_wait_ms_total %d\n", s.FlowStreamCreditWaitMsTotal)
+
+	// Bug #9 (2026-05-31) — stream-migration observability (§4.3). MIGRATE is the
+	// preemptive reassociation (slot A still alive); RESUME is the reactive one
+	// after a slot died into the grace window. The per-reason fail breakdown
+	// distinguishes "stale client / wrong streamID" (not_found) from "forged or
+	// wrong-session proof" (bad_proof) from "RESUME arrived after grace closed the
+	// relay" (grace_expired). shadowlink_migrate_fail_total is the aggregate.
+	fmt.Fprintf(w, "# HELP shadowlink_migrate_ok_total Successful preemptive MIGRATE reassociations\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_migrate_ok_total counter\n")
+	fmt.Fprintf(w, "shadowlink_migrate_ok_total %d\n", s.MigrateOK)
+
+	fmt.Fprintf(w, "# HELP shadowlink_resume_ok_total Successful reactive RESUME reassociations (from grace window)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_resume_ok_total counter\n")
+	fmt.Fprintf(w, "shadowlink_resume_ok_total %d\n", s.ResumeOK)
+
+	fmt.Fprintf(w, "# HELP shadowlink_migrate_fail_total MIGRATE/RESUME rejections (aggregate; see reason label for breakdown)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_migrate_fail_total counter\n")
+	fmt.Fprintf(w, "shadowlink_migrate_fail_total %d\n", s.MigrateFail)
+	fmt.Fprintf(w, "shadowlink_migrate_fail_total{reason=\"not_found\"} %d\n", s.MigrateFailNotFound)
+	fmt.Fprintf(w, "shadowlink_migrate_fail_total{reason=\"bad_proof\"} %d\n", s.MigrateFailBadProof)
+	fmt.Fprintf(w, "shadowlink_migrate_fail_total{reason=\"grace_expired\"} %d\n", s.MigrateFailGraceExpired)
+
+	fmt.Fprintf(w, "# HELP shadowlink_migrate_grace_expired_total Grace window elapsed without a RESUME → orphaned relay closed\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_migrate_grace_expired_total counter\n")
+	fmt.Fprintf(w, "shadowlink_migrate_grace_expired_total %d\n", s.MigrateGraceExpired)
+
+	fmt.Fprintf(w, "# HELP shadowlink_migrate_tail_resent_total Unacked-tail frames re-enqueued on the new binding after slot-A death (§5.3)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_migrate_tail_resent_total counter\n")
+	fmt.Fprintf(w, "shadowlink_migrate_tail_resent_total %d\n", s.MigrateTailResent)
+
+	fmt.Fprintf(w, "# HELP shadowlink_migrate_tail_buffered_bytes Bytes currently held in unacked relay tails (gauge)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_migrate_tail_buffered_bytes gauge\n")
+	fmt.Fprintf(w, "shadowlink_migrate_tail_buffered_bytes %d\n", s.MigrateTailBufferedBytes)
+
+	// Orphan / FD-budget series — sourced from the relay registry (Task 12 caps,
+	// §5.5). OrphanedRelaysActive is the live count of orphaned relays holding an
+	// egress socket through their grace window with no WS behind them; a sustained
+	// high value paired with a rising FD-budget-rejected counter signals a peer
+	// spraying CONNECT-then-kill-WS to pin sockets.
+	fmt.Fprintf(w, "# HELP shadowlink_orphaned_relays_active Orphaned relays currently holding an egress conn through the grace window (gauge)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_orphaned_relays_active gauge\n")
+	fmt.Fprintf(w, "shadowlink_orphaned_relays_active %d\n", s.OrphanedRelaysActive)
+
+	fmt.Fprintf(w, "# HELP shadowlink_orphan_fd_budget_rejected_total admitOrphan rejections because the orphan FD budget was exhausted (egress closed instead of held)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_orphan_fd_budget_rejected_total counter\n")
+	fmt.Fprintf(w, "shadowlink_orphan_fd_budget_rejected_total %d\n", s.OrphanFDBudgetRejected)
+
+	fmt.Fprintf(w, "# HELP shadowlink_orphaned_evicted_limit_total Idle orphaned relays evicted to enforce the per-client / global orphan caps\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_orphaned_evicted_limit_total counter\n")
+	fmt.Fprintf(w, "shadowlink_orphaned_evicted_limit_total %d\n", s.OrphanedEvictedLimit)
 }

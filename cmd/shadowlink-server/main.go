@@ -30,6 +30,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -66,7 +67,18 @@ func main() {
 	decoySnapshotStrict := flag.Bool("decoy-snapshot-strict", false,
 		"if true, fail-fast on decoy snapshot loading errors (default: warn and continue header-only)")
 	flowMaxWindow := flag.Int("flow-max-window", 1048576, "Bug #8: max per-stream flow-control window (bytes) the server grants; 0 disables flow control")
-	streamMigration := flag.Bool("stream-migration", true, "Bug #9 §3.5: enable per-stream migration negotiation (server echoes the client's advertised capability). Default on; the full env table lands in Task 18")
+	streamMigration := flag.Bool("stream-migration", true, "Bug #9 §3.5: enable per-stream migration negotiation (server echoes the client's advertised capability). Default on")
+	// Bug #9 §7: orphan grace + DoS caps. The flag DEFAULT is sourced from the
+	// matching env var when set (SHADOWLINK_MIGRATE_GRACE / MAX_ORPHANED /
+	// MAX_ORPHANED_TOTAL), otherwise the spec default (8s / 16 / 1024). An
+	// explicitly-passed flag then wins over both — same precedence as
+	// -flow-max-window. Env parse failures fall back to the spec default.
+	migrateGrace := flag.Duration("migrate-grace", envDurationDefault("SHADOWLINK_MIGRATE_GRACE", 8*time.Second),
+		"Bug #9 §5.5: how long the server keeps an orphaned relay alive awaiting RESUME (env SHADOWLINK_MIGRATE_GRACE)")
+	migrateMaxOrphaned := flag.Int("migrate-max-orphaned", envIntDefault("SHADOWLINK_MAX_ORPHANED", 16),
+		"Bug #9 §5.5: max orphaned relays a single client may hold through grace (env SHADOWLINK_MAX_ORPHANED)")
+	migrateMaxOrphanedTotal := flag.Int("migrate-max-orphaned-total", envIntDefault("SHADOWLINK_MAX_ORPHANED_TOTAL", 1024),
+		"Bug #9 §5.5: global ceiling on orphaned relays across all clients (env SHADOWLINK_MAX_ORPHANED_TOTAL)")
 	flag.Parse()
 
 	if *validateConfig != "" {
@@ -167,6 +179,15 @@ func main() {
 	if explicitly["stream-migration"] {
 		config.StreamMigrationEnabled = streamMigration
 	}
+	// Bug #9 §7: always apply migrate grace + orphan caps. The flag default was
+	// pre-seeded from the env var (or the spec default), and an explicit flag
+	// overrides both — so the resolved *value is always the intended one. Zero
+	// is never produced here (envDurationDefault/envIntDefault floor at the spec
+	// default), so Config.*OrphanedOrDefault helpers stay as a belt-and-braces
+	// fail-safe for Configs built without this flag layer.
+	config.MigrateGracePeriod = *migrateGrace
+	config.MaxOrphanedPerClient = *migrateMaxOrphaned
+	config.MaxOrphanedTotal = *migrateMaxOrphanedTotal
 	srv, err := server.New(config, nil)
 	if err != nil {
 		slog.Error("failed to create server", "error", err)
@@ -283,4 +304,37 @@ func logMimicryConfig(fc *server.FileConfig, cfg *server.Config) {
 	}
 
 	slog.Info("mimicry config", attrs...)
+}
+
+// envDurationDefault returns the time.Duration parsed from env var `key`, or
+// `def` when the var is unset/blank/unparseable. Used to seed flag defaults from
+// the environment (Bug #9 §7: SHADOWLINK_MIGRATE_GRACE). Accepts Go duration
+// syntax ("8s", "2m") and bare integer seconds ("8") for operator convenience.
+func envDurationDefault(key string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	if d, err := time.ParseDuration(v); err == nil && d > 0 {
+		return d
+	}
+	if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		return time.Duration(n) * time.Second
+	}
+	return def
+}
+
+// envIntDefault returns the positive int parsed from env var `key`, or `def`
+// when the var is unset/blank/unparseable/non-positive. Used to seed flag
+// defaults from the environment (Bug #9 §7: SHADOWLINK_MAX_ORPHANED,
+// SHADOWLINK_MAX_ORPHANED_TOTAL).
+func envIntDefault(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		return n
+	}
+	return def
 }

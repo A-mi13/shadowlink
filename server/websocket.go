@@ -503,11 +503,14 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	h.runWebSocketSession(conn, session, flowWindow, migrateEnabled)
 }
 
-// migrateGracePeriod is how long the server keeps an orphaned relay alive
-// after its WS slot dies, waiting for a RESUME on a live slot (§5.5, default
-// 8s). The env override (SHADOWLINK_MIGRATE_GRACE) and Config field land in
-// Task 18 (§7); the const default carries the behaviour until then.
-const migrateGracePeriod = 8 * time.Second
+// migrateGracePeriod resolves how long the server keeps an orphaned relay alive
+// after its WS slot dies, waiting for a RESUME on a live slot (§5.5, default 8s).
+// Task 18 (§7) made it Config-driven (Config.MigrateGracePeriod, exposed via the
+// -migrate-grace flag / SHADOWLINK_MIGRATE_GRACE env); the helper applies the 8s
+// fail-safe default for any Config that left it unset.
+func (h *Handler) migrateGracePeriod() time.Duration {
+	return h.config.migrateGracePeriodOrDefault()
+}
 
 // handleMigrateOrResume processes a FlagMigrate (preemptive, §5.3) or FlagResume
 // (reactive, §5.5) control frame. It runs on the reader goroutine of the NEW
@@ -535,6 +538,7 @@ func (h *Handler) handleMigrateOrResume(flag byte, payload []byte, clientID stri
 	entry, ok := h.relayRegistry.find(clientID, sid)
 	if !ok {
 		h.metrics.MigrateFail.Add(1)
+		h.metrics.MigrateFailNotFound.Add(1)
 		h.enqueueMigrateFail(session, writer, flag, sid, core.MigrateReasonNotFound)
 		return
 	}
@@ -545,6 +549,7 @@ func (h *Handler) handleMigrateOrResume(flag byte, payload []byte, clientID stri
 	perClientKey := core.DeriveServerPerClientKey(h.migrateMasterKey(), clientID)
 	if !core.VerifyStreamProof(proof, perClientKey, clientID, sid, entry.originSessionNonce) {
 		h.metrics.MigrateFail.Add(1)
+		h.metrics.MigrateFailBadProof.Add(1)
 		h.enqueueMigrateFail(session, writer, flag, sid, core.MigrateReasonBadProof)
 		return
 	}
@@ -556,6 +561,7 @@ func (h *Handler) handleMigrateOrResume(flag byte, payload []byte, clientID stri
 		// (and closed tc / removed it) — the relay is gone, RESUME is too late.
 		if !entry.state.CompareAndSwap(stOrphaned, stActive) {
 			h.metrics.MigrateFail.Add(1)
+			h.metrics.MigrateFailGraceExpired.Add(1)
 			h.enqueueMigrateFail(session, writer, flag, sid, core.MigrateReasonGraceExpired)
 			return
 		}
@@ -566,6 +572,13 @@ func (h *Handler) handleMigrateOrResume(flag byte, payload []byte, clientID stri
 		h.relayRegistry.releaseOrphanFD(entry)
 	}
 
+	// Task 18 (§4.3, §5.3): count the unacked-tail frames re-enqueued on the new
+	// binding when slot A died before acking. resendTail snapshots the same set
+	// reassociate(aDead=true) re-sends; it does NOT clear the buffer, so reading it
+	// here is a side-effect-free observation. Only the aDead (RESUME) path resends.
+	if aDead {
+		h.metrics.MigrateTailResent.Add(uint64(len(entry.resendTail())))
+	}
 	resumeSeq := entry.reassociate(session, writer, migrateEnabled, aDead)
 	if flag == core.FlagResume {
 		h.metrics.ResumeOK.Add(1)
@@ -1270,7 +1283,7 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 			e.perEntryMu.Lock()
 			cond.Broadcast()
 			e.perEntryMu.Unlock()
-			h.relayRegistry.launchGraceTimer(e, migrateGracePeriod, func() {
+			h.relayRegistry.launchGraceTimer(e, h.migrateGracePeriod(), func() {
 				h.metrics.MigrateGraceExpired.Add(1)
 			})
 		}

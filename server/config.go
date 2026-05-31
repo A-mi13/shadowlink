@@ -87,6 +87,24 @@ type Config struct {
 	// compile.
 	StreamMigrationEnabled *bool `yaml:"stream_migration_enabled,omitempty"`
 
+	// MigrateGracePeriod is how long the server keeps an orphaned relay alive
+	// after its WS slot dies, waiting for a RESUME on a live slot (Bug #9 §5.5).
+	// 0 → default 8s via migrateGracePeriodOrDefault. Env/flag: Task 18 (§7),
+	// -migrate-grace / SHADOWLINK_MIGRATE_GRACE.
+	MigrateGracePeriod time.Duration `yaml:"migrate_grace_period,omitempty"`
+
+	// MaxOrphanedPerClient caps the orphaned relays a single client may hold
+	// through the grace window (Bug #9 Task 12, F5). 0 → default 16 via
+	// maxOrphanedPerClientOrDefault. Env/flag: -migrate-max-orphaned /
+	// SHADOWLINK_MAX_ORPHANED.
+	MaxOrphanedPerClient int `yaml:"max_orphaned_per_client,omitempty"`
+
+	// MaxOrphanedTotal is the global ceiling on orphaned relays across all
+	// clients (Bug #9 Task 12, F5). 0 → default 1024 via
+	// maxOrphanedTotalOrDefault. Env/flag: -migrate-max-orphaned-total /
+	// SHADOWLINK_MAX_ORPHANED_TOTAL.
+	MaxOrphanedTotal int `yaml:"max_orphaned_total,omitempty"`
+
 	// BlockDomains is a list of domain suffixes/exact names the server refuses to dial.
 	BlockDomains []string
 
@@ -174,6 +192,42 @@ func (c Config) streamMigrationEnabledOrDefault() bool {
 		return true
 	}
 	return *c.StreamMigrationEnabled
+}
+
+// Bug #9 §7 defaults. The grace window and orphan caps are 0-means-default so an
+// operator who never sets them (or a test using TestConfig) inherits the spec
+// values, while an explicit YAML/flag/env override wins. The CLI flag layer in
+// cmd/shadowlink-server applies flag defaults (8s/16/1024) when unset, mirroring
+// the -flow-max-window plumbing; these helpers are the in-package fail-safe so
+// any Config produced without the flag layer still resolves the spec defaults.
+const (
+	defaultMigrateGracePeriod   = 8 * time.Second
+	defaultMaxOrphanedPerClient = 16
+	defaultMaxOrphanedTotal     = 1024
+)
+
+// migrateGracePeriodOrDefault resolves Config.MigrateGracePeriod (0 → 8s).
+func (c Config) migrateGracePeriodOrDefault() time.Duration {
+	if c.MigrateGracePeriod <= 0 {
+		return defaultMigrateGracePeriod
+	}
+	return c.MigrateGracePeriod
+}
+
+// maxOrphanedPerClientOrDefault resolves Config.MaxOrphanedPerClient (0 → 16).
+func (c Config) maxOrphanedPerClientOrDefault() int {
+	if c.MaxOrphanedPerClient <= 0 {
+		return defaultMaxOrphanedPerClient
+	}
+	return c.MaxOrphanedPerClient
+}
+
+// maxOrphanedTotalOrDefault resolves Config.MaxOrphanedTotal (0 → 1024).
+func (c Config) maxOrphanedTotalOrDefault() int {
+	if c.MaxOrphanedTotal <= 0 {
+		return defaultMaxOrphanedTotal
+	}
+	return c.MaxOrphanedTotal
 }
 
 // DefaultConfig returns production-ready defaults for a 2 vCPU / 2 GB RAM VPS.

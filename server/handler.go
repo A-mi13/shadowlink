@@ -269,26 +269,19 @@ func NewHandler(serverKey *core.KeyPair, config Config, decoyDir string) *Handle
 		relayRegistry: newRelayRegistry(),
 	}
 
-	// Bug #9 Task 12 (F5/F6): configure orphan DoS caps. An orphaned relay holds
-	// a real egress socket through the grace window with no WS behind it, so the
-	// caps bound that resource:
-	//   per-client = MaxConnsPerClient — a client never legitimately migrates
-	//     more streams at once than its connection cap.
-	//   total      = MaxClients * MaxConnsPerClient — global ceiling.
+	// Bug #9 Task 12 (F5/F6) + Task 18 (§7): configure orphan DoS caps. An
+	// orphaned relay holds a real egress socket through the grace window with no
+	// WS behind it, so the caps bound that resource. Task 18 makes these
+	// env/flag/YAML-tunable via Config (defaults 16 / 1024 from the §7 table);
+	// Task 12 originally derived them from MaxConnsPerClient × MaxClients.
+	//   per-client = Config.MaxOrphanedPerClient (default 16).
+	//   total      = Config.MaxOrphanedTotal     (default 1024).
 	//   fdBudget   = ~half the RLIMIT_NOFILE soft limit (orphans are transient;
 	//     leave the other half for live sessions + listeners). On Windows dev
 	//     readFDSoftLimit()==0 → fall back to `total` so the cap still applies.
-	// Env-tunability lands in Task 18 (§4.3); these are safe defaults.
 	{
-		perClient := int(config.MaxConnsPerClient)
-		if perClient <= 0 {
-			perClient = 8
-		}
-		maxClients := config.MaxClients
-		if maxClients <= 0 {
-			maxClients = 100
-		}
-		total := maxClients * perClient
+		perClient := config.maxOrphanedPerClientOrDefault()
+		total := config.maxOrphanedTotalOrDefault()
 		fdBudget := total
 		if soft := readFDSoftLimit(); soft > 0 {
 			fdBudget = int(soft / 2)
@@ -298,6 +291,12 @@ func NewHandler(serverKey *core.KeyPair, config Config, decoyDir string) *Handle
 		}
 		h.relayRegistry.setLimits(perClient, total, fdBudget)
 	}
+
+	// Bug #9 Task 18 (§4.3): publish the registry to Metrics so the orphan series
+	// (OrphanedRelaysActive gauge, orphan_fd_budget_rejected, orphaned_evicted_limit)
+	// surface through the text/JSON exporters reading the registry's own counters —
+	// a single source of truth, no duplicate count on the admit/evict hot paths.
+	h.metrics.AttachRelayRegistry(h.relayRegistry)
 
 	// Eagerly populate the asymmetric decoy fixture used by the
 	// failClosedToDecoy timing pipeline so the first hot-path call does
