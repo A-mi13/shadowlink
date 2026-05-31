@@ -1,6 +1,7 @@
 package socks5
 
 import (
+	"context"
 	"net"
 	"sync"
 	"testing"
@@ -66,7 +67,7 @@ func TestDownlinkReassembly_OutOfOrderWritesInOrder(t *testing.T) {
 	loopDone := make(chan struct{})
 	go func() {
 		defer close(loopDone)
-		downlinkReassemblyLoop(incoming, appSide, nil, dep)
+		downlinkReassemblyLoop(context.Background(), incoming, appSide, nil, dep)
 	}()
 
 	select {
@@ -108,7 +109,7 @@ func TestDownlinkReassembly_ControlSeqZero(t *testing.T) {
 	loopDone := make(chan struct{})
 	go func() {
 		defer close(loopDone)
-		downlinkReassemblyLoop(incoming, appSide, nil, dep)
+		downlinkReassemblyLoop(context.Background(), incoming, appSide, nil, dep)
 	}()
 
 	// CONNECT_OK (control) then one real data frame, then CONNECT_FAIL (break).
@@ -162,7 +163,7 @@ func TestDownlinkReassembly_GapTimeoutBreaks(t *testing.T) {
 	start := time.Now()
 	go func() {
 		defer close(loopDone)
-		downlinkReassemblyLoop(incoming, appSide, nil, dep)
+		downlinkReassemblyLoop(context.Background(), incoming, appSide, nil, dep)
 	}()
 
 	select {
@@ -203,7 +204,7 @@ func TestDownlinkReassembly_GapClosedInTimeNoTimeout(t *testing.T) {
 	loopDone := make(chan struct{})
 	go func() {
 		defer close(loopDone)
-		downlinkReassemblyLoop(incoming, appSide, nil, dep)
+		downlinkReassemblyLoop(context.Background(), incoming, appSide, nil, dep)
 	}()
 
 	// Open the hole, wait a bit (less than gapTimeout), then close it.
@@ -240,4 +241,58 @@ func TestDownlinkReassembly_GapClosedInTimeNoTimeout(t *testing.T) {
 	if got != "AB" {
 		t.Fatalf("reassembled bytes wrong: got %q want %q", got, "AB")
 	}
+}
+
+// TestDownlinkReassembly_CtxCancelBreaks proves the Bug #9 T14 goroutine-leak
+// fix: on the loopback-SOCKS5 path peerFullClose is nil and the incoming
+// channel is never closed by UnregisterStream, so a cleanly-finished stream
+// (no reassembly gap → gap timer disarmed) leaves the loop parked forever on
+// <-incoming. The uplink goroutine signals teardown by cancelling ctx2; the
+// loop MUST observe ctx.Done() and return. Without the case <-ctx.Done() this
+// test hangs (and the production goroutine + 512-frame buffer leak).
+func TestDownlinkReassembly_CtxCancelBreaks(t *testing.T) {
+	appSide, peerSide := net.Pipe()
+	defer appSide.Close()
+	defer peerSide.Close()
+	_, _, readDone := drainPipe(t, peerSide)
+
+	// Clean-finish scenario: deliver one in-order frame so the run flushes and
+	// NO gap exists (gap timer stays disarmed). The channel is intentionally
+	// left OPEN — mirrors a live downlink channel that UnregisterStream does
+	// not close.
+	incoming := make(chan client.StreamFrame, 4)
+	incoming <- client.StreamFrame{Seq: 1, Data: []byte("Z")}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	dep := downlinkReassemblyDeps{
+		gapTimeout:  10 * time.Second, // long: must NOT be the thing that breaks us
+		maxBuffered: 1 << 20,
+	}
+	loopDone := make(chan struct{})
+	go func() {
+		defer close(loopDone)
+		downlinkReassemblyLoop(ctx, incoming, appSide, nil, dep)
+	}()
+
+	// Let the in-order frame flush; the loop should now be parked on <-incoming
+	// (no gap armed, channel open, peerFullClose nil).
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-loopDone:
+		t.Fatal("loop exited before ctx cancel — should be parked on <-incoming")
+	default:
+	}
+
+	// Teardown signal: exactly what the uplink goroutine does on Read-EOF.
+	cancel()
+
+	select {
+	case <-loopDone:
+		// PASS: ctx cancel broke the loop — no goroutine leak.
+	case <-time.After(2 * time.Second):
+		t.Fatal("loop did not exit on ctx cancel — goroutine leak (Bug #9 T14 regression)")
+	}
+	appSide.Close()
+	<-readDone
 }

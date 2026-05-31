@@ -477,6 +477,13 @@ type downlinkReassemblyDeps struct {
 // through reasm, and writes the in-order runs to conn. It is the migration-mode
 // counterpart of the legacy downlink select-loop. peerFullClose may be nil
 // (loopback / tests). The loop returns (tearing the stream down) on:
+//   - ctx cancelled: the uplink goroutine's Read-EOF teardown cancels ctx2.
+//     On the loopback-SOCKS5 path (socks5Replies==true) peerFullClose is nil,
+//     so ctx.Done() is the ONLY teardown signal for a stream that finishes
+//     cleanly without a reassembly gap — without this case the loop parks
+//     forever on <-incoming and leaks the goroutine + its registration + the
+//     512-frame buffer (Bug #9 T14 leak fix, symmetric with the legacy loop's
+//     case <-ctx2.Done()).
 //   - incoming channel closed
 //   - reassembler overflow (degradation, NOT corruption)
 //   - gap timeout: an unfillable hole did not close within gapTimeout (NEW-1) —
@@ -484,6 +491,7 @@ type downlinkReassemblyDeps struct {
 //   - conn.Write error (after draining incoming)
 //   - peerFullClose fires (app did a real FIN)
 func downlinkReassemblyLoop(
+	ctx context.Context,
 	incoming <-chan client.StreamFrame,
 	conn net.Conn,
 	peerFullClose <-chan struct{},
@@ -570,6 +578,14 @@ func downlinkReassemblyLoop(
 		case <-peerFullClose:
 			disarm()
 			return // app did a full Close (real FIN)
+		case <-ctx.Done():
+			// ctx2 cancelled by the uplink goroutine on Read-EOF teardown.
+			// On the loopback-SOCKS5 path this is the only teardown signal for
+			// a cleanly-finished stream (peerFullClose is nil, incoming is not
+			// closed by UnregisterStream). Disarm the gap timer and exit so the
+			// goroutine + its 512-frame buffer are reclaimed (Bug #9 T14 leak).
+			disarm()
+			return
 		}
 	}
 }
@@ -985,7 +1001,7 @@ func tunnelTCPStream(ctx context.Context, conn net.Conn, cl *client.Client, wst 
 					}
 				},
 			}
-			downlinkReassemblyLoop(incomingSeqCh, conn, peerFullClose, dep)
+			downlinkReassemblyLoop(ctx2, incomingSeqCh, conn, peerFullClose, dep)
 			slog.Info("downlink done (migration)", "dest", destAddr, "stream", streamID,
 				"bytes", total, "chunks", chunks, "elapsed", time.Since(relayStart).Round(time.Millisecond))
 			return
