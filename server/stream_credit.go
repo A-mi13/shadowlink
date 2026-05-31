@@ -14,6 +14,13 @@ func negotiateFlowWindow(clientWindow, serverMax uint32) uint32 {
 	return clientWindow
 }
 
+// negotiateMigration reports whether Bug #9 stream migration is enabled for a
+// session: both the server config and the client's advertised capability must
+// agree (§3.5).
+func negotiateMigration(serverEnabled, clientAdvertised bool) bool {
+	return serverEnabled && clientAdvertised
+}
+
 // stream_credit.go — server-side per-stream send credit (Bug #8). The WS
 // per-stream relay goroutine calls waitForCredit BEFORE reading the target
 // (websocket.go), so a stream with no credit simply doesn't read — the target

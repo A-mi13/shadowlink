@@ -141,43 +141,43 @@ const firstFrameReadLimit = 8 * 1024
 // DoS hygiene: a tight 8 KiB read limit and 1500ms deadline apply only during
 // auth. On successful return, the caller (handleWebSocket) restores the normal
 // 256 KiB read limit and removes the deadline.
-func (h *Handler) authenticateFirstFrame(conn *websocket.Conn) (*core.Session, uint32) {
+func (h *Handler) authenticateFirstFrame(conn *websocket.Conn) (*core.Session, uint32, bool) {
 	conn.SetReadLimit(firstFrameReadLimit)
 	conn.SetReadDeadline(time.Now().Add(firstFrameAuthTimeout))
 	defer conn.SetReadDeadline(time.Time{})
 
 	msgType, data, err := conn.ReadMessage()
 	if err != nil || msgType != websocket.BinaryMessage {
-		return nil, 0
+		return nil, 0, false
 	}
 
 	tokenLen := h.sessionTokenSize()
 	if len(data) < tokenLen+core.MinChunk {
-		return nil, 0
+		return nil, 0, false
 	}
 
 	session := h.findSessionByHint(data[:tokenLen])
 	if session == nil {
-		return nil, 0
+		return nil, 0, false
 	}
 
 	chunk, err := session.DecryptChunkSafe(data[tokenLen:])
 	if err != nil {
-		return nil, 0
+		return nil, 0, false
 	}
 	if !session.AcceptSeqNum(chunk.SeqNum) {
-		return nil, 0
+		return nil, 0, false
 	}
 
 	if chunk.Flags != core.FlagKeepalive {
-		return nil, 0
+		return nil, 0, false
 	}
 
 	h.tunnelsMu.RLock()
 	tunnel, ok := h.tunnels[session.ID]
 	h.tunnelsMu.RUnlock()
 	if !ok {
-		return nil, 0
+		return nil, 0, false
 	}
 
 	// A3-S-HIGH-2 (2026-04-25): gate concurrent WS attaches. CAS prevents
@@ -186,19 +186,27 @@ func (h *Handler) authenticateFirstFrame(conn *websocket.Conn) (*core.Session, u
 	// rejection). Without this, an attacker holding a session token can
 	// race the legit client and starve seq-num space / inject CONNECTs.
 	if !tunnel.WSAttached.CompareAndSwap(false, true) {
-		return nil, 0
+		return nil, 0, false
 	}
 
 	// Bug #8: read FLOWCTL marker from the (decrypted) keepalive payload and,
 	// if present & supported, emit a synchronous FLOWCTL-ack BEFORE the relay
 	// loop starts (the first keepalive never reaches the reader-loop).
+	//
+	// Bug #9 §3.5: the same marker (V2) carries the client's migrate-capability
+	// bit. We echo back negotiateMigration(serverEnabled, clientAdvertised) in
+	// the ack so both peers agree. migrateEnabled is only ever true when flow
+	// control negotiation also succeeds (the ack rides the same marker); a
+	// legacy 11-byte marker parses with migrate=false (backwards compat).
 	var effectiveWindow uint32
-	if cw, okFlow := core.ParseFlowCtlMarker(chunk.Payload); okFlow {
+	var migrateEnabled bool
+	if cw, migrateAdvertised, okFlow := core.ParseFlowCtlMarkerV2(chunk.Payload); okFlow {
 		effectiveWindow = negotiateFlowWindow(cw, uint32(h.flowMaxWindow))
 		if effectiveWindow > 0 {
+			negotiatedMigrate := negotiateMigration(h.migrationEnabled, migrateAdvertised)
 			ackSent := false
 			ack := &core.Chunk{SessionID: session.ID, SeqNum: session.NextSeqNum(), Flags: core.FlagAck,
-				Payload: core.BuildFlowCtlMarker(effectiveWindow)}
+				Payload: core.BuildFlowCtlMarkerV2(effectiveWindow, negotiatedMigrate)}
 			if enc, encErr := session.EncryptChunk(ack); encErr == nil {
 				conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 				if werr := conn.WriteMessage(websocket.BinaryMessage, enc); werr == nil {
@@ -211,8 +219,12 @@ func (h *Handler) authenticateFirstFrame(conn *websocket.Conn) (*core.Session, u
 			// MUST match that — otherwise it would gate on credit the client never
 			// sends, stalling the stream after the first window. Disable flow for
 			// this session so the relay runs ungated (same as an old client).
+			// Migration likewise stays off — the client never read our echo, so it
+			// must not believe migration was negotiated.
 			if !ackSent {
 				effectiveWindow = 0
+			} else {
+				migrateEnabled = negotiatedMigrate
 			}
 		}
 	}
@@ -227,7 +239,7 @@ func (h *Handler) authenticateFirstFrame(conn *websocket.Conn) (*core.Session, u
 	// without needing a separate field.
 	session.AttachedAt.Store(time.Now().UnixNano())
 
-	return session, effectiveWindow
+	return session, effectiveWindow, migrateEnabled
 }
 
 // fakeAckAndClose replies to a failed first-frame auth with a random binary
@@ -464,7 +476,7 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		h.metrics.WSPathLegacyHits.Add(1)
 	}
 
-	session, flowWindow := h.authenticateFirstFrame(conn)
+	session, flowWindow, migrateEnabled := h.authenticateFirstFrame(conn)
 	if session == nil {
 		h.fakeAckAndClose(conn)
 		return
@@ -488,17 +500,23 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	h.runWebSocketSession(conn, session, flowWindow)
+	h.runWebSocketSession(conn, session, flowWindow, migrateEnabled)
 }
 
 // runWebSocketSession runs the per-session WebSocket relay: async writer,
 // 20 s ping, pong-reset read deadlines, and the inbound dispatcher for
 // data/connect/fin/keepalive/udp chunks. Returns when either side closes
 // the connection.
-func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Session, flowWindow uint32) {
+func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Session, flowWindow uint32, migrateEnabled bool) {
 	// Bug #8 flow control: flowWindow > 0 means client negotiated flow control
 	// and we sent back a FLOWCTL-ack with effectiveWindow in authenticateFirstFrame.
 	flowEnabled := flowWindow > 0
+	// Bug #9 §3.5: migrateEnabled reflects negotiateMigration() — both server
+	// config and client capability agreed. When false the relay stays on the
+	// legacy (non-migratable) path. The actual MIGRATE/RESUME handling is wired
+	// in later tasks (T9-T11); for now the flag is carried so the relay loop can
+	// branch on it without another signature change.
+	_ = migrateEnabled
 	credits := make(map[uint16]*streamCredit)
 	creditsMu := &sync.Mutex{}
 	if flowEnabled {

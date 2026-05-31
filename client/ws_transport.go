@@ -11,6 +11,8 @@ import (
 	mrand "math/rand"
 	"net"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -67,6 +69,13 @@ type WebSocketTransport struct {
 	flowDesiredWindow  uint32
 	flowControlEnabled bool
 	flowWindow         uint32
+
+	// flowMigrateEnabled records whether Bug #9 stream migration was negotiated
+	// for this WS connection (§3.5). It is set from the server's FLOWCTL-ack
+	// (V2 marker, migrate bit) read synchronously in UpgradeToWS. False unless
+	// BOTH sides advertised the capability — an old server that echoes a legacy
+	// 11-byte marker (no migrate bit) leaves this false (backwards compat).
+	flowMigrateEnabled bool
 }
 
 // NewWebSocketTransport creates a transport that uses WebSocket for data relay.
@@ -536,9 +545,14 @@ func (t *WebSocketTransport) UpgradeToWS(token []byte, session *core.Session) er
 		conn.SetReadDeadline(time.Time{})
 		if ackErr == nil && ackType == websocket.BinaryMessage {
 			if ackChunk, derr := session.DecryptChunkSafe(ackData); derr == nil && ackChunk.Flags == core.FlagAck {
-				if win, okFlow := parseFlowAckPayload(ackChunk.Payload); okFlow {
+				// Bug #9 §3.5: parse the V2 marker so we capture the server's
+				// echoed migrate bit alongside the window. A legacy 11-byte ack
+				// parses with migrate=false (backwards compat) — migration stays
+				// off unless both sides agreed.
+				if win, migrate, okFlow := core.ParseFlowCtlMarkerV2(ackChunk.Payload); okFlow {
 					t.flowControlEnabled = true
 					t.flowWindow = win
+					t.flowMigrateEnabled = migrate
 				}
 			}
 		}
@@ -610,6 +624,24 @@ const bestEffortSessionFINTimeout = 2 * time.Second
 // synchronously in UpgradeToWS. Kept short: if the server doesn't support
 // flow control the read must not stall the upgrade path.
 const negotiationAckTimeout = 500 * time.Millisecond
+
+// migrateAckTimeout bounds how long the client waits for a MIGRATE_OK /
+// RESUME_OK before degrading the stream to a hard break (F3 fail-safe,
+// §3.5). Same order as the first-frame negotiation window so an old server
+// that silently ignores FlagMigrate never hangs a stream.
+const migrateAckTimeout = 1500 * time.Millisecond
+
+// streamMigrationEnabledFromEnv resolves SHADOWLINK_STREAM_MIGRATION.
+// Default ON; 0/false/no/off (case-insensitive) disables. Main kill-switch (§7).
+func streamMigrationEnabledFromEnv() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("SHADOWLINK_STREAM_MIGRATION")))
+	switch v {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
 
 // sendBestEffortSessionFIN fires a best-effort POST containing a FIN chunk
 // for streamID=0 (session-level FIN semantic). C10 M5 (May audit,
@@ -722,7 +754,12 @@ func (t *WebSocketTransport) buildFirstFramePayload(token []byte, session *core.
 		Flags:     core.FlagKeepalive,
 	}
 	if flowWindow > 0 {
-		keepalive.Payload = core.BuildFlowCtlMarker(flowWindow) // inside AES-GCM (NH2)
+		// Bug #9 §3.5: announce the migrate-capability bit in the same FLOWCTL
+		// marker (V2). The extra byte is invisible to an old server's
+		// ParseFlowCtlMarker (reads only the first 11 bytes), so this stays
+		// backwards compatible. Migration is only ever negotiated alongside flow
+		// control (the server echoes the bit in its FLOWCTL-ack).
+		keepalive.Payload = core.BuildFlowCtlMarkerV2(flowWindow, streamMigrationEnabledFromEnv()) // inside AES-GCM (NH2)
 	}
 	encrypted, err := session.EncryptChunk(keepalive)
 	if err != nil {

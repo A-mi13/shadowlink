@@ -78,6 +78,15 @@ type Config struct {
 	// Bug #8: exposed via -flow-max-window CLI flag (Task 11).
 	FlowMaxWindow uint64
 
+	// StreamMigrationEnabled gates Bug #9 stream migration server-side (§3.5).
+	// nil → default ON (the negotiation is fail-safe — an old client that never
+	// advertises the migrate capability still disables migration for its
+	// session via negotiateMigration). A non-nil *false is the explicit
+	// server-side kill-switch. The full env/flag table lands in Task 18; this
+	// field exists now so streamMigrationEnabledOrDefault and the handler wiring
+	// compile.
+	StreamMigrationEnabled *bool `yaml:"stream_migration_enabled,omitempty"`
+
 	// BlockDomains is a list of domain suffixes/exact names the server refuses to dial.
 	BlockDomains []string
 
@@ -153,6 +162,18 @@ type RateLimitConfig struct {
 // that an explicit -flow-max-window=0 actually disables flow control.
 func (c Config) flowMaxWindowOrDefault() uint64 {
 	return c.FlowMaxWindow
+}
+
+// streamMigrationEnabledOrDefault resolves Config.StreamMigrationEnabled with a
+// default-ON fallback (nil → true). Bug #9 §3.5: migration is opt-out
+// server-side; an explicit *false is the kill-switch. The negotiation itself
+// stays fail-safe — a non-advertising client always disables migration for its
+// own session regardless of this default (see negotiateMigration).
+func (c Config) streamMigrationEnabledOrDefault() bool {
+	if c.StreamMigrationEnabled == nil {
+		return true
+	}
+	return *c.StreamMigrationEnabled
 }
 
 // DefaultConfig returns production-ready defaults for a 2 vCPU / 2 GB RAM VPS.

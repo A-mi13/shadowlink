@@ -36,10 +36,12 @@ func TestWSPingInterval_MedianBumped(t *testing.T) {
 	}
 }
 
-// wsAuthResult is the pair returned by authenticateFirstFrame (session + negotiated window).
+// wsAuthResult is the tuple returned by authenticateFirstFrame (session +
+// negotiated window + negotiated migrate capability, Bug #9 §3.5).
 type wsAuthResult struct {
 	session    *core.Session
 	flowWindow uint32
+	migrateOK  bool
 }
 
 // wsAuthHarness wires a single-shot httptest server that upgrades the request
@@ -63,8 +65,8 @@ func newWSAuthHarness(t *testing.T, h *Handler) *wsAuthHarness {
 			return
 		}
 		defer conn.Close()
-		sess, fw := h.authenticateFirstFrame(conn)
-		resCh <- wsAuthResult{session: sess, flowWindow: fw}
+		sess, fw, mig := h.authenticateFirstFrame(conn)
+		resCh <- wsAuthResult{session: sess, flowWindow: fw, migrateOK: mig}
 	}))
 	return &wsAuthHarness{
 		srv:   srv,

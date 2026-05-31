@@ -39,6 +39,14 @@ type Handler struct {
 	// NewHandler. Task 11 will expose this via Config.
 	flowMaxWindow uint64
 
+	// migrationEnabled gates Bug #9 stream migration server-side (§3.5). When
+	// true the server echoes the client's advertised migrate capability back in
+	// the FLOWCTL-ack (V2 marker) so both peers agree before any MIGRATE/RESUME
+	// is attempted. Default true (set in NewHandler from Config.StreamMigrationEnabled
+	// with a default-on fallback). The full env table lands in Task 18; for now
+	// the field just carries the negotiated default. Read-only after construction.
+	migrationEnabled bool
+
 	// exemption caches recently-seen authenticated clientIDs and lets them
 	// bypass the per-IP rate-limit bucket on the data path / subsequent
 	// handshakes. Set once in NewHandler (default-on, opt out via
@@ -247,6 +255,8 @@ func NewHandler(serverKey *core.KeyPair, config Config, decoyDir string) *Handle
 		exemption:          exempt,
 		safeDialFn:         SafeDial,
 		flowMaxWindow:      config.flowMaxWindowOrDefault(), // Bug #8 Task 11: from Config.FlowMaxWindow
+		// migrationEnabled — Bug #9 §3.5: default-on, opt-out via Config/Task 18 env.
+		migrationEnabled: config.streamMigrationEnabledOrDefault(),
 	}
 
 	// Eagerly populate the asymmetric decoy fixture used by the

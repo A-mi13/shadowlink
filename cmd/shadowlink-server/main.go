@@ -66,6 +66,7 @@ func main() {
 	decoySnapshotStrict := flag.Bool("decoy-snapshot-strict", false,
 		"if true, fail-fast on decoy snapshot loading errors (default: warn and continue header-only)")
 	flowMaxWindow := flag.Int("flow-max-window", 1048576, "Bug #8: max per-stream flow-control window (bytes) the server grants; 0 disables flow control")
+	streamMigration := flag.Bool("stream-migration", true, "Bug #9 §3.5: enable per-stream migration negotiation (server echoes the client's advertised capability). Default on; the full env table lands in Task 18")
 	flag.Parse()
 
 	if *validateConfig != "" {
@@ -159,6 +160,13 @@ func main() {
 	// Always apply flow-max-window: flag default (1048576) applies when not
 	// explicitly set; explicit 0 disables flow control on the server.
 	config.FlowMaxWindow = uint64(*flowMaxWindow)
+	// Bug #9 §3.5: only override the YAML/default when -stream-migration was
+	// explicitly passed. Unset leaves Config.StreamMigrationEnabled untouched
+	// (nil → default ON via streamMigrationEnabledOrDefault). The full env table
+	// lands in Task 18; this flag is the minimal server-side kill-switch.
+	if explicitly["stream-migration"] {
+		config.StreamMigrationEnabled = streamMigration
+	}
 	srv, err := server.New(config, nil)
 	if err != nil {
 		slog.Error("failed to create server", "error", err)
