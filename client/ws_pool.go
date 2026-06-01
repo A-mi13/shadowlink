@@ -99,7 +99,36 @@ var slotBackoffDurationForTest = slotBackoffDuration
 //
 // nil means "fall through to the real implementation" — production paths
 // must NOT see this hook and the build never references it.
-var connectSlotForTest func() error
+//
+// Access is synchronized through an atomic.Pointer: the hook is read from
+// background goroutines (reconnectLoop / connectReserveSlot run detached) while
+// tests overwrite it from the test goroutine — and a leaked background goroutine
+// from a prior subtest may still be reading when the next subtest writes. Plain
+// global assignment races the reader (-race report on the package global). The
+// stored value is a *(func() error) so a nil function pointer is representable
+// (load returns nil → "fall through to real implementation"). Production keeps
+// the pointer nil, so getConnectSlotForTest() is a single atomic.Load of a nil
+// pointer on the hot path — no allocation, no lock, no measurable overhead.
+var connectSlotForTestPtr atomic.Pointer[func() error]
+
+// getConnectSlotForTest returns the currently installed test hook, or nil when
+// none is set (production). Safe to call from any goroutine.
+func getConnectSlotForTest() func() error {
+	if fp := connectSlotForTestPtr.Load(); fp != nil {
+		return *fp
+	}
+	return nil
+}
+
+// setConnectSlotForTest installs (or, with nil, clears) the test hook. Safe to
+// call concurrently with getConnectSlotForTest readers in background goroutines.
+func setConnectSlotForTest(fn func() error) {
+	if fn == nil {
+		connectSlotForTestPtr.Store(nil)
+		return
+	}
+	connectSlotForTestPtr.Store(&fn)
+}
 
 // sleepWithCancel sleeps for d, returning early if ctx is cancelled. Used
 // by reconnectLoop to pace the rate-limit cool-down without blocking
@@ -2076,10 +2105,10 @@ func (p *WSPoolTransport) reconnectLoop(idx int) {
 		}
 
 		var connectErr error
-		if connectSlotForTest != nil {
-			// Test seam — see ws_pool.go::connectSlotForTest. Production
+		if hook := getConnectSlotForTest(); hook != nil {
+			// Test seam — see ws_pool.go::connectSlotForTestPtr. Production
 			// builds never enter this branch because nothing assigns the var.
-			connectErr = connectSlotForTest()
+			connectErr = hook()
 		} else {
 			connectErr = p.connectSlot(p.ctx, idx)
 		}

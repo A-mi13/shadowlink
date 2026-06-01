@@ -1366,12 +1366,12 @@ func TestReconnectLoop_RecycleGuard(t *testing.T) {
 
 	// Stub connectSlot — must NOT be called when guard fires.
 	called := false
-	prev := connectSlotForTest
-	connectSlotForTest = func() error {
+	prev := getConnectSlotForTest()
+	setConnectSlotForTest(func() error {
 		called = true
 		return nil
-	}
-	defer func() { connectSlotForTest = prev }()
+	})
+	defer func() { setConnectSlotForTest(prev) }()
 
 	// Stub backoff to zero so the timer fires immediately — without this,
 	// slotBackoffDuration(0) returns 5-10s and the test hangs.
@@ -1653,11 +1653,11 @@ func TestConnectReserveSlot_FreesPlaceholderOnFailure(t *testing.T) {
 	p.slots[8] = placeholder
 
 	// Stub connectSlot to fail.
-	prev := connectSlotForTest
-	connectSlotForTest = func() error {
+	prev := getConnectSlotForTest()
+	setConnectSlotForTest(func() error {
 		return errors.New("handshake failed")
-	}
-	defer func() { connectSlotForTest = prev }()
+	})
+	defer func() { setConnectSlotForTest(prev) }()
 
 	// Stub slotBackoffDurationForTest to 0 so the spawned reconnectLoop
 	// doesn't block exit; we only verify the placeholder cleanup.

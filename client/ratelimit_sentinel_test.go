@@ -209,9 +209,9 @@ func TestReconnectLoop_AppliesCooldownOnRateLimit(t *testing.T) {
 		return nil
 	}
 
-	prevStub := connectSlotForTest
-	connectSlotForTest = stub
-	defer func() { connectSlotForTest = prevStub }()
+	prevStub := getConnectSlotForTest()
+	setConnectSlotForTest(stub)
+	defer func() { setConnectSlotForTest(prevStub) }()
 
 	p := &WSPoolTransport{
 		poolSize: 1,
@@ -295,9 +295,9 @@ func reconnectLoopHelper(t *testing.T, connectErr error) (fallbackInvoked bool) 
 		}
 		return nil
 	}
-	prevStub := connectSlotForTest
-	connectSlotForTest = stub
-	defer func() { connectSlotForTest = prevStub }()
+	prevStub := getConnectSlotForTest()
+	setConnectSlotForTest(stub)
+	defer func() { setConnectSlotForTest(prevStub) }()
 
 	p := &WSPoolTransport{
 		poolSize: 1,

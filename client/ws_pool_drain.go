@@ -507,8 +507,8 @@ func (p *WSPoolTransport) connectReserveSlot(cl *Client, newIdx, oldIdx int) {
 	}
 
 	var err error
-	if connectSlotForTest != nil {
-		err = connectSlotForTest()
+	if hook := getConnectSlotForTest(); hook != nil {
+		err = hook()
 	} else {
 		err = p.connectSlot(p.ctx, newIdx)
 	}

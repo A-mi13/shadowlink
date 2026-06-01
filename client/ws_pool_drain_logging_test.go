@@ -706,9 +706,9 @@ func TestConnectReserveSlot_IncrementsFailureCounterOnFailure(t *testing.T) {
 	p.slots[1] = &poolSlot{index: 1}
 	p.slots[1].setState(slotConnecting)
 
-	prev := connectSlotForTest
-	connectSlotForTest = func() error { return errors.New("simulated failure") }
-	t.Cleanup(func() { connectSlotForTest = prev })
+	prev := getConnectSlotForTest()
+	setConnectSlotForTest(func() error { return errors.New("simulated failure") })
+	t.Cleanup(func() { setConnectSlotForTest(prev) })
 
 	p.connectReserveSlot(nil, 1, 0)
 
@@ -736,15 +736,15 @@ func TestConnectReserveSlot_ResetsFailureCounterOnSuccess(t *testing.T) {
 	p.slots[2].setState(slotConnecting)
 	p.reserveConnectFailures[2].Store(5) // simulate prior failures
 
-	prev := connectSlotForTest
+	prev := getConnectSlotForTest()
 	// Success: return nil. NOTE: real connectReserveSlot spawns
 	// p.slotReader on success, which we cannot run here (no real Client).
 	// But the counter reset happens BEFORE the slotReader spawn, so
 	// we observe the side effect synchronously. The slotReader spawn
 	// is harmless — it operates on a non-existent transport and exits
 	// immediately when ReadMessage fails.
-	connectSlotForTest = func() error { return nil }
-	t.Cleanup(func() { connectSlotForTest = prev })
+	setConnectSlotForTest(func() error { return nil })
+	t.Cleanup(func() { setConnectSlotForTest(prev) })
 
 	// Use a non-nil minimal Client so slotReader can dispatch into it
 	// without nil deref. Read paths in slotReader will fail fast on
@@ -772,9 +772,9 @@ func TestConnectReserveSlot_PoolLevelCounterSurvivesSlotRecycle(t *testing.T) {
 	p.slots[idx] = &poolSlot{index: idx}
 	p.slots[idx].setState(slotConnecting)
 
-	prev := connectSlotForTest
-	connectSlotForTest = func() error { return errors.New("still failing") }
-	t.Cleanup(func() { connectSlotForTest = prev })
+	prev := getConnectSlotForTest()
+	setConnectSlotForTest(func() error { return errors.New("still failing") })
+	t.Cleanup(func() { setConnectSlotForTest(prev) })
 
 	p.connectReserveSlot(nil, idx, 0)
 
