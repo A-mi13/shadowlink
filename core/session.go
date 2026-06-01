@@ -73,6 +73,26 @@ type Session struct {
 	// handshake path stores it under no lock either; pure CAS-style publish).
 	AttachedAt atomic.Int64
 
+	// DetachedAt is the unix nanosecond timestamp at which this session's WS
+	// transport last DETACHED (the slot's reader goroutine exited — TSPU
+	// age-cut close 1006, io_timeout, peer_eof, or our own teardown). 0 means
+	// "no transport has detached since the last attach" (currently attached, or
+	// never attached).
+	//
+	// Server ghost-sweep (2026-06-01 pool-capacity-dip-fix): a session whose
+	// transport died externally lingers in the manager until the coarse idle
+	// timeout, accumulating ghost sessions (active_clients=18 after the client
+	// disconnected) that drift the server toward its rate limit. The WS session
+	// teardown stamps DetachedAt; CleanupDetachedGhosts reclaims a session that
+	// has stayed detached longer than a SHORT grace — gated so a session a
+	// stream is migrating onto (Bug#9 orphan window) is never evicted mid-RESUME.
+	//
+	// Cleared back to 0 by authenticateFirstFrame on a successful re-attach (a
+	// pool reconnect re-adopting the same session) so a healthy reconnect is not
+	// mistaken for a ghost. Atomic for the same lock-free read/publish reason as
+	// AttachedAt.
+	DetachedAt atomic.Int64
+
 	// Cached AES-GCM ciphers (zero-alloc encrypt/decrypt).
 	// A1-M2: sendEpoch is held in an atomic.Pointer so EncryptChunk can be lock-free.
 	// recvGCM/oldRecvGCM remain under mu — their swap path (Rekey) is the only writer.
@@ -678,6 +698,101 @@ func (sm *SessionManager) CleanupNewbornOrphans(now time.Time, maxAge time.Durat
 		delete(sm.sessions, c.id)
 		sm.mu.Unlock()
 		evicted = append(evicted, c.id)
+	}
+	return evicted
+}
+
+// CleanupDetachedGhosts reclaims sessions whose WS transport DETACHED (the
+// slot's reader goroutine exited — TSPU age-cut, io_timeout, peer_eof) more
+// than `grace` ago and which the caller-supplied gate confirms are safe to
+// evict. It is the SERVER side of the 2026-06-01 pool-capacity-dip-fix: the
+// client cannot FIN an age-cut session (dead transport, no on-wire session
+// addressing — see docs/sl-capacity-dip-spec-review.md BLOCKER-1), so the
+// server reclaims the ghost promptly instead of waiting for the coarse idle
+// timeout (the source of active_clients=18 ghosts that drift toward rate-limit).
+//
+// Eligibility (a session is a sweepable ghost when ALL hold):
+//   - AttachedAt != 0   — it actually completed a handshake + attach (a newborn
+//     orphan is handled by CleanupNewbornOrphans, not here).
+//   - DetachedAt != 0   — a transport detached since the last attach (0 means
+//     currently attached, or a reconnect re-adopted it and cleared the stamp).
+//   - now - DetachedAt > grace — past the short grace that lets a RESUME/MIGRATE
+//     re-adopt the relay (the grace MUST be >= the Bug#9 orphan window).
+//   - gate(id) == true  — the caller (server.Handler) confirms there is NO
+//     active orphan relay still bound to this session AND no live transport
+//     re-attached. This is the CRITICAL Bug#9-coexistence constraint: a session
+//     a stream is migrating onto must survive until its grace expires.
+//
+// Two-phase (mirrors CleanupNewbornOrphans, P2-3): Phase 1 collects candidate
+// IDs under RLock; Phase 2 re-validates each under the write lock (DetachedAt is
+// atomic; the gate is re-consulted) before zeroing key material and deleting.
+// The gate is called in BOTH phases — Phase 1 to cheaply skip the common case,
+// Phase 2 under the write lock to close the migrate-onto race (a RESUME between
+// phases re-attaches and clears DetachedAt, which Phase 2's re-read observes).
+func (sm *SessionManager) CleanupDetachedGhosts(now time.Time, grace time.Duration, gate func(id uint32) bool) []uint32 {
+	graceNs := grace.Nanoseconds()
+
+	// Phase 1: collect candidates under read lock only.
+	var candidates []uint32
+	sm.mu.RLock()
+	for id, s := range sm.sessions {
+		if s.AttachedAt.Load() == 0 {
+			continue // never attached — newborn-orphan path owns it
+		}
+		det := s.DetachedAt.Load()
+		if det == 0 {
+			continue // currently attached (or re-adopted)
+		}
+		if now.UnixNano()-det <= graceNs {
+			continue // still within the short grace — let a RESUME re-adopt it
+		}
+		if gate != nil && !gate(id) {
+			continue // an orphan relay / live transport still references it
+		}
+		candidates = append(candidates, id)
+	}
+	sm.mu.RUnlock()
+
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	// Phase 2: per-candidate write-lock window, re-validate eligibility.
+	evicted := make([]uint32, 0, len(candidates))
+	for _, id := range candidates {
+		// Re-consult the gate OUTSIDE the manager lock to avoid holding it across
+		// the caller's registry/tunnel locks (lock-order safety).
+		if gate != nil && !gate(id) {
+			continue
+		}
+		sm.mu.Lock()
+		s, ok := sm.sessions[id]
+		if !ok {
+			sm.mu.Unlock()
+			continue
+		}
+		// A reconnect between phases re-attaches and clears DetachedAt (and may
+		// have bumped AttachedAt) — re-read under the lock and skip if so.
+		det := s.DetachedAt.Load()
+		if s.AttachedAt.Load() == 0 || det == 0 || now.UnixNano()-det <= graceNs {
+			sm.mu.Unlock()
+			continue
+		}
+		// Zero key material under the session lock (mirrors Destroy).
+		s.mu.Lock()
+		ZeroBytes(s.SendKey)
+		ZeroBytes(s.RecvKey)
+		if s.oldRecvKey != nil {
+			ZeroBytes(s.oldRecvKey)
+			s.oldRecvKey = nil
+		}
+		s.sendEpochPtr.Store(nil)
+		s.recvGCM = nil
+		s.oldRecvGCM = nil
+		s.mu.Unlock()
+		delete(sm.sessions, id)
+		sm.mu.Unlock()
+		evicted = append(evicted, id)
 	}
 	return evicted
 }

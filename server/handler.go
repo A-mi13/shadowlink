@@ -1878,6 +1878,45 @@ func (h *Handler) SessionCount() int {
 // renegotiation, small enough to keep the orphan footprint tiny.
 const newbornOrphanMaxAge = 30 * time.Second
 
+// detachedGhostGrace is how long an attached session may stay DETACHED (its WS
+// reader exited) before the server ghost-sweep reclaims it. MUST be >= the Bug#9
+// migration grace window (migrateGracePeriod, default 8s) so a session a stream
+// is RESUMING onto is never reclaimed mid-migration — the gate
+// (ghostSweepEligible) ALSO refuses while a relay is still bound, but the grace
+// is the coarse first line so a re-adopting reconnect/RESUME has time to clear
+// DetachedAt before the sweep even considers the session. 15s gives comfortable
+// margin over the 8s orphan window while still draining ghosts ~20× faster than
+// the 5-min idle timeout (the source of active_clients=18 in
+// docs/sl-burst2-freeze-analysis.md §3). Server ghost-sweep, 2026-06-01.
+const detachedGhostGrace = 15 * time.Second
+
+// ghostSweepEligible is the eviction gate for CleanupDetachedGhosts. It returns
+// true only when session `id` is safe to reclaim: NO live WS transport is
+// attached (WSAttached==false) AND no orphaned relay is still bound to it (no
+// stream is mid-RESUME). The Bug#9-coexistence constraint lives here — a session
+// a stream is migrating onto must survive until its relay's grace expires.
+func (h *Handler) ghostSweepEligible(id uint32) bool {
+	sess, ok := h.sessions.Get(id)
+	if !ok {
+		return false // already gone — nothing to sweep
+	}
+	h.tunnelsMu.RLock()
+	t, ok := h.tunnels[id]
+	h.tunnelsMu.RUnlock()
+	if !ok {
+		// No tunnel: the session has no relay state to migrate and no live
+		// transport. Safe to reclaim (the bare session is the pure ghost).
+		return true
+	}
+	if t.WSAttached.Load() {
+		return false // a transport re-attached — not a ghost
+	}
+	if t.ClientID != "" && h.relayRegistry.hasBoundEntriesForSession(t.ClientID, sess) {
+		return false // an orphaned relay is still bound — a stream may RESUME
+	}
+	return true
+}
+
 // reapOrphanTunnels removes tunnel state for sessions evicted by the
 // newborn-orphan fast path. Mirrors the post-Cleanup reap logic but
 // keyed by the explicit eviction list rather than a presence check.
@@ -1932,6 +1971,19 @@ func (h *Handler) StartCleanup(stop <-chan struct{}) {
 					h.metrics.OrphanSessionCleaned.Add(uint64(n))
 					h.reapOrphanTunnels(orphanIDs)
 					slog.Debug("newborn orphan cleanup", "evicted", n)
+				}
+
+				// Server ghost-sweep (2026-06-01 pool-capacity-dip-fix): reclaim
+				// ATTACHED sessions whose WS transport detached (TSPU age-cut)
+				// past detachedGhostGrace, gated so a session a stream is RESUMING
+				// onto (Bug#9 orphan window) is never reclaimed mid-migration.
+				// Runs after the newborn sweep, before the coarse idle Cleanup —
+				// the same reapOrphanTunnels teardown frees the matching tunnels.
+				ghostIDs := h.sessions.CleanupDetachedGhosts(time.Now(), detachedGhostGrace, h.ghostSweepEligible)
+				if n := len(ghostIDs); n > 0 {
+					h.metrics.GhostSessionSwept.Add(uint64(n))
+					h.reapOrphanTunnels(ghostIDs)
+					slog.Debug("ghost session sweep", "swept", n)
 				}
 
 				removed := h.sessions.Cleanup()

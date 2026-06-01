@@ -189,6 +189,13 @@ func (h *Handler) authenticateFirstFrame(conn *websocket.Conn) (*core.Session, u
 		return nil, 0, false
 	}
 
+	// Server ghost-sweep (2026-06-01 pool-capacity-dip-fix): a fresh transport is
+	// now attached to this session — clear any DetachedAt stamp left by a prior
+	// WS teardown so CleanupDetachedGhosts does not reclaim a session a pool
+	// reconnect just re-adopted. Ordered AFTER the WSAttached CAS so only the
+	// winning attacher clears it.
+	session.DetachedAt.Store(0)
+
 	// Bug #8: read FLOWCTL marker from the (decrypted) keepalive payload and,
 	// if present & supported, emit a synchronous FLOWCTL-ack BEFORE the relay
 	// loop starts (the first keepalive never reaches the reader-loop).
@@ -519,6 +526,16 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		if ok {
 			t.WSAttached.Store(false)
 		}
+		// Server ghost-sweep (2026-06-01 pool-capacity-dip-fix): stamp the
+		// detach time so CleanupDetachedGhosts can reclaim this session after a
+		// short grace instead of waiting for the coarse idle timeout. The slot's
+		// WS reader exited (TSPU age-cut close 1006 / io_timeout / peer_eof) and
+		// runWebSocketSession returned — the transport is gone. A legitimate pool
+		// reconnect re-adopting this same session clears the stamp back to 0 in
+		// authenticateFirstFrame. Stamped unconditionally (even if the tunnel was
+		// already removed by closeTunnel — the session may still linger in the
+		// manager, and a stale DetachedAt on an already-removed session is inert).
+		session.DetachedAt.Store(time.Now().UnixNano())
 	}()
 
 	h.runWebSocketSession(conn, session, flowWindow, migrateEnabled)

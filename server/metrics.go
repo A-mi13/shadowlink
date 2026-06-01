@@ -167,6 +167,17 @@ type Metrics struct {
 	// stripping the upgrade, NAT churn between two requests).
 	OrphanSessionCleaned atomic.Uint64
 
+	// GhostSessionSwept counts sessions reclaimed by the server ghost-sweep
+	// (2026-06-01 pool-capacity-dip-fix): attached sessions whose WS transport
+	// detached (TSPU age-cut close 1006 / io_timeout / peer_eof) more than the
+	// short grace ago, with no orphan relay still bound to them. This is the
+	// server-side close of the ghost-session leak the client cannot FIN (dead
+	// transport, no on-wire session addressing). A non-zero rate is EXPECTED in
+	// direct mode under TSPU age-cutting — it is the mechanism working, draining
+	// ghosts that previously lingered to the idle timeout and drifted the server
+	// toward its rate limit (the freeze aggravator, docs/sl-burst2-freeze-analysis.md §3-4).
+	GhostSessionSwept atomic.Uint64
+
 	// WS reader-exit classification (2026-05-18 forensics, post-storm-brake).
 	// Field debug question we keep hitting: when the client logs `close 1006
 	// (abnormal closure): unexpected EOF`, who CLOSED the TCP first — the
@@ -443,6 +454,8 @@ type MetricsSnapshot struct {
 	RatelimitBurstRejectedData      uint64 `json:"ratelimit_burst_rejected_data"`
 	// Plan §C10 M2 (May audit) — newborn-not-attached evictions.
 	OrphanSessionCleaned uint64 `json:"orphan_session_cleaned"`
+	// 2026-06-01 pool-capacity-dip-fix — detached-ghost (age-cut) sweeps.
+	GhostSessionSwept uint64 `json:"ghost_session_swept"`
 	// 2026-05-18 forensics — server-side classification of WS reader exits.
 	// Cross-reference against client `close 1006` reports to attribute
 	// teardown source (peer EOF / TCP RST / read deadline / local Close).
@@ -542,6 +555,7 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		RatelimitBurstRejectedHandshake:    m.RatelimitBurstRejected_Handshake.Load(),
 		RatelimitBurstRejectedData:         m.RatelimitBurstRejected_Data.Load(),
 		OrphanSessionCleaned:               m.OrphanSessionCleaned.Load(),
+		GhostSessionSwept:                  m.GhostSessionSwept.Load(),
 		WSReaderExitPeerEOF:                m.WSReaderExitPeerEOF.Load(),
 		WSReaderExitReset:                  m.WSReaderExitReset.Load(),
 		WSReaderExitIOTimeout:              m.WSReaderExitIOTimeout.Load(),
@@ -707,6 +721,10 @@ func writePromMetrics(w io.Writer, s *MetricsSnapshot) {
 	fmt.Fprintf(w, "# HELP shadowlink_orphan_session_cleaned_total Newborn sessions evicted by the 30s §C10 M2 (May audit) fast-path timeout — handshake completed, transport never attached\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_orphan_session_cleaned_total counter\n")
 	fmt.Fprintf(w, "shadowlink_orphan_session_cleaned_total %d\n", s.OrphanSessionCleaned)
+
+	fmt.Fprintf(w, "# HELP shadowlink_ghost_session_swept_total Attached sessions reclaimed by the server ghost-sweep (2026-06-01 pool-capacity-dip-fix): WS transport detached (TSPU age-cut close 1006 / io_timeout / peer_eof) past the short grace, no orphan relay still bound. Closes the ghost leak the client cannot FIN. Non-zero rate is expected under TSPU age-cutting.\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_ghost_session_swept_total counter\n")
+	fmt.Fprintf(w, "shadowlink_ghost_session_swept_total %d\n", s.GhostSessionSwept)
 
 	// 2026-05-18 forensics — WS reader-exit attribution. Cross-reference
 	// against client-side "WS pool slot reader error" lines to determine

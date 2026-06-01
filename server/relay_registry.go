@@ -326,6 +326,25 @@ func (r *relayRegistry) entriesForSession(clientID string, sess *core.Session) [
 	return out
 }
 
+// hasBoundEntriesForSession reports whether any relayEntry under clientID is
+// still bound to sess — i.e. an orphaned relay in the Bug#9 grace window that a
+// stream may RESUME onto. The server ghost-sweep (2026-06-01) consults this as
+// its eviction gate: a session with a live bound relay MUST survive until the
+// relay's grace timer either resumes it (binding moves elsewhere) or tears it
+// down (entry removed), so we never reclaim a session mid-migration. Cheaper
+// than entriesForSession (no slice allocation) since the sweep only needs the
+// boolean.
+func (r *relayRegistry) hasBoundEntriesForSession(clientID string, sess *core.Session) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, e := range r.byClient[clientID] {
+		if b := e.bound.Load(); b != nil && b.session == sess {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *relayRegistry) countForClient(clientID string) int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
