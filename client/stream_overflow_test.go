@@ -1,7 +1,6 @@
 package client
 
 import (
-	"bytes"
 	"log/slog"
 	"strings"
 	"sync"
@@ -12,9 +11,9 @@ import (
 // captureSlogOverflow redirects the default slog logger to an in-memory buffer
 // and returns a cleanup func + the buffer. Caller asserts on buffer
 // contents to verify log emissions.
-func captureSlogOverflow(t *testing.T, level slog.Level) *bytes.Buffer {
+func captureSlogOverflow(t *testing.T, level slog.Level) *syncBuffer {
 	t.Helper()
-	buf := &bytes.Buffer{}
+	buf := &syncBuffer{}
 	handler := slog.NewTextHandler(buf, &slog.HandlerOptions{Level: level})
 	prev := slog.Default()
 	slog.SetDefault(slog.New(handler))

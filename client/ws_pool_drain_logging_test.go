@@ -12,14 +12,52 @@ import (
 	"time"
 )
 
+// syncBuffer is a concurrency-safe slog sink. A *bytes.Buffer is NOT
+// safe for concurrent use, but drain/reconnect tests install the sink as
+// p.log (or slog.Default) and then run real background goroutines
+// (drainWatchdog → handleSlotDeath → reconnectLoop, connectReserveSlot)
+// that keep logging while the test goroutine reads the captured output.
+// That produced the Linux -race report bytes.(*Buffer).grow (handler
+// Write) vs bytes.(*Buffer).Len (test String()). Guarding both Write and
+// String with one mutex closes it without weakening any assertion — the
+// test still reads exactly what was logged, just under the lock.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *syncBuffer) Bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	// Return a copy so callers can read it lock-free without racing a
+	// concurrent Write growing the underlying array.
+	return append([]byte(nil), b.buf.Bytes()...)
+}
+
 // captureSlogForDrain creates a text handler bound to an in-memory buffer
 // at the requested level. Unlike captureSlog in may_audit_p2_test.go this
 // helper does NOT touch slog.Default — it returns a *slog.Logger that the
 // caller installs into p.log directly, because drain-deferred messages
 // are emitted via p.log (the pool's own logger), not the package default.
-func captureSlogForDrain(t *testing.T, level slog.Level) (*bytes.Buffer, *slog.Logger) {
+//
+// The sink is a *syncBuffer (concurrency-safe) because callers run real
+// drain/reconnect background goroutines that log concurrently with the
+// test's String() read.
+func captureSlogForDrain(t *testing.T, level slog.Level) (*syncBuffer, *slog.Logger) {
 	t.Helper()
-	buf := &bytes.Buffer{}
+	buf := &syncBuffer{}
 	handler := slog.NewTextHandler(buf, &slog.HandlerOptions{Level: level})
 	return buf, slog.New(handler)
 }

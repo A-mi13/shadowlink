@@ -723,18 +723,25 @@ func TestConnectReserveSlot_FailureFallsBackToReconnectLoop(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 
 	newIdx := p.poolSize // first reserve cell — 2
+	// Read the cell under reserveMu: background connectReserveSlot/reconnectLoop
+	// goroutines write p.slots[newIdx] under reserveMu, so an unguarded read here
+	// races them (Linux -race). Snapshot the pointer once under the lock and
+	// assert against the copy.
+	p.reserveMu.Lock()
+	slot := p.slots[newIdx]
+	p.reserveMu.Unlock()
 	// T9 invariant: after connectSlot failure the placeholder is freed to nil
 	// so claimFreeSlot can immediately reuse the cell for the next drain.
 	// reconnectLoop is scheduled and may reinstall a slot in the background —
 	// we only assert the failure path did NOT leave a non-nil dead/connecting
 	// placeholder permanently blocking the cell.
-	if slot := p.slots[newIdx]; slot != nil && slot.getState() == slotReady {
+	if slot != nil && slot.getState() == slotReady {
 		t.Errorf("reserve slot should NOT be slotReady after connect to invalid port; got slotReady")
 	}
 	// Acceptable post-failure states: nil (freed by T9) or slotConnecting
 	// (reconnectLoop successfully reinstalled a slot in the background
 	// within the 300ms window — rare but valid).
-	if slot := p.slots[newIdx]; slot != nil && slot.getState() == slotDead {
+	if slot != nil && slot.getState() == slotDead {
 		t.Errorf("reserve cell should be nil (freed) or reconnected after failure, not permanently slotDead")
 	}
 }
@@ -1348,9 +1355,14 @@ func TestReconnectLoop_RecycleGuard(t *testing.T) {
 
 	// Pre-install a slotReady cell at idx 3 (simulating a drain having
 	// recycled this cell while a stale reconnectLoop was running).
+	// Write under reserveMu — reconnectLoop reads p.slots[idx] under
+	// reserveMu (recycle guard, §2.2.2); matching the lock on the setup
+	// write closes the Linux -race report on this slice cell.
 	recycledSlot := &poolSlot{index: 3}
 	recycledSlot.setState(slotReady)
+	p.reserveMu.Lock()
 	p.slots[3] = recycledSlot
+	p.reserveMu.Unlock()
 
 	// Stub connectSlot — must NOT be called when guard fires.
 	called := false
@@ -1376,7 +1388,10 @@ func TestReconnectLoop_RecycleGuard(t *testing.T) {
 	if called {
 		t.Errorf("connectSlot called despite recycled cell — guard failed")
 	}
-	if p.slots[3] != recycledSlot {
+	p.reserveMu.Lock()
+	cell3 := p.slots[3]
+	p.reserveMu.Unlock()
+	if cell3 != recycledSlot {
 		t.Errorf("recycled cell was overwritten")
 	}
 }
@@ -1968,7 +1983,16 @@ func TestStartDrain_ForceEvictsIdleSlot_WhenSliceFull(t *testing.T) {
 	if got := Stats.DrainStartedTotal.Load() - beforeStarted; got != 1 {
 		t.Errorf("DrainStartedTotal increment = %d, want 1 (drain should proceed after evict)", got)
 	}
-	if got := p.slots[0].getState(); got != slotDraining {
+	// Snapshot all cells under reserveMu: the spawned connectReserveSlot
+	// goroutine writes p.slots[newIdx] under reserveMu (placeholder install /
+	// nil-on-failure), so unguarded reads of p.slots[i] below race it
+	// (Linux -race). Assert against the copied pointers.
+	p.reserveMu.Lock()
+	snap := make([]*poolSlot, len(p.slots))
+	copy(snap, p.slots)
+	p.reserveMu.Unlock()
+
+	if got := snap[0].getState(); got != slotDraining {
 		t.Errorf("drain target slot[0] state = %v, want slotDraining", got)
 	}
 
@@ -1977,7 +2001,7 @@ func TestStartDrain_ForceEvictsIdleSlot_WhenSliceFull(t *testing.T) {
 	// in slotReady. The drain target [0] must be slotDraining.
 	evictedCount := 0
 	for i := 8; i < 16; i++ {
-		if p.slots[i] == nil {
+		if snap[i] == nil {
 			evictedCount++
 		}
 	}
@@ -1985,10 +2009,10 @@ func TestStartDrain_ForceEvictsIdleSlot_WhenSliceFull(t *testing.T) {
 		t.Errorf("nil idle cells in [8..16) = %d, want 1 (force-evict picks exactly one)", evictedCount)
 	}
 	for i := 1; i < 8; i++ {
-		if p.slots[i] == nil {
+		if snap[i] == nil {
 			t.Errorf("busy primary slot[%d] was evicted — must not touch active-stream slots", i)
-		} else if p.slots[i].getState() != slotReady {
-			t.Errorf("busy primary slot[%d] state = %v, want slotReady (untouched)", i, p.slots[i].getState())
+		} else if snap[i].getState() != slotReady {
+			t.Errorf("busy primary slot[%d] state = %v, want slotReady (untouched)", i, snap[i].getState())
 		}
 	}
 }
@@ -2124,8 +2148,12 @@ func TestStartDrain_ForceEvictBumpsGeneration(t *testing.T) {
 		t.Errorf("victim.generation = %d, want > %d (bump before handleSlotDeath)",
 			genAfter, genBefore)
 	}
-	// And the cell must be nil (handleSlotDeath ran).
-	if p.slots[1] != nil {
+	// And the cell must be nil (handleSlotDeath ran). Read under reserveMu —
+	// background connectReserveSlot/handleSlotDeath write p.slots[i] under it.
+	p.reserveMu.Lock()
+	cell1 := p.slots[1]
+	p.reserveMu.Unlock()
+	if cell1 != nil {
 		t.Errorf("p.slots[1] should be nil after force-evict; got non-nil")
 	}
 }
@@ -2277,12 +2305,18 @@ func TestStartDrain_EmergencyEvictsMinStreamsWhenOverAged(t *testing.T) {
 	if got := Stats.DrainStartedTotal.Load() - beforeStarted; got != 1 {
 		t.Errorf("DrainStartedTotal increment = %d, want 1", got)
 	}
-	if p.slots[5] != nil {
-		t.Errorf("cell [5] (min streams) should be nil after emergency evict; got %v", p.slots[5])
+	// Snapshot under reserveMu — background connectReserveSlot writes
+	// p.slots[newIdx] under the lock; unguarded reads here race it.
+	p.reserveMu.Lock()
+	snap := make([]*poolSlot, len(p.slots))
+	copy(snap, p.slots)
+	p.reserveMu.Unlock()
+	if snap[5] != nil {
+		t.Errorf("cell [5] (min streams) should be nil after emergency evict; got %v", snap[5])
 	}
 	// Other busy cells [1..4, 6..15] must not be evicted.
 	for _, i := range []int{1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15} {
-		if p.slots[i] == nil {
+		if snap[i] == nil {
 			t.Errorf("cell [%d] (not min-streams) should not be evicted", i)
 		}
 	}
@@ -2405,7 +2439,11 @@ func TestStartDrain_PrefersIdleOverEmergencyEvenWhenOverAged(t *testing.T) {
 	if got := Stats.DrainForceEvictedActiveTotal.Load() - beforeActive; got != 0 {
 		t.Errorf("DrainForceEvictedActiveTotal increment = %d, want 0 (idle preferred)", got)
 	}
-	if p.slots[9] != nil {
+	// Read under reserveMu — background connectReserveSlot writes p.slots[newIdx].
+	p.reserveMu.Lock()
+	cell9 := p.slots[9]
+	p.reserveMu.Unlock()
+	if cell9 != nil {
 		t.Errorf("idle cell [9] should be evicted; got non-nil")
 	}
 }
@@ -2791,8 +2829,11 @@ func TestWriteControlMessageForStream_StampsPerStream(t *testing.T) {
 //
 // Spec 2026-05-25-drain-per-stream-idle-decision-design §4.2 #7.
 func TestDrainWatchdog_PerStreamIdle_TriggersWhenAllSilent(t *testing.T) {
-	var logBuf bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	// syncBuffer sink: drainWatchdog → handleSlotDeath may spawn a
+	// reconnectLoop goroutine that logs to this same logger concurrently
+	// with the String() read below (Linux -race: bytes grow vs Len).
+	logBuf := &syncBuffer{}
+	logger := slog.New(slog.NewTextHandler(logBuf, nil))
 
 	cl := &Client{streamChans: make(map[uint16]chan []byte)}
 	p := NewWSPoolTransport(cl, WSPoolConfig{

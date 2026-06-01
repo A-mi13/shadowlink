@@ -1482,6 +1482,27 @@ func (p *WSPoolTransport) allocSlots() {
 	p.reserveConnectFailures = make([]atomic.Int32, p.poolSize*2)
 }
 
+// snapshotSlots returns a copy of the p.slots element pointers taken under
+// reserveMu. Background sweepers (rotationWatchdogSweep) MUST iterate this
+// snapshot rather than indexing p.slots directly: writers (connectSlot,
+// connectReserveSlot, handleSlotDeath teardown, claimFreeReserveSlot,
+// startDrain claim) mutate the slice cells under reserveMu, and an unguarded
+// `slot := p.slots[idx]` read races with those writes (Linux -race, Bug#6
+// drain/reconnect). The slice header itself never changes after allocSlots,
+// so only the per-cell pointer read needs the lock; copying pointers is O(n)
+// under a short critical section and lets the sweep run lock-free afterwards
+// (every shared *poolSlot field it touches is atomic). The snapshot may go
+// stale immediately after the lock is released — that is acceptable: a cell
+// nilled or replaced after the copy is simply skipped/handled on the next
+// 5s tick, exactly as before this fix.
+func (p *WSPoolTransport) snapshotSlots() []*poolSlot {
+	p.reserveMu.Lock()
+	defer p.reserveMu.Unlock()
+	out := make([]*poolSlot, len(p.slots))
+	copy(out, p.slots)
+	return out
+}
+
 // Connect establishes all WS connections in parallel.
 // Returns success when at least one slot is ready.
 func (p *WSPoolTransport) Connect(ctx context.Context) error {
@@ -1579,8 +1600,17 @@ func (p *WSPoolTransport) rotationWatchdogSweep() {
 	// Uniform-cells: iterate the entire slice. Cells that drifted from
 	// primary to reserve range still need age-driven drain — see spec
 	// 2026-05-20 §2.3.
-	for idx := range p.slots {
-		slot := p.slots[idx]
+	//
+	// Snapshot the slice-cell pointers under reserveMu (see snapshotSlots):
+	// connectSlot/connectReserveSlot/handleSlotDeath/startDrain all write
+	// p.slots[idx] under reserveMu, so an unguarded `slot := p.slots[idx]`
+	// read here races them (Bug#6 drain/reconnect, Linux -race). We do NOT
+	// hold reserveMu across the sweep — startDrain/connect would stall — so
+	// take the snapshot once, then iterate it lock-free (every *poolSlot
+	// field below is atomic).
+	slots := p.snapshotSlots()
+	for idx := range slots {
+		slot := slots[idx]
 		if slot == nil || slot.getState() != slotReady {
 			continue
 		}
