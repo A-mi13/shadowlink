@@ -82,6 +82,29 @@ func TestGhostSweepEligible_BoundOrphanRelayBlocks(t *testing.T) {
 		"after the orphaned relay is gone, the detached session is a sweepable ghost")
 }
 
+// TestGhostSweepEligible_RelayMigratedAwayIsSweepable: a relay that was
+// preemptively migrated to ANOTHER live slot has its binding pointing at a
+// different session — it is no longer bound to the dying session, so the dying
+// session IS a sweepable ghost (the migrated stream keeps running elsewhere).
+// This pins that the gate keys on binding identity, not mere clientID presence.
+func TestGhostSweepEligible_RelayMigratedAwayIsSweepable(t *testing.T) {
+	h, _ := setupTestHandler(t)
+	dying := ghostSweepSession(t, h, "user-1:devA", 30*time.Second)
+
+	// A relay under the same clientID, but bound to a DIFFERENT (live) session —
+	// it migrated to another slot and no longer references `dying`.
+	otherKey := make([]byte, 32)
+	otherSess, err := h.sessions.Create(otherKey, otherKey)
+	require.NoError(t, err)
+	e := &relayEntry{originClientID: "user-1:devA", globalStreamID: 11}
+	e.bound.Store(&binding{session: otherSess})
+	h.relayRegistry.add("user-1:devA", 11, e)
+
+	require.True(t, h.ghostSweepEligible(dying.ID),
+		"a session whose relay migrated AWAY (binding points elsewhere) is a "+
+			"sweepable ghost — the gate keys on binding identity, not clientID presence")
+}
+
 // TestCleanupDetachedGhosts_HandlerGate_EndToEnd: drives the real
 // CleanupDetachedGhosts with the handler gate. A bound-relay session survives;
 // a no-relay session past grace is swept.
