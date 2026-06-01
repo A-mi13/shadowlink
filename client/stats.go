@@ -337,6 +337,18 @@ type statsRegistry struct {
 	// saturated; consider raising slice size.
 	DrainForceEvictedActiveTotal atomic.Uint64
 
+	// EmergencyEvictMigratedTotal — streams SAVED by PREEMPTIVELY migrating them
+	// off an emergency-eviction victim cell BEFORE its forced teardown, while the
+	// aging TCP is still healthy (spec 2026-06-01 emergency-evict-migrate).
+	// Reuses the Bug#9 MIGRATE primitive at the tier-2 eviction site. A healthy
+	// non-zero value means capacity-pressure evictions no longer break
+	// user-visible flows that had a younger slot to move onto. Streams NOT moved
+	// by this pass fall through to handleSlotDeath's RESUME-on-death attempt
+	// (counted as MigrateResumeOnDeathOK/Fail) — there is deliberately no
+	// separate "killed" counter here, which would double-count streams the
+	// teardown's RESUME still rescues.
+	EmergencyEvictMigratedTotal atomic.Uint64
+
 	// ReserveConnectFailuresTotal — cumulative count of connectReserveSlot
 	// failures (across all cells). High rate suggests TIME_WAIT exhaustion
 	// or origin endpoint instability — investigate before raising
@@ -353,6 +365,33 @@ type statsRegistry struct {
 	// of DrainNaturalFinishTotal: in steady state, NaturalFinish ≥
 	// IdleFinish always.
 	DrainIdleFinishTotal atomic.Uint64
+
+	// Pool capacity-dip fix (spec 2026-06-01-pool-capacity-dip-fix-design.md).
+	//
+	// AgeCutReconnectsTotal — slots that died to an EXPECTED TSPU age-cut
+	// (mature slot, close 1006) and were reconnected via the fast path
+	// (reconnectLoopFast attempt-0 success). The cascade of mature-slot cuts is
+	// driven by the middlebox, not us; this counter measures how often the fast
+	// reconnect healed the slot near-instantly instead of sitting in the old
+	// 5-10s exponential. A steady non-zero rate in direct mode is EXPECTED and
+	// healthy (it is the TSPU age-cutting bare-origin TCP).
+	AgeCutReconnectsTotal atomic.Uint64
+
+	// AgeCutReconnectFail — age-cut fast reconnect whose attempt-0 connect FAILED
+	// (so the loop fell into the exponential ladder). A rising rate is the canary
+	// signal that "age-cut" is masking a GENUINE failure (the origin is actually
+	// down, not just the middlebox cutting a mature TCP) — if it climbs, the
+	// classification (isAgeCut) or the ageCutMinAgeMs threshold needs review.
+	// Healthy steady state: near zero (age-cuts reconnect cleanly).
+	AgeCutReconnectFail atomic.Uint64
+
+	// CapacityDipTotal — observability counter for the residual capacity dip
+	// (Lever 4, counter-only). Incremented when an age-cut would drop the pool's
+	// ready capacity below the floor while streams are active — the condition the
+	// fast reconnect is meant to shorten. The canary uses this to PROVE the dip
+	// is gone after Levers 1+3 ship; a non-zero residual rate gates the (deferred)
+	// headroom-mechanism iteration.
+	CapacityDipTotal atomic.Uint64
 }
 
 // Histogram is a fixed-bucket histogram for duration-style observations.
@@ -755,6 +794,10 @@ func WritePromMetrics(w io.Writer) {
 	fmt.Fprintf(w, "# TYPE shadowlink_slot_drain_force_evicted_active_total counter\n")
 	fmt.Fprintf(w, "shadowlink_slot_drain_force_evicted_active_total %d\n", Stats.DrainForceEvictedActiveTotal.Load())
 
+	fmt.Fprintf(w, "# HELP shadowlink_emergency_evict_migrated_total Streams preemptively migrated off an emergency-eviction victim cell before its forced teardown (spec 2026-06-01). Reuses the Bug#9 MIGRATE primitive; non-zero means capacity-pressure evictions no longer break flows that had a younger slot to move onto. Streams not moved here fall through to RESUME-on-death (see migrate_resume_on_death_*).\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_emergency_evict_migrated_total counter\n")
+	fmt.Fprintf(w, "shadowlink_emergency_evict_migrated_total %d\n", Stats.EmergencyEvictMigratedTotal.Load())
+
 	fmt.Fprintf(w, "# HELP shadowlink_reserve_connect_failures_total Cumulative count of connectReserveSlot failures across all cells. High sustained rate suggests TIME_WAIT exhaustion or origin endpoint instability — investigate before raising maxConcurrentDrainsFraction further.\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_reserve_connect_failures_total counter\n")
 	fmt.Fprintf(w, "shadowlink_reserve_connect_failures_total %d\n", Stats.ReserveConnectFailuresTotal.Load())
@@ -770,6 +813,19 @@ func WritePromMetrics(w io.Writer) {
 	} else {
 		fmt.Fprintf(w, "shadowlink_drain_inflight 0\n")
 	}
+
+	// Pool capacity-dip fix (2026-06-01).
+	fmt.Fprintf(w, "# HELP shadowlink_age_cut_reconnects_total Slots that died to an expected TSPU age-cut (mature slot, close 1006) and were reconnected via the fast path. Steady non-zero rate in direct mode is expected (TSPU age-cutting bare-origin TCP).\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_age_cut_reconnects_total counter\n")
+	fmt.Fprintf(w, "shadowlink_age_cut_reconnects_total %d\n", Stats.AgeCutReconnectsTotal.Load())
+
+	fmt.Fprintf(w, "# HELP shadowlink_age_cut_reconnect_fail_total Age-cut fast reconnects whose attempt-0 connect failed (fell into the exponential ladder). A rising rate signals age-cut is masking a genuine origin failure — review isAgeCut / ageCutMinAgeMs.\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_age_cut_reconnect_fail_total counter\n")
+	fmt.Fprintf(w, "shadowlink_age_cut_reconnect_fail_total %d\n", Stats.AgeCutReconnectFail.Load())
+
+	fmt.Fprintf(w, "# HELP shadowlink_capacity_dip_total Times an age-cut would drop ready pool capacity below the floor while streams were active. Canary observability for the residual dip after the fast-reconnect fix; gates the deferred headroom-mechanism iteration.\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_capacity_dip_total counter\n")
+	fmt.Fprintf(w, "shadowlink_capacity_dip_total %d\n", Stats.CapacityDipTotal.Load())
 }
 
 // StartStatsLogger launches a goroutine that logs counter deltas every

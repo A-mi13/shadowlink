@@ -78,19 +78,58 @@ func clampRefillIn(d time.Duration) time.Duration {
 	return d
 }
 
-// slotRateLimitedCooldownForTest is a test seam: production code calls
-// slotRateLimitedCooldown directly, but TestReconnectLoop_AppliesCooldownOnRateLimit
-// substitutes a 100ms shim so the integration test can complete in <1s.
+// slotRateLimitedCooldownForTestPtr / slotBackoffDurationForTestPtr are test
+// seams for reconnectLoop integration tests. Production reconnectLoop calls
+// slotRateLimitedCooldown() / slotBackoffDuration(attempt) directly; tests
+// install a fast shim so the integration test finishes in milliseconds.
 //
-// Defaults to slotRateLimitedCooldown so production behavior is unchanged
-// when no test stub is installed.
-var slotRateLimitedCooldownForTest = slotRateLimitedCooldown
+// Synchronized via atomic.Pointer for the SAME reason as connectSlotForTestPtr
+// (see below): reconnectLoop reads these from a DETACHED background goroutine
+// while tests overwrite them from the test goroutine — and a leaked background
+// reconnectLoop from a prior subtest may still be reading when the next subtest
+// writes. A plain package-global `var` races the reader under -race
+// (TestReconnectLoop_RecycleGuard write vs a sibling test's live reconnectLoop
+// read — 2026-06-01 race report). nil pointer → "use the production function".
+var (
+	slotRateLimitedCooldownForTestPtr atomic.Pointer[func() time.Duration]
+	slotBackoffDurationForTestPtr     atomic.Pointer[func(int) time.Duration]
+)
 
-// slotBackoffDurationForTest is a test seam matching slotRateLimitedCooldownForTest.
-// Production reconnectLoop calls slotBackoffDuration(attempt) directly; tests
-// override this to return a fast backoff so reconnectLoop integration tests
-// finish in milliseconds instead of seconds.
-var slotBackoffDurationForTest = slotBackoffDuration
+// slotRateLimitedCooldownForTest returns the installed cooldown shim, or the
+// production slotRateLimitedCooldown when none is set. Safe from any goroutine.
+func slotRateLimitedCooldownForTest() time.Duration {
+	if fp := slotRateLimitedCooldownForTestPtr.Load(); fp != nil {
+		return (*fp)()
+	}
+	return slotRateLimitedCooldown()
+}
+
+// setSlotRateLimitedCooldownForTest installs (nil clears) the cooldown shim.
+func setSlotRateLimitedCooldownForTest(fn func() time.Duration) {
+	if fn == nil {
+		slotRateLimitedCooldownForTestPtr.Store(nil)
+		return
+	}
+	slotRateLimitedCooldownForTestPtr.Store(&fn)
+}
+
+// slotBackoffDurationForTest returns the installed backoff shim, or the
+// production slotBackoffDuration when none is set. Safe from any goroutine.
+func slotBackoffDurationForTest(attempt int) time.Duration {
+	if fp := slotBackoffDurationForTestPtr.Load(); fp != nil {
+		return (*fp)(attempt)
+	}
+	return slotBackoffDuration(attempt)
+}
+
+// setSlotBackoffDurationForTest installs (nil clears) the backoff shim.
+func setSlotBackoffDurationForTest(fn func(int) time.Duration) {
+	if fn == nil {
+		slotBackoffDurationForTestPtr.Store(nil)
+		return
+	}
+	slotBackoffDurationForTestPtr.Store(&fn)
+}
 
 // connectSlotForTest is a test seam for reconnectLoop integration tests —
 // production code uses (*WSPoolTransport).connectSlot directly. The stub
@@ -184,8 +223,20 @@ const (
 //     paused reconnect for 10s on a perfectly healthy pool (observed in
 //     field log 2026-05-18 right after the watchdog landed).
 //
+//   - deathCauseAgeCut — the EXPECTED TSPU age-cut: a mature direct-TCP slot
+//     (age >= ageCutMinAgeMs) closed 1006 by the middlebox (docs/
+//     sl-burst2-freeze-analysis.md). This is routine and anticipated in direct
+//     mode — not a fault. It MUST reconnect FAST (ageCutReconnectJitter, not the
+//     5-10s exponential) so a cascade of mature-slot cuts does not bare the pool
+//     and freeze quiet streams' downlink, and it MUST NOT feed the meltdown
+//     detector (a steady cascade of routine cuts would otherwise trip the
+//     cooldown and PAUSE all reconnects — deepening the dip, the opposite of
+//     what we want). For FIN behavior the age-cut is identical to natural: the
+//     transport is already dead (cut externally), so no session FIN is sent.
+//
 // recordSlotDeath is only invoked for the Natural cause; the meltdown
-// detector therefore tracks ONLY real failures.
+// detector therefore tracks ONLY real failures (age-cut is expected, not a
+// failure).
 type slotDeathCause int
 
 const (
@@ -199,6 +250,11 @@ const (
 	// dispatcher additionally sets p.slots[idx] = nil to free the cell for
 	// future reserve reuse via claimFreeReserveSlot.
 	deathCauseDrainTeardown
+	// deathCauseAgeCut — expected TSPU age-cut on a mature slot (close 1006 at
+	// age >= ageCutMinAgeMs). Fast reconnect (no exponential, no meltdown feed),
+	// no FIN (transport already dead). See the doc-comment above for the full
+	// rationale. Added 2026-06-01 (pool-capacity-dip-fix).
+	deathCauseAgeCut
 )
 
 func (c slotDeathCause) String() string {
@@ -209,6 +265,8 @@ func (c slotDeathCause) String() string {
 		return "preemptive_rotation"
 	case deathCauseDrainTeardown:
 		return "drain_teardown"
+	case deathCauseAgeCut:
+		return "age_cut"
 	default:
 		return "unknown"
 	}
@@ -726,6 +784,16 @@ func (p *WSPoolTransport) readyCapacityFloor() int {
 	return floor
 }
 
+// recordCapacityDip ticks the canary observability counter for a residual
+// capacity dip (Lever 4, counter-only — the headroom MECHANISM is deferred, see
+// spec Out-of-scope). Called from the age-cut death path when the cut would drop
+// ready capacity below the floor with active streams in flight — i.e. exactly
+// the condition the fast reconnect is meant to shorten. The canary uses this to
+// prove the dip is gone after Levers 1+3 ship.
+func (p *WSPoolTransport) recordCapacityDip() {
+	Stats.CapacityDipTotal.Add(1)
+}
+
 // effectiveStickyMaxSlots is the static ceiling on concurrently-sticky slots
 // (Bug #6). 0 (config) → auto = poolSize/2 (min 1). <0 → 0 (sticky disabled).
 // The ACTUAL cap is further gated dynamically by readyCapacity in
@@ -820,6 +888,26 @@ func (p *WSPoolTransport) maxConcurrentDrains() int {
 
 func (s *poolSlot) getState() slotState   { return slotState(s.state.Load()) }
 func (s *poolSlot) setState(st slotState) { s.state.Store(int32(st)) }
+
+// decStreamsFloor decrements s.streams by one but never below zero
+// (spec 2026-06-01 stream-counter-leak-fix, F2). A negative counter — which a
+// historical mismatched dec (dec landing on a slot whose paired inc went to a
+// now-retired object) could otherwise produce — would corrupt AssignStream's
+// load-balancing picker (picks the "least loaded" slot) and the health
+// active_streams sum. The CAS loop keeps it race-safe against a concurrent
+// Add/Add on the same counter. This bounds the SYMPTOM; the cause is fixed by
+// addressing counter mutations via captured *poolSlot pointers (F1/F3).
+func decStreamsFloor(s *poolSlot) {
+	for {
+		cur := s.streams.Load()
+		if cur <= 0 {
+			return
+		}
+		if s.streams.CompareAndSwap(cur, cur-1) {
+			return
+		}
+	}
+}
 
 // tryMarkDead atomically transitions the slot to slotDead from any non-dead
 // state. Returns true if THIS caller performed the transition (i.e., the slot
@@ -941,6 +1029,46 @@ func looksLikeHTTPPrefix(msg string) bool {
 		strings.Contains(msg, "HTTP") ||
 		strings.Contains(msg, "<!DOCTYPE") ||
 		strings.Contains(msg, "<html")
+}
+
+// ageCutMinAgeMs is the slot-age floor (milliseconds) above which a close-1006
+// terminal read error is classified as an EXPECTED TSPU age-cut rather than a
+// genuine failure. Rationale (docs/sl-burst2-freeze-analysis.md): warm-up plus
+// any genuine early instability shows well under 60s; the observed TSPU cuts of
+// bare-origin direct-TCP land at 100-190s. A 60s floor keeps the fast path
+// conservative — only clearly-mature cuts qualify, a young-slot 1006 stays
+// natural (exponential backoff + meltdown feed).
+const ageCutMinAgeMs = 60_000
+
+// ageCutReconnectJitter bounds the near-zero initial delay (U(0, jitter)) the
+// fast age-cut reconnect sleeps before its first connect attempt. A small spread
+// avoids a synchronized JA4 handshake burst when several mature slots are cut
+// close in time (same anti-thunder-herd rationale as reconnectJitterOffset),
+// while staying far below slotBackoffDuration(0)'s 5-10s — that 5-10s curve was
+// the measured source of the capacity dip (3-4 slots simultaneously in reconnect
+// under the cascade).
+const ageCutReconnectJitter = 800 * time.Millisecond
+
+// isClose1006 reports whether a terminal reader error belongs to the close-1006
+// (abnormal closure / unexpected EOF) family — the on-wire signature of a
+// middlebox tearing down the TCP without a clean WS close handshake. Reuses the
+// existing classifyWSReadError vocabulary so the label set stays single-sourced.
+func isClose1006(err error) bool {
+	return classifyWSReadError(err) == "close_other"
+}
+
+// isAgeCut reports whether a terminal reader error on a slot of the given age
+// (milliseconds) is the EXPECTED TSPU age-cut (a mature bare-origin direct-TCP
+// closed 1006 by the middlebox) rather than a genuine failure. Age-cuts are
+// routine in direct mode and must reconnect fast (ageCutReconnectJitter) without
+// feeding the meltdown detector. A young-slot death (age < ageCutMinAgeMs) is a
+// real early failure and stays deathCauseNatural — the conservative behavior for
+// genuine instability.
+func isAgeCut(err error, slotAgeMs int64) bool {
+	if slotAgeMs < ageCutMinAgeMs {
+		return false
+	}
+	return isClose1006(err)
 }
 
 // slotBackoffDuration returns reconnect wait for a per-slot reconnect attempt.
@@ -2037,6 +2165,27 @@ func (p *WSPoolTransport) connectSlot(ctx context.Context, idx int) error {
 // stacked on top of an already-aged exp curve — after a rate-limit event
 // we want a clean slow-start, not "5s × 2^N + 180s".
 func (p *WSPoolTransport) reconnectLoop(idx int) {
+	p.reconnectLoopInner(idx, false)
+}
+
+// reconnectLoopFast is the age-cut reconnect path (Lever 1, pool-capacity-dip-
+// fix). It is reconnectLoop with a near-zero initial delay: attempt 0 sleeps
+// U(0, ageCutReconnectJitter) instead of slotBackoffDuration(0)'s 5-10s. A
+// successful attempt-0 connect heals the dip immediately; if attempt 0's connect
+// FAILS (a genuine origin problem, not a routine middlebox cut), the loop falls
+// into the SAME exponential ladder as reconnectLoop from attempt=1 — so a real
+// outage still backs off properly. All other machinery (meltdown cooldown gate,
+// recycle guard, ctx-cancel, ErrRateLimited cooldown) is shared verbatim.
+func (p *WSPoolTransport) reconnectLoopFast(idx int) {
+	p.reconnectLoopInner(idx, true)
+}
+
+// reconnectLoopInner is the shared reconnect loop body. fastFirstAttempt selects
+// the age-cut fast path on attempt 0 (ageCutReconnectJitter, with age-cut
+// counters); false is the legacy natural/rotation path (exponential backoff,
+// post-meltdown handshake spreading). Extracted so the two entry points do NOT
+// duplicate the recycle-guard / ctx-cancel / rate-limit logic (DRY).
+func (p *WSPoolTransport) reconnectLoopInner(idx int, fastFirstAttempt bool) {
 	for attempt := 0; ; attempt++ {
 		select {
 		case <-p.ctx.Done():
@@ -2056,39 +2205,52 @@ func (p *WSPoolTransport) reconnectLoop(idx int) {
 			}
 		}
 
-		// A2 (2026-05-18): post-meltdown handshake spreading. When 8
-		// reconnect goroutines exit the cooldown together, without jitter
-		// they fire 8 identical-JA4 TLS handshakes to origin within
-		// milliseconds — a thunder-herd signature observable by any
-		// per-source-IP TLS counter at the origin (or on path). The
-		// per-slot offset spreads them across ~0-1.6s on a poolSize=8.
-		//
-		// Gate on attempt==0 && idx > 0 AND a recent meltdown timestamp:
-		//   - attempt > 0 retries already have exp backoff jitter.
-		//   - idx == 0 is the anchor reconnect, fires immediately.
-		//   - No recent meltdown (steady-state single-slot rotation) skips
-		//     the spread — it'd just add latency for no benefit.
-		if attempt == 0 && idx > 0 {
-			if last := p.recentMeltdownNs.Load(); last > 0 {
-				since := time.Since(time.Unix(0, last))
-				if since < reconnectJitterWindow {
-					jitter := reconnectJitterOffset(idx)
-					p.log.Debug("WS pool post-meltdown reconnect jitter",
-						"slot", idx, "jitter", jitter, "since_meltdown", since.Truncate(time.Millisecond))
-					sleepWithCancel(p.ctx, jitter)
+		// Initial-delay selection. The age-cut fast path (fastFirstAttempt) on
+		// attempt 0 uses a near-zero U(0, ageCutReconnectJitter) spread — the
+		// whole point of the dip fix is to NOT sit in the 5-10s exponential while
+		// a routine TSPU cut heals. Once attempt 0 has failed, the loop is no
+		// longer "fast": it falls into the same exponential ladder as the
+		// natural path (a real outage backs off), so the fast branch is gated on
+		// attempt == 0 only.
+		if fastFirstAttempt && attempt == 0 {
+			jitter := time.Duration(rand.Float64() * float64(ageCutReconnectJitter))
+			p.log.Debug("WS pool fast age-cut reconnect", "slot", idx, "jitter", jitter)
+			sleepWithCancel(p.ctx, jitter)
+		} else {
+			// A2 (2026-05-18): post-meltdown handshake spreading. When 8
+			// reconnect goroutines exit the cooldown together, without jitter
+			// they fire 8 identical-JA4 TLS handshakes to origin within
+			// milliseconds — a thunder-herd signature observable by any
+			// per-source-IP TLS counter at the origin (or on path). The
+			// per-slot offset spreads them across ~0-1.6s on a poolSize=8.
+			//
+			// Gate on attempt==0 && idx > 0 AND a recent meltdown timestamp:
+			//   - attempt > 0 retries already have exp backoff jitter.
+			//   - idx == 0 is the anchor reconnect, fires immediately.
+			//   - No recent meltdown (steady-state single-slot rotation) skips
+			//     the spread — it'd just add latency for no benefit.
+			if attempt == 0 && idx > 0 {
+				if last := p.recentMeltdownNs.Load(); last > 0 {
+					since := time.Since(time.Unix(0, last))
+					if since < reconnectJitterWindow {
+						jitter := reconnectJitterOffset(idx)
+						p.log.Debug("WS pool post-meltdown reconnect jitter",
+							"slot", idx, "jitter", jitter, "since_meltdown", since.Truncate(time.Millisecond))
+						sleepWithCancel(p.ctx, jitter)
+					}
 				}
 			}
-		}
 
-		d := slotBackoffDurationForTest(attempt)
-		p.log.Debug("WS pool reconnecting slot", "slot", idx, "backoff", d, "attempt", attempt)
+			d := slotBackoffDurationForTest(attempt)
+			p.log.Debug("WS pool reconnecting slot", "slot", idx, "backoff", d, "attempt", attempt)
 
-		timer := time.NewTimer(d)
-		select {
-		case <-p.ctx.Done():
-			timer.Stop()
-			return
-		case <-timer.C:
+			timer := time.NewTimer(d)
+			select {
+			case <-p.ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
 		}
 
 		// Recycle guard (spec §2.2.2): if a drain has recycled this cell
@@ -2114,9 +2276,25 @@ func (p *WSPoolTransport) reconnectLoop(idx int) {
 		}
 
 		if connectErr == nil {
+			if fastFirstAttempt {
+				// Tick the age-cut reconnect counter once per healed age-cut slot
+				// (the canary measures residual dip via this vs CapacityDipTotal).
+				Stats.AgeCutReconnectsTotal.Add(1)
+			}
 			p.log.Info("WS pool slot reconnected", "slot", idx)
 			go p.slotReader(idx)
 			return
+		}
+
+		// Fast attempt-0 connect FAILED → this was not a routine middlebox cut,
+		// it is a genuine connect failure. Record it (the canary watches this:
+		// a rising AgeCutReconnectFail means "age-cut" is masking a real fault and
+		// the classification/threshold needs review) and let the loop fall into
+		// the exponential ladder from attempt=1 (a real outage backs off). Do NOT
+		// double-count a rate-limit response as a fail — ErrRateLimited is the
+		// server pacing us, handled below, not an origin fault.
+		if fastFirstAttempt && attempt == 0 && !errors.Is(connectErr, ErrRateLimited) {
+			Stats.AgeCutReconnectFail.Add(1)
 		}
 
 		// Task A2: typed sentinel — server told us we're rate-limited.
@@ -2531,6 +2709,16 @@ func (p *WSPoolTransport) AssignStream(streamID uint16) {
 		}
 		return
 	}
+	// Counter-leak note (spec 2026-06-01, N2): inc is by-index here, not via a
+	// captured pointer like rebindStreamToSlot/ReleaseStream. The Assign/Release
+	// pair both address the same idx, so a single stream's lifecycle does not
+	// drift even if the object is replaced mid-flight (the paired dec, floor-
+	// clamped, lands on whatever object now occupies idx). The pointer-capture
+	// hardening was applied where the drift was PROVEN (rebind: inc and dec on
+	// TWO indices, one swappable). The residual Assign window is far narrower
+	// (single index, requires death exactly between pick and Add) and cannot
+	// reproduce the observed 1397 drift; left by-index to keep this hot path
+	// lock-free. Revisit if a future canary shows Assign-path drift.
 	p.slots[minIdx].streams.Add(1)
 	p.streamMap.Store(streamID, newStreamEntry(minIdx))
 	Trace("stream assigned", "stream", streamID, "slot", minIdx,
@@ -2620,8 +2808,19 @@ func (p *WSPoolTransport) ReleaseStream(streamID uint16) {
 			return
 		}
 		idx := e.slotIdx
-		if idx < len(p.slots) && p.slots[idx] != nil {
-			p.slots[idx].streams.Add(-1)
+		// Spec 2026-06-01 (counter-leak fix, F3): capture the slot pointer under
+		// reserveMu and floor-clamp the dec. If the object at idx was replaced by
+		// a fresh poolSlot (death+reconnect) between AssignStream and here, a
+		// by-index dec would drive the new zeroed object negative; floor-clamp
+		// absorbs that residual, and capturing keeps the dec on a coherent object.
+		p.reserveMu.Lock()
+		var slot *poolSlot
+		if idx >= 0 && idx < len(p.slots) {
+			slot = p.slots[idx]
+		}
+		p.reserveMu.Unlock()
+		if slot != nil {
+			decStreamsFloor(slot)
 		}
 		p.streamMap.Delete(streamID)
 	}
@@ -2960,18 +3159,32 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 			if lw := myTransport.LastWriteUnixNano(); lw > 0 {
 				lastWriteAgeMs = (time.Now().UnixNano() - lw) / int64(time.Millisecond)
 			}
+			slotAgeMs := time.Since(slotStart).Milliseconds()
+
+			// Capacity-dip fix (2026-06-01): distinguish the EXPECTED TSPU
+			// age-cut (a mature slot closed 1006 by the middlebox) from a
+			// genuine failure. An age-cut reconnects FAST and does NOT feed the
+			// meltdown detector (deathCauseAgeCut); a young-slot death or any
+			// non-1006 error stays deathCauseNatural (exponential backoff +
+			// meltdown feed — the conservative behavior for real instability).
+			cause := deathCauseNatural
+			if isAgeCut(err, slotAgeMs) {
+				cause = deathCauseAgeCut
+			}
+
 			p.log.Warn("WS pool slot reader error",
 				"slot", idx,
 				"err", err,
 				"anomaly", anomaly,
+				"cause", cause,
 				"messages", msgCount,
-				"slot_age_ms", time.Since(slotStart).Milliseconds(),
+				"slot_age_ms", slotAgeMs,
 				"down_bytes", slot.downBytes.Load(),
 				"last_write_age_ms", lastWriteAgeMs,
 				"writer_exits", Stats.WriterExits.Load(),
 				"mode", mode,
 			)
-			p.handleSlotDeath(cl, idx, deathCauseNatural)
+			p.handleSlotDeath(cl, idx, cause)
 			return
 		}
 
@@ -3349,6 +3562,13 @@ func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int, cause slotDeathCa
 		return true
 	})
 
+	// Tidy reset of THIS (dying) object's counters. As of the 2026-06-01
+	// counter-leak fix, correctness no longer depends on this Store(0): the
+	// live invariant (slot.streams == live entries on that object) is upheld by
+	// pointer-addressed inc/dec in rebindStreamToSlot/ReleaseStream. This object
+	// is about to be replaced by connectSlot's fresh poolSlot anyway, so a
+	// residual count here is inert (it leaves p.slots and the health sum). Kept
+	// as a defensive zero.
 	slot.streams.Store(0)
 	slot.pendingConnects.Store(0) // Reset: pending CONNECTs from dead slot can't be decremented normally
 
@@ -3357,9 +3577,13 @@ func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int, cause slotDeathCa
 	// via a session-wide FIN before we close the socket. Without this the server
 	// keeps the session until its idle timeout; under pool rotation that lets
 	// sessions accumulate and trip the server's MaxClients gate (ghost-session
-	// bug, 2026-05-29). For deathCauseNatural the transport is already broken —
-	// nothing to send over — so we skip and rely on the server's idle sweeper.
-	if cause != deathCauseNatural {
+	// bug, 2026-05-29). For deathCauseNatural AND deathCauseAgeCut the transport
+	// is already broken (the latter was cut externally by the TSPU) — nothing to
+	// send over — so we skip and rely on the SERVER ghost-sweep (a client FIN for
+	// an age-cut session is impossible: the dead transport carries no session, and
+	// there is no on-wire session addressing to route a FIN over a live sibling —
+	// see docs/sl-capacity-dip-spec-review.md BLOCKER-1).
+	if cause != deathCauseNatural && cause != deathCauseAgeCut {
 		p.sendSlotSessionFIN(slot)
 	}
 
@@ -3375,6 +3599,22 @@ func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int, cause slotDeathCa
 		// same idx (reader observed the death, no replacement exists).
 		p.recordSlotDeath()
 		go p.reconnectLoop(idx)
+	case deathCauseAgeCut:
+		// Expected TSPU age-cut on a mature slot — routine in direct mode.
+		// Reconnect FAST (ageCutReconnectJitter, NOT the 5-10s exponential) so
+		// the cascade of mature-slot cuts does not bare the pool and freeze
+		// quiet streams' downlink. Do NOT call recordSlotDeath: a steady cascade
+		// of routine cuts must never trip the meltdown cooldown (which would
+		// pause ALL reconnects and deepen the dip — Lever 3). Same idx as natural
+		// (reader observed the death, no replacement exists).
+		//
+		// Lever 4 (counter-only): if this cut dropped ready capacity below the
+		// floor, the pool is in (or entering) the dip the fast reconnect is meant
+		// to shorten — tick the canary counter so we can measure the residual.
+		if p.readyCapacity() < p.readyCapacityFloor() {
+			p.recordCapacityDip()
+		}
+		go p.reconnectLoopFast(idx)
 	case deathCausePreemptiveRotation:
 		// OUR rotation — do NOT advance meltdown (would falsely trip under
 		// steady-state rotation load, see field log 2026-05-18), but DO
