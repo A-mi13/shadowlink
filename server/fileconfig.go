@@ -58,6 +58,12 @@ type FileConfig struct {
 	AuthorizedClients []string             `yaml:"authorized_clients"`
 	RateLimit         *FileRateLimitConfig `yaml:"rate_limit"`
 
+	// OriginDeathTeardown (Bug #10) gates the origin-death → FlagStreamClose
+	// signal. nil → leaves Config.OriginDeathTeardown untouched (default OFF via
+	// originDeathTeardownEnabledOrDefault). A YAML `origin_death_teardown: true`
+	// turns it on; this pointer is propagated (not deref'd) so absence stays nil.
+	OriginDeathTeardown *bool `yaml:"origin_death_teardown,omitempty"`
+
 	// IdleTimeoutSec is the HTTP server IdleTimeout in seconds.
 	// Valid range: [60, 600]. Default (when nil): 300 (Wave 2.3 hardcoded).
 	// Task 5.1 (2026-05-17): exposed via YAML for ops tuning. Wiring through
@@ -332,6 +338,12 @@ func (fc *FileConfig) ApplyTo(cfg *Config) {
 	}
 	if fc.BehindProxy != nil {
 		cfg.BehindProxy = *fc.BehindProxy
+	}
+	// Bug #10: propagate the pointer (not the value) so an absent YAML key leaves
+	// Config.OriginDeathTeardown nil (→ default OFF). A CLI -origin-death-teardown
+	// flag still wins over this in main.go (applied after ApplyTo).
+	if fc.OriginDeathTeardown != nil {
+		cfg.OriginDeathTeardown = fc.OriginDeathTeardown
 	}
 	if fc.Management != nil {
 		if fc.Management.Port != nil {

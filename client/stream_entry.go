@@ -43,6 +43,15 @@ type streamEntry struct {
 	// performs the wire send; the loser observes migrating==true and stands down
 	// (no double-send, no close of a stream another goroutine is moving).
 	migrating atomic.Bool
+
+	// migrationScheduled gates preemptive migration scheduling PER STREAM. The
+	// watchdog re-invokes scheduleSlotMigration every 5s while a slot is above
+	// its migration threshold; this per-stream CAS arms exactly ONE migration
+	// timer per stream over its life on a slot, so a stream that attached to the
+	// aging slot AFTER the first scheduling pass still gets scheduled on a later
+	// tick. A fresh entry from newStreamEntry has it false (zero value); a rebind
+	// to a new slot installs a fresh entry, re-arming on the next slot's aging.
+	migrationScheduled atomic.Bool
 }
 
 // newStreamEntry constructs a fully-initialized entry: slotIdx pinned,

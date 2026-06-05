@@ -182,6 +182,16 @@ func (p *WSPoolTransport) claimFreeSlot() int {
 // flows. Spec 2026-05-20 §2.2.3 (emergency eviction).
 const emergencyEvictAgeMultiplier = 2
 
+// emergencyEvictMigrateBudget bounds the TOTAL time spent migrating an
+// emergency-eviction victim's streams before its forced teardown
+// (spec 2026-06-01 emergency-evict-migrate). startDrain runs the eviction
+// synchronously, so an unbounded per-stream ack sum could stall the rotation
+// watchdog; this caps the whole victim-migration pass. One migrateAckTimeout
+// covers the common 1-3 streams/victim (tier-2 picks the MIN-streams cell);
+// streams not moved within the budget die with the cell — exactly the
+// pre-2026-06-01 behavior, so worst-case is never worse than the status quo.
+const emergencyEvictMigrateBudget = migrateAckTimeout
+
 // tryForceEvictIdleSlot scans the slice for a slotReady cell with
 // streams.Load() == 0 and, if found, force-tears it down via
 // handleSlotDeath(deathCauseDrainTeardown) — freeing the cell for the
@@ -314,14 +324,106 @@ func (p *WSPoolTransport) tryEmergencyEvictMinStreamsSlot(cl *Client, skipIdx in
 	}
 
 	streamsAtEvict := victim.streams.Load()
+
+	// Spec 2026-06-01: before tearing the victim down, PREEMPTIVELY migrate its
+	// active streams onto a live slot while the victim's TCP is still healthy.
+	// The victim is already slotDraining (tryMarkDraining above), so
+	// selectYoungTargetSlot — which only returns slotReady slots — can never pick
+	// it as a self-target, and AssignStream is fenced off it. Gated by
+	// MigrateCapable(): when migration is unavailable (not negotiated /
+	// hysteresis-disabled) this is skipped and behavior is identical to the
+	// pre-2026-06-01 unconditional kill.
+	//
+	// Why this is NOT redundant with the RESUME-on-death below: handleSlotDeath
+	// (deathCauseDrainTeardown) already attempts a grace RESUME for each surviving
+	// stream — but only AFTER transport.Close(), relying on the server's orphan
+	// grace window. The preemptive MIGRATE here moves the stream while the aging
+	// TCP is still up, eliminating the close→RESUME gap and the grace-window
+	// dependency for streams that have a younger slot to move onto NOW. Whatever
+	// this pass does not move falls through to handleSlotDeath's RESUME attempt
+	// (counted there as MigrateResumeOnDeathOK/Fail) — so we deliberately do NOT
+	// emit a separate "killed" counter here, which would double-count streams the
+	// teardown's RESUME still rescues.
+	migrated := 0
+	if p.MigrateCapable() {
+		migrated = p.migrateVictimStreams(bestIdx)
+	}
+	if migrated > 0 {
+		Stats.EmergencyEvictMigratedTotal.Add(uint64(migrated))
+	}
+	// remaining = streams still on the victim after the preemptive pass; their
+	// fate (RESUME survive vs close) is decided by handleSlotDeath below.
+	remaining := victim.streams.Load()
+	if remaining < 0 {
+		remaining = 0 // defensive — counter never legitimately goes negative
+	}
+
 	p.log.Warn("WS pool drain emergency-evicted slot with active streams",
 		"evicted_slot", bestIdx,
 		"for_drain_of", skipIdx,
-		"killed_streams", streamsAtEvict)
+		"streams_at_evict", streamsAtEvict,
+		"migrated", migrated,
+		"remaining", remaining)
 
 	victim.generation.Add(1)
 	p.handleSlotDeath(cl, bestIdx, deathCauseDrainTeardown)
 	return true
+}
+
+// migrateVictimStreams attempts to migrate every active stream currently bound
+// to the emergency-eviction victim cell (victimIdx) onto a live slot, reusing
+// the Bug#9 migrateStream primitive. It runs synchronously under a single
+// emergencyEvictMigrateBudget deadline so the caller (startDrain, on its own
+// goroutine) is never stalled by a slow/silent server. Returns the number of
+// streams that actually left the victim (a successful rebind).
+//
+// Why count by binding-departure (not migrateStream's outcome): migrateStream
+// has no return value and may stand down on its single-winner CAS when the
+// preemptive watchdog already armed the same stream's move — in that case the
+// stream still legitimately leaves the victim and must count as saved. So we
+// snapshot each stream's pre-migration slotIdx and re-read it after: a binding
+// that no longer names victimIdx is a save.
+//
+// Snapshot-then-migrate: we collect the victim's stream IDs first (a single
+// streamMap.Range), then migrate outside the Range — migrateStream mutates the
+// streamMap (rebind), which must not happen mid-Range. Streams that release
+// concurrently between snapshot and migrate are handled by migrateStream's
+// own Load-miss (no-op) and by the post-read finding the entry gone (not
+// counted as migrated, not counted as killed beyond the victim's live counter).
+func (p *WSPoolTransport) migrateVictimStreams(victimIdx int) int {
+	var victimIDs []uint16
+	p.streamMap.Range(func(key, value any) bool {
+		e, ok := value.(*streamEntry)
+		if !ok || e.slotIdx != victimIdx {
+			return true
+		}
+		if sid, ok := key.(uint16); ok {
+			victimIDs = append(victimIDs, sid)
+		}
+		return true
+	})
+
+	deadline := time.Now().Add(emergencyEvictMigrateBudget)
+	migrated := 0
+	for _, sid := range victimIDs {
+		if time.Now().After(deadline) {
+			break // bounded — do not stall startDrain on the remaining streams
+		}
+		p.migrateStream(sid)
+		// Did the binding actually leave the victim?
+		v, ok := p.streamMap.Load(sid)
+		if !ok {
+			continue // stream released concurrently — not a migration we own
+		}
+		e, ok := v.(*streamEntry)
+		if !ok {
+			continue
+		}
+		if e.slotIdx != victimIdx {
+			migrated++
+		}
+	}
+	return migrated
 }
 
 // drainTargetOverAged returns true when oldSlot's age exceeds

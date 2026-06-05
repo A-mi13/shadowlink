@@ -447,15 +447,6 @@ type poolSlot struct {
 	// a 30s margin to actually migrate the streams BEFORE the middlebox freezes
 	// the aging TCP. 0 = migration trigger disabled for this slot.
 	migrationThresholdNs atomic.Int64
-
-	// migrationScheduled is set true (CAS) the first time the watchdog schedules
-	// migration of this slot's active streams. It makes scheduleSlotMigration
-	// idempotent — the watchdog ticks every 5s and would otherwise re-arm a
-	// fresh batch of time.AfterFunc timers on every tick while the slot stays
-	// above its threshold. Lives on poolSlot (not keyed by index) so a recycled
-	// cell's NEW *poolSlot starts with migrationScheduled=false (zero value);
-	// reset explicitly in connectSlot on (re)connect.
-	migrationScheduled atomic.Bool
 }
 
 // slotFreshnessPenaltyWindow defines how long after a slot's last death
@@ -467,11 +458,13 @@ type poolSlot struct {
 // the window — see AssignStream's pickInPass closure.
 const slotFreshnessPenaltyWindow = 30 * time.Second
 
-// slotRotationStaggerStep is the per-slot GRID INTERVAL added to MaxSlotAge
-// so 8 slots created within milliseconds of each other don't all rotate at
-// the same instant. With a 2-min base and 15s grid step, the 8th slot
-// rotates ≈ 2m after the 1st — one rotation roughly every 15 seconds, no
-// reconnect storm.
+// slotRotationStaggerStep is the FALLBACK per-slot GRID INTERVAL added to
+// MaxSlotAge so slots created within milliseconds of each other don't all
+// rotate at the same instant. Used only when WSPoolConfig.StaggerStep is 0;
+// the production direct-mode default is 6s + a 45s cap (env SHADOWLINK_STAGGER_STEP /
+// SHADOWLINK_STAGGER_OFFSET_CAP, spec 2026-06-05 age-window-tuning) so even the
+// highest-idx uniform cell rotates under the ~130s TSPU freeze window. This 15s
+// const is the legacy fallback for callers that don't set StaggerStep.
 //
 // 2026-05-18 (A1 fix): the offset for a given slot is no longer
 // deterministic `idx × step` but `idx × step + uniform([-step/2, step/2))`
@@ -523,14 +516,30 @@ const slotRotationStaggerStep = 15 * time.Second
 // and allocation-free. Called from rotationWatchdogSweep (single goroutine,
 // 5s tick) and from maybeRotateSlot (single reader goroutine per slot
 // via readerActive CAS). No hot-path pressure.
-func slotStaggerOffset(idx int) time.Duration {
+//
+// Step / cap (BLOCKER-1): the grid interval is p.staggerStep (falling back
+// to slotRotationStaggerStep when unset) and the linear base is clamped to
+// p.staggerOffsetCap when that is > 0. The cap exists because the
+// uniform-cells slice runs idx 0..2*poolSize-1 — at poolSize=8 the
+// uncapped ladder would add up to 15*step on top of MaxSlotAge, pushing the
+// highest-idx slot into the ~130s TSPU direct-TCP freeze window. Capping
+// keeps every slot rotating before the freeze. cap=0 preserves the legacy
+// unbounded ladder.
+func (p *WSPoolTransport) slotStaggerOffset(idx int) time.Duration {
 	if idx <= 0 {
 		return 0
 	}
-	base := time.Duration(idx) * slotRotationStaggerStep
+	step := p.staggerStep
+	if step <= 0 {
+		step = slotRotationStaggerStep
+	}
+	base := time.Duration(idx) * step
+	if p.staggerOffsetCap > 0 && base > p.staggerOffsetCap {
+		base = p.staggerOffsetCap
+	}
 	// Float64() ∈ [0, 1.0). Map to [-0.5, 0.5) then to half-open
 	// [-step/2, step/2).
-	jitter := time.Duration((rand.Float64() - 0.5) * float64(slotRotationStaggerStep))
+	jitter := time.Duration((rand.Float64() - 0.5) * float64(step))
 	return base + jitter
 }
 
@@ -584,7 +593,7 @@ const reconnectJitterStaggerStep = 200 * time.Millisecond
 
 // reconnectJitterOffset returns the per-slot additive grid jitter for
 // post-meltdown reconnect spreading. Mirrors slotStaggerOffset but at a
-// much smaller scale (200ms step vs 15s step) — handshake spreading is
+// much smaller scale (200ms step vs the multi-second rotation step) — handshake spreading is
 // a sub-second concern, rotation timing is a multi-minute concern.
 //
 // Returns 0 for idx ≤ 0 (slot 0 is the "first reconnect" anchor).
@@ -648,7 +657,9 @@ const readyCapacityFloorFraction = 0.75
 // stored once per (re)connect in poolSlot.byteBudget.
 //
 // Center formula: base + (idx × base / poolSize). For 8 slots × 8 MiB base:
-//   slot 0 → 8.0 MiB center, slot 1 → 9.0, ..., slot 7 → 15.0 MiB.
+//
+//	slot 0 → 8.0 MiB center, slot 1 → 9.0, ..., slot 7 → 15.0 MiB.
+//
 // Spread is exactly +base across the pool (slot N has 2× the budget center
 // of slot 0 at the high end), structurally identical to the 2× spread the
 // age stagger produces (slot 0 = 2m, slot 7 = 2m + 7×15s = 3m45s before
@@ -1058,17 +1069,42 @@ func isClose1006(err error) bool {
 }
 
 // isAgeCut reports whether a terminal reader error on a slot of the given age
-// (milliseconds) is the EXPECTED TSPU age-cut (a mature bare-origin direct-TCP
-// closed 1006 by the middlebox) rather than a genuine failure. Age-cuts are
-// routine in direct mode and must reconnect fast (ageCutReconnectJitter) without
-// feeding the meltdown detector. A young-slot death (age < ageCutMinAgeMs) is a
-// real early failure and stays deathCauseNatural — the conservative behavior for
-// genuine instability.
-func isAgeCut(err error, slotAgeMs int64) bool {
-	if slotAgeMs < ageCutMinAgeMs {
+// (milliseconds) is the EXPECTED middlebox age-cut rather than a genuine
+// failure. Age-cuts are routine in direct mode and must reconnect fast
+// (ageCutReconnectJitter) without feeding the meltdown detector.
+//
+// Classification keys on slot AGE, not error type (REVISED 2026-06-01 after the
+// burst3 field test, docs/sl-burst3-agecut-gap-analysis.md). The TSPU/middlebox
+// tears down a mature bare-origin direct-TCP slot via MULTIPLE shapes — a WS
+// close 1006 AND a raw TCP RST ("wsarecv: forcibly closed by remote host" /
+// "connection reset by peer"). The original close-1006-only test let a
+// mature-slot RST fall through to deathCauseNatural → 6-9s exponential backoff →
+// a downlink stall (the residual freeze the user still saw). Both shapes are the
+// SAME routine age-cut, so ANY terminal error on a MATURE slot (age >=
+// ageCutMinAgeMs) is an age-cut. This is safe because the server never RSTs
+// (ws_reader_exit_reset=0 server-side — a mature-slot RST is always the on-path
+// middlebox); a session a stream is migrating off is unaffected (migration is a
+// separate path).
+//
+// A young-slot death (age < floor) is a genuine early failure and stays
+// deathCauseNatural — there the error type WOULD matter, but warm-up
+// instability is rare and conservative meltdown-feeding is correct.
+//
+// The floor is configurable via p.ageCutMinAge (held in lockstep with
+// MaxSlotAge so the classification window does not collapse when MaxSlotAge is
+// lowered). A zero p.ageCutMinAge falls back to the ageCutMinAgeMs (60s)
+// default, preserving the historical behavior.
+//
+// nil error is never an age-cut (no terminal failure occurred).
+func (p *WSPoolTransport) isAgeCut(err error, slotAgeMs int64) bool {
+	if err == nil {
 		return false
 	}
-	return isClose1006(err)
+	floorMs := int64(ageCutMinAgeMs)
+	if p.ageCutMinAge > 0 {
+		floorMs = p.ageCutMinAge.Milliseconds()
+	}
+	return slotAgeMs >= floorMs
 }
 
 // slotBackoffDuration returns reconnect wait for a per-slot reconnect attempt.
@@ -1112,10 +1148,13 @@ type WSPoolTransport struct {
 	slots    []*poolSlot
 	poolSize int
 
-	maxPendingPerSlot int32 // cap on in-flight CONNECTs per slot
-	maxStreamsPerSlot int32 // cap on active streams per slot (0 = unlimited)
+	maxPendingPerSlot int32         // cap on in-flight CONNECTs per slot
+	maxStreamsPerSlot int32         // cap on active streams per slot (0 = unlimited)
 	maxBytesPerSlot   int64         // rotate slot after N downstream bytes (0 = disabled)
 	maxSlotAge        time.Duration // rotate slot after this much wallclock age (0 = disabled)
+	staggerStep       time.Duration // per-slot grid interval (0 → slotRotationStaggerStep)
+	staggerOffsetCap  time.Duration // max staggerOffset regardless of idx (0 → no cap)
+	ageCutMinAge      time.Duration // age-cut classification floor (0 → ageCutMinAgeMs default)
 	// byteBudgetMinInterval — wall-clock floor before a byte-budget rotation
 	// may fire on a freshly-(re)connected slot (Bug #4 storm fix). 0 disables
 	// the floor. Defaults to byteBudgetMinRotationInterval when byte budget is
@@ -1268,7 +1307,7 @@ type WSPoolTransport struct {
 	// Spec 2026-05-24 (concurrency-lift-and-backoff) §2.
 	reserveConnectFailures []atomic.Int32
 
-	startedAt        time.Time
+	startedAt time.Time
 
 	// recentMeltdownNs is the UnixNano timestamp of the most recent
 	// meltdown event (set by emitMeltdownLog). Used by reconnectLoop's
@@ -1375,12 +1414,12 @@ type migrateResult struct {
 
 // Compile-time assertions.
 var (
-	_ StreamTransport      = (*WSPoolTransport)(nil)
-	_ PoolAware            = (*WSPoolTransport)(nil)
-	_ PendingTracker       = (*WSPoolTransport)(nil)
-	_ ControlPoolAware     = (*WSPoolTransport)(nil)
-	_ TryControlPoolAware  = (*WSPoolTransport)(nil) // Bug #8 Task 11: guards TryWriteControlMessageForStream
-	_ PoolReadiness        = (*WSPoolTransport)(nil)
+	_ StreamTransport     = (*WSPoolTransport)(nil)
+	_ PoolAware           = (*WSPoolTransport)(nil)
+	_ PendingTracker      = (*WSPoolTransport)(nil)
+	_ ControlPoolAware    = (*WSPoolTransport)(nil)
+	_ TryControlPoolAware = (*WSPoolTransport)(nil) // Bug #8 Task 11: guards TryWriteControlMessageForStream
+	_ PoolReadiness       = (*WSPoolTransport)(nil)
 )
 
 // WSPoolConfig configures the WebSocket pool.
@@ -1423,10 +1462,27 @@ type WSPoolConfig struct {
 	// slot_age_ms ~3min at moment of close 1006). 0 for viaCF (byte budget
 	// alone handles the much shorter TSPU freeze).
 	//
-	// Per-slot stagger is automatic: slot N rotates at MaxSlotAge + N*15s,
+	// Per-slot stagger is automatic: slot N rotates at MaxSlotAge + N*step,
 	// so 8 slots ageing simultaneously don't all rotate in the same instant
-	// and create a handshake storm.
+	// and create a handshake storm. The stagger ladder is capped via
+	// StaggerOffsetCap so high-idx slots in the 2*poolSize uniform-cells
+	// slice can't be pushed into the TSPU freeze window.
 	MaxSlotAge time.Duration
+
+	// StaggerStep is the per-slot grid interval used by slotStaggerOffset.
+	// 0 → slotRotationStaggerStep default. env SHADOWLINK_STAGGER_STEP.
+	StaggerStep time.Duration
+
+	// StaggerOffsetCap clamps the linear idx*step stagger so high-idx slots
+	// (the uniform-cells slice runs idx 0..2*poolSize-1) don't get pushed
+	// past MaxSlotAge into the ~130s TSPU direct-TCP freeze window. 0 → no
+	// cap (legacy unbounded ladder). env SHADOWLINK_STAGGER_OFFSET_CAP.
+	StaggerOffsetCap time.Duration
+
+	// AgeCutMinAge is the age-cut classification floor; kept in lockstep with
+	// MaxSlotAge so slots are reclassified as "aged" consistently with the
+	// rotation threshold. 0 → 60s default. env SHADOWLINK_AGE_CUT_MIN_AGE.
+	AgeCutMinAge time.Duration
 
 	// ByteBudgetMinInterval is the wall-clock floor before a byte-budget
 	// rotation may fire on a freshly-(re)connected slot (Bug #4 storm fix).
@@ -1582,38 +1638,41 @@ func NewWSPoolTransport(cl *Client, cfg WSPoolConfig) *WSPoolTransport {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &WSPoolTransport{
-		poolSize:          cfg.Size,
-		maxPendingPerSlot: int32(cfg.MaxPendingPerSlot),
-		maxStreamsPerSlot: int32(cfg.MaxStreamsPerSlot),
-		maxBytesPerSlot:   cfg.MaxBytesPerSlot,
-		maxSlotAge:        cfg.MaxSlotAge,
+		poolSize:              cfg.Size,
+		maxPendingPerSlot:     int32(cfg.MaxPendingPerSlot),
+		maxStreamsPerSlot:     int32(cfg.MaxStreamsPerSlot),
+		maxBytesPerSlot:       cfg.MaxBytesPerSlot,
+		maxSlotAge:            cfg.MaxSlotAge,
+		staggerStep:           cfg.StaggerStep,
+		staggerOffsetCap:      cfg.StaggerOffsetCap,
+		ageCutMinAge:          cfg.AgeCutMinAge,
 		byteBudgetMinInterval: byteBudgetMinInterval,
-		gracefulDrain:       cfg.GracefulDrain,
-		drainHardCap:        drainHardCap,
-		drainIdleThreshold:  drainIdleThreshold,
-		drainIdleStreamsMax: drainIdleStreamsMax,
-		stickyMaxDrainAge:   stickyMaxDrainAge,
-		stickyMaxTotalBytes: stickyMaxTotalBytes,
-		stickyMaxSlots:      cfg.StickyMaxSlots,
-		serverAddr:        cfg.ServerAddr,
-		sniHost:           cfg.SNIHost,
-		cfIP:              cfg.CFIP,
-		useTLS:            cfg.UseTLS,
-		skipVerify:        cfg.SkipVerify,
-		lockedFP:          cfg.LockedFP,
-		client:            cl,
-		writeTimeout:      cfg.WriteTimeout,
-		staggerDelay:      cfg.StaggerDelay,
-		keepaliveBase:     keepaliveBase,
-		meltdownWindow:    cfg.MeltdownWindow,
-		meltdownThreshold: cfg.MeltdownThreshold,
-		meltdownCooldown:  cfg.MeltdownCooldown,
-		meltdownLimiter:   newMeltdownLimiter(),
-		meltdownLogRNG:    mrand.New(mrand.NewSource(time.Now().UnixNano())),
-		startedAt:         time.Now(),
-		ctx:               ctx,
-		cancel:            cancel,
-		log:               slog.Default(),
+		gracefulDrain:         cfg.GracefulDrain,
+		drainHardCap:          drainHardCap,
+		drainIdleThreshold:    drainIdleThreshold,
+		drainIdleStreamsMax:   drainIdleStreamsMax,
+		stickyMaxDrainAge:     stickyMaxDrainAge,
+		stickyMaxTotalBytes:   stickyMaxTotalBytes,
+		stickyMaxSlots:        cfg.StickyMaxSlots,
+		serverAddr:            cfg.ServerAddr,
+		sniHost:               cfg.SNIHost,
+		cfIP:                  cfg.CFIP,
+		useTLS:                cfg.UseTLS,
+		skipVerify:            cfg.SkipVerify,
+		lockedFP:              cfg.LockedFP,
+		client:                cl,
+		writeTimeout:          cfg.WriteTimeout,
+		staggerDelay:          cfg.StaggerDelay,
+		keepaliveBase:         keepaliveBase,
+		meltdownWindow:        cfg.MeltdownWindow,
+		meltdownThreshold:     cfg.MeltdownThreshold,
+		meltdownCooldown:      cfg.MeltdownCooldown,
+		meltdownLimiter:       newMeltdownLimiter(),
+		meltdownLogRNG:        mrand.New(mrand.NewSource(time.Now().UnixNano())),
+		startedAt:             time.Now(),
+		ctx:                   ctx,
+		cancel:                cancel,
+		log:                   slog.Default(),
 	}
 	p.flowDesiredWindow = flowWindowFromEnv(1 << 20)
 	p.allocSlots()
@@ -1788,8 +1847,9 @@ func (p *WSPoolTransport) rotationWatchdogSweep() {
 		// with an independent U(0,spread) delay (NOT a burst — F7 §5.6). This is
 		// ADDITIVE to the age/byte rotation below: the aging slot keeps serving
 		// until its streams drain or it hits the (later) age-rotation threshold,
-		// but its long-lived downloads get moved off BEFORE the ~90s TSPU cut
-		// window freezes the TCP. Idempotent per slot via migrationScheduled.
+		// but its long-lived downloads get moved off BEFORE the ~130s TSPU
+		// freeze window freezes the TCP. Idempotent per stream via streamEntry.
+		// migrationScheduled (covers streams that attach after the first pass).
 		if migThresh := slot.migrationThresholdNs.Load(); migThresh > 0 &&
 			nowNs-started >= migThresh &&
 			p.MigrateCapable() &&
@@ -2116,15 +2176,14 @@ func (p *WSPoolTransport) connectSlot(ctx context.Context, idx int) error {
 	// oscillate between "ready" and "not ready" — see slotStaggerOffset
 	// docstring. Stored as nanoseconds (int64) so the watchdog can do raw
 	// arithmetic with maxSlotAge.Nanoseconds().
-	slot.staggerOffsetNs.Store(int64(slotStaggerOffset(idx)))
+	slot.staggerOffsetNs.Store(int64(p.slotStaggerOffset(idx)))
 	// Bug #9 Task 16: sample THIS connection's preemptive-migration threshold
 	// once and freeze it (base × U(0.7,1.0)). Per-slot jitter smears the
 	// migration onset so the pool's slots don't all begin migrating at the same
-	// offset from connect (FFT-visible periodicity). Reset the per-slot
-	// scheduling gate so a recycled cell re-arms cleanly — the OLD watchdog's
-	// timers operate on the OLD *poolSlot, the NEW slot starts un-scheduled.
+	// offset from connect (FFT-visible periodicity). The migration scheduling
+	// gate is now per-stream (streamEntry.migrationScheduled) — a recycled cell's
+	// fresh streamEntries start un-scheduled, so no per-slot reset is needed here.
 	slot.migrationThresholdNs.Store(sampleMigrationThreshold(migrationThresholdBase()))
-	slot.migrationScheduled.Store(false)
 	// Stamp the slot's startup time — both the reader's local age check and
 	// the pool-level rotation watchdog goroutine read this. Set BEFORE
 	// setState(slotReady) so the watchdog never observes a ready slot with
@@ -3168,7 +3227,7 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 			// non-1006 error stays deathCauseNatural (exponential backoff +
 			// meltdown feed — the conservative behavior for real instability).
 			cause := deathCauseNatural
-			if isAgeCut(err, slotAgeMs) {
+			if p.isAgeCut(err, slotAgeMs) {
 				cause = deathCauseAgeCut
 			}
 
@@ -3213,6 +3272,21 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 		// header). Resolve the pending ack and consume the frame.
 		if chunk.Flags == core.FlagMigrate || chunk.Flags == core.FlagResume {
 			p.resolveMigrateReplyPayload(chunk.Payload)
+			continue
+		}
+
+		// Bug #10: FlagStreamClose is a top-level control frame sent by the
+		// server when the origin TCP connection for this stream died. Handle it
+		// BEFORE the W5 stale-frame guard and BEFORE the len<2 payload filter
+		// so the close is honored even if the stream just migrated to a
+		// different slotIdx (the RESUME-fallback delivers FlagStreamClose on
+		// slot B while the streamMap still records slotIdx A). Tearing the
+		// stream down closes its chan -> the SOCKS5/memConn reader gets EOF ->
+		// the app retries instead of hanging forever.
+		if chunk.Flags == core.FlagStreamClose {
+			if sid, perr := core.ParseStreamCloseFrame(chunk.Payload); perr == nil {
+				p.handleStreamClose(cl, sid)
+			}
 			continue
 		}
 
@@ -3494,6 +3568,29 @@ func (p *WSPoolTransport) fireRotation(cl *Client, idx int) {
 	p.handleSlotDeath(cl, idx, deathCausePreemptiveRotation)
 }
 
+// handleStreamClose tears down a single stream on behalf of a FlagStreamClose
+// control frame (Bug #10). It enforces the Delete-before-close invariant
+// (streamMap.Delete before close(ch)) that ReleaseStream relies on, and is
+// safe to call when the streamID is not present in streamChans (no-op then).
+//
+// This is the shared teardown used by both the demux FlagStreamClose branch
+// and the handleSlotDeath closeStream helper, keeping the logic in one place.
+func (p *WSPoolTransport) handleStreamClose(cl *Client, streamID uint16) {
+	p.streamMap.Delete(streamID)
+	cl.streamMu.Lock()
+	if ch, ok := cl.streamChans[streamID]; ok {
+		close(ch)
+		delete(cl.streamChans, streamID)
+	}
+	// streamFramesChans is used when migrateEnabled — close it too so the
+	// reassembler goroutine sees EOF and exits cleanly.
+	if fch, ok := cl.streamFramesChans[streamID]; ok {
+		close(fch)
+		delete(cl.streamFramesChans, streamID)
+	}
+	cl.streamMu.Unlock()
+}
+
 // handleSlotDeath marks a slot as dead, closes its streams, and triggers reconnect.
 //
 // Idempotent: if the slot is already dead, the function returns immediately
@@ -3527,17 +3624,12 @@ func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int, cause slotDeathCa
 	// its active streams. For each recoverable stream we first try a grace
 	// RESUME onto a live slot; only on a confirmed failure (no live target,
 	// RESUME_FAIL/timeout, or an already-migrating stream another goroutine is
-	// moving) do we fall through to the legacy chan-close. closeStream is the
-	// shared teardown that preserves the Delete-before-close invariant.
+	// moving) do we fall through to the legacy chan-close. closeStream delegates
+	// to handleStreamClose which owns the Delete-before-close invariant and also
+	// handles streamFramesChans (used when migrateEnabled).
 	migrationOn := p.migrateEnabled.Load()
 	closeStream := func(streamID uint16) {
-		p.streamMap.Delete(streamID)
-		cl.streamMu.Lock()
-		if ch, ok := cl.streamChans[streamID]; ok {
-			close(ch)
-			delete(cl.streamChans, streamID)
-		}
-		cl.streamMu.Unlock()
+		p.handleStreamClose(cl, streamID)
 	}
 	p.streamMap.Range(func(key, value any) bool {
 		e, ok := value.(*streamEntry)

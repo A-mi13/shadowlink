@@ -47,19 +47,22 @@ func TestMigrationThresholdJitter_ZeroBase(t *testing.T) {
 
 // TestMigrationThresholdBelowCutWindow is the anti-DPI safety invariant:
 // even at the maximum jitter multiplier (×1.0) the effective threshold must
-// stay strictly below the observed middlebox cut window (~90s) with margin,
-// so a stream is migrated BEFORE the TSPU freezes the aging slot's TCP.
+// stay strictly below the observed middlebox TSPU freeze window (~130s, spec
+// 2026-06-05) with margin, so a stream is migrated BEFORE the TSPU freezes the
+// aging slot's TCP.
 func TestMigrationThresholdBelowCutWindow(t *testing.T) {
 	base := migrationThresholdBase()
-	const observedCutWindow = 90 * time.Second
+	const observedCutWindow = 130 * time.Second
 	// Max effective threshold is base × 1.0 (the high end of U(0.7,1.0)).
 	maxEffective := base
 	if maxEffective >= observedCutWindow {
-		t.Fatalf("max migration threshold %v >= cut window %v — no margin to migrate before TSPU kill",
+		t.Fatalf("max migration threshold %v >= freeze window %v — no margin to migrate before TSPU kill",
 			maxEffective, observedCutWindow)
 	}
-	// Sanity: the default base is 60s, leaving a 30s margin.
-	if base != 60*time.Second {
+	// Sanity: the default base is 45s, well below the 130s freeze window and
+	// below the 75s slot age-cut (SHADOWLINK_MAX_SLOT_AGE) so migration starts
+	// before rotation.
+	if base != 45*time.Second {
 		t.Logf("note: migrationThresholdBase()=%v (env override active)", base)
 	}
 }
@@ -71,8 +74,8 @@ func TestMigrationThresholdBase_EnvOverride(t *testing.T) {
 		t.Fatalf("migrationThresholdBase() = %v, want 45s", got)
 	}
 	os.Unsetenv("SHADOWLINK_MIGRATE_THRESHOLD")
-	if got := migrationThresholdBase(); got != 60*time.Second {
-		t.Fatalf("migrationThresholdBase() default = %v, want 60s", got)
+	if got := migrationThresholdBase(); got != 45*time.Second {
+		t.Fatalf("migrationThresholdBase() default = %v, want 45s", got)
 	}
 }
 
@@ -180,11 +183,9 @@ func TestMigrationSpread_ZeroSpread(t *testing.T) {
 	}
 }
 
-// TestScheduleSlotMigration_Idempotent verifies the watchdog does not
-// re-schedule a slot whose migration has already been scheduled. We drive
-// scheduleSlotMigration twice and confirm only one batch of timers fires per
-// stream (the migrationScheduled flag gates the second call).
-func TestScheduleSlotMigration_Idempotent(t *testing.T) {
+// TestScheduleSlotMigration_ReArmsLateStreams: per-stream gate. Поздний стрим,
+// привязавшийся ПОСЛЕ первого прохода, получает таймер на следующем проходе.
+func TestScheduleSlotMigration_ReArmsLateStreams(t *testing.T) {
 	p := &WSPoolTransport{poolSize: 2}
 	p.slots = make([]*poolSlot, 2)
 	for i := range p.slots {
@@ -196,39 +197,68 @@ func TestScheduleSlotMigration_Idempotent(t *testing.T) {
 	p.slots[1].startedAtNs.Store(now)
 	p.slots[1].state.Store(int32(slotReady))
 
-	// Two streams attached to the aging slot 0.
-	p.streamMap.Store(uint16(10), newStreamEntry(0))
-	p.streamMap.Store(uint16(11), newStreamEntry(0))
-
 	var mu sync.Mutex
 	calls := map[uint16]int{}
-	// Inject a test hook so we count migrateStream invocations without the
-	// real wire round-trip.
 	p.migrateStreamHook = func(streamID uint16) {
 		mu.Lock()
 		calls[streamID]++
 		mu.Unlock()
 	}
-
-	// Use a tiny spread so the AfterFunc timers fire quickly in-test.
 	p.migrateSpreadOverride = 10 * time.Millisecond
 
-	// First schedule: arms timers for both streams.
+	p.streamMap.Store(uint16(10), newStreamEntry(0))
 	if !p.scheduleSlotMigration(0, p.slots[0]) {
-		t.Fatal("first scheduleSlotMigration should report scheduled=true")
+		t.Fatal("first pass must schedule the early stream (true = >=1 new)")
 	}
-	// Second schedule on the SAME aging slot must be a no-op (idempotent).
 	if p.scheduleSlotMigration(0, p.slots[0]) {
-		t.Fatal("second scheduleSlotMigration must be idempotent (scheduled=false)")
+		t.Fatal("pass with no NEW streams must return false")
+	}
+	p.streamMap.Store(uint16(11), newStreamEntry(0))
+	if !p.scheduleSlotMigration(0, p.slots[0]) {
+		t.Fatal("late stream must be scheduled on a later pass (re-arm)")
 	}
 
-	// Wait for the timers to fire.
 	time.Sleep(120 * time.Millisecond)
-
 	mu.Lock()
 	defer mu.Unlock()
-	if calls[10] != 1 || calls[11] != 1 {
-		t.Fatalf("each stream must be migrated exactly once, got %v", calls)
+	if calls[10] != 1 {
+		t.Fatalf("early stream migrated exactly once, got %d", calls[10])
+	}
+	if calls[11] != 1 {
+		t.Fatalf("late stream migrated exactly once (re-arm), got %d", calls[11])
+	}
+}
+
+// TestScheduleSlotMigration_SkipsMigratingStream: стрим уже migrating → НЕ планируется.
+func TestScheduleSlotMigration_SkipsMigratingStream(t *testing.T) {
+	p := &WSPoolTransport{poolSize: 2}
+	p.slots = make([]*poolSlot, 2)
+	for i := range p.slots {
+		p.slots[i] = &poolSlot{index: i}
+	}
+	now := time.Now().UnixNano()
+	p.slots[0].startedAtNs.Store(now - int64(120*time.Second))
+	p.slots[0].state.Store(int32(slotReady))
+	p.slots[1].startedAtNs.Store(now)
+	p.slots[1].state.Store(int32(slotReady))
+
+	var mu sync.Mutex
+	calls := 0
+	p.migrateStreamHook = func(streamID uint16) { mu.Lock(); calls++; mu.Unlock() }
+	p.migrateSpreadOverride = 10 * time.Millisecond
+
+	e := newStreamEntry(0)
+	e.migrating.Store(true)
+	p.streamMap.Store(uint16(20), e)
+
+	if p.scheduleSlotMigration(0, p.slots[0]) {
+		t.Fatal("a migrating stream must NOT be scheduled (returns false)")
+	}
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("migrating stream must not be scheduled, got %d", calls)
 	}
 }
 
@@ -277,6 +307,19 @@ func TestMigrateStream_TransfersSlotCounter(t *testing.T) {
 	}
 	if got := p.slots[0].streams.Load(); got != 0 {
 		t.Fatalf("aging slot 0 streams = %d after Release, want 0 (must not go negative)", got)
+	}
+}
+
+func TestStreamEntry_MigrationScheduledDefaultsFalse(t *testing.T) {
+	e := newStreamEntry(3)
+	if e.migrationScheduled.Load() {
+		t.Fatal("migrationScheduled must default false on fresh entry")
+	}
+	if !e.migrationScheduled.CompareAndSwap(false, true) {
+		t.Fatal("first CAS false→true must win")
+	}
+	if e.migrationScheduled.CompareAndSwap(false, true) {
+		t.Fatal("second CAS must lose (already true)")
 	}
 }
 

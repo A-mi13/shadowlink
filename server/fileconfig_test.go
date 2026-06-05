@@ -120,6 +120,31 @@ func TestApplyTo(t *testing.T) {
 	assert.True(t, cfg.BehindProxy)
 }
 
+func TestApplyTo_OriginDeathTeardown(t *testing.T) {
+	// Bug #10: YAML origin_death_teardown propagates as a pointer (nil-preserving).
+	on := true
+	fc := &FileConfig{OriginDeathTeardown: &on}
+	cfg := DefaultConfig()
+	fc.ApplyTo(&cfg)
+	if cfg.OriginDeathTeardown == nil || !*cfg.OriginDeathTeardown {
+		t.Fatal("origin_death_teardown: true must propagate as *true")
+	}
+	if !cfg.originDeathTeardownEnabledOrDefault() {
+		t.Fatal("resolved gate must be ON when YAML set true")
+	}
+
+	// Absent YAML key → pointer stays nil → default OFF.
+	fcNil := &FileConfig{}
+	cfgNil := DefaultConfig()
+	fcNil.ApplyTo(&cfgNil)
+	if cfgNil.OriginDeathTeardown != nil {
+		t.Fatal("absent YAML key must leave OriginDeathTeardown nil")
+	}
+	if cfgNil.originDeathTeardownEnabledOrDefault() {
+		t.Fatal("nil must resolve to default OFF")
+	}
+}
+
 func TestApplyTo_PartialOverride(t *testing.T) {
 	// Only listen is set — other fields should remain at defaults
 	fc := &FileConfig{

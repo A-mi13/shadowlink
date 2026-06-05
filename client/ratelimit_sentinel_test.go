@@ -175,24 +175,22 @@ func TestReconnectLoop_AppliesCooldownOnRateLimit(t *testing.T) {
 	Stats.RateLimitedFromServer.Store(0)
 
 	cooldownInvocations := 0
-	prev := slotRateLimitedCooldownForTest
-	slotRateLimitedCooldownForTest = func() time.Duration {
+	setSlotRateLimitedCooldownForTest(func() time.Duration {
 		cooldownInvocations++
 		// Override to 100ms so the test stays fast — the production helper
 		// returns 126-234s. The floor envelope is asserted in
 		// TestSlotRateLimitedCooldown_RangeIsFixed independently.
 		return 100 * time.Millisecond
-	}
-	defer func() { slotRateLimitedCooldownForTest = prev }()
+	})
+	defer setSlotRateLimitedCooldownForTest(nil)
 
 	// Also accelerate slotBackoffDuration so attempt-0 backoff (normally
 	// 5-10s) doesn't dominate the test wall-clock. The 5-10s envelope is
 	// covered separately by TestSlotBackoffDuration_RangesPerAttempt.
-	prevBackoff := slotBackoffDurationForTest
-	slotBackoffDurationForTest = func(int) time.Duration {
+	setSlotBackoffDurationForTest(func(int) time.Duration {
 		return 10 * time.Millisecond
-	}
-	defer func() { slotBackoffDurationForTest = prevBackoff }()
+	})
+	defer setSlotBackoffDurationForTest(nil)
 
 	// Build a minimal pool — bypass full Connect by constructing the struct
 	// directly and forcing connectSlot through a stub.
@@ -268,16 +266,14 @@ func reconnectLoopHelper(t *testing.T, connectErr error) (fallbackInvoked bool) 
 	Stats.RateLimitedFromServer.Store(0)
 
 	var fallbackCount int
-	prev := slotRateLimitedCooldownForTest
-	slotRateLimitedCooldownForTest = func() time.Duration {
+	setSlotRateLimitedCooldownForTest(func() time.Duration {
 		fallbackCount++
 		return 50 * time.Millisecond // fast for CI
-	}
-	defer func() { slotRateLimitedCooldownForTest = prev }()
+	})
+	defer setSlotRateLimitedCooldownForTest(nil)
 
-	prevBackoff := slotBackoffDurationForTest
-	slotBackoffDurationForTest = func(int) time.Duration { return 5 * time.Millisecond }
-	defer func() { slotBackoffDurationForTest = prevBackoff }()
+	setSlotBackoffDurationForTest(func(int) time.Duration { return 5 * time.Millisecond })
+	defer setSlotBackoffDurationForTest(nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

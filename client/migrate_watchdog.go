@@ -27,14 +27,17 @@ import (
 //     at the same offset-from-connect (no FFT periodicity at 1/threshold).
 //   - Per-stream spread = U(0,8s): the streams of one slot scatter their moves
 //     instead of clustering at one tick (no "synchronized handoff" signature).
-//   - Effective threshold ≤ base (60s) < observed TSPU cut window (~90s):
-//     streams migrate while the aging TCP is still healthy, with margin.
+//   - Effective threshold ≤ base (45s) < idx=0 age-cut (75s) < observed TSPU
+//     freeze window (~130s): streams migrate while the aging TCP is still
+//     healthy, with margin before the slot rotates.
 
 const (
 	// migrationThresholdDefault is the base slot age at which preemptive stream
-	// migration begins. 60s leaves a ~30s margin below the observed ~90s TSPU
-	// cut window even at the high end of the jitter band.
-	migrationThresholdDefault = 60 * time.Second
+	// migration begins. 45s leaves a 30s margin below the idx=0 age-cut at 75s
+	// (SHADOWLINK_MAX_SLOT_AGE) so streams migrate off a slot before it rotates,
+	// and stays well below the observed ~130s TSPU freeze window even at the
+	// high end of the jitter band.
+	migrationThresholdDefault = 45 * time.Second
 
 	// migrationThresholdJitterLow is the low multiplier of the per-slot
 	// threshold jitter band U(migrationThresholdJitterLow, 1.0).
@@ -152,15 +155,16 @@ func (p *WSPoolTransport) selectYoungTargetSlot(agingIdx int) (int, bool) {
 	return best, true
 }
 
-// scheduleSlotMigration arms a per-stream migration of every active stream
-// currently attached to the aging slot. Each stream's MIGRATE is delayed by an
-// independent U(0,spread) offset (NOT a burst). Returns true if it scheduled
-// this pass, false if migration was already scheduled for this slot (idempotent
-// — the watchdog re-invokes every 5s while the slot stays above threshold).
+// scheduleSlotMigration arms a per-stream migration timer for every active
+// stream currently attached to the aging slot that has NOT yet been scheduled.
+// Each stream's MIGRATE is delayed by an independent U(0,spread) offset (NOT a
+// burst). Returns true if >=1 NEW stream was scheduled on this pass.
 //
-// Idempotency: migrationScheduled is CAS'd false→true once; subsequent calls
-// short-circuit. The flag is reset in connectSlot on (re)connect so a recycled
-// cell re-arms cleanly.
+// Per-stream gate (replaces the old per-slot slot.migrationScheduled CAS). The
+// watchdog re-invokes this every 5s while the slot is above threshold; each
+// pass arms a timer only for streams not yet scheduled (per-stream CAS) and not
+// already migrating. This covers streams that attached to the aging slot AFTER
+// the first pass — the per-slot gate left them unscheduled.
 //
 // Concurrency: streamMap.Range visits each entry at most once (sync.Map
 // contract). A stream released concurrently may or may not appear — a missing
@@ -170,13 +174,6 @@ func (p *WSPoolTransport) scheduleSlotMigration(agingIdx int, slot *poolSlot) bo
 	if slot == nil {
 		return false
 	}
-	// One scheduling pass per slot lifetime — CAS gate. The watchdog ticks
-	// every 5s; without this gate it would re-arm a fresh batch of timers on
-	// each tick for the whole time the slot sits above its threshold.
-	if !slot.migrationScheduled.CompareAndSwap(false, true) {
-		return false
-	}
-
 	spread := p.effectiveMigrationSpread()
 	scheduled := 0
 	p.streamMap.Range(func(key, value any) bool {
@@ -186,6 +183,18 @@ func (p *WSPoolTransport) scheduleSlotMigration(agingIdx int, slot *poolSlot) bo
 		}
 		streamID, ok := key.(uint16)
 		if !ok {
+			return true
+		}
+		// Skip streams already migrating: an in-flight move owns the stream; a
+		// second timer would short-circuit on the migrating CAS in migrateStream.
+		if e.migrating.Load() {
+			return true
+		}
+		// Per-stream single-winner: arm exactly one timer per stream per slot life.
+		// The type-assert above is done BEFORE this CAS so a (theoretically
+		// impossible) non-uint16 key never burns migrationScheduled and strands
+		// the stream un-armed.
+		if !e.migrationScheduled.CompareAndSwap(false, true) {
 			return true
 		}
 		offset := sampleMigrationOffset(spread)
@@ -201,11 +210,6 @@ func (p *WSPoolTransport) scheduleSlotMigration(agingIdx int, slot *poolSlot) bo
 	})
 
 	if scheduled == 0 {
-		// No active streams found after winning the CAS — release the gate so a
-		// later tick (once streams attach) can schedule. Without this a slot
-		// that had its streams released between the watchdog's stream-count
-		// check and the Range would stay permanently flagged.
-		slot.migrationScheduled.Store(false)
 		return false
 	}
 	Stats.MigrateScheduled.Add(uint64(scheduled))
@@ -326,14 +330,36 @@ func (p *WSPoolTransport) rebindStreamToSlot(streamID uint16, targetIdx int) {
 		return // already bound to target (race / repeat) — avoid double-count
 	}
 
+	// Spec 2026-06-01 (counter-leak fix, F1): capture BOTH slot pointers up
+	// front under reserveMu — the same lock connectSlot holds when it swaps
+	// p.slots[idx] with a fresh *poolSlot after a death. Mutating BY INDEX
+	// (the old code) let a close-1006 reconnect replace the object at srcIdx
+	// BETWEEN the inc and the dec, so the dec landed on the new zeroed object
+	// while the inc stranded on the live target with no pairing dec → the
+	// active_streams sum drifted upward (observed 1397 vs max 80). Capturing
+	// pointers binds inc and dec to the SAME objects regardless of any
+	// concurrent index re-occupation: if a captured object is later retired,
+	// its counter no longer feeds the health sum, so a residual count on it is
+	// inert.
+	p.reserveMu.Lock()
+	var srcSlot, dstSlot *poolSlot
+	if targetIdx >= 0 && targetIdx < len(p.slots) {
+		dstSlot = p.slots[targetIdx]
+	}
+	if srcIdx >= 0 && srcIdx < len(p.slots) {
+		srcSlot = p.slots[srcIdx]
+	}
+	p.reserveMu.Unlock()
+
 	// (1) inc target before publishing the binding.
-	if targetIdx >= 0 && targetIdx < len(p.slots) && p.slots[targetIdx] != nil {
-		p.slots[targetIdx].streams.Add(1)
+	if dstSlot != nil {
+		dstSlot.streams.Add(1)
 	}
 	// (2) re-bind so subsequent uplink writes / routing target the new slot.
 	p.streamMap.Store(streamID, newStreamEntry(targetIdx))
-	// (3) dec the slot the stream actually left.
-	if srcIdx >= 0 && srcIdx < len(p.slots) && p.slots[srcIdx] != nil {
-		p.slots[srcIdx].streams.Add(-1)
+	// (3) dec the captured src object — floor-clamped so a historical mismatch
+	// can never drive it negative.
+	if srcSlot != nil {
+		decStreamsFloor(srcSlot)
 	}
 }

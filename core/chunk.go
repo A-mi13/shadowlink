@@ -24,6 +24,7 @@ const (
 	FlagMigrate      byte = 0x0B // payload = [globalStreamID(2 BE)] + [proof(32)] — preemptive migration (§3.2)
 	FlagResume       byte = 0x0C // payload = [globalStreamID(2 BE)] + [proof(32)] — reactive resume from grace
 	FlagStreamAck    byte = 0x0D // payload = [globalStreamID(2 BE)] + [ackedDownSeq(8 BE)] — reassembler barrier (§3.3)
+	FlagStreamClose  byte = 0x0E // payload = [globalStreamID(2 BE)] — origin закрылся, стрим завершён (Bug #10)
 )
 
 const (
@@ -397,6 +398,25 @@ func ParseStreamAckFrame(payload []byte) (streamID uint16, ackedDownSeq uint64, 
 	streamID = binary.BigEndian.Uint16(payload[0:2])
 	ackedDownSeq = binary.BigEndian.Uint64(payload[2:10])
 	return streamID, ackedDownSeq, nil
+}
+
+// NewStreamCloseChunk creates a per-stream close control chunk (Bug #10): the
+// origin (server↔destination TCP) for this stream died, so the stream is over.
+// Payload format: [globalStreamID(2 BE)]. The client tears the stream down and
+// hands EOF to the app (which then retries). NOT session-wide (unlike FlagFin).
+func NewStreamCloseChunk(sessID, seq uint32, streamID uint16) *Chunk {
+	p := make([]byte, 2)
+	binary.BigEndian.PutUint16(p[0:2], streamID)
+	return &Chunk{SessionID: sessID, SeqNum: seq, Flags: FlagStreamClose, Payload: p}
+}
+
+// ParseStreamCloseFrame extracts the globalStreamID from a FlagStreamClose
+// payload. Errors (never panics) on payload shorter than 2 bytes.
+func ParseStreamCloseFrame(payload []byte) (streamID uint16, err error) {
+	if len(payload) < 2 {
+		return 0, fmt.Errorf("stream close frame too short: %d < 2", len(payload))
+	}
+	return binary.BigEndian.Uint16(payload[0:2]), nil
 }
 
 // ───────────────────────────────────────────────────────────────────────────

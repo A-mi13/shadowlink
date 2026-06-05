@@ -590,6 +590,22 @@ func downlinkReassemblyLoop(
 	}
 }
 
+// wakeUplink unblocks the uplink goroutine (parked in conn.Read) when the
+// downlink goroutine exits. cancel() alone does not wake a blocking Read and the
+// relay conn is not otherwise closed on downlink exit, so without this the uplink
+// goroutine keeps reading the app's request into a dead stream. CloseRead closes
+// only the read half (idempotent); a conn without CloseRead falls back to full
+// Close (downlink is already gone, so closing both halves is safe). socks5Replies
+// is kept for symmetry/future gating; CloseRead is valid for both memConn and
+// loopback *net.TCPConn.
+func wakeUplink(conn net.Conn, socks5Replies bool) {
+	if cr, ok := conn.(interface{ CloseRead() error }); ok {
+		_ = cr.CloseRead()
+		return
+	}
+	_ = conn.Close()
+}
+
 // HandleTCPConnectWS handles a SOCKS5 CONNECT command over WebSocket (full-duplex).
 // Each CONNECT gets a StreamID. All streams share one WS connection.
 // Server pushes data instantly -- no polling.
@@ -933,6 +949,7 @@ func tunnelTCPStream(ctx context.Context, conn net.Conn, cl *client.Client, wst 
 	go func() {
 		defer wg.Done()
 		defer cancel()
+		defer wakeUplink(conn, socks5Replies) // wake uplink (parked in conn.Read) on ANY downlink exit
 		total := 0
 		chunks := 0
 		connectConfirmed := false

@@ -716,7 +716,15 @@ func (c *Client) NextStreamID() uint16 {
 		if c.streamCounter == 0 {
 			c.streamCounter = 1
 		}
-		if _, used := c.streamChans[c.streamCounter]; !used {
+		// Spec 2026-06-01 (counter-leak fix, F4): a migration-negotiated stream
+		// lives in streamFramesChans (RegisterStreamSeq), NOT streamChans, so
+		// checking only streamChans could hand out an ID still live in the frames
+		// map. The colliding stream then trips AssignStream's dup-guard, which
+		// returns without incrementing — leaving the per-slot counter unpaired.
+		// Check BOTH maps.
+		_, usedChan := c.streamChans[c.streamCounter]
+		_, usedFrames := c.streamFramesChans[c.streamCounter]
+		if !usedChan && !usedFrames {
 			return c.streamCounter
 		}
 	}

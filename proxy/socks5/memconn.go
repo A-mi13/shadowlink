@@ -4,6 +4,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -186,6 +187,16 @@ type memConn struct {
 	isAppEnd      bool
 	peerFullClose chan struct{}
 	fullCloseOnce *sync.Once
+
+	// downlinkDeadlineImmune is set on the APP end when tun2socks half-closes the
+	// uplink (CloseWrite). While set (and full Close has not happened), the app's
+	// downlink Read ignores any read-deadline: a long-poll / SSE response that goes
+	// quiet for >tun2socks tcpWaitTimeout (60s) is legitimate and must NOT be torn
+	// down. tun2socks calls CloseWrite() THEN SetReadDeadline(now+60s) in sequence
+	// (vendored tunnel/tcp.go:68→72), so both CloseWrite (clears the live deadline)
+	// and SetReadDeadline (becomes a no-op) must honor this flag. Full Close still
+	// tears down via rd.close()/peerFullClose — immune does not affect that.
+	downlinkDeadlineImmune atomic.Bool
 }
 
 // newMemPipe returns a connected pair of buffered in-memory net.Conns. The
@@ -226,8 +237,17 @@ func (c *memConn) Close() error {
 
 // CloseWrite half-closes the write direction: the peer's Read drains buffered
 // data then returns io.EOF. Our Read side stays open. [tun2socks half-close]
+//
+// On the APP end this is the tun2socks half-close signal (uplink done). We mark
+// the downlink deadline-immune and clear any already-armed read-deadline so a
+// quiet long-poll downlink is not torn down by the 60s tcpWaitTimeout that
+// tun2socks arms on the very next line (vendored tunnel/tcp.go:72).
 func (c *memConn) CloseWrite() error {
 	c.wr.close()
+	if c.isAppEnd {
+		c.downlinkDeadlineImmune.Store(true)
+		c.rd.setReadDeadline(time.Time{}) // clear any deadline armed before CloseWrite
+	}
 	return nil
 }
 
@@ -258,11 +278,20 @@ func (c *memConn) LocalAddr() net.Addr  { return c.localAddr }
 func (c *memConn) RemoteAddr() net.Addr { return c.localAddr }
 
 func (c *memConn) SetDeadline(t time.Time) error {
-	c.rd.setReadDeadline(t)
+	c.SetReadDeadline(t) // honors the half-close immune guard
 	c.wr.setWriteDeadline(t)
 	return nil
 }
-func (c *memConn) SetReadDeadline(t time.Time) error  { c.rd.setReadDeadline(t); return nil }
+func (c *memConn) SetReadDeadline(t time.Time) error {
+	// After a half-close on the app end, ignore read-deadlines on the downlink:
+	// tun2socks arms a 60s deadline right after CloseWrite, which would otherwise
+	// kill a legitimately-quiet long-poll/SSE response.
+	if c.isAppEnd && c.downlinkDeadlineImmune.Load() {
+		return nil
+	}
+	c.rd.setReadDeadline(t)
+	return nil
+}
 func (c *memConn) SetWriteDeadline(t time.Time) error { c.wr.setWriteDeadline(t); return nil }
 
 // memAddr is a synthetic net.Addr that parses as host:port for tun2socks'

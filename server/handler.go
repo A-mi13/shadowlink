@@ -291,6 +291,7 @@ func NewHandler(serverKey *core.KeyPair, config Config, decoyDir string) *Handle
 		}
 		h.relayRegistry.setLimits(perClient, total, fdBudget)
 	}
+	h.relayRegistry.setOriginDeathTeardown(config.originDeathTeardownEnabledOrDefault())
 
 	// Bug #9 Task 18 (§4.3): publish the registry to Metrics so the orphan series
 	// (OrphanedRelaysActive gauge, orphan_fd_budget_rejected, orphaned_evicted_limit)

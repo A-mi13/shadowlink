@@ -426,3 +426,37 @@ func TestFlagStreamOpenValue(t *testing.T) {
 		seen[f] = true
 	}
 }
+
+func TestStreamCloseChunk_RoundTrip(t *testing.T) {
+	const sessID, seq uint32 = 42, 7
+	const streamID uint16 = 0x1234
+	c := NewStreamCloseChunk(sessID, seq, streamID)
+	if c.Flags != FlagStreamClose {
+		t.Fatalf("flags = 0x%02x, want FlagStreamClose 0x%02x", c.Flags, FlagStreamClose)
+	}
+	if c.SessionID != sessID || c.SeqNum != seq {
+		t.Fatalf("header mismatch: sess=%d seq=%d", c.SessionID, c.SeqNum)
+	}
+	got, err := ParseStreamCloseFrame(c.Payload)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got != streamID {
+		t.Fatalf("streamID = 0x%04x, want 0x%04x", got, streamID)
+	}
+}
+
+func TestStreamCloseFrame_TooShort(t *testing.T) {
+	if _, err := ParseStreamCloseFrame([]byte{0x00}); err == nil {
+		t.Fatal("expected error on 1-byte payload")
+	}
+}
+
+func TestFlagStreamClose_Value(t *testing.T) {
+	if FlagStreamClose != 0x0E {
+		t.Fatalf("FlagStreamClose = 0x%02x, want 0x0E", FlagStreamClose)
+	}
+	if FlagStreamClose == FlagStreamAck {
+		t.Fatal("FlagStreamClose collides with FlagStreamAck")
+	}
+}

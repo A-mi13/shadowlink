@@ -49,7 +49,9 @@ func TestReassociate_MigrateOK_SwitchesBindingAndDrainsBuffer(t *testing.T) {
 	sink := newTestWriterSink()
 	defer sink.close()
 
-	resumeSeq := e.reassociate(sessB, sink.asWriter(), true /*migrateEnabled*/, false /*aDead*/)
+	bnd := &binding{session: sessB, writer: sink.asWriter()}
+	e.bound.Store(bnd)
+	resumeSeq := e.reassociate(bnd, true /*migrateEnabled*/, false /*aDead*/, false /*originDeathTeardown*/)
 	if resumeSeq != 2 {
 		t.Fatalf("resumeDownSeq=%d, want 2", resumeSeq)
 	}
@@ -109,7 +111,9 @@ func TestReassociate_DownSeqNotReset(t *testing.T) {
 	sink := newTestWriterSink()
 	defer sink.close()
 
-	resumeSeq := e.reassociate(sessB, sink.asWriter(), true, false)
+	bnd := &binding{session: sessB, writer: sink.asWriter()}
+	e.bound.Store(bnd)
+	resumeSeq := e.reassociate(bnd, true, false, false)
 	if resumeSeq != 17 {
 		t.Fatalf("resumeDownSeq=%d, want 17", resumeSeq)
 	}
@@ -286,7 +290,9 @@ func TestReassociate_ResendsUnackedTailWhenADead(t *testing.T) {
 	sink := newTestWriterSink()
 	defer sink.close()
 
-	e.reassociate(sessB, sink.asWriter(), true, true /*aDead*/)
+	bnd := &binding{session: sessB, writer: sink.asWriter()}
+	e.bound.Store(bnd)
+	e.reassociate(bnd, true, true /*aDead*/, false /*originDeathTeardown*/)
 
 	want := []struct {
 		seq  uint64
@@ -543,7 +549,9 @@ func TestRelayLoop_BufferFull_NoSeqGap(t *testing.T) {
 	sessB := newSelfSession(t)
 	sink := newTestWriterSink()
 	defer sink.close()
-	e.reassociate(sessB, sink.asWriter(), true, false)
+	bnd := &binding{session: sessB, writer: sink.asWriter()}
+	e.bound.Store(bnd)
+	e.reassociate(bnd, true, false, false)
 
 	// Collect all frames; verify strictly monotonic, gapless seq starting at 1,
 	// and that the tag bytes arrive in write order (no loss, no reorder).

@@ -4,10 +4,18 @@ Custom steganographic VPN protocol. All code MUST stay in `shadowlink/` at repo 
 
 ## Protocol Overview
 
-- HTTP-level steganography (NOT TLS-level) — VPN data is AES-256-GCM encrypted, base64-encoded, wrapped in JSON analytics events: `{"events":[{"type":"page_view","data":"<base64>"}]}`
-- Traffic pattern mimics SPA analytics (Google Analytics 4 / Mixpanel)
+- HTTP-level steganography (NOT TLS-level) — VPN data is AES-256-GCM encrypted, base64-encoded.
 - X25519 key exchange, AES-256-GCM payload encryption
-- Works through Cloudflare orange cloud — CF cannot decrypt the payload
+
+> **⚠ ТЕКУЩАЯ МОДЕЛЬ МАСКИРОВКИ (2026-06, уточнение — старый текст ниже описывает РАННЮЮ концепцию):**
+> - **Основной канал данных = WebSocket binary frames** (`conn.WriteMessage(websocket.BinaryMessage,...)`), НЕ JSON-обёртка на горячем пути.
+> - **JSON analytics envelope** (`{"events":[{"type":"page_view",...}]}`, GA4/Mixpanel-стиль) остался ТОЛЬКО на handshake POST + cover-трафике. Сама «Mixpanel/SDK persona is phantom» — TSPU не парсит зашифрованные тела (см. F3 wire-trigger, 2026-05-02).
+> - **Главная маскировка для зондов = decoy-сайт** (per-persona React+Vite SPA), отдаётся на все не-VPN запросы.
+> - **Транспорт = DIRECT к голому origin IP, НЕ через CF/CDN.** Cloudflare orange cloud отпал: РКН блокирует диапазоны CDN/CF. Защита от TSPU-реза долгих TCP — ротация слотов под окно заморозки ~130с (spec 2026-06-05-tspu-age-window-tuning). НЕ предлагать CDN/fronting.
+
+Историческая концепция (раннее состояние, частично неактуально):
+- Traffic pattern mimics SPA analytics (Google Analytics 4 / Mixpanel) — теперь только handshake/cover
+- Works through Cloudflare orange cloud — CF cannot decrypt the payload — РЕЖИМ ОТПАЛ (РКН режет CF)
 - SOCKS5 proxy with UDP ASSOCIATE for system VPN mode
 
 ## Architecture

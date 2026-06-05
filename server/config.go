@@ -87,6 +87,13 @@ type Config struct {
 	// compile.
 	StreamMigrationEnabled *bool `yaml:"stream_migration_enabled,omitempty"`
 
+	// OriginDeathTeardown gates Bug #10: signal FlagStreamClose to the client when
+	// a stream's origin TCP dies (broken pipe / EOF) so the app retries instead of
+	// hanging. nil → default OFF (first-canary safety; opposite of Bug #9 which is
+	// default-ON). An explicit *true enables it. The b1 bound.Store reorder is NOT
+	// gated — it only narrows a race window and is safe unconditionally.
+	OriginDeathTeardown *bool `yaml:"origin_death_teardown,omitempty"`
+
 	// MigrateGracePeriod is how long the server keeps an orphaned relay alive
 	// after its WS slot dies, waiting for a RESUME on a live slot (Bug #9 §5.5).
 	// 0 → default 8s via migrateGracePeriodOrDefault. Env/flag: Task 18 (§7),
@@ -192,6 +199,15 @@ func (c Config) streamMigrationEnabledOrDefault() bool {
 		return true
 	}
 	return *c.StreamMigrationEnabled
+}
+
+// originDeathTeardownEnabledOrDefault resolves Config.OriginDeathTeardown
+// (nil → false, default-OFF first-canary safety; *true enables). Bug #10.
+func (c Config) originDeathTeardownEnabledOrDefault() bool {
+	if c.OriginDeathTeardown == nil {
+		return false
+	}
+	return *c.OriginDeathTeardown
 }
 
 // Bug #9 §7 defaults. The grace window and orphan caps are 0-means-default so an

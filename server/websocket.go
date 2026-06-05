@@ -292,6 +292,13 @@ type wsStream struct {
 	mu         sync.Mutex
 	connected  bool     // true after Activate() — target TCP is ready
 	pendingBuf [][]byte // data buffered while !connected (capped at pendingBufMax)
+
+	// onWriteErr (Bug #10): for a migration relay, startWriter calls this on an
+	// origin write error INSTEAD of bare s.Close() — it routes the failure to
+	// signalStreamEnd (closes egress + signals client). nil for non-migration
+	// streams (legacy s.Close() teardown). Guarded by s.mu (set after Activate,
+	// read in startWriter's error branch).
+	onWriteErr func(err error)
 }
 
 const pendingBufMax = 64 // max queued chunks before TCP dial completes
@@ -338,7 +345,19 @@ func (s *wsStream) startWriter() {
 				_, err := s.targetConn.Write(data)
 				core.PutBuffer(data)
 				if err != nil {
-					s.Close()
+					// Bug #10 path A: for a migration relay, route the origin write
+					// error to centralized teardown (signals FlagStreamClose on the
+					// live slot + closes egress). For non-migration streams use the
+					// legacy s.Close(). Read callback under s.mu to avoid a data
+					// race with the setter in the CONNECT branch.
+					s.mu.Lock()
+					cb := s.onWriteErr
+					s.mu.Unlock()
+					if cb != nil {
+						cb(err)
+					} else {
+						s.Close()
+					}
 					return
 				}
 			case <-s.done:
@@ -593,10 +612,23 @@ func (h *Handler) handleMigrateOrResume(flag byte, payload []byte, clientID stri
 	}
 
 	aDead := flag == core.FlagResume
+
+	// b1 (Bug #10 BLOCKER-2): publish the binding onto the NEW live slot B BEFORE
+	// flipping state to stActive. This eliminates the window where state==stActive
+	// but bound still points at the dead slot A — in which an origin-death teardown
+	// could win CAS(stActive→stClosing) and signal/close the relay the RESUME is
+	// about to revive. After this Store, any origin-death winner from stActive
+	// reads bound==B (live). NIT-2: ONLY bound.Store moves up here — releaseOrphanFD
+	// / tail-resend metric / reassociate drain all stay AFTER the CAS (they are
+	// correct only once the RESUME has actually won).
+	b := &binding{session: session, writer: writer}
+	entry.bound.Store(b)
+
 	if flag == core.FlagResume {
-		// Single-winner vs the grace timer: only one of {RESUME, timer} may flip
-		// the state. If CAS fails the timer already moved the entry to stClosing
-		// (and closed tc / removed it) — the relay is gone, RESUME is too late.
+		// Single-winner vs grace timer / evict. If CAS fails the entry is gone
+		// (closing/closed) — RESUME is too late. (bound is already B but the entry
+		// is being torn down by the single-winner; harmless — teardown closes the
+		// whole entry regardless of binding.)
 		if !entry.state.CompareAndSwap(stOrphaned, stActive) {
 			h.metrics.MigrateFail.Add(1)
 			h.metrics.MigrateFailGraceExpired.Add(1)
@@ -607,6 +639,7 @@ func (h *Handler) handleMigrateOrResume(flag byte, payload []byte, clientID stri
 		// orphan pinning a no-WS socket, so release the FD budget it charged at
 		// admitOrphan. releaseOrphanFD is idempotent (clears holdsFD) so a later
 		// grace-timer teardown of this same entry won't double-decrement.
+		// FD budget released only now that RESUME genuinely won the entry.
 		h.relayRegistry.releaseOrphanFD(entry)
 	}
 
@@ -617,7 +650,7 @@ func (h *Handler) handleMigrateOrResume(flag byte, payload []byte, clientID stri
 	if aDead {
 		h.metrics.MigrateTailResent.Add(uint64(len(entry.resendTail())))
 	}
-	resumeSeq := entry.reassociate(session, writer, migrateEnabled, aDead)
+	resumeSeq := entry.reassociate(b, migrateEnabled, aDead, h.relayRegistry.originDeathTeardown)
 	if flag == core.FlagResume {
 		h.metrics.ResumeOK.Add(1)
 	} else {
@@ -854,8 +887,14 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 					// error we leave teardown to the FIN / grace / dest-EOF paths.
 					if entry, ok := h.relayRegistry.find(migrateClientID, streamID); ok && entry.tc != nil {
 						if _, werr := entry.tc.Write(payload); werr != nil {
+							// Bug #10: origin TCP (entry.tc) died (broken pipe). Do NOT
+							// just log-and-continue — that left the client uploading into
+							// a dead origin forever (the hang). Centralized teardown
+							// signals FlagStreamClose on the live WS slot (or records
+							// destClosed if orphaned) so the client retries.
 							slog.Warn("WS uplink registry-fallback write failed",
-								"stream", streamID, "err", werr)
+								"stream", streamID, "err", werr, "reason", "origin_write_broken_pipe")
+							h.relayRegistry.signalStreamEnd(entry, migrateEnabled, "B")
 						}
 					}
 				}
@@ -1053,6 +1092,22 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 						}
 						entry.bound.Store(&binding{session: session, writer: writer})
 						h.relayRegistry.add(clientID, sid, entry)
+
+						// Bug #10 path A: wire the stream's writer-error to centralized
+						// teardown. startWriter calls this on s.targetConn (==entry.tc)
+						// write error instead of bare s.Close(), so the client gets a
+						// FlagStreamClose and the egress is closed via signalStreamEnd.
+						// The window between Activate (above, which started the writer
+						// goroutine) and here is safe: a tc write error in that window
+						// finds onWriteErr==nil and falls back to s.Close() — harmless,
+						// the entry is stActive and a later RESUME re-delivers / the
+						// grace timer reaps it. Set under s.mu; startWriter reads it under
+						// s.mu too (closes the data race on the field).
+						s.mu.Lock()
+						s.onWriteErr = func(error) {
+							h.relayRegistry.signalStreamEnd(entry, true /*migrateEnabled*/, "A")
+						}
+						s.mu.Unlock()
 
 						// Bug #9 §5.5 (T20 e2e fix): the relay pump's lifetime is
 						// the ENTRY's own closeCh, NOT this slot's `done`. If it

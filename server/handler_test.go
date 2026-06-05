@@ -7,8 +7,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -412,7 +414,13 @@ func TestHandleDownloadStreamV2_ImmediateFlush(t *testing.T) {
 	// handleDownloadStreamV2 looks up h.tunnels[sess.ID]; the handshake path
 	// populates this in handleHandshakeNew.
 
-	rec := httptest.NewRecorder()
+	// The stream handler runs in a goroutine and writes to the recorder
+	// concurrently with the main goroutine reading rec.Body below. A bare
+	// httptest.ResponseRecorder's Body (bytes.Buffer) is NOT safe for that
+	// concurrent access (-race report 2026-06-01). syncRecorder guards the
+	// underlying recorder with a mutex so the write (in handleDownloadStreamV2)
+	// and the read (rec.bodyLen()) are serialized.
+	rec := newSyncRecorder()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	req := httptest.NewRequest("POST", "/stream", nil).WithContext(ctx)
@@ -425,17 +433,76 @@ func TestHandleDownloadStreamV2_ImmediateFlush(t *testing.T) {
 
 	// Give the goroutine enough time to write headers + preamble frame.
 	time.Sleep(100 * time.Millisecond)
-	bodyLen := rec.Body.Len()
+	bodyLen := rec.bodyLen()
 	cancel() // signal the loop to exit
 	<-done
 
-	require.Equal(t, 200, rec.Code, "download stream must write OK immediately")
-	require.Equal(t, "text/event-stream", rec.Header().Get("Content-Type"))
-	require.Equal(t, "no", rec.Header().Get("X-Accel-Buffering"))
+	require.Equal(t, 200, rec.code(), "download stream must write OK immediately")
+	require.Equal(t, "text/event-stream", rec.header().Get("Content-Type"))
+	require.Equal(t, "no", rec.header().Get("X-Accel-Buffering"))
 	// Preamble: 4-byte length prefix + 100-500B encrypted payload (+ GCM overhead).
 	// Minimum plausible frame: 4 + MinChunk + 100 = 132 bytes. Be lenient — just
 	// confirm something non-trivial was written before context cancel.
 	require.Greater(t, bodyLen, 4+core.MinChunk, "preamble frame must be flushed before loop blocks")
+}
+
+// syncRecorder wraps httptest.ResponseRecorder with a mutex so a handler
+// goroutine writing the response can run concurrently with a test goroutine
+// reading Body/Code/Header. A bare ResponseRecorder's Body (bytes.Buffer) is
+// not safe for that concurrent access (-race report 2026-06-01,
+// TestHandleDownloadStreamV2_ImmediateFlush). All accesses go through the mutex.
+type syncRecorder struct {
+	mu  sync.Mutex
+	rec *httptest.ResponseRecorder
+}
+
+func newSyncRecorder() *syncRecorder {
+	return &syncRecorder{rec: httptest.NewRecorder()}
+}
+
+func (s *syncRecorder) Header() http.Header {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rec.Header()
+}
+
+func (s *syncRecorder) Write(b []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rec.Write(b)
+}
+
+func (s *syncRecorder) WriteHeader(code int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rec.WriteHeader(code)
+}
+
+// Flush satisfies http.Flusher — handleDownloadStreamV2 type-asserts the writer
+// to a Flusher and flushes after each frame. httptest.ResponseRecorder's Flush
+// only sets a flag, but the assertion must succeed.
+func (s *syncRecorder) Flush() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rec.Flush()
+}
+
+func (s *syncRecorder) bodyLen() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rec.Body.Len()
+}
+
+func (s *syncRecorder) code() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rec.Code
+}
+
+func (s *syncRecorder) header() http.Header {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rec.Header()
 }
 
 // wrapInJSONEnvelope produces the analytics-style upload envelope expected by

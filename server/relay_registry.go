@@ -1,6 +1,7 @@
 package server
 
 import (
+	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -242,6 +243,12 @@ type relayRegistry struct {
 	orphanFDBudget       int
 	evictIdleThreshold   time.Duration
 
+	// originDeathTeardown gates Bug #10 FlagStreamClose signalling (write-once at
+	// init via setOriginDeathTeardown, read-only thereafter — same contract as the
+	// setLimits int fields). Resolved from Config.originDeathTeardownEnabledOrDefault
+	// in NewHandler.
+	originDeathTeardown bool
+
 	// orphanedFDInUse counts orphaned relays currently holding the FD budget.
 	// Mutated atomically by admitOrphan (+1) and evictIdleOrphan / grace-timer
 	// teardown (-1) so the budget check needs no registry lock.
@@ -272,6 +279,11 @@ func (r *relayRegistry) setLimits(perClient, total, fdBudget int) {
 	if r.evictIdleThreshold <= 0 {
 		r.evictIdleThreshold = defaultEvictIdleThreshold
 	}
+}
+
+// setOriginDeathTeardown configures the Bug #10 signal gate (write-once at init).
+func (r *relayRegistry) setOriginDeathTeardown(enabled bool) {
+	r.originDeathTeardown = enabled
 }
 
 func (r *relayRegistry) add(clientID string, streamID uint16, e *relayEntry) {
@@ -619,14 +631,12 @@ func (e *relayEntry) relayLoop(migrateEnabled bool, closeCh <-chan struct{}) {
 			e.credit.consume(n)
 		}
 		if err != nil {
-			// F13: egress closed/errored. If this happened while the relay was
-			// orphaned (no live WS behind it), record that the destination is
-			// gone so a later RESUME flushes the remaining downBuffer and then
-			// signals end-of-stream rather than leaving the client hanging. For a
-			// still-active relay the normal teardown handles it.
-			if e.state.Load() == stOrphaned {
-				e.destClosed.Store(true)
-			}
+			// Bug #10 Component 1: origin TCP read closed/errored. Record
+			// destClosed UNCONDITIONALLY (was: only when stOrphaned). For an
+			// active stream a later teardown / RESUME-fallback delivers the
+			// client signal; for an orphaned one RESUME/grace does. Either way
+			// the stream no longer hangs.
+			e.destClosed.Store(true)
 			// Part 1b (Bug #9 NEW-4 followup) — eager registry/FD release on a
 			// NORMAL dest EOF over a LIVE binding is intentionally NOT done here.
 			// TODO(bug9-1b): A relay whose downlink (dest→client) hit EOF on a
@@ -713,26 +723,31 @@ func (e *relayEntry) routeDownFrame(data []byte, closeCh <-chan struct{}) (*bind
 	}
 }
 
-// reassociate switches the entry to a new (session, writer) pair, drains any
-// downlink buffered during the no-binding window onto the new binding in seq
-// order, and — when slot A is known-dead (aDead, §5.3) — resends the still-
-// unacked tail on the new binding. downSeqCounter is NEVER reset (NEW-3): the
-// counter is monotonic across every migration. Returns resumeDownSeq = the
-// highest seq assigned before the binding switched, so the client knows how far
-// the old slot's in-flight tail extends (§3.4 MIGRATE_OK).
+// reassociate drains downlink buffered during the no-binding window onto the
+// ALREADY-PUBLISHED binding `b` in seq order, and — when slot A is known-dead
+// (aDead, §5.3) — resends the still-unacked tail. downSeqCounter is NEVER reset
+// (NEW-3): the counter is monotonic across every migration. Returns
+// resumeDownSeq = the highest seq assigned before the binding switched, so the
+// client knows how far the old slot's in-flight tail extends (§3.4 MIGRATE_OK).
 //
-// Concurrency: the binding is published with one atomic Store of the consistent
-// {session, writer} pair (NEW-5) so the relay loop can never observe a torn
-// pair. The buffer is drained under perEntryMu (held only for the snapshot, not
-// for the enqueue) to avoid holding the lock across encrypt/enqueue. After the
-// store + drain we Broadcast bufCond so a relay loop that blocked on a full
-// downBuffer during the no-binding window wakes, sees the now-non-nil binding /
-// freed buffer, and resumes — no deadlock because reassociate does not hold
-// perEntryMu while enqueuing.
-func (e *relayEntry) reassociate(sess *core.Session, w *core.WSAsyncWriter, migrateEnabled bool, aDead bool) uint64 {
+// NIT-1 (Bug #10): reassociate NO LONGER stores the binding — the caller
+// publishes e.bound.Store(b) BEFORE calling reassociate (b1: before the stActive
+// CAS). reassociate is now pure drain, so there is exactly ONE publication point
+// for B.
+//
+// Concurrency: the buffer is drained under perEntryMu (held only for the
+// snapshot, not for the enqueue) to avoid holding the lock across
+// encrypt/enqueue. After the drain we Broadcast bufCond so a relay loop that
+// blocked on a full downBuffer during the no-binding window wakes, sees the
+// now-non-nil binding / freed buffer, and resumes — no deadlock because
+// reassociate does not hold perEntryMu while enqueuing.
+//
+// originDeathTeardown gates the Component-4 RESUME-fallback (Bug #10 Task 7):
+// when true AND e.destClosed is set, after the drain a FlagStreamClose is sent
+// on the new binding B. Threaded as a param because reassociate is a *relayEntry
+// method with no registry reference.
+func (e *relayEntry) reassociate(b *binding, migrateEnabled, aDead, originDeathTeardown bool) uint64 {
 	resumeDownSeq := e.downSeqCounter.Load()
-	b := &binding{session: sess, writer: w}
-	e.bound.Store(b)
 
 	cond := e.bufCondOf()
 	e.perEntryMu.Lock()
@@ -758,6 +773,20 @@ func (e *relayEntry) reassociate(sess *core.Session, w *core.WSAsyncWriter, migr
 	}
 	for _, f := range resend {
 		e.enqueueDownFrame(b, migrateEnabled, f)
+	}
+	// Bug #10 Component 4 (RESUME-fallback): if the origin died while this relay
+	// was orphaned (destClosed is set), the immediate FlagStreamClose either was
+	// never sent (read-EOF orphaned path) or went to a dead writer ("both TCP
+	// died at once"). Now that we have a LIVE binding B again, deliver the
+	// stream-close on it so the client tears down the stream and retries.
+	if originDeathTeardown && e.destClosed.Load() {
+		chunk := core.NewStreamCloseChunk(b.session.ID, b.session.NextSeqNum(), e.globalStreamID)
+		if enc, err := b.session.EncryptChunk(chunk); err == nil {
+			_ = b.writer.Enqueue(websocketBinaryMessage, enc)
+		}
+		// NewStreamCloseChunk allocates a 2-byte heap slice (not pooled);
+		// PutBuffer is a no-op here, kept for symmetry with signalStreamEnd.
+		core.PutBuffer(chunk.Payload)
 	}
 	return resumeDownSeq
 }
@@ -789,6 +818,15 @@ func (r *relayRegistry) launchGraceTimer(e *relayEntry, grace time.Duration, onE
 			return
 		}
 		// Winner: tear down the orphaned relay.
+		//
+		// Bug #10 note: a grace-expired orphan whose origin had died (destClosed)
+		// is torn down here WITHOUT sending FlagStreamClose — intentionally. The
+		// signal needs a live binding, and for an orphan that never got a RESUME
+		// there is none (its WS slot is gone). The client learns of the break via
+		// its OWN slot-death cleanup (handleSlotDeath → closeStream) when slot A
+		// died, so there is no hang. The FlagStreamClose path matters for the
+		// LIVE-slot symptom (origin dead but WS slot alive), which signalStreamEnd
+		// (active branch) and the RESUME-fallback in reassociate already cover.
 		r.remove(e.originClientID, e.globalStreamID)
 		// Permanent teardown: stop the egress pump (closeCh + credit) so the
 		// relayLoop exits, THEN close the egress tc. Ordering closeReader before
@@ -832,4 +870,61 @@ func (e *relayEntry) enqueueDownFrame(b *binding, migrateEnabled bool, f pending
 		return
 	}
 	_ = b.writer.Enqueue(websocketBinaryMessage, enc)
+}
+
+// signalStreamEnd is the centralized Bug #10 origin-death teardown. Called from
+// BOTH uplink write-error paths (A=startWriter callback, B=registry-fallback)
+// and (indirectly via destClosed) the relayLoop read-EOF path. Single-winner via
+// CAS(stActive→stClosing):
+//
+//   - WON (was stActive, live WS slot): snapshot bound ONCE, send FlagStreamClose
+//     on that live binding (session+writer from one snapshot), then permanent
+//     teardown (remove + closeReader + releaseOrphanFD + tc.Close + broadcast).
+//   - NOT stActive (orphaned/closing): do NOT CAS, do NOT remove — only
+//     destClosed.Store(true) when stOrphaned (NIT-3, mirrors relayLoop read-EOF).
+//     RESUME-fallback or the grace timer delivers the close on a live slot and
+//     tears down.
+//
+// r.originDeathTeardown gates SENDING (YAML origin_death_teardown, default-off
+// first canary). migrateEnabled is a defense-in-depth assert (HIGH-C): the helper
+// is only reachable under migration paths; on a legacy session it logs and
+// returns without sending.
+func (r *relayRegistry) signalStreamEnd(e *relayEntry, migrateEnabled bool, pathTag string) {
+	if !migrateEnabled {
+		slog.Warn("bug10 helper reached on non-migration session", "stream", e.globalStreamID, "path", pathTag)
+		return
+	}
+
+	if e.state.CompareAndSwap(stActive, stClosing) {
+		// Won the CAS — we are the single teardown authority for this stream.
+		b := e.bound.Load()
+		if r.originDeathTeardown && b != nil && b.session != nil && b.writer != nil {
+			chunk := core.NewStreamCloseChunk(b.session.ID, b.session.NextSeqNum(), e.globalStreamID)
+			if enc, err := b.session.EncryptChunk(chunk); err == nil {
+				_ = b.writer.Enqueue(websocketBinaryMessage, enc)
+			}
+			// NewStreamCloseChunk allocates a 2-byte heap slice (not pooled);
+			// PutBuffer is a no-op here, kept for symmetry with enqueueDownFrame
+			// in case the constructor later uses a pooled buffer.
+			core.PutBuffer(chunk.Payload)
+		}
+		r.remove(e.originClientID, e.globalStreamID)
+		e.closeReader()
+		r.releaseOrphanFD(e)
+		if e.tc != nil {
+			e.tc.Close()
+		}
+		cond := e.bufCondOf()
+		e.perEntryMu.Lock()
+		cond.Broadcast()
+		e.perEntryMu.Unlock()
+		return
+	}
+
+	// Did not win CAS — entry is stOrphaned or stClosing. Record destClosed so
+	// a later RESUME-fallback (Task 7) or grace timer can signal the client.
+	// NIT-3: mirrors relayLoop read-EOF which only sets destClosed, never removes.
+	if e.state.Load() == stOrphaned {
+		e.destClosed.Store(true)
+	}
 }

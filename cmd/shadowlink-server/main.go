@@ -68,6 +68,7 @@ func main() {
 		"if true, fail-fast on decoy snapshot loading errors (default: warn and continue header-only)")
 	flowMaxWindow := flag.Int("flow-max-window", 1048576, "Bug #8: max per-stream flow-control window (bytes) the server grants; 0 disables flow control")
 	streamMigration := flag.Bool("stream-migration", true, "Bug #9 §3.5: enable per-stream migration negotiation (server echoes the client's advertised capability). Default on")
+	originDeathTeardown := flag.Bool("origin-death-teardown", false, "Bug #10: signal FlagStreamClose to the client when a stream's origin TCP dies (broken pipe/EOF) so the app retries instead of hanging. Default OFF (first-canary safety); also settable via YAML origin_death_teardown")
 	// Bug #9 §7: orphan grace + DoS caps. The flag DEFAULT is sourced from the
 	// matching env var when set (SHADOWLINK_MIGRATE_GRACE / MAX_ORPHANED /
 	// MAX_ORPHANED_TOTAL), otherwise the spec default (8s / 16 / 1024). An
@@ -178,6 +179,13 @@ func main() {
 	// lands in Task 18; this flag is the minimal server-side kill-switch.
 	if explicitly["stream-migration"] {
 		config.StreamMigrationEnabled = streamMigration
+	}
+	// Bug #10: only override when -origin-death-teardown was explicitly passed.
+	// Unset leaves Config.OriginDeathTeardown as ApplyTo set it (YAML) or nil
+	// (→ default OFF via originDeathTeardownEnabledOrDefault). Explicit flag wins
+	// over YAML — same precedence as -stream-migration.
+	if explicitly["origin-death-teardown"] {
+		config.OriginDeathTeardown = originDeathTeardown
 	}
 	// Bug #9 §7: always apply migrate grace + orphan caps. The flag default was
 	// pre-seeded from the env var (or the spec default), and an explicit flag

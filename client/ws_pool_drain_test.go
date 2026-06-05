@@ -1375,9 +1375,8 @@ func TestReconnectLoop_RecycleGuard(t *testing.T) {
 
 	// Stub backoff to zero so the timer fires immediately — without this,
 	// slotBackoffDuration(0) returns 5-10s and the test hangs.
-	prevBackoff := slotBackoffDurationForTest
-	slotBackoffDurationForTest = func(int) time.Duration { return 0 }
-	defer func() { slotBackoffDurationForTest = prevBackoff }()
+	setSlotBackoffDurationForTest(func(int) time.Duration { return 0 })
+	defer setSlotBackoffDurationForTest(nil)
 
 	// Let reconnectLoop run normally (don't cancel ctx upfront). If the
 	// guard fires (cell recycled, not slotDead) it returns without calling
@@ -1661,9 +1660,8 @@ func TestConnectReserveSlot_FreesPlaceholderOnFailure(t *testing.T) {
 
 	// Stub slotBackoffDurationForTest to 0 so the spawned reconnectLoop
 	// doesn't block exit; we only verify the placeholder cleanup.
-	prevBackoff := slotBackoffDurationForTest
-	slotBackoffDurationForTest = func(int) time.Duration { return 0 }
-	defer func() { slotBackoffDurationForTest = prevBackoff }()
+	setSlotBackoffDurationForTest(func(int) time.Duration { return 0 })
+	defer setSlotBackoffDurationForTest(nil)
 
 	p.connectReserveSlot(nil, 8, 0)
 

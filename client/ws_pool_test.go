@@ -989,8 +989,12 @@ func TestMaybeRotateSlot_ByteBudgetDeferIsStaggered(t *testing.T) {
 		s := &poolSlot{}
 		s.setState(slotReady)
 		s.streams.Store(5) // active streams — forces defer path
-		// Pin staggerOffsetNs to the deterministic grid center for this
-		// test. Real production samples vary within ±step/2 of this value.
+		// Pin staggerOffsetNs to the deterministic legacy 15s-grid center for
+		// this test. This is INTENTIONAL: this test exercises sweep ORDERING,
+		// not the production capped 6s formula (covered by
+		// TestSlotStaggerOffset_Capped). Do NOT "fix" the 15s here to 6s —
+		// it's a fixed grid for deterministic ordering. Real production samples
+		// use p.slotStaggerOffset(idx) with cap + ±step/2 jitter.
 		s.staggerOffsetNs.Store(int64(i) * int64(slotRotationStaggerStep))
 		pool.slots[i] = s
 	}
@@ -1202,8 +1206,9 @@ func TestConnectSlot_ByteBudgetZeroWhenFeatureDisabled(t *testing.T) {
 // A regression that ever returned non-zero for idx=0 would cascade into
 // flaky test failures across the rotation suite.
 func TestSlotStaggerOffset_ZeroForFirstSlot(t *testing.T) {
+	p := &WSPoolTransport{staggerStep: slotRotationStaggerStep}
 	for trial := 0; trial < 200; trial++ {
-		got := slotStaggerOffset(0)
+		got := p.slotStaggerOffset(0)
 		require.Zero(t, got, "trial %d: slot 0 offset must be zero", trial)
 	}
 }
@@ -1223,13 +1228,14 @@ func TestSlotStaggerOffset_ZeroForFirstSlot(t *testing.T) {
 // flake probability astronomically low.
 func TestSlotStaggerOffset_InRange(t *testing.T) {
 	const trials = 500
+	p := &WSPoolTransport{staggerStep: slotRotationStaggerStep}
 	step := slotRotationStaggerStep
 	for idx := 1; idx <= 7; idx++ {
 		base := time.Duration(idx) * step
 		lo := base - step/2
 		hi := base + step/2 // exclusive
 		for trial := 0; trial < trials; trial++ {
-			got := slotStaggerOffset(idx)
+			got := p.slotStaggerOffset(idx)
 			require.GreaterOrEqual(t, got, lo,
 				"slot %d trial %d: offset %v < low bound %v", idx, trial, got, lo)
 			require.Less(t, got, hi,
@@ -1249,10 +1255,11 @@ func TestSlotStaggerOffset_InRange(t *testing.T) {
 // require >50% distinct as a conservative regression sentinel.
 func TestSlotStaggerOffset_RejectsConstant(t *testing.T) {
 	const trials = 200
+	p := &WSPoolTransport{staggerStep: slotRotationStaggerStep}
 	for idx := 1; idx <= 7; idx++ {
 		seen := make(map[time.Duration]struct{})
 		for trial := 0; trial < trials; trial++ {
-			seen[slotStaggerOffset(idx)] = struct{}{}
+			seen[p.slotStaggerOffset(idx)] = struct{}{}
 		}
 		require.Greater(t, len(seen), trials/2,
 			"slot %d: only %d distinct offsets in %d trials — sampler collapsed (A1 regression)",
@@ -1280,14 +1287,15 @@ func TestSlotStaggerOffset_RejectsConstant(t *testing.T) {
 // the boundary to confirm density.
 func TestSlotStaggerOffset_AdjacentSlotsTouchBoundary(t *testing.T) {
 	const trials = 1000
+	p := &WSPoolTransport{staggerStep: slotRotationStaggerStep}
 	step := slotRotationStaggerStep
 	boundary := time.Duration(1)*step + step/2 // 22.5s
-	tolerance := step / 8                       // 1.875s — generous
+	tolerance := step / 8                      // 1.875s — generous
 
 	var slot1Max, slot2Min time.Duration = 0, 1 << 62
 	for trial := 0; trial < trials; trial++ {
-		s1 := slotStaggerOffset(1)
-		s2 := slotStaggerOffset(2)
+		s1 := p.slotStaggerOffset(1)
+		s2 := p.slotStaggerOffset(2)
 		if s1 > slot1Max {
 			slot1Max = s1
 		}
@@ -1323,11 +1331,12 @@ func TestSlotStaggerOffset_AdjacentSlotsTouchBoundary(t *testing.T) {
 // probability astronomically low.
 func TestSlotStaggerOffset_MonotonicInExpectation(t *testing.T) {
 	const trials = 500
+	p := &WSPoolTransport{staggerStep: slotRotationStaggerStep}
 	means := make([]int64, 8)
 	for idx := 0; idx < 8; idx++ {
 		var sum int64
 		for trial := 0; trial < trials; trial++ {
-			sum += int64(slotStaggerOffset(idx))
+			sum += int64(p.slotStaggerOffset(idx))
 		}
 		means[idx] = sum / trials
 	}
@@ -1345,8 +1354,34 @@ func TestSlotStaggerOffset_MonotonicInExpectation(t *testing.T) {
 // signed-int math underflow), the helper must not crash or return a
 // negative time.Duration that would skew the threshold backwards.
 func TestSlotStaggerOffset_NegativeIdxSafeFallback(t *testing.T) {
-	require.Zero(t, slotStaggerOffset(-1), "negative idx must fall back to 0")
-	require.Zero(t, slotStaggerOffset(-100), "negative idx must fall back to 0")
+	p := &WSPoolTransport{staggerStep: slotRotationStaggerStep}
+	require.Zero(t, p.slotStaggerOffset(-1), "negative idx must fall back to 0")
+	require.Zero(t, p.slotStaggerOffset(-100), "negative idx must fall back to 0")
+}
+
+// TestSlotStaggerOffset_Capped is the BLOCKER-1 regression test
+// (TSPU freeze window). Without a cap, idx*step grows unbounded — at
+// poolSize=8 the uniform-cells slice runs idx 0..15, so idx=15 yields
+// 15*15s = +225s (or +90s sided against a 6s step) of stagger ON TOP of
+// MaxSlotAge, pushing the slot's effective max age well into the ~130s
+// TSPU direct-TCP freeze window. The cap clamps the linear ladder so the
+// highest-idx slot still rotates before the freeze.
+func TestSlotStaggerOffset_Capped(t *testing.T) {
+	p := &WSPoolTransport{staggerStep: 6 * time.Second, staggerOffsetCap: 45 * time.Second}
+	if got := p.slotStaggerOffset(0); got != 0 {
+		t.Fatalf("idx=0: got %v want 0", got)
+	}
+	g7 := p.slotStaggerOffset(7) // 42s ± 3s
+	if g7 < 39*time.Second || g7 > 45*time.Second {
+		t.Fatalf("idx=7: got %v want ~42s±3s", g7)
+	}
+	g15 := p.slotStaggerOffset(15) // capped 45s ± 3s (NOT 90s)
+	if g15 < 42*time.Second || g15 > 48*time.Second {
+		t.Fatalf("idx=15: got %v want ~45s capped NOT 90s", g15)
+	}
+	if eff := 75*time.Second + g15; eff >= 130*time.Second {
+		t.Fatalf("idx=15 effectiveMaxAge=%v must be <130s", eff)
+	}
 }
 
 // TestAssignStream_BurstRebalanceWithCap is the A4 regression test

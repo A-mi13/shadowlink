@@ -38,22 +38,49 @@ func fakeAgeCutClose1006() error {
 func TestIsAgeCut_MatureClose1006(t *testing.T) {
 	close1006 := fakeAgeCutClose1006()
 
-	require.True(t, isAgeCut(close1006, ageCutMinAgeMs),
+	// Zero ageCutMinAge → 60s (ageCutMinAgeMs) const fallback, the historical floor.
+	p := &WSPoolTransport{}
+
+	require.True(t, p.isAgeCut(close1006, ageCutMinAgeMs),
 		"close 1006 exactly at the min-age floor must count as an age-cut")
-	require.True(t, isAgeCut(close1006, 120_000),
+	require.True(t, p.isAgeCut(close1006, 120_000),
 		"close 1006 at 120s (TSPU cut window) must count as an age-cut")
 
-	require.False(t, isAgeCut(close1006, 20_000),
+	require.False(t, p.isAgeCut(close1006, 20_000),
 		"close 1006 at 20s is a young-slot failure, not an age-cut (be conservative)")
-	require.False(t, isAgeCut(close1006, ageCutMinAgeMs-1),
+	require.False(t, p.isAgeCut(close1006, ageCutMinAgeMs-1),
 		"just under the floor must NOT qualify as an age-cut")
 
-	// A genuine non-1006 terminal error at a mature age is a real failure.
-	resetErr := errors.New("read tcp: connection reset by peer")
-	require.False(t, isAgeCut(resetErr, 120_000),
-		"a TCP RST is a genuine failure regardless of age, not an age-cut")
+	// REVISED 2026-06-01 (field burst3): the middlebox cuts a mature direct-TCP
+	// slot via MULTIPLE error shapes — WS close 1006 AND a raw TCP RST
+	// ("wsarecv: forcibly closed by remote host" / "connection reset by peer").
+	// Both are the SAME routine age-cut on a mature slot, so classification keys
+	// on slot AGE, not error type. A mature slot (age >= floor) dying to ANY
+	// terminal error in direct mode is an age-cut → fast reconnect. (Server is
+	// healthy: ws_reader_exit_reset=0 — the server never RSTs; a mature-slot RST
+	// is always the on-path middlebox.) The error type only matters for YOUNG
+	// slots, where a RST/EOF is a genuine early failure.
+	resetErr := errors.New("read tcp 192.168.1.137:64937->104.222.177.67:443: wsarecv: An existing connection was forcibly closed by the remote host.")
+	require.True(t, p.isAgeCut(resetErr, 120_000),
+		"a TCP RST on a MATURE slot (120s) is the middlebox age-cut, not a genuine failure")
+	require.True(t, p.isAgeCut(errors.New("read tcp: connection reset by peer"), 120_000),
+		"connection-reset on a mature slot is also an age-cut")
+	require.False(t, p.isAgeCut(resetErr, 20_000),
+		"a TCP RST on a YOUNG slot (20s) is a genuine early failure, NOT an age-cut")
 
-	require.False(t, isAgeCut(nil, 120_000), "nil error is never an age-cut")
+	require.False(t, p.isAgeCut(nil, 120_000), "nil error is never an age-cut")
+
+	// Configurable floor (lockstep with MaxSlotAge): a 45s floor reclassifies the
+	// [45s, 60s) window as age-cut, and a zero floor keeps the 60s const.
+	p45 := &WSPoolTransport{ageCutMinAge: 45 * time.Second}
+	require.True(t, p45.isAgeCut(close1006, 50_000),
+		"50s with a 45s configured floor must be an age-cut")
+	require.False(t, p45.isAgeCut(close1006, 40_000),
+		"40s with a 45s configured floor must NOT be an age-cut")
+	require.False(t, p.isAgeCut(close1006, 50_000),
+		"50s with the zero/default 60s floor must NOT be an age-cut")
+	require.True(t, p.isAgeCut(close1006, 65_000),
+		"65s with the zero/default 60s floor must be an age-cut")
 }
 
 // TestIsClose1006 pins the helper that detects the close-1006 family via the

@@ -377,13 +377,16 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 					// from middleboxes (NAT age timers, stateful firewalls,
 					// TSPU's age heuristic for long-lived flows) every 2-5
 					// minutes. Self-rotating BEFORE that window keeps the
-					// kill signal off the wire. 8 MiB byte budget + 2 min
+					// kill signal off the wire. 8 MiB byte budget + 75s
 					// age budget cover both heavy-upload and long-idle cases.
-					// Per-slot stagger inside the pool (slotRotationStaggerStep
-					// = 15s × idx) keeps 8 rotations spread across 2 minutes
-					// — one every ~15s, never a handshake storm.
+					// 75s rotates slots well inside the ~130s TSPU freeze
+					// window (spec 2026-06-05). Per-slot stagger inside the
+					// pool (capped 6s × idx, see StaggerStep/StaggerOffsetCap
+					// below) keeps rotations spread out — never a handshake
+					// storm — while keeping high-idx uniform-cells under the
+					// freeze window. Field-tunable via SHADOWLINK_MAX_SLOT_AGE.
 					maxBytesPerSlot = 8 * 1024 * 1024
-					maxSlotAge = 2 * time.Minute
+					maxSlotAge = envDurationDefault("SHADOWLINK_MAX_SLOT_AGE", 75*time.Second)
 					// A2 (2026-05-18): spread INITIAL connect handshakes
 					// by 300ms × idx so 8 TCP SYNs don't arrive at origin
 					// in the same millisecond. Same value as viaCF mode
@@ -427,10 +430,26 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 				// "all readers exited" regressions 0, decrypt_fails 0, downlink
 				// write errors 0. SHADOWLINK_GRACEFUL_DRAIN=0 (or false/no/off)
 				// is the emergency opt-out — restores legacy hard-rotation path.
-				// SHADOWLINK_DRAIN_HARD_CAP is field-tunable without redeploy
-				// (Envoy Gateway-recommended 90s default).
+				// SHADOWLINK_DRAIN_HARD_CAP is field-tunable without redeploy.
+				// Lowered to 30s (2026-06-05): worst-case teardown is now
+				// maxSlotAge(75s, or up to 120s for the highest-idx uniform
+				// cell) + 30s drain = ≤150s, keeping the forced teardown near
+				// the ~130s TSPU freeze edge. Streams still in flight RESUME
+				// onto a live slot via the migration watchdog — no data loss.
 				gracefulDrain := envBoolDefault("SHADOWLINK_GRACEFUL_DRAIN", true)
-				drainHardCap := envDurationDefault("SHADOWLINK_DRAIN_HARD_CAP", 90*time.Second)
+				drainHardCap := envDurationDefault("SHADOWLINK_DRAIN_HARD_CAP", 30*time.Second)
+				// Invariant guard (final-review MEDIUM-1): the lowered drain hard-cap
+				// only stays safe because in-flight streams RESUME onto a live slot
+				// via the migration watchdog when the draining slot is torn down. If
+				// stream migration is OFF, a slot torn down at maxSlotAge+drainHardCap
+				// can land inside the ~130s TSPU freeze window and drop its streams by
+				// close(chan). Warn loudly so an operator who disabled migration also
+				// reconsiders the aggressive drain cap.
+				if gracefulDrain && !envBoolDefault("SHADOWLINK_STREAM_MIGRATION", true) &&
+					maxSlotAge+drainHardCap >= 120*time.Second {
+					slog.Warn("aggressive drain hard-cap WITHOUT stream migration: in-flight streams may be dropped near the TSPU freeze window — raise SHADOWLINK_DRAIN_HARD_CAP or enable SHADOWLINK_STREAM_MIGRATION",
+						"maxSlotAge", maxSlotAge, "drainHardCap", drainHardCap)
+				}
 				// Drain idle-finish heuristic — defaults derived from 2026-05-22
 				// 8h canary: 79.6% of hard-cap drains held ≤2 streams that were
 				// keepalive-idle for the entire 90s window. 30s idle threshold
@@ -471,6 +490,17 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 				// unrecoverably. Field-tunable without redeploy; 0/unset → 5s.
 				keepaliveInterval := envDurationDefault("SHADOWLINK_KEEPALIVE_INTERVAL", 5*time.Second)
 
+				// TSPU age-window tuning (2026-06-05): rotate slots BEFORE the ~130s
+				// middlebox freeze window. staggerOffsetCap keeps high-idx uniform-cells
+				// (idx up to 2*Size-1) under the window. ageCutMinAge is the slot-age
+				// floor for classifying a terminal read error as an expected age-cut
+				// (vs a genuine early failure) — kept in lockstep with the 75s rotation
+				// and the 45s migration threshold so the classification window doesn't
+				// collapse. Field-tunable without rebuild.
+				staggerStep := envDurationDefault("SHADOWLINK_STAGGER_STEP", 6*time.Second)
+				staggerOffsetCap := envDurationDefault("SHADOWLINK_STAGGER_OFFSET_CAP", 45*time.Second)
+				ageCutMinAge := envDurationDefault("SHADOWLINK_AGE_CUT_MIN_AGE", 45*time.Second)
+
 				pool := client.NewWSPoolTransport(e.cl, client.WSPoolConfig{
 					Size:                poolSize,
 					ServerAddr:          wsTarget,
@@ -485,6 +515,9 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 					WriteTimeout:        writeTimeout,
 					StaggerDelay:        staggerDelay,
 					KeepaliveInterval:   keepaliveInterval,
+					StaggerStep:         staggerStep,
+					StaggerOffsetCap:    staggerOffsetCap,
+					AgeCutMinAge:        ageCutMinAge,
 					GracefulDrain:       gracefulDrain,
 					DrainHardCap:        drainHardCap,
 					DrainIdleThreshold:  drainIdleThreshold,
