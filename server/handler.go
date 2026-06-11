@@ -299,6 +299,16 @@ func NewHandler(serverKey *core.KeyPair, config Config, decoyDir string) *Handle
 	// a single source of truth, no duplicate count on the admit/evict hot paths.
 	h.metrics.AttachRelayRegistry(h.relayRegistry)
 
+	// CRIT-1 / LOW-4 (2026-06-11): wire nil-safe UDP-relay metric hooks. Set once
+	// here, before StartCleanup/readLoop goroutines run, so the relay can read them
+	// lock-free. onCapped ticks per amplification-cap drop; onReaped per idle reap.
+	if h.udpRelay != nil {
+		h.udpRelay.SetHooks(
+			func() { h.metrics.UDPRespCapped.Add(1) },
+			func() { h.metrics.UDPFlowsReaped.Add(1) },
+		)
+	}
+
 	// Eagerly populate the asymmetric decoy fixture used by the
 	// failClosedToDecoy timing pipeline so the first hot-path call does
 	// not pay cold-RNG keypair-generation cost under sync.Once mutex —
@@ -446,6 +456,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.metrics.NewPathHits.Add(1)
 	h.handleNewFormatPost(w, r)
 }
+
+// handshakeProfileFromUA derives a browser profile label ("chrome", "firefox",
+// or "other") from a User-Agent string. Used for aggregate D2 (FP-mimicry)
+// handshake-profile counters on the server — the label is derived locally from
+// the request header and never stored in the session or any per-client LRU.
+//
+// Detection rules (order matters — Chrome UA strings also contain "Safari/"):
+//   - "Chrome/" anywhere → "chrome"
+//   - "Firefox/" anywhere → "firefox"
+//   - anything else → "other"
+func handshakeProfileFromUA(ua string) string {
+	if strings.Contains(ua, "Chrome/") {
+		return "chrome"
+	}
+	if strings.Contains(ua, "Firefox/") {
+		return "firefox"
+	}
+	return "other"
+}
+
 
 // handleHandshakeNew serves a handshake on the Phase B body-prefix path.
 // Phase 0 retire (2026-04-26): legacy 3-arg handleHandshake deleted.
@@ -648,6 +678,10 @@ proceed:
 	h.metrics.HandshakesTotal.Add(1)
 	h.metrics.HandshakesOK.Add(1)
 	h.metrics.HandshakesNewTotal.Add(1)
+	// D2 (FP-mimicry): aggregate handshake count by browser profile.
+	// Profile derived locally from User-Agent header — NOT stored in session
+	// or any per-client structure (privacy invariant).
+	h.metrics.IncHandshakeProfile(handshakeProfileFromUA(r.Header.Get("User-Agent")))
 	// MimicrySession is populated inside SessionManager.Create before publish
 	// (Plan §C11.3, May 2026 audit) — no per-handler assignment needed.
 	h.metrics.ActiveClients.Add(1)
@@ -655,6 +689,10 @@ proceed:
 
 	v := uint8(1)
 	serverHello.ProtoVersion = &v
+	// C2 (FP-mimicry): embed fingerprint weights from server config so the client
+	// can perform weighted profile selection matching this server's population model.
+	// nil map (absent YAML section) is valid — client interprets as chrome 100%.
+	serverHello.FingerprintWeights = h.config.FingerprintWeights
 	responsePayload := encodeServerHello(serverHello)
 	respBody, err := browser.BuildDownloadResponse(responsePayload, 0)
 	if err != nil {
@@ -1545,7 +1583,7 @@ func (h *Handler) handleUDPData(w http.ResponseWriter, session *core.Session, ch
 	// Use the resolved IP:port to prevent TOCTOU DNS rebinding
 	resolvedTarget := resolvedAddr.String()
 
-	h.udpRelay.Send(streamID, resolvedTarget, data, func(response []byte) {
+	h.udpRelay.Send(session.ID, streamID, resolvedTarget, data, func(response []byte) {
 		if tunnel.HasDownloadStream.Load() {
 			// SplitHTTP: push raw UDP payload to OutgoingUDP channel.
 			// Download stream reads from it separately and sends with FlagUDP.
@@ -1621,6 +1659,11 @@ func (h *Handler) handleStreamFin(session *core.Session, streamID uint16) {
 	if sc != nil && sc.TargetConn != nil {
 		sc.TargetConn.Close() // triggers relayStreamFromTarget exit
 	}
+	// C1b (2026-06-11): tear down any UDP flow bound to this stream so the NAT
+	// entry + socket don't leak after the stream FINs.
+	if h.udpRelay != nil {
+		h.udpRelay.RemoveFlow(session.ID, streamID)
+	}
 	slog.Debug("stream FIN", "stream", streamID, "remaining", remaining)
 }
 
@@ -1646,6 +1689,10 @@ func (h *Handler) handleFin(session *core.Session) {
 		delete(h.tunnels, session.ID)
 	}
 	h.tunnelsMu.Unlock()
+	// C1b (2026-06-11): a dead session must not leave UDP sockets/NAT entries.
+	if h.udpRelay != nil {
+		h.udpRelay.RemoveSession(session.ID)
+	}
 	h.sessions.Remove(session.ID)
 	h.metrics.ActiveClients.Add(-1)
 }
@@ -1962,6 +2009,12 @@ func (h *Handler) StartCleanup(stop <-chan struct{}) {
 				// M6 fix: clean up rate limiter maps alongside sessions
 				h.rateLimiters.Cleanup()
 
+				// CRIT-1 (2026-06-11): reap idle UDP flows so the NAT map +
+				// FDs don't grow unbounded. Mirrors rateLimiters.Cleanup().
+				if h.udpRelay != nil {
+					h.udpRelay.Cleanup()
+				}
+
 				// Plan §C10 M2 (May 2026 audit): fast-path eviction for
 				// newborn-not-attached sessions. Runs BEFORE the regular
 				// idle Cleanup so an orphan never lingers past the 30s
@@ -2010,6 +2063,10 @@ func (h *Handler) StartCleanup(stop <-chan struct{}) {
 							tunnel.mu.Unlock()
 							tunnel.closeTunnel()
 							delete(h.tunnels, id)
+							// C1b (2026-06-11): reap UDP flows of the removed session.
+							if h.udpRelay != nil {
+								h.udpRelay.RemoveSession(id)
+							}
 							h.metrics.ActiveClients.Add(-1)
 						}
 					}
@@ -2048,6 +2105,7 @@ func encodeServerHello(sh *core.ServerHello) []byte {
 		ProtoVersion *uint8            `json:"_v,omitempty"`
 		Deprecated   bool              `json:"_deprecated,omitempty"`
 		UA           map[string]string `json:"ua,omitempty"`
+		FW           map[string]int    `json:"fw,omitempty"` // fingerprint weights
 	}{
 		EphPub:       sh.EphemeralPub,
 		Token:        sh.EncryptedSessionToken,
@@ -2055,6 +2113,7 @@ func encodeServerHello(sh *core.ServerHello) []byte {
 		ChunkSize:    sh.ChunkSize,
 		ProtoVersion: sh.ProtoVersion,
 		Deprecated:   sh.ProtoVersion == nil, // legacy path → mark deprecated
+		FW:           sh.FingerprintWeights,
 		UA: map[string]string{
 			// Chrome UA mirrors browser.LockedChromeUA() (Chrome/133) so the
 			// server-issued client config stays consistent with the four

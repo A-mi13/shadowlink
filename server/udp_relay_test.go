@@ -63,7 +63,7 @@ func TestUDPRelayBasic(t *testing.T) {
 	}
 
 	// Send data through relay
-	err := relay.Send(1, echoAddr, []byte("hello udp"), onReceive)
+	err := relay.Send(1, 1, echoAddr, []byte("hello udp"), onReceive)
 	require.NoError(t, err)
 
 	// Wait for echo response
@@ -92,7 +92,7 @@ func TestUDPRelayMultipleStreams(t *testing.T) {
 	got1 := make(chan struct{}, 1)
 	got2 := make(chan struct{}, 1)
 
-	err := relay.Send(1, echoAddr, []byte("stream1"), func(data []byte) {
+	err := relay.Send(1, 1, echoAddr, []byte("stream1"), func(data []byte) {
 		mu1.Lock()
 		received1 = append(received1, data...)
 		mu1.Unlock()
@@ -103,7 +103,7 @@ func TestUDPRelayMultipleStreams(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	err = relay.Send(2, echoAddr, []byte("stream2"), func(data []byte) {
+	err = relay.Send(1, 2, echoAddr, []byte("stream2"), func(data []byte) {
 		mu2.Lock()
 		received2 = append(received2, data...)
 		mu2.Unlock()
@@ -150,7 +150,7 @@ func TestUDPRelayReuseFlow(t *testing.T) {
 	}
 
 	// Send twice on same stream — should reuse the same flow
-	err := relay.Send(1, echoAddr, []byte("first"), onReceive)
+	err := relay.Send(1, 1, echoAddr, []byte("first"), onReceive)
 	require.NoError(t, err)
 
 	select {
@@ -160,7 +160,7 @@ func TestUDPRelayReuseFlow(t *testing.T) {
 		t.Fatal("timed out")
 	}
 
-	err = relay.Send(1, echoAddr, []byte("second"), onReceive)
+	err = relay.Send(1, 1, echoAddr, []byte("second"), onReceive)
 	require.NoError(t, err)
 
 	select {
@@ -181,7 +181,7 @@ func TestUDPRelayCleanup(t *testing.T) {
 	relay := NewUDPRelay(100 * time.Millisecond)
 	defer relay.Close()
 
-	err := relay.Send(1, echoAddr, []byte("hello"), func(data []byte) {})
+	err := relay.Send(1, 1, echoAddr, []byte("hello"), func(data []byte) {})
 	require.NoError(t, err)
 	assert.Equal(t, 1, relay.FlowCount())
 
@@ -199,16 +199,16 @@ func TestUDPRelayRemoveFlow(t *testing.T) {
 	relay := NewUDPRelay(5 * time.Second)
 	defer relay.Close()
 
-	err := relay.Send(1, echoAddr, []byte("hello"), func(data []byte) {})
+	err := relay.Send(1, 1, echoAddr, []byte("hello"), func(data []byte) {})
 	require.NoError(t, err)
-	err = relay.Send(2, echoAddr, []byte("world"), func(data []byte) {})
+	err = relay.Send(1, 2, echoAddr, []byte("world"), func(data []byte) {})
 	require.NoError(t, err)
 	assert.Equal(t, 2, relay.FlowCount())
 
-	relay.RemoveFlow(1)
+	relay.RemoveFlow(1, 1)
 	assert.Equal(t, 1, relay.FlowCount())
 
-	relay.RemoveFlow(2)
+	relay.RemoveFlow(1, 2)
 	assert.Equal(t, 0, relay.FlowCount())
 }
 
@@ -218,12 +218,124 @@ func TestUDPRelayClose(t *testing.T) {
 
 	relay := NewUDPRelay(5 * time.Second)
 
-	err := relay.Send(1, echoAddr, []byte("a"), func(data []byte) {})
+	err := relay.Send(1, 1, echoAddr, []byte("a"), func(data []byte) {})
 	require.NoError(t, err)
-	err = relay.Send(2, echoAddr, []byte("b"), func(data []byte) {})
+	err = relay.Send(1, 2, echoAddr, []byte("b"), func(data []byte) {})
 	require.NoError(t, err)
 	assert.Equal(t, 2, relay.FlowCount())
 
 	relay.Close()
 	assert.Equal(t, 0, relay.FlowCount())
+}
+
+func TestUDPRelay_SessionIsolation(t *testing.T) {
+	echoAddr, cleanup := startUDPEchoServer(t)
+	defer cleanup()
+
+	relay := NewUDPRelay(5 * time.Second)
+	defer relay.Close()
+
+	gotA := make(chan []byte, 4)
+	gotB := make(chan []byte, 4)
+	cbA := func(d []byte) { cp := make([]byte, len(d)); copy(cp, d); gotA <- cp }
+	cbB := func(d []byte) { cp := make([]byte, len(d)); copy(cp, d); gotB <- cp }
+
+	// Две РАЗНЫЕ сессии, ОДИН streamID=1.
+	require.NoError(t, relay.Send(100, 1, echoAddr, []byte("for-A"), cbA))
+	require.NoError(t, relay.Send(200, 1, echoAddr, []byte("for-B"), cbB))
+
+	// Должно быть ДВА независимых flow, не один.
+	assert.Equal(t, 2, relay.FlowCount())
+
+	// Ответ A приходит ТОЛЬКО в cbA, B — ТОЛЬКО в cbB.
+	select {
+	case d := <-gotA:
+		assert.Equal(t, []byte("for-A"), d)
+	case <-time.After(2 * time.Second):
+		t.Fatal("session A response lost")
+	}
+	select {
+	case d := <-gotB:
+		assert.Equal(t, []byte("for-B"), d)
+	case <-time.After(2 * time.Second):
+		t.Fatal("session B response lost")
+	}
+	// cbB не должен получить пакет A.
+	select {
+	case stray := <-gotB:
+		t.Fatalf("session B received stray packet: %q", stray)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestUDPRelay_ReadLoopSelfTeardown(t *testing.T) {
+	echoAddr, cleanup := startUDPEchoServer(t)
+	defer cleanup()
+
+	// Короткий timeout — readLoop выйдет по read-deadline без новых данных.
+	relay := NewUDPRelay(150 * time.Millisecond)
+	defer relay.Close()
+
+	require.NoError(t, relay.Send(7, 3, echoAddr, []byte("ping"), func([]byte) {}))
+	assert.Equal(t, 1, relay.FlowCount())
+
+	// После timeout readLoop ДОЛЖЕН сам удалить flow (без вызова Cleanup).
+	require.Eventually(t, func() bool {
+		return relay.FlowCount() == 0
+	}, 2*time.Second, 50*time.Millisecond, "readLoop did not self-reap flow on idle")
+}
+
+func TestUDPRelay_RemoveSession(t *testing.T) {
+	echoAddr, cleanup := startUDPEchoServer(t)
+	defer cleanup()
+	relay := NewUDPRelay(5 * time.Second)
+	defer relay.Close()
+
+	// Сессия 50: два стрима. Сессия 51: один стрим.
+	require.NoError(t, relay.Send(50, 1, echoAddr, []byte("a"), func([]byte) {}))
+	require.NoError(t, relay.Send(50, 2, echoAddr, []byte("b"), func([]byte) {}))
+	require.NoError(t, relay.Send(51, 1, echoAddr, []byte("c"), func([]byte) {}))
+	assert.Equal(t, 3, relay.FlowCount())
+
+	// RemoveSession(50) убирает оба flow сессии 50, не трогая 51.
+	relay.RemoveSession(50)
+	assert.Equal(t, 1, relay.FlowCount())
+
+	// Оставшийся — именно (51,1).
+	relay.RemoveFlow(51, 1)
+	assert.Equal(t, 0, relay.FlowCount())
+}
+
+func TestUDPRelay_RespCap(t *testing.T) {
+	echoAddr, cleanup := startUDPEchoServer(t)
+	defer cleanup()
+
+	relay := NewUDPRelay(5 * time.Second)
+	relay.SetMaxResp(8) // 8 байт потолок ответа на flow
+	defer relay.Close()
+
+	var mu sync.Mutex
+	var total int
+	got := make(chan struct{}, 16)
+	cb := func(d []byte) {
+		mu.Lock()
+		total += len(d)
+		mu.Unlock()
+		select {
+		case got <- struct{}{}:
+		default:
+		}
+	}
+
+	// Эхо вернёт ровно то, что отправили. Шлём 5 байт дважды = 10 байт ответа,
+	// потолок 8 → второй ответ (превышающий cap) должен быть подавлен.
+	require.NoError(t, relay.Send(1, 1, echoAddr, []byte("12345"), cb))
+	<-got
+	require.NoError(t, relay.Send(1, 1, echoAddr, []byte("12345"), cb))
+
+	// Дать время на возможную (нежелательную) доставку второго.
+	time.Sleep(300 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	assert.LessOrEqual(t, total, 8, "response bytes exceeded per-flow cap")
 }

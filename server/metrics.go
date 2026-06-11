@@ -285,6 +285,20 @@ type Metrics struct {
 	// the gate).
 	decoyServed []atomic.Uint64
 
+	// D2 (FP-mimicry, 2026-06): aggregate handshake counters by browser profile
+	// derived from the User-Agent header on the handshake POST.
+	// PRIVACY: profile is derived locally in handleHandshakeNew from the UA on the
+	// hot path — it is NEVER stored in core.Session or any per-client LRU. Only
+	// these aggregate counters are updated. Dashboard use: A/B observability of
+	// real-world population split reaching this server instance.
+	HandshakesProfileChrome  atomic.Uint64
+	HandshakesProfileFirefox atomic.Uint64
+	HandshakesProfileOther   atomic.Uint64
+
+	// UDP relay (CRIT-1 / LOW-4, 2026-06-11)
+	UDPRespCapped  atomic.Uint64 // response packets dropped after per-flow byte cap
+	UDPFlowsReaped atomic.Uint64 // flows removed by Cleanup ticker (idle reap)
+
 	startTime time.Time
 }
 
@@ -300,6 +314,22 @@ func (m *Metrics) IncRatelimitClientIDExempted() {
 // §C7 (May audit, 2026-05-02).
 func (m *Metrics) IncRatelimitClientIDSoftLimitRejected() {
 	m.RatelimitClientIDSoftLimitRejected.Add(1)
+}
+
+// IncHandshakeProfile increments the aggregate handshake counter for the given
+// browser profile label. Called from handleHandshakeNew using a locally-derived
+// profile (from the User-Agent header) — the profile label is NEVER stored in
+// the session or any per-client structure (D2 privacy invariant).
+// Unknown labels route to "other".
+func (m *Metrics) IncHandshakeProfile(profile string) {
+	switch profile {
+	case "chrome":
+		m.HandshakesProfileChrome.Add(1)
+	case "firefox":
+		m.HandshakesProfileFirefox.Add(1)
+	default:
+		m.HandshakesProfileOther.Add(1)
+	}
 }
 
 // IncRatelimitBurstConsumed routes a per-bucket "token actually consumed"
@@ -505,6 +535,14 @@ type MetricsSnapshot struct {
 	// emits the map keyed by reason label so dashboards that consume the
 	// JSON variant don't need to know the slice order.
 	DecoyServed map[DecoyReason]uint64 `json:"decoy_served"`
+	// D2 (FP-mimicry, 2026-06): aggregate handshake counts by browser profile.
+	// Derived from User-Agent on the handshake POST — never stored per-client.
+	HandshakesProfileChrome  uint64 `json:"handshakes_profile_chrome"`
+	HandshakesProfileFirefox uint64 `json:"handshakes_profile_firefox"`
+	HandshakesProfileOther   uint64 `json:"handshakes_profile_other"`
+	// UDP relay (CRIT-1 / LOW-4, 2026-06-11).
+	UDPRespCapped  uint64 `json:"udp_resp_capped"`
+	UDPFlowsReaped uint64 `json:"udp_flows_reaped"`
 }
 
 // Snapshot returns current metrics.
@@ -596,6 +634,11 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		GoRoutines:                     runtime.NumGoroutine(),
 		Backpressure:                   m.backpressureActive.Load(),
 		DecoyServed:                    m.DecoyServedSnapshot(),
+		HandshakesProfileChrome:        m.HandshakesProfileChrome.Load(),
+		HandshakesProfileFirefox:       m.HandshakesProfileFirefox.Load(),
+		HandshakesProfileOther:         m.HandshakesProfileOther.Load(),
+		UDPRespCapped:                  m.UDPRespCapped.Load(),
+		UDPFlowsReaped:                 m.UDPFlowsReaped.Load(),
 	}
 }
 
@@ -879,4 +922,20 @@ func writePromMetrics(w io.Writer, s *MetricsSnapshot) {
 	fmt.Fprintf(w, "# HELP shadowlink_orphaned_evicted_limit_total Idle orphaned relays evicted to enforce the per-client / global orphan caps\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_orphaned_evicted_limit_total counter\n")
 	fmt.Fprintf(w, "shadowlink_orphaned_evicted_limit_total %d\n", s.OrphanedEvictedLimit)
+
+	// D2 (FP-mimicry, 2026-06) — handshake profile distribution.
+	// Profile derived from User-Agent on handshake POST; never stored per-client.
+	fmt.Fprintf(w, "# HELP shadowlink_handshakes_profile_total Successful handshakes by browser profile inferred from User-Agent (D2 FP-mimicry observability)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_handshakes_profile_total counter\n")
+	fmt.Fprintf(w, "shadowlink_handshakes_profile_total{profile=\"chrome\"} %d\n", s.HandshakesProfileChrome)
+	fmt.Fprintf(w, "shadowlink_handshakes_profile_total{profile=\"firefox\"} %d\n", s.HandshakesProfileFirefox)
+	fmt.Fprintf(w, "shadowlink_handshakes_profile_total{profile=\"other\"} %d\n", s.HandshakesProfileOther)
+
+	// UDP relay (CRIT-1 / LOW-4, 2026-06-11) — amplification cap drops + idle reaps.
+	fmt.Fprintf(w, "# HELP shadowlink_udp_resp_capped_total UDP response packets dropped after hitting the per-flow byte cap (LOW-4 amplification ceiling)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_udp_resp_capped_total counter\n")
+	fmt.Fprintf(w, "shadowlink_udp_resp_capped_total %d\n", s.UDPRespCapped)
+	fmt.Fprintf(w, "# HELP shadowlink_udp_flows_reaped_total UDP flows removed by the idle Cleanup ticker (CRIT-1 NAT-map/FD reap)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_udp_flows_reaped_total counter\n")
+	fmt.Fprintf(w, "shadowlink_udp_flows_reaped_total %d\n", s.UDPFlowsReaped)
 }

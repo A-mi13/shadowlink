@@ -1308,7 +1308,7 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 				resolvedTarget := resolvedAddr.String()
 
 				if h.udpRelay != nil {
-					h.udpRelay.Send(streamID, resolvedTarget, data, func(response []byte) {
+					h.udpRelay.Send(session.ID, streamID, resolvedTarget, data, func(response []byte) {
 						respChunk := core.NewUDPDataChunk(session.ID, session.NextSeqNum(), streamID, targetAddr, response)
 						if enc, err := session.EncryptChunk(respChunk); err == nil {
 							writeMsg(enc)
