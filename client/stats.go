@@ -246,6 +246,19 @@ type statsRegistry struct {
 	// separate diagnostic is warranted).
 	DownlinkReplayDroppedTotal atomic.Uint64
 
+	// MigrationFrameUnparseable — H-C2 (audit 2026-06-11). A decrypted FlagData
+	// frame on a migration-negotiated slot that matched NEITHER the legacy
+	// control-string path NOR ParseStreamDataSeq (len<10 / malformed seq shape).
+	// Pre-fix this frame was silently dropped — a hole in the proxied TCP byte
+	// stream (the Bug#8 class: app-side TLS decrypt failure / broken download)
+	// with NO telemetry. The frame is now NOT dropped silently: the owning
+	// stream is deterministically torn down (handleStreamClose → EOF → app
+	// retry) and this counter is bumped. MUST stay ~0 in a healthy canary; a
+	// sustained non-zero rate means a wire-format contract gap (e.g. a server
+	// build emitting a control frame our matcher doesn't recognize, or a
+	// per-slot/pool decode-shape desync — see H-C3).
+	MigrationFrameUnparseable atomic.Uint64
+
 	// SnapshotNegativeAgeTotal — counts cases where drainStreamSnapshot
 	// observed lastWriteNs > now (clock went backwards under NTP adjust,
 	// or, worse, arbitrary value stored). Clamped to 0 in snapshot logic;
@@ -803,6 +816,10 @@ func WritePromMetrics(w io.Writer) {
 	fmt.Fprintf(w, "# TYPE shadowlink_stale_frame_dropped_total counter\n")
 	fmt.Fprintf(w, "shadowlink_stale_frame_dropped_total %d\n", Stats.StaleFrameDroppedTotal.Load())
 	fmt.Fprintf(w, "shadowlink_downlink_replay_dropped_total %d\n", Stats.DownlinkReplayDroppedTotal.Load())
+
+	fmt.Fprintf(w, "# HELP shadowlink_migration_frame_unparseable_total Decrypted FlagData frames on a migration slot that matched neither the control path nor ParseStreamDataSeq; stream torn down (H-C2). Should stay ~0\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_migration_frame_unparseable_total counter\n")
+	fmt.Fprintf(w, "shadowlink_migration_frame_unparseable_total %d\n", Stats.MigrationFrameUnparseable.Load())
 
 	fmt.Fprintf(w, "# HELP shadowlink_slot_drain_inflight_cap_deferred_total Drains deferred by storm-brake inflight-cap gate (concurrent drains >= maxConcurrentDrains)\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_slot_drain_inflight_cap_deferred_total counter\n")

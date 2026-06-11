@@ -428,6 +428,24 @@ type poolSlot struct {
 	flowControlEnabled bool
 	flowWindow         uint64
 
+	// migrateNegotiated is the PER-SLOT migration wire-format latch (audit
+	// 2026-06-11 H-C3). Set true in connectSlot from this slot's OWN FLOWCTL V2
+	// ack (wst.flowMigrateEnabled) — i.e. the downlink wire format the SERVER
+	// session behind THIS slot speaks. The slot reader selects its decode shape
+	// (seq-tagged vs legacy flat FlagData) from this field, NOT from the
+	// pool-wide migrateEnabled bit.
+	//
+	// Why per-slot: migrateEnabled is pool-wide write-once-true, flipped when
+	// ANY slot negotiates migration. If slot B flips it while slot A's session
+	// still speaks the flat format (the server latches seq format per-session at
+	// its own negotiation point — not atomically with the client's pool-wide
+	// flip), a pool-wide read would make slot A's reader seq-decode flat frames,
+	// mis-parsing 8 payload bytes as downSeq → frame drop / mis-route. Latching
+	// the decode shape on the session that PRODUCED the frame closes that
+	// window. Atomic so the slot reader reads it lock-free. Zero value (false) on
+	// a fresh/recycled cell = flat decode until that slot negotiates.
+	migrateNegotiated atomic.Bool
+
 	// migrationThresholdNs is the per-slot, per-session age (nanoseconds) at
 	// which the rotation watchdog begins preemptively MIGRATING this slot's
 	// active streams onto a younger slot (Bug #9 Task 16, F7 §5.6). Sampled
@@ -1326,13 +1344,19 @@ type WSPoolTransport struct {
 	flowDesiredWindow uint64 // Bug #8: 0 → flow control off; else advertised window
 
 	// migrateEnabled is set true once ANY slot negotiates Bug #9 stream
-	// migration (FLOWCTL V2 marker, migrate bit). Atomic so slotReaderWithClient
-	// (per-slot goroutines) and the SOCKS5 front-end (MigrationEnabled accessor)
-	// read it lock-free. Pool-wide because all slots in a pool talk to the same
-	// server with the same negotiated capability — once on, the downlink wire
-	// format is seq-tagged for FlagData frames (§5.4). Write-once-true in
-	// connectSlot; never flipped back to false (a server that drops the
-	// capability mid-pool would be a protocol violation).
+	// migration (FLOWCTL V2 marker, migrate bit). Atomic so the SOCKS5 front-end
+	// (MigrationEnabled accessor) reads it lock-free. Pool-wide and write-once-true
+	// (connectSlot); never flipped back to false.
+	//
+	// SCOPE (H-C3, audit 2026-06-11): this bit drives ONLY the SOCKS front-end
+	// registration decision (it must register seq channels as soon as ANY slot
+	// CAN produce seq frames). It does NOT decide the per-frame downlink DECODE
+	// shape — that is now per-slot (poolSlot.migrateNegotiated), latched from each
+	// slot's OWN FLOWCTL ack. The old invariant "once on, the downlink format is
+	// seq-tagged for all slots" was false: the server latches seq format
+	// per-session at its own negotiation point, not atomically with this
+	// pool-wide flip, so a flat-session slot must keep flat-decoding after the
+	// flip. The decode shape follows the producing session, not this pool bit.
 	migrateEnabled atomic.Bool
 
 	// ── Bug #9 Task 15: MIGRATE/RESUME send + ack-await + hysteresis ──────────
@@ -2192,9 +2216,17 @@ func (p *WSPoolTransport) connectSlot(ctx context.Context, idx int) error {
 		slot.flowWindow = uint64(wst.flowWindow)
 		p.client.EnableFlowControl(uint64(wst.flowWindow), p)
 	}
-	// Bug #9 §5.4: latch pool-wide migration once a slot negotiated it. Sets the
-	// downlink wire format to seq-tagged (slotReaderWithClient routes FlagData
-	// via RouteToStreamSeq) and lets the SOCKS5 front-end register seq channels.
+	// H-C3 (audit 2026-06-11): latch the seq-tagged decode shape PER-SLOT from
+	// THIS slot's own FLOWCTL ack. The slot reader keys its FlagData decode on
+	// slot.migrateNegotiated so a slot whose session speaks flat keeps
+	// flat-decoding even after another slot flips the pool-wide bit. A recycled
+	// cell got a fresh *poolSlot from connectSlot's reserve path, so this is set
+	// fresh per (re)connect (no stale-true carry-over from a prior session).
+	slot.migrateNegotiated.Store(wst.flowMigrateEnabled)
+	// Bug #9 §5.4: latch pool-wide migration once a slot negotiated it. Kept for
+	// the SOCKS5 front-end registration decision (MigrationEnabled accessor) —
+	// it must register seq channels as soon as ANY slot can produce seq frames.
+	// The downlink DECODE shape is now per-slot (above), not this bit.
 	if wst.flowMigrateEnabled {
 		p.migrateEnabled.Store(true)
 		// Task 15: a fresh negotiated handshake re-arms migration capability and
@@ -3380,31 +3412,12 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 		// format is seq-tagged ([streamID(2)][downSeq(8)][data]) so the client
 		// reassembler can reorder frames split across an old+new slot. FlagUDP
 		// is NOT seq-tagged (datagram, no ordering contract) — it stays on the
-		// legacy []byte path in both modes. Legacy (non-migration) FlagData also
-		// stays byte-for-byte on RouteToStream(chunk.Payload[2:]).
+		// legacy []byte path in both modes. FlagData routing (seq vs flat) is
+		// decided per-slot in routeDownlinkFlagData (H-C2/H-C3, audit 2026-06-11).
 		if chunk.Flags == core.FlagUDP {
 			cl.RouteToStream(streamID, chunk.Payload)
-		} else if p.migrateEnabled.Load() {
-			// Bug #9 §5.4: on a migration slot the FlagData downlink mixes two
-			// shapes — relay DATA is seq-tagged ([streamID][downSeq(8)][data],
-			// downSeq>=1) but CONNECT_OK/FAIL control is still emitted by the
-			// server's CONNECT handler as the legacy flat [streamID][string]
-			// (no downSeq). We disambiguate by exact-matching the two known
-			// control strings on the post-streamID payload and routing them as
-			// seq==0 control (the downlink loop's control path). This is also
-			// forward-compatible: if the server later seq-tags control with
-			// downSeq==0, ParseStreamDataSeq yields seq==0 and the same control
-			// path runs. NEW-2: ParseStreamDataSeq enforces len>=10 and never
-			// panics; a frame too short / unparseable on a migration slot is a
-			// protocol violation — drop rather than corrupt the byte stream.
-			body := chunk.Payload[2:]
-			if isStreamControlMsg(body) {
-				cl.RouteToStreamSeq(streamID, 0, body)
-			} else if sid, downSeq, sdata, perr := core.ParseStreamDataSeq(chunk.Payload); perr == nil {
-				cl.RouteToStreamSeq(sid, downSeq, sdata)
-			}
 		} else {
-			cl.RouteToStream(streamID, chunk.Payload[2:])
+			p.routeDownlinkFlagData(cl, slot, streamID, chunk)
 		}
 
 		// Preemptive byte-based rotation — checked AFTER the frame is
@@ -3632,6 +3645,59 @@ func (p *WSPoolTransport) fireRotation(cl *Client, idx int) {
 //
 // This is the shared teardown used by both the demux FlagStreamClose branch
 // and the handleSlotDeath closeStream helper, keeping the logic in one place.
+// routeDownlinkFlagData routes a decrypted FlagData downlink frame to its
+// stream, choosing the decode shape from the PRODUCING slot's own migration
+// negotiation (H-C3) and refusing to silently drop an unparseable frame (H-C2).
+//
+// H-C3 — per-slot decode shape: the seq-tagged form is selected by
+// slot.migrateNegotiated (latched in connectSlot from THIS slot's FLOWCTL ack),
+// NOT the pool-wide p.migrateEnabled bit. A slot whose server session still
+// speaks the flat format keeps flat-decoding even after another slot flips the
+// pool-wide flag, so the 8-byte downSeq is never mis-parsed out of flat payload.
+//
+// H-C2 — no silent drop: on a migration slot, a frame that matches neither the
+// legacy control path nor ParseStreamDataSeq (len<10 / malformed) is NOT dropped
+// on the floor (a dropped already-decrypted downlink frame is a hole in the TCP
+// byte stream → app-side corruption, the Bug#8 class). Instead it bumps
+// Stats.MigrationFrameUnparseable, logs at WARN, and deterministically tears the
+// stream (handleStreamClose → the SOCKS5/memConn reader gets EOF → the app
+// retries) rather than handing the app a silently-corrupted byte stream.
+func (p *WSPoolTransport) routeDownlinkFlagData(cl *Client, slot *poolSlot, streamID uint16, chunk *core.Chunk) {
+	// Decode shape follows the session that produced the frame (H-C3).
+	seqTagged := slot != nil && slot.migrateNegotiated.Load()
+	if !seqTagged {
+		// Legacy flat FlagData: byte-for-byte [streamID(2)][data].
+		cl.RouteToStream(streamID, chunk.Payload[2:])
+		return
+	}
+
+	// Migration slot: the FlagData downlink mixes two shapes — relay DATA is
+	// seq-tagged ([streamID][downSeq(8)][data], downSeq>=1) but CONNECT_OK/FAIL
+	// control is still emitted by the server's CONNECT handler as the legacy
+	// flat [streamID][string] (no downSeq). Disambiguate by exact-matching the
+	// known control strings on the post-streamID payload and routing them as
+	// seq==0 control. Forward-compatible: if the server later seq-tags control
+	// with downSeq==0, ParseStreamDataSeq yields seq==0 and the same path runs.
+	body := chunk.Payload[2:]
+	if isStreamControlMsg(body) {
+		cl.RouteToStreamSeq(streamID, 0, body)
+		return
+	}
+	if sid, downSeq, sdata, perr := core.ParseStreamDataSeq(chunk.Payload); perr == nil {
+		cl.RouteToStreamSeq(sid, downSeq, sdata)
+		return
+	}
+
+	// H-C2: unparseable on a migration slot. Do NOT silently drop — that punches
+	// a hole in the stream's TCP byte sequence (app-side TLS decrypt failure /
+	// broken download) with no telemetry. Count it and deterministically tear
+	// the stream so the app gets EOF and retries.
+	Stats.MigrationFrameUnparseable.Add(1)
+	p.log.Warn("migration FlagData frame unparseable — tearing stream",
+		"stream", streamID, "payload_len", len(chunk.Payload))
+	p.handleStreamClose(cl, streamID)
+}
+
 func (p *WSPoolTransport) handleStreamClose(cl *Client, streamID uint16) {
 	p.streamMap.Delete(streamID)
 	cl.streamMu.Lock()
