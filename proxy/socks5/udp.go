@@ -29,6 +29,37 @@ import (
 // not penalised.
 const udpMinReadySlots = 2
 
+// udpAssociationIdle is the inactivity window after which a UDP ASSOCIATE is
+// torn down regardless of the control-TCP state (M6, 2026-06-11). The 120s
+// value matches the existing per-read deadline; the watchdog converts that
+// per-read timeout into a hard association-level teardown so a half-closed
+// control TCP can no longer leak the listener + 3 goroutines forever.
+const udpAssociationIdle = 120 * time.Second
+
+// acceptUDPClient implements RFC1928 client pinning (H4, 2026-06-11): the first
+// datagram source IP is pinned for the lifetime of the UDP association; later
+// datagrams from a DIFFERENT IP are rejected so a foreign localhost process
+// cannot smuggle traffic through (or steal responses from) someone else's
+// stream. Same-IP datagrams (any port) are accepted. Returns true if the
+// datagram should be relayed.
+func acceptUDPClient(pinned *atomic.Pointer[net.UDPAddr], src *net.UDPAddr) bool {
+	if pinned.CompareAndSwap(nil, src) {
+		return true // first datagram — pin and accept
+	}
+	cur := pinned.Load()
+	if cur == nil {
+		return false // lost the CAS race and pin cleared — reject defensively
+	}
+	return cur.IP.Equal(src.IP)
+}
+
+// udpAssociationIdleExpired reports whether the association has been idle longer
+// than the given window (M6, 2026-06-11). last holds the most recent activity
+// timestamp in UnixNano.
+func udpAssociationIdleExpired(last *atomic.Int64, now time.Time, idle time.Duration) bool {
+	return now.UnixNano()-last.Load() > idle.Nanoseconds()
+}
+
 // HandleUDPAssociateWS handles SOCKS5 UDP ASSOCIATE over WebSocket transport.
 // Opens a local UDP listener, relays datagrams through the encrypted WS tunnel.
 // conn is NOT closed by this function (caller handles it via defer).
@@ -99,6 +130,9 @@ func HandleUDPAssociateWS(ctx context.Context, conn net.Conn, cl *client.Client,
 
 	// Track last client address for sending responses back
 	var lastClientAddr atomic.Pointer[net.UDPAddr]
+	// M6: association-level activity timestamp (UnixNano) for the idle watchdog.
+	var lastUDPActivity atomic.Int64
+	lastUDPActivity.Store(time.Now().UnixNano())
 
 	ctx2, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -120,7 +154,11 @@ func HandleUDPAssociateWS(ctx context.Context, conn net.Conn, cl *client.Client,
 				continue // too short for SOCKS5 UDP header
 			}
 
-			lastClientAddr.Store(clientAddr)
+			// H4: pin to the first client IP; reject datagrams from any other IP.
+			if !acceptUDPClient(&lastClientAddr, clientAddr) {
+				continue
+			}
+			lastUDPActivity.Store(time.Now().UnixNano())
 
 			targetAddr, dataOffset, ok := ParseSOCKS5UDPHeader(buf, n)
 			if !ok {
@@ -169,9 +207,32 @@ func HandleUDPAssociateWS(ctx context.Context, conn net.Conn, cl *client.Client,
 				ca := lastClientAddr.Load()
 				if ca != nil {
 					udpConn.WriteToUDP(udpResp, ca)
+					lastUDPActivity.Store(time.Now().UnixNano())
 				}
 			case <-ctx2.Done():
 				return
+			}
+		}
+	}()
+
+	// Goroutine 3 (M6 idle watchdog): tear down the association if it goes idle
+	// past udpAssociationIdle even when the control TCP is half-closed/hung —
+	// closing udpConn unblocks ReadFromUDP and cancel() (via defer) stops the rest.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer cancel()
+		ticker := time.NewTicker(udpAssociationIdle / 4)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx2.Done():
+				return
+			case <-ticker.C:
+				if udpAssociationIdleExpired(&lastUDPActivity, time.Now(), udpAssociationIdle) {
+					udpConn.Close() // unblock ReadFromUDP; cancel via defer
+					return
+				}
 			}
 		}
 	}()
@@ -233,6 +294,9 @@ func HandleUDPAssociate(ctx context.Context, conn net.Conn, cl *client.Client, r
 	}
 
 	var lastClientAddr atomic.Pointer[net.UDPAddr]
+	// M6: association-level activity timestamp (UnixNano) for the idle watchdog.
+	var lastUDPActivity atomic.Int64
+	lastUDPActivity.Store(time.Now().UnixNano())
 
 	ctx2, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -253,7 +317,11 @@ func HandleUDPAssociate(ctx context.Context, conn net.Conn, cl *client.Client, r
 			if n < 4 {
 				continue
 			}
-			lastClientAddr.Store(clientAddr)
+			// H4: pin to the first client IP; reject datagrams from any other IP.
+			if !acceptUDPClient(&lastClientAddr, clientAddr) {
+				continue
+			}
+			lastUDPActivity.Store(time.Now().UnixNano())
 
 			targetAddr, dataOffset, ok := ParseSOCKS5UDPHeader(buf, n)
 			if !ok {
@@ -300,6 +368,7 @@ func HandleUDPAssociate(ctx context.Context, conn net.Conn, cl *client.Client, r
 				ca := lastClientAddr.Load()
 				if ca != nil {
 					udpConn.WriteToUDP(udpResp, ca)
+					lastUDPActivity.Store(time.Now().UnixNano())
 				}
 			case <-ctx2.Done():
 				return
@@ -322,6 +391,28 @@ func HandleUDPAssociate(ctx context.Context, conn net.Conn, cl *client.Client, r
 			}
 			client.Stats.UdpPolls.Add(1)
 			cl.PollStreams(ctx2)
+		}
+	}()
+
+	// M6 idle watchdog: tear down the association if idle past udpAssociationIdle
+	// even when the control TCP is half-closed/hung. Closing udpConn unblocks
+	// ReadFromUDP; cancel() (via defer) stops the send/receive/poll goroutines.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer cancel()
+		ticker := time.NewTicker(udpAssociationIdle / 4)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx2.Done():
+				return
+			case <-ticker.C:
+				if udpAssociationIdleExpired(&lastUDPActivity, time.Now(), udpAssociationIdle) {
+					udpConn.Close()
+					return
+				}
+			}
 		}
 	}()
 
