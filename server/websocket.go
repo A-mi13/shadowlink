@@ -194,7 +194,20 @@ func (h *Handler) authenticateFirstFrame(conn *websocket.Conn) (*core.Session, u
 	// WS teardown so CleanupDetachedGhosts does not reclaim a session a pool
 	// reconnect just re-adopted. Ordered AFTER the WSAttached CAS so only the
 	// winning attacher clears it.
-	session.DetachedAt.Store(0)
+	//
+	// HIGH-4 / H-S3 (2026-06-11) TOCTOU fix: clearing DetachedAt with a bare
+	// atomic Store left a window — the sweep's Phase-2 gate could observe
+	// WSAttached==false (before this CAS won) and its lock-held DetachedAt read
+	// could land before this Store, deleting the session out from under the
+	// just-attached transport. ReattachClearDetached clears DetachedAt UNDER
+	// sm.mu (the lock the sweep's delete also holds), serializing the two. If it
+	// returns false the sweep already won and removed the session: undo the
+	// attach latch and bail into fakeAckAndClose so the client reconnects
+	// cleanly on a fresh session rather than serving a manager-unknown ghost.
+	if !h.sessions.ReattachClearDetached(session.ID) {
+		tunnel.WSAttached.Store(false)
+		return nil, 0, false
+	}
 
 	// Bug #8: read FLOWCTL marker from the (decrypted) keepalive payload and,
 	// if present & supported, emit a synchronous FLOWCTL-ack BEFORE the relay

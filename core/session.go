@@ -621,6 +621,35 @@ func (sm *SessionManager) Remove(id uint32) {
 	sm.mu.Unlock()
 }
 
+// ReattachClearDetached atomically commits a WS re-attach against the
+// ghost-sweep: it clears the session's DetachedAt stamp WHILE HOLDING sm.mu,
+// the SAME lock CleanupDetachedGhosts' Phase 2 holds across its
+// existence-check → DetachedAt-read → delete critical section. This serializes
+// the attach-commit against the sweep-delete and closes the TOCTOU race
+// (audit HIGH-4 / H-S3, 2026-06-11):
+//
+//   - If this clear runs first, the sweep's lock-held DetachedAt re-read sees 0
+//     and skips the session.
+//   - If the sweep's delete runs first, this lookup misses (ok==false) and the
+//     caller MUST abort the attach (reset WSAttached, fall back to
+//     fakeAckAndClose) — the client reconnects cleanly on a fresh session.
+//
+// Returns false iff the session is no longer in the manager (already swept):
+// a bare atomic Store on Session.DetachedAt is NOT sufficient because the
+// sweep's decision (map delete) and the attach's signal (DetachedAt / the
+// WSAttached latch on the server Tunnel) live behind different locks — only a
+// common lock makes them mutually exclusive.
+func (sm *SessionManager) ReattachClearDetached(id uint32) bool {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	s, ok := sm.sessions[id]
+	if !ok {
+		return false // swept between the WSAttached CAS-win and this commit
+	}
+	s.DetachedAt.Store(0)
+	return true
+}
+
 // Destroy securely zeroes all key material in the session.
 func (s *Session) Destroy() {
 	s.mu.Lock()
