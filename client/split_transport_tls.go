@@ -39,6 +39,12 @@ func buildUTLSDialTLS(
 	nextProto string,
 ) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	helloID := utlsProfileForFingerprint(fp)
+	// C4 cold-path lockstep (2026-06-11): the Chrome-shaped MLKEM injection in
+	// pqClientHelloSpec is gated per-profile by PQKeyShare, NOT by family. Chrome
+	// 120 ships a classic {X25519} key_share on BOTH cold (utls) and hot
+	// (bogdanfinn) paths; forcing MLKEM on its cold path would desync the two.
+	// Chrome 131/133 carry MLKEM natively on both paths (PQKeyShare=true).
+	// Non-Chrome profiles (Firefox) keep their stock native key_share.
 
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		// cfIP override: swap addr host for the scanned edge while keeping
@@ -62,12 +68,15 @@ func buildUTLSDialTLS(
 		// the JA3 mismatch CRIT-1/2/3 of the 2026-04 audit because the WS
 		// upgrade would speak MLKEM while same-IP same-session cold-path
 		// requests kept the stock HelloChrome_133 spec.
-		usePQ := pqEnabled()
+		// PQ applies only to profiles whose key_share natively carries MLKEM
+		// (chrome131/133). chrome120 and non-Chrome use their stock spec so
+		// cold-path key_share stays paired with the hot-path bogdanfinn spec.
+		usePQ := pqEnabled() && fp != nil && fp.Profile().PQKeyShare
 		var spec utls.ClientHelloSpec
 		pqApplied := false
 		pqFellBack := false
 		if usePQ {
-			if pqSpec, pqErr := pqClientHelloSpec(); pqErr == nil {
+			if pqSpec, pqErr := pqClientHelloSpec(helloID); pqErr == nil {
 				spec = pqSpec
 				pqApplied = true
 			} else {

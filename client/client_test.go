@@ -8,6 +8,7 @@ import (
 
 	"github.com/nixavpn/shadowlink/core"
 	"github.com/nixavpn/shadowlink/server"
+	"github.com/nixavpn/shadowlink/skins/browser"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -185,4 +186,53 @@ func TestClientWithCustomTransport(t *testing.T) {
 	err := cl.Connect(context.Background())
 	require.NoError(t, err)
 	assert.True(t, cl.Connected())
+}
+
+// TestWarnExtremeWeights verifies the >20% non-chrome threshold.
+func TestWarnExtremeWeights(t *testing.T) {
+	if !weightsLookExtreme(map[string]int{"chrome": 50, "firefox": 50}) {
+		t.Error("50% firefox must be flagged extreme")
+	}
+	if weightsLookExtreme(map[string]int{"chrome": 90, "firefox": 10}) {
+		t.Error("10% firefox is realistic, must not flag")
+	}
+	if weightsLookExtreme(map[string]int{"chrome": 100}) {
+		t.Error("100% chrome must not flag")
+	}
+	if weightsLookExtreme(nil) {
+		t.Error("nil weights must not flag")
+	}
+}
+
+// TestClient_AppliesPersistedProfile verifies C4 integration:
+// NewClient reads FPCacheDir, restores the persisted profile,
+// and stores it in selectedProfileName + lockedFP.
+func TestClient_AppliesPersistedProfile(t *testing.T) {
+	dir := t.TempDir()
+	err := SaveFPState(dir, FPState{ProfileName: "chrome"})
+	require.NoError(t, err)
+
+	cfg := ClientConfig{
+		ServerAddr:   "x:443",
+		ServerPubKey: make([]byte, 32),
+		FPCacheDir:   dir,
+	}
+	c := NewClient(cfg)
+	defer c.Close()
+
+	// Persisted ProfileName сохраняется verbatim ("chrome") — обратная
+	// совместимость state-файла.
+	if c.selectedProfileName != "chrome" {
+		t.Errorf("selectedProfileName = %q, want chrome", c.selectedProfileName)
+	}
+	if c.lockedFP == nil {
+		t.Fatal("lockedFP must not be nil")
+	}
+	// lockedFP резолвит legacy "chrome" в chrome133 через LookupProfile alias.
+	if c.lockedFP.Profile().Name != browser.ProfileChrome133 {
+		t.Errorf("lockedFP.Profile().Name = %q, want chrome133 (legacy alias)", c.lockedFP.Profile().Name)
+	}
+	if !browser.IsChromeFamily(c.lockedFP.Profile().Name) {
+		t.Error("lockedFP must be chrome-family")
+	}
 }

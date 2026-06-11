@@ -17,6 +17,18 @@ import (
 // единственный стабильно проходит через РФ-DPI. Константы ProfileSafari /
 // ProfileFirefox удалены вместе с их веткой в Pool/NewFingerprint/UpdateUserAgents.
 const (
+	// Family-метки — класс браузера для policy-веток (PQ, sec-ch-ua, UA-валидация).
+	FamilyChrome  = "chrome"
+	FamilyFirefox = "firefox"
+
+	// Имена-ключи реестра diversity-профилей (persist-значения fp-state.bin).
+	ProfileChrome120 = "chrome120"
+	ProfileChrome131 = "chrome131"
+	ProfileChrome133 = "chrome133"
+
+	// ProfileChrome — legacy-алиас. Сохранён для обратной совместимости с
+	// существующими call-site'ами и persisted state. Резолвится в chrome133
+	// (новейший доступный) через LookupProfile fallback (Task 6).
 	ProfileChrome = "chrome"
 )
 
@@ -58,11 +70,32 @@ func LockedBogdanfinnChromeProfile() profiles.ClientProfile {
 	return profiles.Chrome_133
 }
 
+// ChromeUAForMajor строит User-Agent для заданного Chrome major. Базовый
+// билдер для per-major diversity-профилей (chrome120/131/133).
+func ChromeUAForMajor(major int) string {
+	return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" +
+		strconv.Itoa(major) + ".0.0.0 Safari/537.36"
+}
+
+// ChromeCHUAForMajor строит sec-ch-ua набор для заданного Chrome major.
+// Возвращает билдер-функцию (как поле CHUA в BrowserProfile).
+func ChromeCHUAForMajor(major int) func() [][2]string {
+	v := strconv.Itoa(major)
+	return func() [][2]string {
+		return [][2]string{
+			{"sec-ch-ua", `"Chromium";v="` + v + `", "Not(A:Brand";v="99", "Google Chrome";v="` + v + `"`},
+			{"sec-ch-ua-mobile", "?0"},
+			{"sec-ch-ua-platform", `"Windows"`},
+		}
+	}
+}
+
 // LockedChromeUA returns the User-Agent string for the locked Chrome major.
 // Used by every HTTP request (handshake POST, WarmupRequests, decoy_traffic,
-// LeakGuard CheckIP, server-side exportClientConfig).
+// LeakGuard CheckIP, server-side exportClientConfig). Тонкая обёртка над
+// ChromeUAForMajor(LockedChromeMajor) — обратная совместимость call-sites.
 func LockedChromeUA() string {
-	return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + LockedChromeMajorString + ".0.0.0 Safari/537.36"
+	return ChromeUAForMajor(LockedChromeMajor)
 }
 
 // chuaHeaderSetter is the minimal interface every http header type
@@ -90,7 +123,15 @@ func ApplyChromeCHUA(h chuaHeaderSetter) {
 // names are silent no-ops (defensive: future code paths might construct
 // a Fingerprint via a path we haven't audited).
 func ApplyChromeCHUAForFingerprint(h chuaHeaderSetter, fp *Fingerprint) {
-	if fp == nil || fp.Name() != ProfileChrome {
+	if fp == nil || !IsChromeFamily(fp.Name()) {
+		return
+	}
+	// Emit sec-ch-ua matching the fingerprint's actual Chrome major (diversity:
+	// chrome120/131/133 each emit their own version), not the locked default.
+	if fp.Profile().CHUA != nil {
+		for _, kv := range fp.Profile().CHUA() {
+			h.Set(kv[0], kv[1])
+		}
 		return
 	}
 	ApplyChromeCHUA(h)
@@ -126,12 +167,7 @@ func ApplyChromeCHUAForUA(h chuaHeaderSetter, ua string) {
 // Brand quoting and "Not(A:Brand" string are part of the public Chrome
 // brand-substitution scheme — do NOT change them.
 func LockedChromeCHUA() [][2]string {
-	v := LockedChromeMajorString
-	return [][2]string{
-		{"sec-ch-ua", `"Chromium";v="` + v + `", "Not(A:Brand";v="99", "Google Chrome";v="` + v + `"`},
-		{"sec-ch-ua-mobile", "?0"},
-		{"sec-ch-ua-platform", `"Windows"`},
-	}
+	return ChromeCHUAForMajor(LockedChromeMajor)()
 }
 
 // Fingerprint represents a browser TLS profile with a matching User-Agent.
@@ -140,6 +176,7 @@ func LockedChromeCHUA() [][2]string {
 type Fingerprint struct {
 	name      string
 	userAgent string
+	profile   BrowserProfile // выбранный профиль (lockstep-источник всех поверхностей)
 }
 
 // NewFingerprint creates a fingerprint for the given browser profile.
@@ -152,10 +189,34 @@ func NewFingerprint(profile string) *Fingerprint {
 	uaMu.RLock()
 	defer uaMu.RUnlock()
 
-	fp := &Fingerprint{name: ProfileChrome}
 	_ = profile // legacy parameter: всегда Chrome
-	fp.userAgent = chromeUA
+	// Legacy-алиас "chrome" резолвится через LookupProfile в chrome133.
+	p, _ := LookupProfile(ProfileChrome)
+	ua := p.UAString
+	// chromeUA может быть переопределён сервером (UpdateUserAgents) — уважаем.
+	if chromeUA != "" {
+		ua = chromeUA
+	}
+	fp := &Fingerprint{
+		name:      p.Name,
+		userAgent: ua,
+		profile:   p,
+	}
 	return fp
+}
+
+// NewFingerprintForProfile создаёт Fingerprint для имени профиля из реестра.
+// Неизвестное имя → безопасный fallback на chrome.
+func NewFingerprintForProfile(name string) *Fingerprint {
+	p, ok := LookupProfile(name)
+	if !ok {
+		p, _ = LookupProfile(ProfileChrome133)
+	}
+	return &Fingerprint{
+		name:      p.Name,
+		userAgent: p.UAString,
+		profile:   p,
+	}
 }
 
 // Name returns the profile name.
@@ -167,6 +228,9 @@ func (f *Fingerprint) Name() string {
 func (f *Fingerprint) UserAgent() string {
 	return f.userAgent
 }
+
+// Profile возвращает выбранный browser-профиль (lockstep-источник).
+func (f *Fingerprint) Profile() BrowserProfile { return f.profile }
 
 // UpdateUserAgents updates UA strings for all profiles.
 // Called when the server provides fresh UA versions in ServerHello.
@@ -213,6 +277,11 @@ func NewFingerprintPool() *FingerprintPool {
 			NewFingerprint(ProfileChrome),
 		},
 	}
+}
+
+// NewFingerprintPoolForProfile создаёт пул с единственным выбранным профилем.
+func NewFingerprintPoolForProfile(name string) *FingerprintPool {
+	return &FingerprintPool{profiles: []*Fingerprint{NewFingerprintForProfile(name)}}
 }
 
 // Next returns the locked Chrome fingerprint. The pool is single-entry now;

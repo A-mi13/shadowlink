@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math"
 	"math/rand/v2"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,20 +19,6 @@ import (
 )
 
 const maxClientStreams = 4096 // X-4 fix: bound client-side stream map (high for system VPN mode)
-
-// allowedUAKeys is the closed enum of profile keys the client will accept
-// in the ServerHello UA map. Any other key is dropped before the value is
-// even validated. Final-audit-2026-05-03 P2-2 (T1 §219): defensive
-// hygiene against a compromised server emitting binary-control-char keys
-// that propagate to UpdateUserAgents.
-//
-// 2026-05-05: non-Chrome fingerprints retired (TSPU блокирует Safari/Firefox/
-// Edge). Только chrome допускается; "safari"/"firefox" из ServerHello теперь
-// тихо отбрасываются isAllowedUAKey, server-side exportClientConfig также
-// отправляет только chrome-key.
-var allowedUAKeys = map[string]struct{}{
-	browser.ProfileChrome: {},
-}
 
 // uaForbiddenChars are bytes a real browser UA never contains. Listed
 // explicitly so the disallow set stays auditable even though every entry
@@ -69,6 +56,9 @@ var uaForbiddenChars = []byte{'<', '>', '\n', '\r', 0}
 // failure-to-update does not break wire fingerprint consistency.
 //
 // Final-audit-2026-05-03 P2-2 (T1 §154 + §219).
+//
+// Deprecated: replaced by isValidUAForProfile in C4. Retained until C4
+// wires per-profile call in applyServerHello.
 func isValidUA(ua string) bool {
 	if len(ua) < 80 || len(ua) > 200 {
 		return false
@@ -101,12 +91,75 @@ func isValidUA(ua string) bool {
 	return strings.Contains(ua, needle)
 }
 
-// isAllowedUAKey reports whether the given map key is on the closed enum
-// of profile keys the client will accept from a ServerHello UA map.
-// Final-audit-2026-05-03 P2-2 (T1 §219).
+// isAllowedUAKey reports whether the profile key is a registered browser
+// profile. Расширено с жёсткого {chrome} до имён реестра профилей.
+// Final-audit-2026-05-03 P2-2 (T1 §219). C3 2026-06-09.
 func isAllowedUAKey(k string) bool {
-	_, ok := allowedUAKeys[k]
+	_, ok := browser.LookupProfile(k)
 	return ok
+}
+
+// isValidUAForProfile проверяет, что UA-строка от сервера согласована с
+// УЖЕ ВЫБРАННЫМ профилем клиента. Защита от re-fingerprint (T1 §154):
+// сервер не может навязать chrome-устройству firefox-UA и наоборот.
+// C3 2026-06-09.
+func isValidUAForProfile(ua, profileName string) bool {
+	if len(ua) < 80 || len(ua) > 200 {
+		return false
+	}
+	for i := 0; i < len(ua); i++ {
+		if ua[i] < 0x20 || ua[i] > 0x7E {
+			return false
+		}
+	}
+	for _, bad := range uaForbiddenChars {
+		if strings.IndexByte(ua, bad) >= 0 {
+			return false
+		}
+	}
+	if !strings.Contains(ua, "Mozilla/") {
+		return false
+	}
+	p, ok := browser.LookupProfile(profileName)
+	if !ok {
+		return false
+	}
+	switch p.Family {
+	case browser.FamilyChrome:
+		if strings.Contains(ua, "Firefox/") {
+			return false
+		}
+		// major UA должен совпасть с major выбранного профиля (diversity:
+		// chrome120/131/133 каждый требует свой Chrome/<major>.).
+		return strings.Contains(ua, "Chrome/"+strconv.Itoa(p.Major)+".")
+	case browser.FamilyFirefox:
+		if strings.Contains(ua, "Chrome/") {
+			return false
+		}
+		return strings.Contains(ua, "Firefox/")
+	default:
+		return false
+	}
+}
+
+// weightsLookExtreme сообщает, что доля non-chrome нереалистична (>20%) —
+// сама по себе детектируемая аномалия (спека §6.3 / H3). Мягкая сигнализация:
+// возврат true только инициирует slog.Warn в applyServerHello, не меняет поведение.
+func weightsLookExtreme(weights map[string]int) bool {
+	total, nonChrome := 0, 0
+	for name, w := range weights {
+		if w <= 0 {
+			continue
+		}
+		total += w
+		if !browser.IsChromeFamily(name) {
+			nonChrome += w
+		}
+	}
+	if total == 0 {
+		return false
+	}
+	return float64(nonChrome)/float64(total) > 0.20
 }
 
 // Client is the main ShadowLink client API.
@@ -187,6 +240,24 @@ type Client struct {
 	flowTransport StreamTransport
 	flowStop      chan struct{}
 
+	// C4: per-client browser fingerprint profile (FP-mimicry feature).
+	//
+	// selectedProfileName is the profile resolved at construction time via
+	// ResolveProfile(cfg.FPCacheDir, ...). It is write-once at init (no lock
+	// needed for reads). Used by applyServerHello to validate UA strings from
+	// the server against the chosen profile (re-fingerprint protection).
+	//
+	// lockedFP carries the Fingerprint object for the selected profile and is
+	// passed to NewWebSocketTransport as the LockedProfile so both the
+	// bogdanfinn hot-path (H2 SETTINGS) and the uTLS cold-path (ClientHello)
+	// agree on the same browser identity.
+	//
+	// fpCacheDir is stored so applyServerHello can persist updated
+	// CachedWeights (server-pushed FW field) without re-reading from config.
+	selectedProfileName string
+	lockedFP            *browser.Fingerprint
+	fpCacheDir          string
+
 	// Cold-start observability (Task D5, 2026-05-02 plan).
 	//
 	// connectStartUnixNano stores time.Now().UnixNano() at the start of
@@ -215,6 +286,7 @@ type serverHelloJSON struct {
 	ProtoVersion *uint8            `json:"_v,omitempty"`
 	Deprecated   bool              `json:"_deprecated,omitempty"`
 	UA           map[string]string `json:"ua,omitempty"`
+	FW           map[string]int    `json:"fw,omitempty"` // fingerprint weights
 }
 
 // httpStatusError carries the HTTP status code from SendHandshakeRaw so the
@@ -263,6 +335,15 @@ type ClientConfig struct {
 	CDNDomain   string // if set, use CDN transport via this domain
 	ECHEnabled  bool   // enable ECH (Encrypted Client Hello) for CDN mode
 	SNIOverride string // if set, TLS ServerName = SNIOverride (full-direct mode: IP host + domain SNI). Requires UseTLS=true.
+
+	// FPCacheDir is the directory where the fingerprint profile state is
+	// persisted (fp-state.bin). When empty, ResolveProfile samples fresh
+	// from the default weights and the result is NOT saved to disk —
+	// safe fallback for callers that do not persist state (tests, CLI
+	// without a config dir). Production callers SHOULD set this so the
+	// profile survives restarts and server-pushed weight updates apply on
+	// the next cold start.
+	FPCacheDir string
 }
 
 // NewClient creates a client with the given config.
@@ -276,6 +357,27 @@ func NewClient(config ClientConfig) *Client {
 		slog.Warn("shadowlink: non-UUID-sized ClientID — falling back to legacy v0 handshake path",
 			"size", len(config.ClientID), "recommended", 16)
 	}
+
+	// C4: resolve browser fingerprint profile.
+	// Load persisted weights for weighted-random resample on first run.
+	// When FPCacheDir is empty ResolveProfile uses an empty dir — it will
+	// fail to load state and choose fresh from default weights (chrome),
+	// but will NOT save (MkdirAll("") is a no-op on most systems; worst
+	// case the write silently errors — safe fallback for tests).
+	var cachedWeights map[string]int
+	if config.FPCacheDir != "" {
+		if st, err := LoadFPState(config.FPCacheDir); err == nil {
+			cachedWeights = st.CachedWeights
+		}
+	}
+	// C5: env-выключатель SHADOWLINK_FP_POOL=0/false/no/off форсирует Chrome
+	// без учёта весов и persist (аварийный откат без передеплоя сервера).
+	profileName := resolveProfileWithEnv(config.FPCacheDir, cachedWeights, browser.RandomSeed())
+	lockedFP := browser.NewFingerprintForProfile(profileName)
+	// D3: stamp the gauge so the ops dashboard can observe the actual population
+	// distribution across fleet instances in real time (spec §6.3).
+	Stats.SetActiveProfile(profileName)
+
 	var transport Transport
 	switch {
 	case config.SNIOverride != "":
@@ -290,10 +392,13 @@ func NewClient(config ClientConfig) *Client {
 	}
 
 	return &Client{
-		transport:          transport,
-		serverPub:          config.ServerPubKey,
-		clientID:           config.ClientID,
-		insecureSkipVerify: config.SkipVerify,
+		transport:           transport,
+		serverPub:           config.ServerPubKey,
+		clientID:            config.ClientID,
+		insecureSkipVerify:  config.SkipVerify,
+		selectedProfileName: profileName,
+		lockedFP:            lockedFP,
+		fpCacheDir:          config.FPCacheDir,
 	}
 }
 
@@ -529,6 +634,13 @@ func (c *Client) applyServerHello(clientState *core.HandshakeClientState, sh *se
 	// code can check Session.ProtoVersion without walking back to the client.
 	session.ProtoVersion = protoVersion
 
+	// H-K1 (2026-06-11): switch client uplink to counter-nonce AEAD right after
+	// handshake, before the first EncryptChunk. Wire-compat (peer reads any
+	// 12-byte nonce). Failure means SendKey is unusable — surface the error.
+	if err := session.InitSendEpoch(); err != nil {
+		return fmt.Errorf("init send epoch: %w", err)
+	}
+
 	c.session = session
 	c.token = browser.EncodeTokenWithHint(session.ID, sh.Token)
 	c.maxConns = int(sh.MaxConns)
@@ -542,6 +654,28 @@ func (c *Client) applyServerHello(clientState *core.HandshakeClientState, sh *se
 		sa.SetSessionToken(c.token)
 	}
 
+	// C4: cache server-pushed fingerprint weights so ResolveProfile can use
+	// them on the next cold start for weighted-random profile selection.
+	// We preserve the currently-selected ProfileName — the weights update
+	// affects the NEXT session, not the running one.
+	if len(sh.FW) > 0 && c.fpCacheDir != "" {
+		// Load existing state to preserve ProfileName; on error construct
+		// a minimal state so we still persist the fresh weights.
+		st, err := LoadFPState(c.fpCacheDir)
+		if err != nil {
+			st = FPState{ProfileName: c.selectedProfileName}
+		}
+		st.CachedWeights = sh.FW
+		if saveErr := SaveFPState(c.fpCacheDir, st); saveErr != nil {
+			slog.Warn("shadowlink: failed to persist FP weights from server", "err", saveErr)
+		}
+	}
+	// D3: WARN when server-pushed weights are unrealistic — a non-chrome share
+	// above 20% is itself a detectable population anomaly (spec §6.3 / H3).
+	if weightsLookExtreme(sh.FW) {
+		slog.Warn("shadowlink: fingerprint_weights look unrealistic (non-chrome >20%) — may itself be a DPI signal")
+	}
+
 	if len(sh.UA) > 0 {
 		validUAs := make(map[string]string, len(sh.UA))
 		for profile, ua := range sh.UA {
@@ -552,8 +686,12 @@ func (c *Client) applyServerHello(clientState *core.HandshakeClientState, sh *se
 				slog.Warn("rejected UA from server: unknown profile key")
 				continue
 			}
-			if !isValidUA(ua) {
-				slog.Warn("rejected invalid UA from server", "profile", profile)
+			// C4: validate UA against the selected profile so the server
+			// cannot re-fingerprint the client by pushing a mismatched UA
+			// (e.g. push a Firefox UA to a Chrome-profiled client).
+			if !isValidUAForProfile(ua, c.selectedProfileName) {
+				slog.Warn("rejected UA from server: profile mismatch or invalid",
+					"profile", profile, "selected", c.selectedProfileName)
 				continue
 			}
 			validUAs[profile] = ua
@@ -674,7 +812,9 @@ func (c *Client) SendKeepalive(ctx context.Context) (bool, error) {
 // UpgradeToWebSocket switches to WebSocket transport for full-duplex relay.
 // Must be called after Connect() (needs session token).
 // Returns a WebSocketTransport for direct frame read/write.
-// Optional lockedFP sets a persistent browser fingerprint for uTLS (JA3 consistency).
+// Optional lockedFP overrides the per-client fingerprint for uTLS (JA3 consistency).
+// When omitted the client's own lockedFP (resolved at construction from FPCacheDir)
+// is used so the WS cold-path and hot-path stay on the same browser profile.
 func (c *Client) UpgradeToWebSocket(serverAddr string, useTLS, skipVerify bool, lockedFP ...*browser.Fingerprint) (*WebSocketTransport, error) {
 	c.mu.Lock()
 	token := c.token
@@ -684,8 +824,10 @@ func (c *Client) UpgradeToWebSocket(serverAddr string, useTLS, skipVerify bool, 
 		return nil, errors.New("not connected — call Connect() first")
 	}
 
-	var fp *browser.Fingerprint
-	if len(lockedFP) > 0 {
+	// C4: prefer per-client lockedFP (resolved from FPCacheDir at init);
+	// callers may override by passing an explicit fp.
+	fp := c.lockedFP
+	if len(lockedFP) > 0 && lockedFP[0] != nil {
 		fp = lockedFP[0]
 	}
 	wst := NewWebSocketTransport(serverAddr, useTLS, skipVerify, fp)
@@ -903,6 +1045,14 @@ func (c *Client) SendStream(ctx context.Context, streamID uint16, data []byte) e
 		return nil // ignore decrypt errors on response
 	}
 
+	// M1 (2026-06-11): downlink anti-replay before routing bytes into a stream
+	// (legacy poll/demux path). A replayed authentic chunk would duplicate bytes
+	// in the proxied TCP stream — drop it. Mirrors the ws_pool downlink filter.
+	if !session.AcceptSeqNum(respChunk.SeqNum) {
+		Stats.DownlinkReplayDroppedTotal.Add(1)
+		return nil
+	}
+
 	if len(respChunk.Payload) > 0 {
 		respStreamID, respData := core.ParseStreamID(respChunk.Payload)
 		if len(respData) > 0 {
@@ -961,6 +1111,11 @@ func (c *Client) PollVia(ctx context.Context, t Transport) error {
 			if err != nil || len(respChunk.Payload) < 2 {
 				continue
 			}
+			// M1 (2026-06-11): downlink anti-replay before routing into a stream.
+			if !session.AcceptSeqNum(respChunk.SeqNum) {
+				Stats.DownlinkReplayDroppedTotal.Add(1)
+				continue
+			}
 			streamID := uint16(respChunk.Payload[0])<<8 | uint16(respChunk.Payload[1])
 			if respChunk.Flags == core.FlagUDP {
 				c.RouteToStream(streamID, respChunk.Payload)
@@ -978,6 +1133,11 @@ func (c *Client) PollVia(ctx context.Context, t Transport) error {
 	}
 	respChunk, err := session.DecryptChunkSafe(encResp)
 	if err != nil {
+		return nil
+	}
+	// M1 (2026-06-11): downlink anti-replay before routing into a stream.
+	if !session.AcceptSeqNum(respChunk.SeqNum) {
+		Stats.DownlinkReplayDroppedTotal.Add(1)
 		return nil
 	}
 	if len(respChunk.Payload) >= 2 {
@@ -1259,6 +1419,12 @@ func (c *Client) NewStreamSession(ctx context.Context) (*core.Session, []byte, e
 	session, err := core.CompleteHandshake(clientState, serverHello)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// H-K1 (2026-06-11): this returns a session the caller will use for uplink —
+	// switch it to counter-nonce AEAD before the first EncryptChunk. Wire-compat.
+	if err := session.InitSendEpoch(); err != nil {
+		return nil, nil, fmt.Errorf("init send epoch: %w", err)
 	}
 
 	token := browser.EncodeTokenWithHint(session.ID, shData.Token)

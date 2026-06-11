@@ -91,8 +91,8 @@ func TestConnManagerRotation(t *testing.T) {
 		}
 	}
 	assert.True(t, rotated, "connect() должен запускаться повторно при ротации")
-	assert.Equal(t, browser.ProfileChrome, cm.ActiveFingerprint().Name(),
-		"имя fp должно остаться Chrome после ротации (pool single-entry)")
+	assert.Equal(t, browser.ProfileChrome133, cm.ActiveFingerprint().Name(),
+		"имя fp должно остаться chrome133 после ротации (pool single-entry)")
 }
 
 func TestConnManagerClose(t *testing.T) {
@@ -149,8 +149,8 @@ func TestConnManagerUserAgentMatchesFingerprint(t *testing.T) {
 	ua := fp.UserAgent()
 	name := fp.Name()
 
-	// 2026-05-05: pool единый — только Chrome.
-	assert.Equal(t, browser.ProfileChrome, name)
+	// 2026-05-05: pool единый — только Chrome (chrome133 после diversity-рефактора).
+	assert.Equal(t, browser.ProfileChrome133, name)
 	assert.Contains(t, ua, "Chrome/")
 }
 
@@ -263,55 +263,16 @@ func TestConnManager_DomainPoolSize_AfterSet(t *testing.T) {
 	}
 }
 
-// TestProfileForFingerprint_AlwaysReturnsLockedChrome closes the 2026-05-02
-// wire-trigger followup F2 (Chrome major lockstep): the bogdanfinn hot-path
-// MUST return browser.LockedBogdanfinnChromeProfile() (Chrome_133) for the
-// Chrome fingerprint regardless of SHADOWLINK_TLS_PQ. Previously the path
-// returned Chrome_146 by default (PQ on) and Chrome_133 only when PQ was
-// disabled — producing a (uTLS=133, bogdanfinn=146) mismatch on the
-// default-on path that no real Chrome client emits.
-func TestProfileForFingerprint_AlwaysReturnsLockedChrome(t *testing.T) {
-	expected := browser.LockedBogdanfinnChromeProfile()
-	for _, v := range []string{"", "1", "0", "yes", "false", "no", "off", "garbage"} {
-		t.Run(v, func(t *testing.T) {
-			if v == "" {
-				old, had := os.LookupEnv("SHADOWLINK_TLS_PQ")
-				os.Unsetenv("SHADOWLINK_TLS_PQ")
-				t.Cleanup(func() {
-					if had {
-						os.Setenv("SHADOWLINK_TLS_PQ", old)
-					} else {
-						os.Unsetenv("SHADOWLINK_TLS_PQ")
-					}
-				})
-			} else {
-				t.Setenv("SHADOWLINK_TLS_PQ", v)
-			}
-			fp := browser.NewFingerprint(browser.ProfileChrome)
-			got := profileForFingerprint(fp)
-			if got.GetClientHelloStr() != expected.GetClientHelloStr() {
-				t.Errorf("env=%q: expected %s, got %s",
-					v, expected.GetClientHelloStr(), got.GetClientHelloStr())
-			}
-		})
+// TestProfileForFingerprint_UsesProfile проверяет, что profileForFingerprint
+// читает bogdanfinn-профиль из выбранного BrowserProfile, а не из глобального
+// хардкода Chrome (A5: Locked* читают из профиля).
+func TestProfileForFingerprint_UsesProfile(t *testing.T) {
+	fp := browser.NewFingerprintForProfile("chrome")
+	if profileForFingerprint(fp).GetClientHelloStr() != browser.LockedBogdanfinnChromeProfile().GetClientHelloStr() {
+		t.Error("chrome fp must map to Chrome_133 bogdanfinn profile")
 	}
-}
-
-// TestProfileForFingerprint_LegacyNamesNormalize — на 2026-05-05 non-Chrome
-// fp retired. NewFingerprint("safari") и NewFingerprint("firefox") теперь
-// нормализуются до Chrome (см. browser.NewFingerprint), и hot-path возвращает
-// LockedBogdanfinnChromeProfile() для любого входа.
-func TestProfileForFingerprint_LegacyNamesNormalize(t *testing.T) {
-	expected := browser.LockedBogdanfinnChromeProfile()
-	for _, legacyName := range []string{"safari", "firefox", "edge", "ios"} {
-		t.Run(legacyName, func(t *testing.T) {
-			fp := browser.NewFingerprint(legacyName)
-			got := profileForFingerprint(fp)
-			if got.GetClientHelloStr() != expected.GetClientHelloStr() {
-				t.Errorf("legacy=%q: expected %s, got %s",
-					legacyName, expected.GetClientHelloStr(), got.GetClientHelloStr())
-			}
-		})
+	if profileForFingerprint(nil).GetClientHelloStr() != browser.LockedBogdanfinnChromeProfile().GetClientHelloStr() {
+		t.Error("nil fp must fall back to Chrome")
 	}
 }
 

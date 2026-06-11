@@ -11,12 +11,14 @@ import (
 // Firefox удалены вместе с константами ProfileSafari / ProfileFirefox.
 
 func TestChromeFingerprint(t *testing.T) {
+	// NewFingerprint(legacy "chrome") резолвится в chrome133 через LookupProfile.
 	fp := NewFingerprint(ProfileChrome)
-	assert.Equal(t, "chrome", fp.Name())
+	assert.Equal(t, ProfileChrome133, fp.Name())
+	assert.True(t, IsChromeFamily(fp.Name()))
 	assert.Contains(t, fp.UserAgent(), "Chrome/")
 }
 
-// TestFingerprintRotation — pool теперь single-entry: каждый Next() возвращает Chrome.
+// TestFingerprintRotation — pool теперь single-entry: каждый Next() возвращает Chrome-family.
 func TestFingerprintRotation(t *testing.T) {
 	pool := NewFingerprintPool()
 	seen := map[string]int{}
@@ -24,18 +26,17 @@ func TestFingerprintRotation(t *testing.T) {
 		fp := pool.Next()
 		seen[fp.Name()]++
 	}
-	assert.Equal(t, 1, len(seen), "pool должен содержать только Chrome")
-	assert.Equal(t, 1000, seen[ProfileChrome], "все Next() должны возвращать Chrome")
+	assert.Equal(t, 1, len(seen), "pool должен содержать только один профиль")
+	assert.Equal(t, 1000, seen[ProfileChrome133], "все Next() должны возвращать chrome133")
 }
 
-// TestUnknownProfileFallsToChrome — любое имя профиля нормализуется до Chrome.
-// 2026-05-05: NewFingerprint(...) теперь возвращает имя ProfileChrome
-// независимо от входного аргумента (legacy "safari"/"firefox" из persisted
-// state-файлов или старых call-sites).
+// TestUnknownProfileFallsToChrome — любое имя профиля нормализуется до Chrome-family.
+// NewFingerprint(...) возвращает chrome133 независимо от входного аргумента
+// (legacy "safari"/"firefox"/"chrome" из persisted state-файлов).
 func TestUnknownProfileFallsToChrome(t *testing.T) {
 	for _, name := range []string{"unknown", "safari", "firefox", "edge", ""} {
 		fp := NewFingerprint(name)
-		assert.Equal(t, ProfileChrome, fp.Name(), "input %q должен normalize до Chrome", name)
+		assert.Equal(t, ProfileChrome133, fp.Name(), "input %q должен normalize до chrome133", name)
 		assert.Contains(t, fp.UserAgent(), "Chrome/")
 	}
 }
@@ -74,7 +75,24 @@ func TestFingerprintUserAgentPairing(t *testing.T) {
 	pool := NewFingerprintPool()
 	for range 50 {
 		fp := pool.Next()
-		assert.Equal(t, ProfileChrome, fp.Name())
+		assert.Equal(t, ProfileChrome133, fp.Name())
 		assert.Contains(t, fp.UserAgent(), "Chrome/")
+	}
+}
+
+func TestFingerprint_CarriesProfile(t *testing.T) {
+	fp := NewFingerprintForProfile("chrome131")
+	if fp.Profile().Name != ProfileChrome131 {
+		t.Errorf("Profile().Name = %q, want chrome131", fp.Profile().Name)
+	}
+	if fp.UserAgent() == "" {
+		t.Error("UA must come from profile")
+	}
+}
+
+func TestFingerprint_UnknownProfileFallsBackChrome(t *testing.T) {
+	fp := NewFingerprintForProfile("netscape")
+	if fp.Profile().Name != ProfileChrome133 {
+		t.Errorf("unknown profile must fall back to chrome133, got %q", fp.Profile().Name)
 	}
 }

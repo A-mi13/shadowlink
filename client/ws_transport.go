@@ -220,15 +220,19 @@ func (t *WebSocketTransport) SendHandshake(ctx context.Context, hello *core.Clie
 }
 
 // utlsProfileForFingerprint maps our browser fingerprint to a uTLS ClientHelloID.
-// This ensures the WebSocket TLS handshake has the same JA3 fingerprint as the
-// HTTP handshake (via tls-client).
+// This ensures the WebSocket TLS handshake (cold-path) has the same JA3
+// fingerprint as the H2 SETTINGS handshake (hot-path, bogdanfinn).
 //
-// 2026-05-05: non-Chrome fingerprints retired (TSPU блокирует Safari/Firefox/
-// Edge). Switch свёрнут — функция всегда отдаёт LockedUTLSChromeID() (Chrome 133)
-// независимо от fp.Name(). Сигнатура сохранена для совместимости со всеми каллерами.
+// C4 (2026-06-09): now reads fp.Profile().UTLSHelloID so the cold-path
+// ClientHello matches the selected browser profile. Prior to C4 this always
+// returned LockedUTLSChromeID() — correct for Chrome-only fleets but wrong
+// for any non-Chrome profile (Firefox UA + Chrome ClientHello = detectable
+// cross-layer mismatch on the wire). Nil fingerprint falls back to Chrome 133.
 func utlsProfileForFingerprint(fp *browser.Fingerprint) utls.ClientHelloID {
-	_ = fp // legacy parameter: всегда Chrome
-	return browser.LockedUTLSChromeID()
+	if fp == nil {
+		return browser.LockedUTLSChromeID()
+	}
+	return fp.Profile().UTLSHelloID
 }
 
 // chooseWarmupCount picks the warmup-burst length for a given RNG. Returns
@@ -359,7 +363,12 @@ func (t *WebSocketTransport) UpgradeToWS(token []byte, session *core.Session) er
 		// gorilla/websocket's NetDialTLSContext bypasses crypto/tls entirely.
 		helloID := utlsProfileForFingerprint(fp)
 		originAddr := serverAddr // actual IP:port to connect to
-		usePQ := pqEnabled()
+		// C4 cold-path lockstep (2026-06-11): MLKEM cold-path injection is gated
+		// per-profile by PQKeyShare, not by family. chrome131/133 carry MLKEM
+		// natively on both cold (utls) and hot (bogdanfinn) paths; chrome120 and
+		// non-Chrome profiles keep their stock native key_share so cold stays
+		// paired with hot.
+		usePQ := pqEnabled() && fp != nil && fp.Profile().PQKeyShare
 		dialer.NetDialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			host, port, _ := net.SplitHostPort(addr)
 			if host == "" {
@@ -401,7 +410,7 @@ func (t *WebSocketTransport) UpgradeToWS(token []byte, session *core.Session) er
 			pqApplied := false
 			pqFellBack := false
 			if usePQ {
-				if pqSpec, pqErr := pqClientHelloSpec(); pqErr == nil {
+				if pqSpec, pqErr := pqClientHelloSpec(helloID); pqErr == nil {
 					spec = pqSpec
 					pqApplied = true
 				} else {

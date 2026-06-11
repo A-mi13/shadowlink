@@ -2123,6 +2123,14 @@ func (p *WSPoolTransport) connectSlot(ctx context.Context, idx int) error {
 	}
 
 	slot.session = session
+	// H-K1 (2026-06-11): switch client uplink to counter-nonce AEAD. Wire-compat
+	// (peer reads any 12-byte nonce from the frame header). Failure here means
+	// SendKey is unusable — fail the slot rather than silently fall back to the
+	// random-nonce regime.
+	if err := session.InitSendEpoch(); err != nil {
+		slot.setState(slotDead)
+		return fmt.Errorf("slot %d: init send epoch: %w", idx, err)
+	}
 	slot.token = browser.EncodeTokenWithHint(session.ID, shData.Token)
 
 	// Create WS transport and upgrade
@@ -3290,6 +3298,19 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 			continue
 		}
 
+		// M1 (2026-06-11): downlink anti-replay. AEAD proves authenticity but NOT
+		// freshness; an on-path injector (the TSPU/middlebox threat model) can
+		// re-inject a captured authentic chunk, duplicating bytes in the proxied
+		// TCP stream. Drive the same sliding window the server uses on uplink.
+		// Control frames (Migrate/Resume/StreamClose) are handled above and are
+		// exempt — they are idempotent and carry no stream bytes. Seq-tagged
+		// migration data is additionally dedup'd by the reassembler (downSeq);
+		// this chunk-level check is cheap defense-in-depth covering BOTH modes.
+		if !session.AcceptSeqNum(chunk.SeqNum) {
+			Stats.DownlinkReplayDroppedTotal.Add(1)
+			continue
+		}
+
 		if len(chunk.Payload) < 2 {
 			continue
 		}
@@ -3699,6 +3720,19 @@ func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int, cause slotDeathCa
 		// of routine cuts must never trip the meltdown cooldown (which would
 		// pause ALL reconnects and deepen the dip — Lever 3). Same idx as natural
 		// (reader observed the death, no replacement exists).
+		//
+		// D1 A/B metric: split age-cut events by the selected TLS fingerprint
+		// profile so the canary can tell whether a regional TSPU is targeting
+		// Firefox specifically (Firefox-cohort cuts ≫ Chrome-cohort → adjust
+		// weights).  p.lockedFP is write-once at pool construction; nil is safe
+		// (falls into "other").
+		{
+			profileName := browser.ProfileChrome133 // sensible default when no FP is configured
+			if p.lockedFP != nil {
+				profileName = p.lockedFP.Profile().Name
+			}
+			Stats.IncAgeCut(profileName)
+		}
 		//
 		// Lever 4 (counter-only): if this cut dropped ready capacity below the
 		// floor, the pool is in (or entering) the dip the fast reconnect is meant

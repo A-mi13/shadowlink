@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/nixavpn/shadowlink/core"
+	"github.com/nixavpn/shadowlink/skins/browser"
 )
 
 // Stats holds live counters for debugging throughput/contention issues.
@@ -235,6 +236,16 @@ type statsRegistry struct {
 	// a bug.
 	StaleFrameDroppedTotal atomic.Uint64
 
+	// DownlinkReplayDroppedTotal — downlink chunks dropped because their
+	// transport-level chunk.SeqNum failed the session anti-replay window
+	// (already-seen or too-old). M1 (2026-06-11): AEAD proves authenticity but
+	// NOT freshness; an on-path injector can re-inject a captured authentic
+	// chunk to duplicate bytes in the proxied TCP stream. This counter MUST stay
+	// ~0 in a healthy canary — a sustained non-zero rate means either an
+	// on-path replay attempt OR the server is genuinely re-sending seqs (then a
+	// separate diagnostic is warranted).
+	DownlinkReplayDroppedTotal atomic.Uint64
+
 	// SnapshotNegativeAgeTotal — counts cases where drainStreamSnapshot
 	// observed lastWriteNs > now (clock went backwards under NTP adjust,
 	// or, worse, arbitrary value stored). Clamped to 0 in snapshot logic;
@@ -392,6 +403,31 @@ type statsRegistry struct {
 	// is gone after Levers 1+3 ship; a non-zero residual rate gates the (deferred)
 	// headroom-mechanism iteration.
 	CapacityDipTotal atomic.Uint64
+
+	// FP population mimicry — age-cut split by selected TLS fingerprint profile.
+	// Populated by handleSlotDeath (deathCauseAgeCut branch) using p.lockedFP.
+	// If Firefox-cohort age-cuts exceed Chrome-cohort in the canary → a regional
+	// TSPU is targeting the Firefox fingerprint specifically; use this signal to
+	// weight Chrome higher. A/B metric for Task D1 (2026-06-09).
+	AgeCutChrome  atomic.Uint64
+	AgeCutFirefox atomic.Uint64
+	AgeCutOther   atomic.Uint64
+
+	// FP population — какой профиль выбран этим клиентом (gauge: ровно один = 1).
+	// Stamped by NewClient via SetActiveProfile; lets the ops dashboard observe the
+	// actual population distribution across fleet instances in real time (D3).
+	// ActiveProfileChrome — агрегат: =1 для ЛЮБОГО chrome-family профиля
+	// (chrome120/131/133). Сохранён для обратной совместимости дашборда и как
+	// проверяемая сумма per-major gauge (O-2).
+	ActiveProfileChrome  atomic.Uint64
+	ActiveProfileFirefox atomic.Uint64
+
+	// Per-major gauge популяции (diversity D3). Ровно один из трёх = 1 на
+	// экземпляр клиента; позволяет наблюдать фактическое распределение
+	// 120/131/133 по парку.
+	ActiveProfileChrome120 atomic.Uint64
+	ActiveProfileChrome131 atomic.Uint64
+	ActiveProfileChrome133 atomic.Uint64
 }
 
 // Histogram is a fixed-bucket histogram for duration-style observations.
@@ -593,6 +629,48 @@ func (s *statsRegistry) frameAnomalyCounter(reason string) *atomic.Uint64 {
 	return actual.(*atomic.Uint64)
 }
 
+// IncAgeCut increments the per-profile age-cut counter.
+// profile must be one of "chrome" or "firefox"; any other value falls into
+// the "other" bucket. Call-site: handleSlotDeath deathCauseAgeCut branch.
+func (s *statsRegistry) IncAgeCut(profile string) {
+	switch {
+	case browser.IsChromeFamily(profile):
+		// chrome120/131/133 (и legacy "chrome") → единая Chrome-когорта.
+		s.AgeCutChrome.Add(1)
+	case profile == "firefox":
+		s.AgeCutFirefox.Add(1)
+	default:
+		s.AgeCutOther.Add(1)
+	}
+}
+
+// SetActiveProfile выставляет gauge активного профиля (ровно один в 1, прочие в 0).
+// Вызывается из NewClient сразу после resolveProfileWithEnv — отражает, какой
+// профиль реально использует этот экземпляр клиента. Позволяет наблюдать
+// фактическое распределение популяции по парку клиентов (D3, 2026-06-09).
+func (s *statsRegistry) SetActiveProfile(profile string) {
+	s.ActiveProfileChrome.Store(0)
+	s.ActiveProfileChrome120.Store(0)
+	s.ActiveProfileChrome131.Store(0)
+	s.ActiveProfileChrome133.Store(0)
+	s.ActiveProfileFirefox.Store(0)
+	// Per-major gauge.
+	switch profile {
+	case "chrome120":
+		s.ActiveProfileChrome120.Store(1)
+	case "chrome131":
+		s.ActiveProfileChrome131.Store(1)
+	case "chrome133", "chrome": // legacy alias → 133
+		s.ActiveProfileChrome133.Store(1)
+	case "firefox":
+		s.ActiveProfileFirefox.Store(1)
+	}
+	// Aggregate gauge: =1 для ЛЮБОГО chrome-family (включая будущие major).
+	if browser.IsChromeFamily(profile) {
+		s.ActiveProfileChrome.Store(1)
+	}
+}
+
 // IncBypassMatch ticks shadowlink_bypass_match_total — set when a dial's
 // destination IP is covered by the bypass trie and goes via the direct dialer.
 func (s *statsRegistry) IncBypassMatch() { s.BypassMatchTotal.Add(1) }
@@ -724,6 +802,7 @@ func WritePromMetrics(w io.Writer) {
 	fmt.Fprintf(w, "# HELP shadowlink_stale_frame_dropped_total Frames dropped due to streamID reuse race after drain teardown\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_stale_frame_dropped_total counter\n")
 	fmt.Fprintf(w, "shadowlink_stale_frame_dropped_total %d\n", Stats.StaleFrameDroppedTotal.Load())
+	fmt.Fprintf(w, "shadowlink_downlink_replay_dropped_total %d\n", Stats.DownlinkReplayDroppedTotal.Load())
 
 	fmt.Fprintf(w, "# HELP shadowlink_slot_drain_inflight_cap_deferred_total Drains deferred by storm-brake inflight-cap gate (concurrent drains >= maxConcurrentDrains)\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_slot_drain_inflight_cap_deferred_total counter\n")
@@ -826,6 +905,33 @@ func WritePromMetrics(w io.Writer) {
 	fmt.Fprintf(w, "# HELP shadowlink_capacity_dip_total Times an age-cut would drop ready pool capacity below the floor while streams were active. Canary observability for the residual dip after the fast-reconnect fix; gates the deferred headroom-mechanism iteration.\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_capacity_dip_total counter\n")
 	fmt.Fprintf(w, "shadowlink_capacity_dip_total %d\n", Stats.CapacityDipTotal.Load())
+
+	// D1 A/B metric: age-cut events split by TLS fingerprint profile (Task D1, 2026-06-09).
+	// If Firefox-cohort cuts exceed Chrome-cohort in a region → that TSPU targets Firefox
+	// specifically; use this signal to reweight the FP pool toward Chrome.
+	fmt.Fprintf(w, "# HELP shadowlink_age_cut_by_profile_total Age-cut slot deaths split by the selected TLS fingerprint profile (chrome|firefox|other). A/B metric for FP population mimicry.\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_age_cut_by_profile_total counter\n")
+	fmt.Fprintf(w, "shadowlink_age_cut_by_profile_total{profile=\"chrome\"} %d\n", Stats.AgeCutChrome.Load())
+	fmt.Fprintf(w, "shadowlink_age_cut_by_profile_total{profile=\"firefox\"} %d\n", Stats.AgeCutFirefox.Load())
+	fmt.Fprintf(w, "shadowlink_age_cut_by_profile_total{profile=\"other\"} %d\n", Stats.AgeCutOther.Load())
+
+	// D3 gauge: active FP profile for this client instance (exactly one = 1).
+	// Lets the ops dashboard observe the actual population distribution across
+	// fleet instances in real time. A persistent all-zero reading means the
+	// client binary pre-dates D3 or NewClient did not call SetActiveProfile.
+	fmt.Fprintf(w, "# HELP shadowlink_fingerprint_profile_active Which TLS fingerprint profile this client instance selected at startup (gauge: exactly one = 1). Fleet-wide aggregation shows actual population distribution.\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_fingerprint_profile_active gauge\n")
+	fmt.Fprintf(w, "shadowlink_fingerprint_profile_active{profile=\"chrome\"} %d\n", Stats.ActiveProfileChrome.Load())
+	fmt.Fprintf(w, "shadowlink_fingerprint_profile_active{profile=\"firefox\"} %d\n", Stats.ActiveProfileFirefox.Load())
+
+	// D3 per-major diversity gauge: which Chrome major this instance selected.
+	// Fleet-wide aggregation должна показать распределение ≈ DefaultFPWeights
+	// (10/30/60 для 120/131/133) — подтверждение, что монокультура разбита.
+	fmt.Fprintf(w, "# HELP shadowlink_fingerprint_chrome_major_active Selected Chrome major for this client instance (gauge: exactly one of 120/131/133 = 1). Fleet aggregation shows the JA4-cluster split.\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_fingerprint_chrome_major_active gauge\n")
+	fmt.Fprintf(w, "shadowlink_fingerprint_chrome_major_active{major=\"120\"} %d\n", Stats.ActiveProfileChrome120.Load())
+	fmt.Fprintf(w, "shadowlink_fingerprint_chrome_major_active{major=\"131\"} %d\n", Stats.ActiveProfileChrome131.Load())
+	fmt.Fprintf(w, "shadowlink_fingerprint_chrome_major_active{major=\"133\"} %d\n", Stats.ActiveProfileChrome133.Load())
 }
 
 // StartStatsLogger launches a goroutine that logs counter deltas every
