@@ -24,6 +24,7 @@ func startTestServer(t *testing.T) (*Server, *core.KeyPair) {
 	config := TestConfig()
 	srv, err := New(config, serverKey)
 	require.NoError(t, err)
+	disableBackpressureForTest(srv.handler)
 
 	_, err = srv.Start()
 	require.NoError(t, err)

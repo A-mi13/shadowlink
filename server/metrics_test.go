@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http/httptest"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -11,6 +12,18 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// withMemStats makes BackpressureCheck deterministic by injecting a fixed
+// memory snapshot instead of reading the live process heap. Without this the
+// backpressure tests are flaky under `go test -shuffle`/`-count`: other tests
+// in the same binary inflate Alloc, tripping the heuristic. allocMB/sysMB are
+// the values BackpressureCheck compares (it uses Alloc vs Sys*0.8/0.9).
+func withMemStats(m *Metrics, allocMB, sysMB float64) {
+	m.memStatsFn = func(ms *runtime.MemStats) {
+		ms.Alloc = uint64(allocMB * 1024 * 1024)
+		ms.Sys = uint64(sysMB * 1024 * 1024)
+	}
+}
 
 func TestMetricsSnapshot(t *testing.T) {
 	m := NewMetrics()
@@ -51,8 +64,10 @@ func TestMetricsAtomicIncrements(t *testing.T) {
 
 func TestBackpressureCheckNormal(t *testing.T) {
 	m := NewMetrics()
+	// Inject low memory (alloc well under sys*0.8) so the result does not depend
+	// on the live process heap (deterministic under -shuffle/-count).
+	withMemStats(m, 100, 2048) // 100MB alloc on a 2GB sys → normal
 
-	// Under normal conditions, should return default
 	maxConns, reject := m.BackpressureCheck(8)
 	assert.Equal(t, 8, maxConns)
 	assert.False(t, reject)
@@ -61,12 +76,30 @@ func TestBackpressureCheckNormal(t *testing.T) {
 
 func TestBackpressureStateTracking(t *testing.T) {
 	m := NewMetrics()
+	withMemStats(m, 100, 2048) // normal memory
 
-	// Normal check should set backpressure to false
+	// Normal check should clear a previously-set backpressure flag.
 	m.backpressureActive.Store(true)
 	m.BackpressureCheck(8)
-	// Under normal memory, should clear backpressure
 	assert.False(t, m.backpressureActive.Load())
+}
+
+// TestBackpressureCheck_HighAndCritical proves the injected memory source drives
+// the heuristic: high (>80% sys) reduces conns, critical (>90%) rejects.
+func TestBackpressureCheck_HighAndCritical(t *testing.T) {
+	m := NewMetrics()
+
+	withMemStats(m, 1700, 2048) // 1700/2048 ≈ 83% → high band
+	maxConns, reject := m.BackpressureCheck(8)
+	assert.Equal(t, 4, maxConns, "high memory reduces conns")
+	assert.False(t, reject, "high band still admits new clients")
+	assert.True(t, m.backpressureActive.Load())
+
+	withMemStats(m, 1900, 2048) // 1900/2048 ≈ 93% → critical band
+	maxConns, reject = m.BackpressureCheck(8)
+	assert.Equal(t, 2, maxConns)
+	assert.True(t, reject, "critical memory rejects new clients")
+	assert.True(t, m.backpressureActive.Load())
 }
 
 func TestMetricsHTTPEndpoint(t *testing.T) {

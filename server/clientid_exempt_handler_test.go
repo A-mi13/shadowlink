@@ -107,6 +107,7 @@ func TestHandshake_ExemptionFlow(t *testing.T) {
 	require.NoError(t, err)
 	cfg := TestConfig()
 	h := NewHandler(serverKey, cfg, "")
+	disableBackpressureForTest(h)
 	require.NotNil(t, h.exemption, "exemption must be wired when env flag is on")
 
 	// Handshake — happy path. Different IP than the data-path so we keep the

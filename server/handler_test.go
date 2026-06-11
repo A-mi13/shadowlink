@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"sort"
 	"sync"
 	"testing"
@@ -103,7 +104,25 @@ func setupTestHandler(tb testing.TB) (*Handler, *core.KeyPair) {
 
 	config := TestConfig()
 	h := NewHandler(serverKey, config, "")
+	disableBackpressureForTest(h)
 	return h, serverKey
+}
+
+// disableBackpressureForTest pins a low-memory snapshot on the handler's metrics
+// so handler.go's per-handshake BackpressureCheck never trips on the live
+// process heap. Without this, handshake-path tests flake under `go test
+// -shuffle`/`-count`: memory-heavy sibling tests (broadcast-10k, migrate-perf,
+// fingerprint fan-out) inflate Alloc, BackpressureCheck rejects new clients, the
+// handshake is routed to the decoy, and the test's JSON parse fails with
+// "invalid character '<'". Production keeps the real runtime.ReadMemStats path
+// (memStatsFn stays nil in NewMetrics). Safe to call on any test handler.
+func disableBackpressureForTest(h *Handler) {
+	if h != nil && h.metrics != nil {
+		h.metrics.memStatsFn = func(ms *runtime.MemStats) {
+			ms.Alloc = 64 * 1024 * 1024   // 64 MB in-use
+			ms.Sys = 2048 * 1024 * 1024   // 2 GB reserved → 64/2048 ≈ 3% (normal)
+		}
+	}
 }
 
 func TestUnauthenticatedGETReturnsDecoy(t *testing.T) {

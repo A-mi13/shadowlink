@@ -270,6 +270,17 @@ type Metrics struct {
 
 	backpressureActive atomic.Bool
 
+	// memStatsFn reads process memory for BackpressureCheck. Injectable so tests
+	// are deterministic: the default (runtime.ReadMemStats) depends on the WHOLE
+	// process heap, which under `go test -shuffle`/`-count` is inflated by other
+	// tests in the same binary (broadcast-10k, migrate-perf, fingerprint fan-out)
+	// — that made BackpressureCheck nondeterministically trip, returning a
+	// reduced maxConns / reject=true, which in turn routed handshake-path tests
+	// to the decoy and surfaced as `invalid character '<'` JSON-parse failures in
+	// unrelated tests. Tests inject a fixed snapshot via withMemStats(). Nil →
+	// real runtime stats (production).
+	memStatsFn func(*runtime.MemStats)
+
 	// T1.7 (Phase 2, 2026-04-26) — BroadcastStreamClose drain instrumentation.
 	// Master spec exit criterion: P99 wall-clock < 2s for a 10k-tunnel drain.
 	// Counters track per-reason drops so ops can distinguish "channel full"
@@ -661,7 +672,11 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 //   - RAM > 90% → reject new connections (503)
 func (m *Metrics) BackpressureCheck(maxConnsDefault int) (maxConns int, rejectNew bool) {
 	var memStats runtime.MemStats
-	runtime.ReadMemStats(&memStats)
+	if m.memStatsFn != nil {
+		m.memStatsFn(&memStats)
+	} else {
+		runtime.ReadMemStats(&memStats)
+	}
 
 	// Use Go's heap stats — Sys is total OS memory, Alloc is in-use
 	// For a 2GB VPS, we target staying under ~1.5GB for Go process

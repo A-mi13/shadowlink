@@ -107,6 +107,7 @@ func newE2EHarness(t *testing.T, migrationEnabled bool) *e2eHarness {
 	cfg.FlowMaxWindow = 8 << 20 // 8 MiB — large enough not to throttle the test
 
 	h := NewHandler(serverKey, cfg, "")
+	disableBackpressureForTest(h)
 
 	ha := &e2eHarness{
 		t:         t,
