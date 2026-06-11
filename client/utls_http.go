@@ -13,7 +13,7 @@ import (
 	"github.com/nixavpn/shadowlink/skins/browser"
 )
 
-// pqClientHelloSpec returns a ClientHelloSpec derived from utls.HelloChrome_133
+// pqClientHelloSpec returns a ClientHelloSpec derived from the supplied helloID
 // with X25519MLKEM768 ensured-present in BOTH the SupportedCurvesExtension
 // (a.k.a. supported_groups, RFC 8446 §4.2.7) and the KeyShareExtension (RFC 8446
 // §4.2.8). For current utls (Chrome_133 spec already includes MLKEM at index 1
@@ -46,10 +46,21 @@ import (
 //
 // Fix: deep-copy spec.Extensions and the two extension structs we touch
 // before mutating. Cost is ~200 ns per cold-path handshake — invisible.
-func pqClientHelloSpec() (utls.ClientHelloSpec, error) {
-	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_133)
+//
+// C4 cold-path lockstep (2026-06-09): helloID is now a parameter rather than
+// a hardcoded HelloChrome_133. The spec is derived from the SELECTED browser
+// profile's ClientHelloID. The MLKEM ensure-present injection is idempotent:
+// if the derived spec already carries X25519MLKEM768 in supported_groups /
+// key_share (true for current Chrome_133 and Firefox_148 specs), the append
+// branch never fires and the returned spec equals the stock profile spec.
+// NOTE: this helper applies a Chrome-shaped MLKEM placement (prepend ahead of
+// the existing list) and must only be called for Chrome-family profiles —
+// non-Chrome cold paths use the stock UTLSIdToSpec(helloID) directly so the
+// browser's own native key_share layout is preserved (see callers).
+func pqClientHelloSpec(helloID utls.ClientHelloID) (utls.ClientHelloSpec, error) {
+	spec, err := utls.UTLSIdToSpec(helloID)
 	if err != nil {
-		return utls.ClientHelloSpec{}, fmt.Errorf("pq: derive HelloChrome_133 spec: %w", err)
+		return utls.ClientHelloSpec{}, fmt.Errorf("pq: derive %v spec: %w", helloID, err)
 	}
 
 	// Defensive deep-copy of the Extensions slice. Without this the for-loops

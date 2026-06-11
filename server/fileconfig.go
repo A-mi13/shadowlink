@@ -76,6 +76,20 @@ type FileConfig struct {
 	// (or omitted when responding from the embedded handler). Wiring deferred
 	// to Wave 2.4 — Load() accepts the value but it is not yet emitted.
 	ServerHeader *string `yaml:"server_header"`
+
+	// FingerprintWeights defines relative weights for browser TLS fingerprint
+	// profiles used in population mimicry (C2, FP-mimicry feature).
+	// Keys are profile names (e.g. "chrome", "firefox"); values are relative
+	// weights. Absent section → nil map → client defaults to chrome 100%.
+	//
+	// fingerprint_weights: относительные веса browser-профилей для популяционной
+	// мимикрии. Веса ДОЛЖНЫ отражать реальную популяцию браузеров целевого региона.
+	// Для РФ Firefox ≲ 10-15% — нереалистичная пропорция (напр. 50% Firefox) сама
+	// становится детектируемой аномалией. Отсутствие секции → chrome 100% (дефолт).
+	// fingerprint_weights:
+	//   chrome: 100
+	//   firefox: 0
+	FingerprintWeights map[string]int `yaml:"fingerprint_weights,omitempty"`
 }
 
 // FileRateLimitConfig is the YAML representation of RateLimitConfig.
@@ -372,6 +386,13 @@ func (fc *FileConfig) ApplyTo(cfg *Config) {
 	cfg.UseInflatedResponses = true
 	if fc.Mimicry != nil && fc.Mimicry.Inflation != nil {
 		cfg.UseInflatedResponses = *fc.Mimicry.Inflation
+	}
+	// C2 (FP-mimicry): propagate fingerprint_weights from YAML into Config so the
+	// handler can embed them in ServerHello. Only copied when explicitly set in
+	// YAML (len > 0) — absent section keeps Config.FingerprintWeights nil, which
+	// the client interprets as "chrome 100%".
+	if len(fc.FingerprintWeights) > 0 {
+		cfg.FingerprintWeights = fc.FingerprintWeights
 	}
 	if fc.RateLimit != nil {
 		rl := &cfg.RateLimit

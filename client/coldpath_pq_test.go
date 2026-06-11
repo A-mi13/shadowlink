@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	utls "github.com/refraction-networking/utls"
+
 	"github.com/nixavpn/shadowlink/skins/browser"
 )
 
@@ -68,7 +70,8 @@ func TestColdPath_PQ_OnWire_HandshakeIncrementsClientHelloSent(t *testing.T) {
 	// (Success) or rejects it (Error) is Go/utls version-dependent and not
 	// what this test verifies. Fallback MUST stay at 0 — the helper
 	// pqClientHelloSpec() does not error today; if it ever does, the
-	// fallback delta exposes that.
+	// fallback delta exposes that. (pqClientHelloSpec is called with the
+	// selected profile's helloID; for Chrome that is HelloChrome_133.)
 	deltaSent := Stats.PQClientHelloSent.Load() - before
 	deltaErr := Stats.PQHandshakeError.Load() - beforeErr
 	deltaFb := Stats.PQHandshakeFallback.Load() - beforeFb
@@ -130,5 +133,40 @@ func TestColdPath_PQ_OptOut_NoCounterTick(t *testing.T) {
 	}
 	if d := Stats.PQHandshakeError.Load() - beforeErr; d != 0 {
 		t.Errorf("PQHandshakeError delta = %d, want 0 (env unset)", d)
+	}
+}
+
+// TestColdPath_FirefoxProfileNotChromeHello asserts the C4 cold-path lockstep
+// fix: when the selected profile is Firefox, the cold-path ClientHelloID must
+// be Firefox_148 (NOT Chrome_133), and the stock Firefox spec must derive
+// cleanly without the Chrome-shaped MLKEM injection. Prior to the C4 BLOCKER
+// fix, PQ-on cold paths always discarded the selected helloID and emitted a
+// Chrome 133 ClientHello — a cross-layer mismatch (Firefox UA/H2 + Chrome TLS)
+// detectable on the wire.
+func TestColdPath_FirefoxProfileNotChromeHello(t *testing.T) {
+	if _, ok := browser.LookupProfile("firefox"); !ok {
+		t.Skip("firefox not in registry")
+	}
+	fp := browser.NewFingerprintForProfile("firefox")
+	if fp.Profile().Name != "firefox" {
+		t.Fatalf("profile name = %q, want firefox", fp.Profile().Name)
+	}
+
+	helloID := utlsProfileForFingerprint(fp)
+	if helloID != utls.HelloFirefox_148 {
+		t.Errorf("firefox cold-path helloID = %v, want HelloFirefox_148", helloID)
+	}
+	if helloID == utls.HelloChrome_133 {
+		t.Errorf("firefox cold-path helloID must NOT be Chrome 133")
+	}
+
+	// Stock Firefox spec must derive without panic and without the
+	// Chrome-PQ overlay — this is the non-Chrome cold-path branch.
+	spec, err := utls.UTLSIdToSpec(helloID)
+	if err != nil {
+		t.Fatalf("firefox spec derive: %v", err)
+	}
+	if len(spec.Extensions) == 0 {
+		t.Error("firefox spec has no extensions (unexpected)")
 	}
 }

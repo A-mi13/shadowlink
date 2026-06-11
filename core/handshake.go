@@ -28,7 +28,8 @@ type ServerHello struct {
 	SessionID             uint32
 	MaxConnsPerClient     uint8
 	ChunkSize             uint16
-	ProtoVersion          *uint8 // nil = legacy (Bearer header), non-nil = new body-prefix format version
+	ProtoVersion          *uint8         // nil = legacy (Bearer header), non-nil = new body-prefix format version
+	FingerprintWeights    map[string]int // имя профиля → относительный вес (nil = дефолт chrome 100%)
 }
 
 // HandshakeClientState holds client-side state during handshake.

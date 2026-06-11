@@ -17,7 +17,7 @@ import (
 // observers fingerprint the first non-GREASE key_share group as the
 // "preferred" curve. T1.1 plan T3 Step 1.
 func TestPQClientHelloSpec_KeyShareIncludesMLKEM768(t *testing.T) {
-	spec, err := pqClientHelloSpec()
+	spec, err := pqClientHelloSpec(utls.HelloChrome_133)
 	if err != nil {
 		t.Fatalf("pqClientHelloSpec: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestPQClientHelloSpec_KeyShareIncludesMLKEM768(t *testing.T) {
 // occupy index 0). RFC 8446 §4.2.7: the order signals client preference;
 // Chrome 135+ wire-captures show MLKEM first non-GREASE. T1.1 plan T3 Step 1.
 func TestPQClientHelloSpec_SupportedCurvesPrepend(t *testing.T) {
-	spec, err := pqClientHelloSpec()
+	spec, err := pqClientHelloSpec(utls.HelloChrome_133)
 	if err != nil {
 		t.Fatalf("pqClientHelloSpec: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestPQClientHelloSpec_SupportedCurvesPrepend(t *testing.T) {
 // of GREASE — adding ~2.4KB to ClientHello and breaking RFC 8701 GREASE
 // ordering.
 func TestPQClientHelloSpec_NoDuplicateMLKEM(t *testing.T) {
-	spec, err := pqClientHelloSpec()
+	spec, err := pqClientHelloSpec(utls.HelloChrome_133)
 	if err != nil {
 		t.Fatalf("pqClientHelloSpec: %v", err)
 	}
@@ -360,7 +360,7 @@ func TestPQClientHelloSpec_DoesNotMutateSharedSpec(t *testing.T) {
 	// Call pqClientHelloSpec multiple times — both serially and in parallel —
 	// so any mutation of shared backing storage would compound.
 	for i := 0; i < 4; i++ {
-		if _, err := pqClientHelloSpec(); err != nil {
+		if _, err := pqClientHelloSpec(utls.HelloChrome_133); err != nil {
 			t.Fatalf("pqClientHelloSpec call #%d: %v", i, err)
 		}
 	}
@@ -369,7 +369,7 @@ func TestPQClientHelloSpec_DoesNotMutateSharedSpec(t *testing.T) {
 	done := make(chan error, parallelism)
 	for i := 0; i < parallelism; i++ {
 		go func() {
-			_, err := pqClientHelloSpec()
+			_, err := pqClientHelloSpec(utls.HelloChrome_133)
 			done <- err
 		}()
 	}

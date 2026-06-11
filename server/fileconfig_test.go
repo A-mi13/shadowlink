@@ -8,6 +8,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 )
 
 func TestLoadConfigFile(t *testing.T) {
@@ -434,6 +435,52 @@ decoy: "/tmp/d"
 idle_timeout_sec: 10
 `
 	writeAndLoadExpectError(t, content, "idle_timeout_sec")
+}
+
+// TestConfig_FingerprintWeights verifies that fingerprint_weights is parsed
+// correctly from YAML into FileConfig and propagated into Config via ApplyTo.
+func TestConfig_FingerprintWeights(t *testing.T) {
+	yamlData := []byte("fingerprint_weights:\n  chrome: 90\n  firefox: 10\n")
+	var cfg FileConfig
+	if err := yaml.Unmarshal(yamlData, &cfg); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.FingerprintWeights["chrome"] != 90 {
+		t.Errorf("chrome weight = %d, want 90", cfg.FingerprintWeights["chrome"])
+	}
+	if cfg.FingerprintWeights["firefox"] != 10 {
+		t.Errorf("firefox weight = %d, want 10", cfg.FingerprintWeights["firefox"])
+	}
+
+	// ApplyTo must propagate into Config.
+	c := DefaultConfig()
+	cfg.ApplyTo(&c)
+	if c.FingerprintWeights["chrome"] != 90 {
+		t.Errorf("Config.FingerprintWeights[chrome] = %d, want 90", c.FingerprintWeights["chrome"])
+	}
+	if c.FingerprintWeights["firefox"] != 10 {
+		t.Errorf("Config.FingerprintWeights[firefox] = %d, want 10", c.FingerprintWeights["firefox"])
+	}
+}
+
+// TestConfig_FingerprintWeightsDefaultEmpty verifies that absence of
+// fingerprint_weights in YAML leaves the map empty (nil) — client defaults to
+// chrome 100% when the map is nil.
+func TestConfig_FingerprintWeightsDefaultEmpty(t *testing.T) {
+	var cfg FileConfig
+	if err := yaml.Unmarshal([]byte("listen: \":443\"\n"), &cfg); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(cfg.FingerprintWeights) != 0 {
+		t.Error("missing section → empty weights (client defaults to chrome 100%)")
+	}
+
+	// ApplyTo must not set any weights when YAML section is absent.
+	c := DefaultConfig()
+	cfg.ApplyTo(&c)
+	if len(c.FingerprintWeights) != 0 {
+		t.Errorf("Config.FingerprintWeights must be empty when section absent, got %v", c.FingerprintWeights)
+	}
 }
 
 // TestLoad_ValidAllFields_NoError verifies that a config with all new

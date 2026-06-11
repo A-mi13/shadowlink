@@ -3,9 +3,11 @@ package server
 import (
 	"encoding/json"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/nixavpn/shadowlink/core"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -171,6 +173,83 @@ func TestMetrics_WSPathLegacyHits(t *testing.T) {
 	m.WSPathLegacyHits.Add(2)
 	if got := m.WSPathLegacyHits.Load(); got != 3 {
 		t.Errorf("WSPathLegacyHits = %d, want 3", got)
+	}
+}
+
+// TestMetrics_HandshakeByProfile verifies that IncHandshakeProfile routes
+// per-profile increments to the correct atomic counter (D2, FP-mimicry).
+func TestMetrics_HandshakeByProfile(t *testing.T) {
+	m := NewMetrics()
+	beforeChrome := m.HandshakesProfileChrome.Load()
+	beforeFirefox := m.HandshakesProfileFirefox.Load()
+	beforeOther := m.HandshakesProfileOther.Load()
+
+	m.IncHandshakeProfile("chrome")
+	m.IncHandshakeProfile("firefox")
+	m.IncHandshakeProfile("other")
+	m.IncHandshakeProfile("unknown") // also routes to "other"
+
+	if got := m.HandshakesProfileChrome.Load(); got != beforeChrome+1 {
+		t.Errorf("chrome handshake counter: got %d, want %d", got, beforeChrome+1)
+	}
+	if got := m.HandshakesProfileFirefox.Load(); got != beforeFirefox+1 {
+		t.Errorf("firefox handshake counter: got %d, want %d", got, beforeFirefox+1)
+	}
+	if got := m.HandshakesProfileOther.Load(); got != beforeOther+2 {
+		t.Errorf("other handshake counter: got %d, want %d (want 2: explicit 'other' + unknown)", got, beforeOther+2)
+	}
+}
+
+// TestSession_HasNoProfileField verifies that core.Session does NOT carry a
+// Profile field — the server must never persist client_id→profile association
+// (D2 privacy invariant).
+func TestSession_HasNoProfileField(t *testing.T) {
+	typ := reflect.TypeOf(core.Session{})
+	if _, ok := typ.FieldByName("Profile"); ok {
+		t.Error("core.Session must NOT have a Profile field (D2 privacy: no client_id→profile binding)")
+	}
+}
+
+// TestHandshakeProfileFromUA verifies the UA→profile classifier used in
+// handleHandshakeNew to derive a profile label from the User-Agent header
+// without storing it in the session.
+func TestHandshakeProfileFromUA(t *testing.T) {
+	cases := []struct {
+		ua      string
+		want    string
+	}{
+		{"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36", "chrome"},
+		{"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36", "chrome"},
+		{"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0", "firefox"},
+		{"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15", "other"},
+		{"Go-http-client/1.1", "other"},
+		{"", "other"},
+	}
+	for _, tc := range cases {
+		got := handshakeProfileFromUA(tc.ua)
+		if got != tc.want {
+			t.Errorf("handshakeProfileFromUA(%q) = %q, want %q", tc.ua, got, tc.want)
+		}
+	}
+}
+
+// TestMetrics_HandshakeProfileInSnapshot verifies that the three profile
+// counters are surfaced in the MetricsSnapshot (JSON export).
+func TestMetrics_HandshakeProfileInSnapshot(t *testing.T) {
+	m := NewMetrics()
+	m.IncHandshakeProfile("chrome")
+	m.IncHandshakeProfile("chrome")
+	m.IncHandshakeProfile("firefox")
+
+	snap := m.Snapshot()
+	if snap.HandshakesProfileChrome != 2 {
+		t.Errorf("snapshot chrome = %d, want 2", snap.HandshakesProfileChrome)
+	}
+	if snap.HandshakesProfileFirefox != 1 {
+		t.Errorf("snapshot firefox = %d, want 1", snap.HandshakesProfileFirefox)
+	}
+	if snap.HandshakesProfileOther != 0 {
+		t.Errorf("snapshot other = %d, want 0", snap.HandshakesProfileOther)
 	}
 }
 

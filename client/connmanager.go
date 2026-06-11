@@ -288,12 +288,18 @@ func (cm *ConnManager) connect() {
 // flavors as "Chrome 133 family". With PQ off both paths emit identical
 // stock Chrome_133.
 //
-// 2026-05-05: non-Chrome fingerprints retired (TSPU блокирует Safari/Firefox/
-// Edge). Switch свёрнут — функция всегда возвращает Chrome_133 независимо от
-// fp.Name(). Сигнатура сохранена для совместимости со всеми каллерами.
+// C4 (2026-06-09): the hot-path bogdanfinn H2 profile is now read from the
+// selected browser profile (fp.Profile().BogdanfinnID) so it stays in lockstep
+// with the cold-path uTLS ClientHelloID and the User-Agent. For a Chrome
+// fingerprint this is profiles.Chrome_133; for Firefox, profiles.Firefox_147.
+// Nil fingerprint falls back to the locked Chrome profile. (Prior to C4 this
+// always returned Chrome_133 regardless of fp.Name(); the population-FP work
+// re-enabled non-Chrome profiles when the operator weights them in.)
 func profileForFingerprint(fp *browser.Fingerprint) profiles.ClientProfile {
-	_ = fp // legacy parameter: всегда Chrome
-	return browser.LockedBogdanfinnChromeProfile()
+	if fp == nil {
+		return browser.LockedBogdanfinnChromeProfile()
+	}
+	return fp.Profile().BogdanfinnID
 }
 
 // Do executes an HTTP request using the active tls-client.

@@ -165,7 +165,7 @@ func buildPQClientHelloForCapture() (*utls.PubClientHelloMsg, []byte, error) {
 	}
 	uconn := utls.UClient(clientConn, cfg, utls.HelloCustom)
 
-	spec, err := pqClientHelloSpec()
+	spec, err := pqClientHelloSpec(utls.HelloChrome_133)
 	if err != nil {
 		clientConn.Close()
 		serverConn.Close()
