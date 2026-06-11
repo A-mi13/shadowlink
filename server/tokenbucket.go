@@ -4,17 +4,24 @@ import (
 	"math"
 	"sync"
 	"time"
+
+	lru "github.com/hashicorp/golang-lru/v2/expirable"
 )
 
+// tbIdleTTL mirrors the historical Cleanup(10*time.Minute) idle window so the
+// expirable LRU drops idle entries automatically. HIGH-2.
+const tbIdleTTL = 10 * time.Minute
+
 // TokenBucket per-IP. Burst capacity = burst; refill at refillPerSecond.
-// State map capped at maxIPs (LRU-ish — simple sweep on overflow).
+// State is held in an expirable LRU capped at maxIPs so eviction beyond
+// capacity is O(1) (least-recently-used drop) instead of an O(N) scan. HIGH-2.
 type TokenBucket struct {
 	burst           float64
 	refillPerSecond float64
 	maxIPs          int
 
 	mu    sync.Mutex
-	state map[string]*tbEntry
+	state *lru.LRU[string, *tbEntry]
 }
 
 type tbEntry struct {
@@ -32,23 +39,22 @@ func NewTokenBucket(burst int, refillPerSecond float64, maxIPs int) *TokenBucket
 		burst:           float64(burst),
 		refillPerSecond: refillPerSecond,
 		maxIPs:          maxIPs,
-		state:           make(map[string]*tbEntry, maxIPs),
+		// No eviction callback needed — entries hold no external resource.
+		state: lru.NewLRU[string, *tbEntry](maxIPs, nil, tbIdleTTL),
 	}
 }
 
-// Allow checks and consumes one token. Returns (allowed, remaining, retryAfter).
+// Allow checks and consumes one token. O(1): LRU Get/Add handle eviction; no
+// scan. Returns (allowed, remaining, retryAfter). HIGH-2.
 func (tb *TokenBucket) Allow(ip string) (bool, int, time.Duration) {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
 
 	now := time.Now()
-	e, exists := tb.state[ip]
+	e, exists := tb.state.Get(ip) // refreshes recency on hit
 	if !exists {
-		if len(tb.state) >= tb.maxIPs {
-			tb.evictOne(now)
-		}
 		e = &tbEntry{tokens: tb.burst, last: now}
-		tb.state[ip] = e
+		tb.state.Add(ip, e) // O(1); evicts LRU if over capacity
 	} else {
 		// Refill
 		elapsed := now.Sub(e.last).Seconds()
@@ -68,36 +74,18 @@ func (tb *TokenBucket) Allow(ip string) (bool, int, time.Duration) {
 	return false, 0, retry
 }
 
-// Size returns current state map size.
+// Size returns current state size.
 func (tb *TokenBucket) Size() int {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
-	return len(tb.state)
+	return tb.state.Len()
 }
 
-// evictOne removes the oldest entry. Called under lock when len>=maxIPs.
-func (tb *TokenBucket) evictOne(now time.Time) {
-	var oldestKey string
-	var oldestT time.Time
-	first := true
-	for k, e := range tb.state {
-		if first || e.last.Before(oldestT) {
-			oldestKey = k
-			oldestT = e.last
-			first = false
-		}
-	}
-	delete(tb.state, oldestKey)
-}
-
-// Cleanup removes entries idle longer than window. Called periodically.
+// Cleanup is retained for API compatibility. The expirable LRU evicts idle
+// entries on access automatically (TTL=tbIdleTTL); an explicit periodic sweep
+// is no longer required. The idle parameter is ignored. HIGH-2.
 func (tb *TokenBucket) Cleanup(idle time.Duration) {
-	tb.mu.Lock()
-	defer tb.mu.Unlock()
-	now := time.Now()
-	for k, e := range tb.state {
-		if now.Sub(e.last) > idle {
-			delete(tb.state, k)
-		}
-	}
+	// no-op: expirable LRU handles idle eviction. Kept so RateLimiters.Cleanup
+	// compiles unchanged.
+	_ = idle
 }

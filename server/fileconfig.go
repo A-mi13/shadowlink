@@ -52,6 +52,7 @@ type FileConfig struct {
 	MaxConns          *int                 `yaml:"max_conns"`
 	ChunkSize         *int                 `yaml:"chunk_size"`
 	BehindProxy       *bool                `yaml:"behind_proxy"`
+	TrustedProxies    []string             `yaml:"trusted_proxies"`
 	Management        *MgmtConfig          `yaml:"management"`
 	Mimicry           *MimicryConfig       `yaml:"mimicry"`
 	BlockDomains      []string             `yaml:"block_domains"`
@@ -97,12 +98,13 @@ type FileConfig struct {
 // explicitly-set values override the defaults applied at NewHandler.
 // Plan §C6 (May audit, 2026-05-02).
 type FileRateLimitConfig struct {
-	WSUpgrade             *FileRateLimitBucketSpec `yaml:"ws_upgrade"`
-	Handshake             *FileRateLimitBucketSpec `yaml:"handshake"`
-	ClientIDLruSize       *int                     `yaml:"client_id_lru_size"`
-	ClientIDTTLMin        *int                     `yaml:"client_id_ttl_min"`
-	ClientIDSoftLimit     *int                     `yaml:"client_id_soft_limit"`
-	ClientIDSoftWindowSec *int                     `yaml:"client_id_soft_window_sec"`
+	WSUpgrade               *FileRateLimitBucketSpec `yaml:"ws_upgrade"`
+	Handshake               *FileRateLimitBucketSpec `yaml:"handshake"`
+	ClientIDLruSize         *int                     `yaml:"client_id_lru_size"`
+	ClientIDTTLMin          *int                     `yaml:"client_id_ttl_min"`
+	ClientIDSoftLimit       *int                     `yaml:"client_id_soft_limit"`
+	ClientIDSoftWindowSec   *int                     `yaml:"client_id_soft_window_sec"`
+	ClientIDDataBytesPerSec *int                     `yaml:"client_id_data_bytes_per_sec"`
 }
 
 // FileRateLimitBucketSpec is the YAML representation of RateLimitBucketSpec.
@@ -353,6 +355,10 @@ func (fc *FileConfig) ApplyTo(cfg *Config) {
 	if fc.BehindProxy != nil {
 		cfg.BehindProxy = *fc.BehindProxy
 	}
+	// HIGH-1: trusted reverse-proxy / CDN CIDRs for X-Forwarded-For attribution.
+	if fc.TrustedProxies != nil {
+		cfg.TrustedProxies = fc.TrustedProxies
+	}
 	// Bug #10: propagate the pointer (not the value) so an absent YAML key leaves
 	// Config.OriginDeathTeardown nil (→ default OFF). A CLI -origin-death-teardown
 	// flag still wins over this in main.go (applied after ApplyTo).
@@ -423,6 +429,9 @@ func (fc *FileConfig) ApplyTo(cfg *Config) {
 		}
 		if fc.RateLimit.ClientIDSoftWindowSec != nil {
 			rl.ClientIDSoftWindowSec = *fc.RateLimit.ClientIDSoftWindowSec
+		}
+		if fc.RateLimit.ClientIDDataBytesPerSec != nil {
+			rl.ClientIDDataBytesPerSec = *fc.RateLimit.ClientIDDataBytesPerSec
 		}
 	}
 }

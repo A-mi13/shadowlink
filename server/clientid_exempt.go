@@ -1,6 +1,7 @@
 package server
 
 import (
+	"math"
 	"sync"
 	"time"
 
@@ -15,14 +16,23 @@ type ClientIDExemption struct {
 	ttl        time.Duration
 	softLimit  int
 	softWindow time.Duration
+	// dataBytesPerSec is the generous per-clientID data-path byte/sec ceiling
+	// (burst = 1s worth). <=0 disables it (unlimited). HIGH-3.
+	dataBytesPerSec float64
 
-	mu   sync.Mutex
-	soft map[string]*softCounter
+	mu        sync.Mutex
+	soft      map[string]*softCounter
+	byteState map[string]*byteBucket
 }
 
 type softCounter struct {
 	count    int
 	winStart time.Time
+}
+
+type byteBucket struct {
+	avail float64
+	last  time.Time
 }
 
 // NewClientIDExemption builds the cache.
@@ -32,16 +42,21 @@ type softCounter struct {
 //	softLimit  — max requests per clientID per softWindow before AllowExempted=false.
 //	             softLimit <= 0 disables the soft cap (unlimited).
 //	softWindow — sliding window for soft-limit
-func NewClientIDExemption(capacity int, ttl time.Duration, softLimit int, softWindow time.Duration) *ClientIDExemption {
+//	dataBytesPerSec — generous high-water bytes/sec ceiling for the data path
+//	             per clientID (see AllowExemptedBytes). <=0 disables (unlimited). HIGH-3.
+func NewClientIDExemption(capacity int, ttl time.Duration, softLimit int, softWindow time.Duration, dataBytesPerSec float64) *ClientIDExemption {
 	e := &ClientIDExemption{
-		ttl:        ttl,
-		softLimit:  softLimit,
-		softWindow: softWindow,
-		soft:       make(map[string]*softCounter, capacity),
+		ttl:             ttl,
+		softLimit:       softLimit,
+		softWindow:      softWindow,
+		soft:            make(map[string]*softCounter, capacity),
+		dataBytesPerSec: dataBytesPerSec,
+		byteState:       make(map[string]*byteBucket, capacity),
 	}
 	e.cache = lru.NewLRU(capacity, func(key string, _ struct{}) {
 		e.mu.Lock()
 		delete(e.soft, key)
+		delete(e.byteState, key)
 		e.mu.Unlock()
 	}, ttl)
 	return e
@@ -91,6 +106,39 @@ func (e *ClientIDExemption) AllowExempted(clientID []byte) bool {
 	}
 	c.count++
 	return true
+}
+
+// AllowExemptedBytes applies the generous per-clientID byte/sec ceiling on the
+// data path. Burst capacity = dataBytesPerSec (1s worth). Returns true if the
+// n bytes fit in the budget; false once a single identity exceeds the ceiling.
+// dataBytesPerSec<=0 → always true (unlimited). Kept separate from the
+// request-count AllowExempted so it does not throttle VPN payload throughput.
+// HIGH-3.
+func (e *ClientIDExemption) AllowExemptedBytes(clientID []byte, n int) bool {
+	if e.dataBytesPerSec <= 0 {
+		return true
+	}
+	if len(clientID) == 0 {
+		return false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	now := time.Now()
+	key := string(clientID)
+	b, ok := e.byteState[key]
+	if !ok {
+		b = &byteBucket{avail: e.dataBytesPerSec, last: now}
+		e.byteState[key] = b
+	} else {
+		elapsed := now.Sub(b.last).Seconds()
+		b.avail = math.Min(e.dataBytesPerSec, b.avail+elapsed*e.dataBytesPerSec)
+		b.last = now
+	}
+	if b.avail >= float64(n) {
+		b.avail -= float64(n)
+		return true
+	}
+	return false
 }
 
 // Size — current LRU cache size.

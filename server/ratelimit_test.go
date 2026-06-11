@@ -59,6 +59,14 @@ func TestClientAuthDeviceLimit(t *testing.T) {
 	assert.True(t, ca.CheckDeviceLimit("u1:d3"), "third device should be allowed after destroying one")
 }
 
+func TestClientAuth_IsOpenMode(t *testing.T) {
+	open := NewClientAuth(nil)
+	assert.True(t, open.IsOpenMode())
+
+	closed := NewClientAuth([]string{"u1:d1"})
+	assert.False(t, closed.IsOpenMode())
+}
+
 func TestClientAuthDeviceLimitOpenMode(t *testing.T) {
 	// Open mode: all clients allowed, no device limit checks.
 	ca := NewClientAuth(nil)

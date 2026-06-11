@@ -59,6 +59,11 @@ type Metrics struct {
 	// "client weaponized as bypass" — a single bad actor's clientID should be
 	// the one ticking this counter.
 	RatelimitClientIDSoftLimitRejected atomic.Uint64
+	// RatelimitClientIDByteCapped counts data-path chunks rejected because an
+	// exempt clientID exceeded its generous per-identity byte/sec high-water
+	// ceiling (HIGH-3). A persistent non-zero rate means one identity is trying
+	// to monopolize egress; a flat zero confirms no honest client is throttled.
+	RatelimitClientIDByteCapped atomic.Uint64
 
 	// === Phase 0+ (2026-05-14): WS lifecycle + sentinel framework metrics ===
 	// See docs/superpowers/specs/2026-05-14-shadowlink-ws-lifecycle-design.md §5.3.
@@ -314,6 +319,13 @@ func (m *Metrics) IncRatelimitClientIDExempted() {
 // §C7 (May audit, 2026-05-02).
 func (m *Metrics) IncRatelimitClientIDSoftLimitRejected() {
 	m.RatelimitClientIDSoftLimitRejected.Add(1)
+}
+
+// IncRatelimitClientIDByteCapped bumps the HIGH-3 data-path byte-ceiling
+// counter when an exempt clientID exceeds its generous per-identity byte/sec
+// high-water mark and a data chunk is rejected to the decoy sentinel.
+func (m *Metrics) IncRatelimitClientIDByteCapped() {
+	m.RatelimitClientIDByteCapped.Add(1)
 }
 
 // IncHandshakeProfile increments the aggregate handshake counter for the given

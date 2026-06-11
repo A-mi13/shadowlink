@@ -64,6 +64,37 @@ func TestTokenBucket_MaxIPsCap(t *testing.T) {
 	}
 }
 
+// HIGH-2: eviction must be O(1) (LRU drop), not an O(N) full scan. We assert
+// behaviourally that under heavy distinct-IP churn the map stays capped AND the
+// most-recently-used entry survives while the oldest is evicted.
+func TestTokenBucket_LRUEvictsOldest(t *testing.T) {
+	tb := NewTokenBucket(1, 0.0001 /* effectively no refill */, 2)
+	// Drain "a" and "b".
+	if ok, _, _ := tb.Allow("a"); !ok {
+		t.Fatal("a first allow")
+	}
+	if ok, _, _ := tb.Allow("b"); !ok {
+		t.Fatal("b first allow")
+	}
+	// Touch "a" so it becomes most-recently-used (and stays drained).
+	tb.Allow("a")
+	// Insert "c" → capacity 2 exceeded → LRU ("b") evicted, "a" survives.
+	if ok, _, _ := tb.Allow("c"); !ok {
+		t.Fatal("c is new, full bucket → allowed")
+	}
+	if got := tb.Size(); got > 2 {
+		t.Fatalf("Size=%d exceeds cap 2", got)
+	}
+	// "a" survived as drained → next allow rejected.
+	if ok, _, _ := tb.Allow("a"); ok {
+		t.Fatal("a should still be drained (survived eviction)")
+	}
+	// "b" was evicted → fresh full bucket → allowed.
+	if ok, _, _ := tb.Allow("b"); !ok {
+		t.Fatal("b was evicted, should be fresh")
+	}
+}
+
 func TestTokenBucket_ConcurrentSafe(t *testing.T) {
 	tb := NewTokenBucket(1000, 1000, 100)
 	var wg sync.WaitGroup

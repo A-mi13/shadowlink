@@ -63,6 +63,14 @@ type Config struct {
 	// When false (direct mode), only RemoteAddr is used — prevents XFF spoofing.
 	BehindProxy bool
 
+	// TrustedProxies lists CIDR ranges (or bare IPs) of reverse-proxy / CDN
+	// hops in front of this server. Used by clientIPFromRequest to walk the
+	// X-Forwarded-For chain from the right and return the rightmost UNtrusted
+	// hop (the real client). Loopback is always implicitly trusted, so the
+	// common nginx-on-localhost deployment needs no entries here. HIGH-1.
+	// Env override: SHADOWLINK_TRUSTED_PROXIES (comma-separated).
+	TrustedProxies []string `yaml:"trusted_proxies"`
+
 	// ManagementPort is the port for the Management API (0 = disabled).
 	ManagementPort int
 	// ManagementBind is the bind address for the Management API (default "127.0.0.1").
@@ -192,6 +200,11 @@ type RateLimitConfig struct {
 	// ClientIDSoftWindowSec sliding window for the soft limit (seconds).
 	// Zero → 60.
 	ClientIDSoftWindowSec int `yaml:"client_id_soft_window_sec"`
+	// ClientIDDataBytesPerSec is the generous per-clientID high-water byte/sec
+	// ceiling applied on the exempt data path so one identity cannot consume
+	// the whole box. Zero → default 52428800 (50 MiB/s). A negative value
+	// disables the ceiling (unlimited). HIGH-3.
+	ClientIDDataBytesPerSec int `yaml:"client_id_data_bytes_per_sec"`
 }
 
 // flowMaxWindowOrDefault returns Config.FlowMaxWindow as-is.

@@ -462,7 +462,7 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		h.decoy.ServeHTTP(w, r)
 		return
 	}
-	clientIP := ClientIPFromRequest(r, h.config.BehindProxy)
+	clientIP := h.clientIP(r)
 	allowWS, remaining, retryAfter := h.rateLimiters.AllowWSUpgrade(clientIP)
 	if allowWS {
 		// Plan §C7 (May audit, 2026-05-02): WS-upgrade gate fires before

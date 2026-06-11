@@ -1,8 +1,10 @@
 package server
 
 import (
+	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -128,6 +130,15 @@ func (ca *ClientAuth) IsAuthorized(clientID string) bool {
 	ca.mu.RLock()
 	defer ca.mu.RUnlock()
 	return ca.authorized[clientID]
+}
+
+// IsOpenMode reports whether the authenticator is running with no whitelist
+// (all decrypting clientIDs authorized). LOW-2: a deployment footgun — callers
+// should emit a loud startup WARN. Safe under concurrent SyncClients.
+func (ca *ClientAuth) IsOpenMode() bool {
+	ca.mu.RLock()
+	defer ca.mu.RUnlock()
+	return ca.openMode
 }
 
 // AddClient authorizes a new client_id.
@@ -299,26 +310,113 @@ func (ca *ClientAuth) ActiveSessionCount(userID string) int {
 	return len(ca.activeSessions[userID])
 }
 
-// ClientIPFromRequest extracts the client IP from an HTTP request.
-// M6 audit fix: behindProxy controls whether X-Forwarded-For is trusted.
-// In direct mode (behindProxy=false), XFF is ignored to prevent spoofing.
-func ClientIPFromRequest(r *http.Request, behindProxy bool) string {
-	if behindProxy {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			// First IP in chain is the client
-			for i := range len(xff) {
-				if xff[i] == ',' {
-					return xff[:i]
-				}
-			}
-			return xff
+// trustedProxySet is an immutable set of CIDR ranges considered trusted
+// reverse-proxy / CDN hops. Loopback is always implicitly trusted so the
+// common "nginx on localhost" deployment needs no extra config. HIGH-1.
+type trustedProxySet struct {
+	prefixes []netip.Prefix
+}
+
+// parseTrustedProxies builds a trustedProxySet from CIDR strings or bare IPs.
+// Bare IPs are normalized to /32 (v4) or /128 (v6). Loopback (127.0.0.0/8,
+// ::1) is always added implicitly. A nil/empty input yields a set that trusts
+// only loopback. HIGH-1.
+func parseTrustedProxies(cidrs []string) (*trustedProxySet, error) {
+	s := &trustedProxySet{}
+	// Implicit loopback.
+	for _, lp := range []string{"127.0.0.0/8", "::1/128"} {
+		p := netip.MustParsePrefix(lp)
+		s.prefixes = append(s.prefixes, p)
+	}
+	for _, raw := range cidrs {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		if p, err := netip.ParsePrefix(raw); err == nil {
+			s.prefixes = append(s.prefixes, p)
+			continue
+		}
+		if addr, err := netip.ParseAddr(raw); err == nil {
+			s.prefixes = append(s.prefixes, netip.PrefixFrom(addr, addr.BitLen()))
+			continue
+		}
+		return nil, fmt.Errorf("trusted proxy %q is neither a CIDR nor an IP", raw)
+	}
+	return s, nil
+}
+
+// contains reports whether ip (string form) falls in any trusted prefix.
+// An unparseable ip is treated as NOT trusted (caller stops the walk there).
+// A nil set trusts only loopback.
+func (s *trustedProxySet) contains(ip string) bool {
+	if s == nil {
+		ip = strings.TrimSpace(ip)
+		return ip == "127.0.0.1" || ip == "::1"
+	}
+	addr, err := netip.ParseAddr(strings.TrimSpace(ip))
+	if err != nil {
+		return false
+	}
+	for _, p := range s.prefixes {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// clientIPFromRequest extracts the client IP. In direct mode (behindProxy=false)
+// XFF is ignored entirely (anti-spoof — unchanged). Behind a proxy it walks the
+// XFF chain (plus RemoteAddr) from the RIGHT and returns the first hop NOT in
+// the trusted-proxy set — the rightmost untrusted hop = real client. HIGH-1.
+func clientIPFromRequest(r *http.Request, behindProxy bool, trusted *trustedProxySet) string {
+	remoteHost := r.RemoteAddr
+	if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		remoteHost = h
+	}
+
+	if !behindProxy {
+		return remoteHost
+	}
+
+	xff := r.Header.Get("X-Forwarded-For")
+	if xff == "" {
+		return remoteHost
+	}
+
+	// Build chain left→right, then append the genuine peer so the walk is
+	// robust whether or not nginx already appended it (and covers the
+	// unix-socket case where RemoteAddr is empty/"@" → skipped).
+	parts := strings.Split(xff, ",")
+	chain := make([]string, 0, len(parts)+1)
+	for _, p := range parts {
+		chain = append(chain, strings.TrimSpace(p))
+	}
+	if remoteHost != "" && remoteHost != "@" {
+		chain = append(chain, remoteHost)
+	}
+
+	// Walk from the right; first untrusted hop wins.
+	for i := len(chain) - 1; i >= 0; i-- {
+		if !trusted.contains(chain[i]) {
+			return chain[i]
 		}
 	}
 
-	// Direct connection
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
+	// Every hop trusted → best-available leftmost token, else RemoteAddr.
+	if len(parts) > 0 {
+		if first := strings.TrimSpace(parts[0]); first != "" {
+			return first
+		}
 	}
-	return host
+	return remoteHost
+}
+
+// ClientIPFromRequest is the legacy 2-arg shim retained for existing callers
+// and tests during migration. It uses a loopback-only trust set (the safe
+// nginx-on-localhost default). HIGH-1: prefer h.clientIP(r) which carries the
+// configured trusted-proxy set.
+func ClientIPFromRequest(r *http.Request, behindProxy bool) string {
+	return clientIPFromRequest(r, behindProxy, nil)
 }

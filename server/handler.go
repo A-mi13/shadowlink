@@ -12,6 +12,7 @@ import (
 	mathrand "math/rand/v2"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -62,6 +63,11 @@ type Handler struct {
 	// every handler-method dereference happens after the publish in
 	// NewHandler returns. Plan §C4 (May audit, 2026-05-02).
 	exemption *ClientIDExemption
+	// trustedProxies is the parsed trusted reverse-proxy / CDN CIDR set used by
+	// clientIP(r) to attribute the real client from X-Forwarded-For (HIGH-1).
+	// Built once in NewHandler (loopback implicit + Config.TrustedProxies / env
+	// SHADOWLINK_TRUSTED_PROXIES). Read-only after construction.
+	trustedProxies *trustedProxySet
 	// replayCache rejects bit-for-bit handshake replays. Key is the entire
 	// EncryptedClientID ciphertext (NaCl box nonce + sealed payload) — a
 	// genuine replay reuses the captured ciphertext verbatim, so its 24-byte
@@ -274,7 +280,25 @@ func NewHandler(serverKey *core.KeyPair, config Config, decoyDir string) *Handle
 		if exWin <= 0 {
 			exWin = time.Minute
 		}
-		exempt = NewClientIDExemption(exCap, exTTL, exSoft, exWin)
+		// HIGH-3: generous per-clientID data-path byte/sec high-water ceiling.
+		// 0 → 50 MiB/s default; negative → unlimited (passed through as <=0).
+		exBytes := config.RateLimit.ClientIDDataBytesPerSec
+		if exBytes == 0 {
+			exBytes = 50 * 1024 * 1024 // 50 MiB/s generous default
+		}
+		exempt = NewClientIDExemption(exCap, exTTL, exSoft, exWin, float64(exBytes))
+	}
+
+	// HIGH-1: parse the trusted-proxy set once at construction. Env override
+	// SHADOWLINK_TRUSTED_PROXIES (comma-separated) wins over YAML when set.
+	tpRaw := config.TrustedProxies
+	if env := strings.TrimSpace(os.Getenv("SHADOWLINK_TRUSTED_PROXIES")); env != "" {
+		tpRaw = strings.Split(env, ",")
+	}
+	trustedSet, tpErr := parseTrustedProxies(tpRaw)
+	if tpErr != nil {
+		slog.Warn("invalid trusted_proxies; falling back to loopback-only trust", "err", tpErr)
+		trustedSet, _ = parseTrustedProxies(nil)
 	}
 
 	h := &Handler{
@@ -296,6 +320,7 @@ func NewHandler(serverKey *core.KeyPair, config Config, decoyDir string) *Handle
 		replayCacheWindow:  replayWindow,
 		tunnels:            make(map[uint32]*Tunnel),
 		exemption:          exempt,
+		trustedProxies:     trustedSet,
 		safeDialFn:         SafeDial,
 		flowMaxWindow:      config.flowMaxWindowOrDefault(), // Bug #8 Task 11: from Config.FlowMaxWindow
 		// migrationEnabled — Bug #9 §3.5: default-on, opt-out via Config/Task 18 env.
@@ -351,7 +376,22 @@ func NewHandler(serverKey *core.KeyPair, config Config, decoyDir string) *Handle
 	// final-audit-2026-05-05 Review 1 M-2.
 	EnsureDecoyFixtureInitialized()
 
+	// LOW-2: loud one-shot startup WARN when running with no whitelist. In open
+	// mode ANY client whose handshake decrypts is authorized AND exempt-eligible
+	// (HIGH-3) — an open-relay posture that should be deliberate, not silent.
+	if h.clientAuth != nil && h.clientAuth.IsOpenMode() {
+		slog.Warn("ShadowLink starting in OPEN MODE: authorized_clients is empty — " +
+			"ANY client whose handshake decrypts is authorized and exempt-eligible. " +
+			"This is an open relay posture. Set authorized_clients for production. (LOW-2/HIGH-3)")
+	}
+
 	return h
+}
+
+// clientIP resolves the request's client IP using the configured trusted-proxy
+// set. Single source of truth for all rate-limit/log call sites. HIGH-1.
+func (h *Handler) clientIP(r *http.Request) string {
+	return clientIPFromRequest(r, h.config.BehindProxy, h.trustedProxies)
 }
 
 // Metrics returns the handler's metrics tracker.
@@ -530,7 +570,7 @@ func (h *Handler) handleHandshakeNew(w http.ResponseWriter, r *http.Request, eph
 	// Rate limit per IP via the split Handshake limiter — sized for WS pool
 	// reconnect bursts (see NewRateLimiters) so live sessions aren't starved
 	// by an attacker flooding the handshake endpoint.
-	clientIP := ClientIPFromRequest(r, h.config.BehindProxy)
+	clientIP := h.clientIP(r)
 	allow, remaining, retryAfter := h.rateLimiters.AllowHandshake(clientIP)
 	// preCachedClientID carries the decrypted clientID across the escape-hatch
 	// jump to `proceed:` so the normal-path DecryptClientID below is skipped
@@ -889,10 +929,24 @@ func (h *Handler) handleNewFormatPost(w http.ResponseWriter, r *http.Request) {
 				// An exempt clientID has paid for its trust at handshake
 				// time and is allowed unrestricted data flow.
 				// X1 Stage 2 follow-up (2026-05-03).
-				clientIP := ClientIPFromRequest(r, h.config.BehindProxy)
+				clientIP := h.clientIP(r)
 				if h.exemption != nil {
 					tunnelClientID := h.tunnelClientIDForSession(session.ID)
 					if tunnelClientID != "" && h.exemption.IsExempt([]byte(tunnelClientID)) {
+						// HIGH-3: a generous per-clientID byte/sec high-water
+						// ceiling so one trusted identity cannot monopolize the
+						// box's egress. Default 50 MiB/s — no honest single
+						// client is throttled; zero/negative disables it.
+						if !h.exemption.AllowExemptedBytes([]byte(tunnelClientID), len(chunk.Payload)) {
+							h.metrics.IncRatelimitClientIDByteCapped()
+							h.failClosedToDecoyRateLimitedV2(w, r, RLSentinel{
+								Bucket:    "data-clientid",
+								BurstLeft: 0,
+								RefillIn:  time.Second,
+								Exempt:    1,
+							})
+							return
+						}
 						h.metrics.IncRatelimitClientIDExempted()
 						h.routeDataChunk(w, r, session, chunk)
 						return

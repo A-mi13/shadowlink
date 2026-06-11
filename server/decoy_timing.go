@@ -185,7 +185,7 @@ func (h *Handler) failClosedToDecoyWithReason(w http.ResponseWriter, r *http.Req
 	// process-wide panic during dispatch still produces an audit trail of the
 	// dispatch attempt).
 	if r != nil {
-		clientIP := ClientIPFromRequest(r, h.config.BehindProxy)
+		clientIP := h.clientIP(r)
 		logDecoyServed(reason, r, clientIP)
 	}
 	h.metrics.IncDecoyServed(reason)
