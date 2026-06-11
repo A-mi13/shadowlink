@@ -225,11 +225,14 @@ const emergencyEvictMigrateBudget = migrateAckTimeout
 // closes the transport (which would otherwise surface as a "natural"
 // read error).
 func (p *WSPoolTransport) tryForceEvictIdleSlot(cl *Client, skipIdx int) bool {
-	for i := 0; i < len(p.slots); i++ {
+	// Audit H1/L3 (2026-06-11): scan a snapshot taken under reserveMu rather
+	// than indexing p.slots live (which raced the lifecycle writers). The CAS
+	// on the captured slot below is the authoritative claim; a cell nilled
+	// after the snapshot simply loses the CAS or is skipped on the next tick.
+	for i, s := range p.snapshotSlots() {
 		if i == skipIdx {
 			continue
 		}
-		s := p.slots[i]
 		if s == nil {
 			continue
 		}
@@ -294,12 +297,16 @@ func (p *WSPoolTransport) tryForceEvictIdleSlot(cl *Client, skipIdx int) bool {
 // already).
 func (p *WSPoolTransport) tryEmergencyEvictMinStreamsSlot(cl *Client, skipIdx int) bool {
 	bestIdx := -1
+	var victim *poolSlot
 	bestStreams := int32(1<<31 - 1)
-	for i := 0; i < len(p.slots); i++ {
+	// Audit H1/L3 (2026-06-11): scan a reserveMu snapshot and capture the
+	// winning *poolSlot from that snapshot rather than re-reading
+	// p.slots[bestIdx] live afterwards (which raced the lifecycle writers and
+	// could return a different object than the one we scored).
+	for i, s := range p.snapshotSlots() {
 		if i == skipIdx {
 			continue
 		}
-		s := p.slots[i]
 		if s == nil {
 			continue
 		}
@@ -310,13 +317,13 @@ func (p *WSPoolTransport) tryEmergencyEvictMinStreamsSlot(cl *Client, skipIdx in
 		if st < bestStreams {
 			bestStreams = st
 			bestIdx = i
+			victim = s
 		}
 	}
-	if bestIdx < 0 {
+	if bestIdx < 0 || victim == nil {
 		return false
 	}
 
-	victim := p.slots[bestIdx]
 	if !victim.tryMarkDraining() {
 		// Lost the race — pick may have been claimed by a concurrent
 		// startDrain. Caller will defer; the next watchdog tick re-tries.
@@ -464,7 +471,9 @@ func (p *WSPoolTransport) startDrain(cl *Client, oldIdx int, reason string) {
 	if oldIdx < 0 || oldIdx >= len(p.slots) {
 		return
 	}
-	oldSlot := p.slots[oldIdx]
+	// Audit H1 (2026-06-11): capture under reserveMu via slotAt rather than an
+	// unguarded p.slots[oldIdx] read that races the lifecycle writers.
+	oldSlot := p.slotAt(oldIdx)
 	if oldSlot == nil {
 		return
 	}

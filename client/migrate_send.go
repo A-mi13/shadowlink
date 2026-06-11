@@ -75,10 +75,9 @@ func (p *WSPoolTransport) noteMigrateAck() {
 // under the TARGET slot's session (the stream is moving onto it, so the server
 // decrypts the MIGRATE on that slot's reader-loop binding).
 func (p *WSPoolTransport) slotForMigrate(targetIdx int) (sess *core.Session, enqueue func([]byte) bool, ok bool) {
-	if targetIdx < 0 || targetIdx >= len(p.slots) {
-		return nil, nil, false
-	}
-	slot := p.slots[targetIdx]
+	// Audit H1 (2026-06-11): capture under reserveMu via slotAt rather than an
+	// unguarded p.slots[targetIdx] read racing the lifecycle writers.
+	slot := p.slotAt(targetIdx)
 	if slot == nil || slot.transport == nil || slot.session == nil {
 		return nil, nil, false
 	}

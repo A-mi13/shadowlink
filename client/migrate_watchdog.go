@@ -132,11 +132,13 @@ func (p *WSPoolTransport) effectiveMigrationSpread() time.Duration {
 func (p *WSPoolTransport) selectYoungTargetSlot(agingIdx int) (int, bool) {
 	best := -1
 	var bestStart int64
-	for idx := range p.slots {
+	// Audit H1 (2026-06-11): iterate a reserveMu snapshot rather than indexing
+	// p.slots live; sendMigrate's slotForMigrate re-validates the target at
+	// send time, so a snapshot going stale here is harmless.
+	for idx, slot := range p.snapshotSlots() {
 		if idx == agingIdx {
 			continue
 		}
-		slot := p.slots[idx]
 		if slot == nil || slot.getState() != slotReady {
 			continue
 		}

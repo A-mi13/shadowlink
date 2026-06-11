@@ -766,7 +766,7 @@ func (p *WSPoolTransport) sampleByteBudget(idx int) int64 {
 // watchdog tick (acceptance #9).
 func (p *WSPoolTransport) readyCapacity() int {
 	n := 0
-	for _, slot := range p.slots {
+	for _, slot := range p.snapshotSlots() {
 		if slot != nil && slot.getState() == slotReady {
 			n++
 		}
@@ -1719,6 +1719,42 @@ func (p *WSPoolTransport) snapshotSlots() []*poolSlot {
 	return out
 }
 
+// slotAt returns the *poolSlot installed at idx, read under reserveMu, or
+// nil for an empty/out-of-range cell. This is the SINGLE centralized
+// single-cell accessor: every read of p.slots[idx] outside snapshotSlots
+// goes through here so the locking discipline is uniform — "every slice-cell
+// access holds reserveMu" — rather than the half-applied "writers always
+// lock; readers sometimes lock" hazard the 2026-06-01 snapshot/capture fixes
+// left behind (audit H1, 2026-06-11). The lifecycle writers (connectSlot
+// install, handleSlotDeath teardown nil, claimFreeSlot, connectReserveSlot
+// free, rebind/ReleaseStream capture) all mutate cells under reserveMu; an
+// unguarded `slot := p.slots[idx]` read races them (Linux -race). Critical
+// section is a single pointer load — bounded by the same tiny window as the
+// claim scan, so contention with the hot read paths is negligible.
+func (p *WSPoolTransport) slotAt(idx int) *poolSlot {
+	p.reserveMu.Lock()
+	defer p.reserveMu.Unlock()
+	if idx < 0 || idx >= len(p.slots) {
+		return nil
+	}
+	return p.slots[idx]
+}
+
+// storeSlot installs (or, with nil, clears) the cell at idx under reserveMu.
+// It is the centralized counterpart to slotAt for the rare test/utility
+// writer; the production lifecycle writers keep their own bespoke
+// reserveMu critical sections (connectSlot, handleSlotDeath teardown,
+// claimFreeSlot, connectReserveSlot) because they couple the cell write with
+// adjacent locked reads (recycle guard, claim scan). Out-of-range is a no-op.
+func (p *WSPoolTransport) storeSlot(idx int, slot *poolSlot) {
+	p.reserveMu.Lock()
+	defer p.reserveMu.Unlock()
+	if idx < 0 || idx >= len(p.slots) {
+		return
+	}
+	p.slots[idx] = slot
+}
+
 // Connect establishes all WS connections in parallel.
 // Returns success when at least one slot is ready.
 func (p *WSPoolTransport) Connect(ctx context.Context) error {
@@ -1901,7 +1937,7 @@ func (p *WSPoolTransport) healthSummaryLoop() {
 //   - empty: nil cells (new field — replaces the old "nil primary = dead++" semantics)
 //   - sum invariant: alive + dead + connecting + draining + empty == 2*poolSize
 func (p *WSPoolTransport) poolStateCounts() (alive, dead, connecting, draining, empty int) {
-	for _, slot := range p.slots {
+	for _, slot := range p.snapshotSlots() {
 		if slot == nil {
 			empty++
 			continue
@@ -1925,7 +1961,7 @@ func (p *WSPoolTransport) emitHealthSummary() {
 	rateLimited := 0
 	var totalStreams int32
 	now := time.Now()
-	for _, slot := range p.slots {
+	for _, slot := range p.snapshotSlots() {
 		if slot == nil {
 			continue
 		}
@@ -1999,8 +2035,7 @@ func (p *WSPoolTransport) nextKeepaliveDelay() time.Duration {
 
 func (p *WSPoolTransport) sendKeepaliveToAllSlots() {
 	sent := 0
-	for i := range p.slots {
-		slot := p.slots[i]
+	for i, slot := range p.snapshotSlots() {
 		if slot == nil || slot.getState() != slotReady || slot.transport == nil || slot.session == nil {
 			continue
 		}
@@ -2431,7 +2466,7 @@ func severeMeltdown(dead, total int) bool {
 // the pool size. Lock-free read of per-slot atomics.
 func (p *WSPoolTransport) countDeadSlots() (dead, total int) {
 	total = p.poolSize
-	for _, slot := range p.slots {
+	for _, slot := range p.snapshotSlots() {
 		if slot == nil {
 			// Nil slot has not been initialized yet — treat as not-yet-alive,
 			// which for meltdown reporting purposes does not count as dead.
@@ -2604,8 +2639,7 @@ func (p *WSPoolTransport) rotationLoop() {
 func (p *WSPoolTransport) rotateMinLoadedSlot() {
 	minIdx := -1
 	minStreams := int32(1<<31 - 1)
-	for i := range p.slots {
-		slot := p.slots[i]
+	for i, slot := range p.snapshotSlots() {
 		if slot == nil || slot.getState() != slotReady {
 			continue
 		}
@@ -2631,7 +2665,10 @@ func (p *WSPoolTransport) rotateMinLoadedSlot() {
 // behind the gracefulDrain feature flag during Phase 1 rollout. Deleted
 // in Phase 4 cleanup along with maybeRotateSlot and fireRotation.
 func (p *WSPoolTransport) legacyRotateOneSlot(minIdx int) {
-	slot := p.slots[minIdx]
+	slot := p.slotAt(minIdx)
+	if slot == nil {
+		return
+	}
 	slot.setState(slotDraining)
 	p.log.Info("WS pool rotating slot (legacy)", "slot", minIdx,
 		"activeStreams", slot.streams.Load())
@@ -2654,6 +2691,15 @@ func (p *WSPoolTransport) legacyRotateOneSlot(minIdx int) {
 	}
 
 reconnect:
+	// M4 fix (audit 2026-06-11): bump generation BEFORE tearing the transport
+	// down, mirroring drainWatchdog.tearDown (ws_pool_drain.go) and
+	// tryForceEvictIdleSlot. Without the bump, the old reader blocked in
+	// ReadMessage sees "use of closed network connection", shouldExitReader
+	// returns false (generation unchanged), and it calls
+	// handleSlotDeath(deathCauseNatural) on a cell connectSlot may have already
+	// re-installed — feeding a false meltdown signal for a rotation WE
+	// initiated. The bump makes the stale reader exit silently via gen mismatch.
+	slot.generation.Add(1)
 	if slot.transport != nil {
 		slot.transport.Close()
 	}
@@ -2696,12 +2742,17 @@ reconnect:
 //     fallback: any non-nil slot at all (typically slotConnecting), so a
 //     SOCKS5 CONNECT request never silently disappears.
 func (p *WSPoolTransport) AssignStream(streamID uint16) {
+	// One consistent snapshot under reserveMu for all picking passes (audit
+	// H1, 2026-06-11): the loops below previously indexed p.slots live, racing
+	// the lifecycle writers. Picking on a single snapshot is also more
+	// internally consistent than re-reading the slice between passes.
+	snap := p.snapshotSlots()
 	pickInPass := func(allowFresh bool) (idx int, score int32) {
 		idx = -1
 		score = int32(1<<31 - 1)
 		nowNs := time.Now().UnixNano()
 		windowNs := slotFreshnessPenaltyWindow.Nanoseconds()
-		for i, slot := range p.slots {
+		for i, slot := range snap {
 			if slot == nil || slot.getState() != slotReady {
 				continue
 			}
@@ -2734,7 +2785,7 @@ func (p *WSPoolTransport) AssignStream(streamID uint16) {
 	if minIdx < 0 {
 		// All slots at capacity — pick the slot with fewest streams (soft overflow).
 		minStreams := int32(1<<31 - 1)
-		for i, slot := range p.slots {
+		for i, slot := range snap {
 			if slot == nil || slot.getState() != slotReady {
 				continue
 			}
@@ -2746,7 +2797,7 @@ func (p *WSPoolTransport) AssignStream(streamID uint16) {
 		}
 		if minIdx < 0 {
 			// Truly no ready slots — last resort fallback.
-			for i, slot := range p.slots {
+			for i, slot := range snap {
 				if slot != nil {
 					minIdx = i
 					break
@@ -2776,21 +2827,29 @@ func (p *WSPoolTransport) AssignStream(streamID uint16) {
 		}
 		return
 	}
-	// Counter-leak note (spec 2026-06-01, N2): inc is by-index here, not via a
-	// captured pointer like rebindStreamToSlot/ReleaseStream. The Assign/Release
-	// pair both address the same idx, so a single stream's lifecycle does not
-	// drift even if the object is replaced mid-flight (the paired dec, floor-
-	// clamped, lands on whatever object now occupies idx). The pointer-capture
-	// hardening was applied where the drift was PROVEN (rebind: inc and dec on
-	// TWO indices, one swappable). The residual Assign window is far narrower
-	// (single index, requires death exactly between pick and Add) and cannot
-	// reproduce the observed 1397 drift; left by-index to keep this hot path
-	// lock-free. Revisit if a future canary shows Assign-path drift.
-	p.slots[minIdx].streams.Add(1)
+	// M1 fix (audit 2026-06-11): capture the *poolSlot currently at minIdx
+	// under reserveMu (via slotAt) and inc on the captured pointer, symmetric
+	// with rebindStreamToSlot/ReleaseStream (2026-06-01 counter-leak fix).
+	// Previously the inc was by-index (p.slots[minIdx].streams.Add(1)) which
+	// (a) was itself an unguarded slice read (H1) and (b) could land on a
+	// fresh zeroed object if connectSlot replaced the cell between pick and
+	// Add, while the paired ReleaseStream dec (captured under lock) landed on
+	// a different object — inflating the health active_streams sum on the live
+	// object. Capturing the live pointer here pairs inc and dec on a coherent
+	// object (ReleaseStream re-reads the same way). If the cell is empty/nil
+	// (raced a teardown), skip the inc but still publish the mapping so the
+	// paired Release floor-clamp absorbs the asymmetry — matching prior
+	// floor-clamp semantics.
+	slot := p.slotAt(minIdx)
+	if slot != nil {
+		slot.streams.Add(1)
+	}
 	p.streamMap.Store(streamID, newStreamEntry(minIdx))
-	Trace("stream assigned", "stream", streamID, "slot", minIdx,
-		"pending", p.slots[minIdx].pendingConnects.Load(),
-		"streams", p.slots[minIdx].streams.Load())
+	if slot != nil {
+		Trace("stream assigned", "stream", streamID, "slot", minIdx,
+			"pending", slot.pendingConnects.Load(),
+			"streams", slot.streams.Load())
+	}
 }
 
 // IncrPending increments the pending CONNECT counter for the stream's assigned slot.
@@ -2800,9 +2859,8 @@ func (p *WSPoolTransport) IncrPending(streamID uint16) {
 		if !ok {
 			return
 		}
-		idx := e.slotIdx
-		if idx < len(p.slots) && p.slots[idx] != nil {
-			p.slots[idx].pendingConnects.Add(1)
+		if slot := p.slotAt(e.slotIdx); slot != nil {
+			slot.pendingConnects.Add(1)
 		}
 	}
 }
@@ -2814,9 +2872,8 @@ func (p *WSPoolTransport) DecrPending(streamID uint16) {
 		if !ok {
 			return
 		}
-		idx := e.slotIdx
-		if idx < len(p.slots) && p.slots[idx] != nil {
-			p.slots[idx].pendingConnects.Add(-1)
+		if slot := p.slotAt(e.slotIdx); slot != nil {
+			slot.pendingConnects.Add(-1)
 		}
 	}
 }
@@ -2828,9 +2885,8 @@ func (p *WSPoolTransport) SlotPending(streamID uint16) int32 {
 		if !ok {
 			return 0
 		}
-		idx := e.slotIdx
-		if idx < len(p.slots) && p.slots[idx] != nil {
-			return p.slots[idx].pendingConnects.Load()
+		if slot := p.slotAt(e.slotIdx); slot != nil {
+			return slot.pendingConnects.Load()
 		}
 	}
 	return 0
@@ -2840,7 +2896,7 @@ func (p *WSPoolTransport) SlotPending(streamID uint16) int32 {
 // Returns false when no slots are ready (don't block — let AssignStream fallback handle it).
 func (p *WSPoolTransport) AllSlotsAtMaxPending() bool {
 	anyReady := false
-	for _, slot := range p.slots {
+	for _, slot := range p.snapshotSlots() {
 		if slot != nil && slot.getState() == slotReady {
 			anyReady = true
 			if slot.pendingConnects.Load() < p.maxPendingPerSlot {
@@ -2874,19 +2930,13 @@ func (p *WSPoolTransport) ReleaseStream(streamID uint16) {
 			p.streamMap.Delete(streamID)
 			return
 		}
-		idx := e.slotIdx
 		// Spec 2026-06-01 (counter-leak fix, F3): capture the slot pointer under
 		// reserveMu and floor-clamp the dec. If the object at idx was replaced by
 		// a fresh poolSlot (death+reconnect) between AssignStream and here, a
 		// by-index dec would drive the new zeroed object negative; floor-clamp
 		// absorbs that residual, and capturing keeps the dec on a coherent object.
-		p.reserveMu.Lock()
-		var slot *poolSlot
-		if idx >= 0 && idx < len(p.slots) {
-			slot = p.slots[idx]
-		}
-		p.reserveMu.Unlock()
-		if slot != nil {
+		// slotAt performs the capture under reserveMu (audit H1, 2026-06-11).
+		if slot := p.slotAt(e.slotIdx); slot != nil {
 			decStreamsFloor(slot)
 		}
 		p.streamMap.Delete(streamID)
@@ -2905,9 +2955,8 @@ func (p *WSPoolTransport) SessionForStream(streamID uint16) *core.Session {
 		if !ok {
 			return nil
 		}
-		idx := e.slotIdx
-		if idx >= 0 && idx < len(p.slots) && p.slots[idx] != nil {
-			return p.slots[idx].session
+		if slot := p.slotAt(e.slotIdx); slot != nil {
+			return slot.session
 		}
 	}
 	return nil
@@ -2935,15 +2984,11 @@ func (p *WSPoolTransport) WriteMessageForStream(streamID uint16, data []byte) er
 		if !ok {
 			return p.WriteMessage(data)
 		}
-		idx := e.slotIdx
-		if idx < len(p.slots) {
-			slot := p.slots[idx]
-			if slot != nil && slot.transport != nil {
-				st := slot.getState()
-				if st == slotReady || st == slotDraining {
-					e.lastWriteNs.Store(time.Now().UnixNano())
-					return slot.transport.WriteMessage(data)
-				}
+		if slot := p.slotAt(e.slotIdx); slot != nil && slot.transport != nil {
+			st := slot.getState()
+			if st == slotReady || st == slotDraining {
+				e.lastWriteNs.Store(time.Now().UnixNano())
+				return slot.transport.WriteMessage(data)
 			}
 		}
 	}
@@ -2963,15 +3008,11 @@ func (p *WSPoolTransport) WriteControlMessageForStream(streamID uint16, data []b
 		if !ok {
 			return p.WriteControlMessage(data)
 		}
-		idx := e.slotIdx
-		if idx < len(p.slots) {
-			slot := p.slots[idx]
-			if slot != nil && slot.transport != nil {
-				st := slot.getState()
-				if st == slotReady || st == slotDraining {
-					e.lastWriteNs.Store(time.Now().UnixNano())
-					return slot.transport.WriteControlMessage(data)
-				}
+		if slot := p.slotAt(e.slotIdx); slot != nil && slot.transport != nil {
+			st := slot.getState()
+			if st == slotReady || st == slotDraining {
+				e.lastWriteNs.Store(time.Now().UnixNano())
+				return slot.transport.WriteControlMessage(data)
 			}
 		}
 	}
@@ -2991,11 +3032,7 @@ func (p *WSPoolTransport) TryWriteControlMessageForStream(streamID uint16, data 
 	if !ok {
 		return false
 	}
-	idx := e.slotIdx
-	if idx >= len(p.slots) {
-		return false
-	}
-	slot := p.slots[idx]
+	slot := p.slotAt(e.slotIdx)
 	if slot == nil || slot.transport == nil {
 		return false
 	}
@@ -3015,7 +3052,7 @@ func (p *WSPoolTransport) TryWriteControlMessageForStream(streamID uint16, data 
 
 // WriteMessage sends a data frame to a random ready slot (for non-stream data).
 func (p *WSPoolTransport) WriteMessage(data []byte) error {
-	for _, slot := range p.slots {
+	for _, slot := range p.snapshotSlots() {
 		if slot != nil && slot.getState() == slotReady && slot.transport != nil {
 			return slot.transport.WriteMessage(data)
 		}
@@ -3025,7 +3062,7 @@ func (p *WSPoolTransport) WriteMessage(data []byte) error {
 
 // WriteControlMessage sends a control frame to a random ready slot.
 func (p *WSPoolTransport) WriteControlMessage(data []byte) error {
-	for _, slot := range p.slots {
+	for _, slot := range p.snapshotSlots() {
 		if slot != nil && slot.getState() == slotReady && slot.transport != nil {
 			return slot.transport.WriteControlMessage(data)
 		}
@@ -3071,8 +3108,7 @@ func (p *WSPoolTransport) StartReader(ctx context.Context, cl *Client) error {
 // The readerActive CAS inside slotReaderWithClient is the authoritative
 // duplicate-prevention gate — this function just primes the spawn.
 func (p *WSPoolTransport) spawnMissingReaders(ctx context.Context, cl *Client) {
-	for i := range p.slots {
-		slot := p.slots[i]
+	for i, slot := range p.snapshotSlots() {
 		if slot == nil {
 			continue
 		}
@@ -3104,7 +3140,7 @@ func (p *WSPoolTransport) slotReader(idx int) {
 // read on failed websocket connection" panic that occurs when two readers
 // race on the same conn.
 func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, idx int) {
-	slot := p.slots[idx]
+	slot := p.slotAt(idx)
 	if slot == nil || slot.transport == nil {
 		return
 	}
@@ -3623,7 +3659,7 @@ func (p *WSPoolTransport) handleStreamClose(cl *Client, streamID uint16) {
 // cause distinguishes natural failures from preemptive rotations. ONLY
 // natural failures advance the meltdown counter — see slotDeathCause.
 func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int, cause slotDeathCause) {
-	slot := p.slots[idx]
+	slot := p.slotAt(idx)
 	if slot == nil {
 		return
 	}
@@ -3844,14 +3880,14 @@ func (p *WSPoolTransport) Close() error {
 	// so the slot transports are still live for the FIN write. Without this a
 	// clean client shutdown leaves up to poolSize ghost sessions on the server
 	// until their idle timeout (ghost-session bug, 2026-05-29).
-	for _, slot := range p.slots {
+	for _, slot := range p.snapshotSlots() {
 		if slot == nil || slot.getState() != slotReady {
 			continue
 		}
 		p.sendSlotSessionFIN(slot)
 	}
 	p.cancel()
-	for _, slot := range p.slots {
+	for _, slot := range p.snapshotSlots() {
 		if slot == nil {
 			continue
 		}
@@ -3873,7 +3909,7 @@ func (p *WSPoolTransport) Close() error {
 // capacity (active drain replacement) so it counts toward health.
 func (p *WSPoolTransport) HealthySlots() int {
 	count := 0
-	for _, slot := range p.slots {
+	for _, slot := range p.snapshotSlots() {
 		if slot != nil && slot.getState() == slotReady {
 			count++
 		}
