@@ -298,8 +298,15 @@ func DefaultConfig() Config {
 // TestConfig returns config suitable for testing (no TLS, localhost).
 func TestConfig() Config {
 	return Config{
-		ListenAddr:        "127.0.0.1:0", // random port
-		MaxClients:        10,
+		ListenAddr: "127.0.0.1:0", // random port
+		// MaxClients is intentionally large here. Many tests share a process
+		// and, under `go test -shuffle`/`-count`, sessions created by sibling
+		// tests accumulate in the manager across a run; a small cap (was 10)
+		// caused handshake-path tests to hit `max_clients` and get routed to the
+		// decoy, surfacing as a flaky `invalid character '<'` JSON parse in an
+		// unrelated test. Tests that specifically exercise the cap set their own
+		// small h.config.MaxClients locally (e.g. TestMaxClientsEnforced=2).
+		MaxClients:        100000,
 		MaxConnsPerClient: 4,
 		ChunkSize:         12288,
 		SessionTimeout:    1 * time.Minute,
