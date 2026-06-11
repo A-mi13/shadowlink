@@ -55,12 +55,15 @@ func TestAckJitter_MedianApproximately5Ms(t *testing.T) {
 }
 
 // TestAckJitter_ParetoTailPresent verifies the right-tail mixture is doing
-// its job: with 5% Pareto(α=2, xm=50ms) ≈ 50% of tail samples land >70ms,
-// so over 10k draws we expect ~250 samples > 100ms. Observed counts swing
-// roughly 87–125 across runs (heavy-tail sampling variance), so the prior
-// >100 assertion flaked. We assert >50 — still ~5× below the analytical mean
-// and far above the ~0 a full tail-drop regression would yield, so it catches
-// the regression this test guards while tolerating sampling noise.
+// its job. With 5% Pareto(α=2, xm=50ms), P(a tail sample > 100ms) = (50/100)²
+// = 0.25, so P(any sample > 100ms) ≈ 0.05·0.25 = 0.0125. Over 10k draws the
+// expected count is ~125 (mean = n·p ≈ 125, σ = √(n·p·(1−p)) ≈ 11), NOT ~250
+// as an earlier comment wrongly assumed. Observed counts swing roughly 87–125
+// across runs (heavy-tail sampling variance), so the prior >100 assertion sat
+// only ~2σ below the mean and flaked (~1%/run). We assert >50 — ~6σ below the
+// mean (false-fail <<0.01%) yet far above the ~0 a full tail-drop regression
+// would yield, so it catches the regression this test guards while tolerating
+// sampling noise.
 func TestAckJitter_ParetoTailPresent(t *testing.T) {
 	const samples = 10000
 	above100ms := 0

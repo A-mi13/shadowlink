@@ -282,6 +282,15 @@ func HandleTCPConnectWSPerStream(ctx context.Context, conn net.Conn, cl *client.
 	var wg sync.WaitGroup
 	relayStart := time.Now()
 
+	// SEC-H5: idle-aware uplink teardown. The downlink goroutine stamps this
+	// on every received frame; after uplink EOF the uplink goroutine waits for
+	// downlinkIdleGrace of genuine downlink silence (not a fixed 15s) before
+	// cancelling — mirroring tunnelTCPStream's waitForIdleOrCancel so a large
+	// response body still streaming after the request finished is not severed
+	// at a hard 15s mark.
+	var lastDownlinkNs atomic.Int64
+	lastDownlinkNs.Store(time.Now().UnixNano())
+
 	// Keepalive: prevent CF idle timeout (100s). Log-normal jitter
 	// (sigma=0.5, final-audit-2026-05-03 P1-3, upgraded from uniform ±30%
 	// NEW-1 fix) so the per-stream relay loop does not emit encrypted
@@ -314,10 +323,10 @@ func HandleTCPConnectWSPerStream(ctx context.Context, conn net.Conn, cl *client.
 			if err != nil {
 				slog.Info("per-stream uplink done", "dest", destAddr, "stream", streamID,
 					"bytes", total, "elapsed", time.Since(relayStart).Round(time.Millisecond))
-				select {
-				case <-time.After(15 * time.Second):
-				case <-ctx2.Done():
-				}
+				// SEC-H5: wait for downlink idle (reset on every received
+				// frame) instead of a fixed 15s, so an active response stream
+				// survives past the request's completion.
+				waitForIdleOrCancel(ctx2, &lastDownlinkNs, downlinkIdleGrace, downlinkIdlePoll)
 				cancel()
 				return
 			}
@@ -392,6 +401,7 @@ func HandleTCPConnectWSPerStream(ctx context.Context, conn net.Conn, cl *client.
 
 			total += len(payload)
 			chunks++
+			lastDownlinkNs.Store(time.Now().UnixNano()) // SEC-H5: keep uplink idle-grace alive
 			client.Stats.DownlinkBytes.Add(int64(len(payload)))
 			if chunks <= 5 || chunks%100 == 0 {
 				client.Trace("per-stream downlink data", "dest", destAddr, "stream", streamID,
