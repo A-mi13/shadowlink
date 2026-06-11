@@ -184,11 +184,14 @@ func TestNewHandler_ReplayCacheConfigurable(t *testing.T) {
 	t.Run("custom values applied", func(t *testing.T) {
 		cfg := TestConfig()
 		cfg.ReplayCacheMaxSize = 50
-		cfg.ReplayCacheWindow = 1 * time.Minute
+		// Use a window >= the M3 drift floor (300s) so it is preserved as-is.
+		// A shorter window is clamped up to the drift window — covered by
+		// TestNewHandler_ReplayWindowClampedToDrift.
+		cfg.ReplayCacheWindow = 6 * time.Minute
 		h := NewHandler(serverKey, cfg, "")
 		require.NotNil(t, h.replayCache)
 		require.Equal(t, 50, h.replayCacheMaxSize)
-		require.Equal(t, 1*time.Minute, h.replayCacheWindow)
+		require.Equal(t, 6*time.Minute, h.replayCacheWindow)
 	})
 
 	t.Run("zero values fall back to defaults", func(t *testing.T) {

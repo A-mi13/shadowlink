@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
 	"io"
 
 	"golang.org/x/crypto/hkdf"
@@ -21,9 +22,14 @@ func DeriveServerPerClientKey(serverMasterKey []byte, clientID string) []byte {
 	r := hkdf.New(sha256.New, serverMasterKey, migrateHKDFSalt, []byte(clientID))
 	out := make([]byte, 32)
 	if _, err := io.ReadFull(r, out); err != nil {
-		// HKDF-Expand over SHA-256 for 32 bytes cannot fail in practice; return
-		// zeros so a downstream VerifyStreamProof fails closed rather than panic.
-		return make([]byte, 32)
+		// L3 (2026-06-11): HKDF-Expand(SHA-256) for 32 bytes is one block and
+		// CANNOT fail in practice. The former "return zeros so VerifyStreamProof
+		// fails closed" was wrong — a zero key is DETERMINISTIC and PREDICTABLE:
+		// both sides would compute the same proof, enabling forgery if the path
+		// ever triggered on one side only. Panic (consistent with
+		// NewSessionManager's CSPRNG fail-fast) — an unreachable error here means
+		// the runtime crypto stack is broken and no downstream op is safe.
+		panic(fmt.Sprintf("ShadowLink: HKDF derive per-client key failed (unreachable): %v", err))
 	}
 	return out
 }

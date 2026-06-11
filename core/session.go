@@ -46,6 +46,13 @@ type Session struct {
 	recvBitmap  [WindowSize / 64]uint64
 	CreatedAt   time.Time
 
+	// windowResets counts AcceptSeqNum full-window resets (seq jumps >=
+	// WindowSize). L5 (2026-06-11) observability — a persistently growing value
+	// signals pathological seq growth / a buggy duplicate-heavy peer. Atomic so
+	// the exported reader is lock-free; the increment in AcceptSeqNum already
+	// runs under s.mu.
+	windowResets atomic.Uint64
+
 	// AttachedAt is the unix nanosecond timestamp marking the session as
 	// "handshake-complete and ready for use by the owning client". 0 means
 	// "newborn — Create() returned but the handshake response was not yet
@@ -157,6 +164,36 @@ func NewSession(id uint32, sendKey, recvKey []byte) *Session {
 	return s
 }
 
+// InitSendEpoch installs a counter-nonce sendEpoch on a session that was built
+// via NewSession (client handshake completion) and therefore lacks the cached
+// send GCM. Idempotent: if an epoch is already present (server Create path, or a
+// prior InitSendEpoch), it is a no-op so the counter is NEVER reset — resetting
+// would replay nonce 0 under the same key (AES-GCM catastrophic reuse).
+//
+// H-K1 (2026-06-11 audit): the client previously fell through EncryptChunk's
+// random-nonce fallback (session.go fallback branch) for 100% of its uplink.
+// A counter nonce removes all birthday-collision reliance. WIRE-COMPATIBLE: the
+// peer decrypts via gcm.Open over whatever 12-byte nonce sits in the frame
+// header (chunk.go DecryptWith/DecryptChunk), so the sender's nonce regime is
+// invisible on the wire — no ServerHello._v bump, no two-client smoke required.
+//
+// MUST be called exactly once after CompleteHandshake, before the first
+// EncryptChunk, on every client-side session (see client/ws_pool.go slot setup
+// and client/client.go direct paths).
+func (s *Session) InitSendEpoch() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sendEpochPtr.Load() != nil {
+		return nil // already cached (server Create, or idempotent re-call)
+	}
+	gcm, err := newGCM(s.SendKey)
+	if err != nil {
+		return fmt.Errorf("InitSendEpoch: %w", err)
+	}
+	s.sendEpochPtr.Store(&sendEpoch{gcm: gcm}) // nonce counter starts at 0
+	return nil
+}
+
 // NextSeqNum returns the next sequence number for sending.
 func (s *Session) NextSeqNum() uint32 {
 	s.mu.Lock()
@@ -176,6 +213,7 @@ func (s *Session) AcceptSeqNum(seq uint32) bool {
 	if seq > s.recvHighest {
 		shift := seq - s.recvHighest
 		if shift >= WindowSize {
+			s.windowResets.Add(1) // L5 observability: pathological seq growth signal
 			for i := range s.recvBitmap {
 				s.recvBitmap[i] = 0
 			}
@@ -198,6 +236,11 @@ func (s *Session) AcceptSeqNum(seq uint32) bool {
 	s.setBit(diff)
 	return true
 }
+
+// WindowResetCount returns how many times AcceptSeqNum performed a full-window
+// reset (seq jump >= WindowSize). A persistently growing value signals
+// pathological seq growth / a buggy duplicate-heavy peer (L5, 2026-06-11).
+func (s *Session) WindowResetCount() uint64 { return s.windowResets.Load() }
 
 // IsExpired returns true if the session has been inactive longer than timeout.
 func (s *Session) IsExpired(timeout time.Duration) bool {
@@ -350,8 +393,15 @@ func (s *Session) EncryptChunk(chunk *Chunk) ([]byte, error) {
 	}
 
 	// Fallback for sessions created via NewSession (no cached GCM).
-	// Used by client-side handshake completion (CompleteHandshakeWithVersion) and
-	// by tests. Falls through to legacy chunk.Encrypt with a per-call random nonce.
+	// Falls through to legacy chunk.Encrypt with a per-call random nonce.
+	//
+	// SECURITY (H-K1, 2026-06-11): after this audit a production client MUST call
+	// Session.InitSendEpoch() right after CompleteHandshake (see client/ws_pool.go
+	// slot setup and client/client.go direct paths). Reaching this branch in prod
+	// means InitSendEpoch was skipped — uplink would silently degrade to the
+	// random-nonce regime (birthday-collision reliance). This branch now remains
+	// only for tests that build a Session via NewSession without InitSendEpoch and
+	// that exercise the random-nonce path deliberately.
 	s.mu.Lock()
 	key := make([]byte, len(s.SendKey))
 	copy(key, s.SendKey)

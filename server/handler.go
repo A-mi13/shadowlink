@@ -170,6 +170,18 @@ func (t *Tunnel) closeTunnel() {
 }
 
 // NewHandler creates a ShadowLink request handler.
+// estimatedPeakHandshakesPerWindow gives a rough upper bound on how many
+// distinct handshakes a single rate-limit bucket admits inside `window`:
+// the initial burst plus the refill rate × window minutes. Used by the M3
+// sizing guard to warn when ReplayCacheMaxSize could let FIFO eviction drop a
+// replay-cache entry that is still inside the drift window under a flood. This
+// is a deliberately coarse over-estimate (per-IP buckets are not summed) —
+// surfacing the order of magnitude is the goal, not an exact peak.
+func estimatedPeakHandshakesPerWindow(hs RateLimitBucketSpec, window time.Duration) int {
+	windowMinutes := window.Minutes()
+	return hs.Burst + int(float64(hs.RefillPerMin)*windowMinutes)
+}
+
 func NewHandler(serverKey *core.KeyPair, config Config, decoyDir string) *Handler {
 	// Handshake rate limit sized for WS pool reconnect bursts (pool=4-8 slots ×
 	// cascade reconnects generate 20-50 handshakes/min per client IP). The old
@@ -214,6 +226,30 @@ func NewHandler(serverKey *core.KeyPair, config Config, decoyDir string) *Handle
 	}
 	if ws.RefillPerMin <= 0 {
 		ws.RefillPerMin = 30
+	}
+
+	// M3 (2026-06-11): the anti-replay guarantee is only as wide as
+	// min(drift_window, replay_cache_window) AND needs the cache entry to survive
+	// the whole drift window. A window shorter than the handshake drift window
+	// leaves a [cacheWindow, driftWindow] gap where a captured ClientHello — still
+	// inside its drift window — re-decrypts AND has no surviving cache entry, so it
+	// is accepted as fresh. Clamp up to the drift window and warn so a
+	// misconfiguration cannot silently reopen the replay window.
+	driftWindow := time.Duration(core.HandshakeDriftWindowSecs) * time.Second
+	if replayWindow < driftWindow {
+		slog.Warn("ShadowLink: ReplayCacheWindow shorter than handshake drift window — "+
+			"clamping up to prevent replay reopen (M3)",
+			"configured", replayWindow, "driftWindow", driftWindow)
+		replayWindow = driftWindow
+	}
+	// Sizing guard: FIFO eviction must not drop an entry still inside the drift
+	// window under a handshake flood. Warn if maxSize is below the configured
+	// handshake burst×refill envelope for the window. (Warn, not fail: the exact
+	// peak rate is deployment-specific; surfacing it is enough.)
+	if minEntries := estimatedPeakHandshakesPerWindow(hs, replayWindow); replayMax < minEntries {
+		slog.Warn("ShadowLink: ReplayCacheMaxSize below estimated peak handshakes per window — "+
+			"FIFO eviction may reopen replay window under flood (M3)",
+			"maxSize", replayMax, "estimatedPeak", minEntries)
 	}
 
 	// Plan §C4 (May audit, 2026-05-02): ClientID exemption. Default-on,

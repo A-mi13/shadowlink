@@ -633,6 +633,14 @@ func (t *SplitTransport) StartReader(ctx context.Context, cl *Client) error {
 			continue
 		}
 
+		// M1 (2026-06-11): downlink anti-replay before routing bytes into a
+		// stream (SplitHTTP download reader). A replayed authentic chunk would
+		// duplicate bytes in the proxied TCP stream — drop it.
+		if !session.AcceptSeqNum(chunk.SeqNum) {
+			Stats.DownlinkReplayDroppedTotal.Add(1)
+			continue
+		}
+
 		if len(chunk.Payload) < 2 {
 			if chunk.Flags == core.FlagAck {
 				slog.Debug("SplitHTTP keepalive ACK received")

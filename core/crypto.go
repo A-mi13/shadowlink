@@ -23,6 +23,18 @@ var timeNow = func() int64 { return time.Now().Unix() }
 // in server/handler.go) so tests can consistently freeze time across the codebase.
 func TimeNowUnix() int64 { return timeNow() }
 
+// HandshakeDriftWindowSecs is the allowed |now - ts| wall-clock skew for a
+// ClientHello timestamp (operational freshness, NOT anti-replay by itself —
+// replay is enforced by ReplayCache). M3 (2026-06-11): named so the server boot
+// validation can require ReplayCacheWindow >= this window (replay defence is only
+// as wide as min(drift, cache-window) AND requires the cache entry to survive the
+// whole drift window). Value 300s is the current production window and is
+// DELIBERATELY KEPT (owner decision 2026-06-11) — this change only extracts the
+// former hardcoded 300 into a named constant so the boot enforcement (T7) and the
+// replay-cache window are bound to one source of truth. No behaviour change: a
+// client with up to 5 min clock drift still authenticates.
+const HandshakeDriftWindowSecs int64 = 300
+
 // ZeroBytes securely zeroes a byte slice (for key material cleanup).
 // A1-H3 fix: runtime.KeepAlive prevents the compiler from eliminating the zeroing
 // loop as a dead store (the slice is "used" after the loop from the compiler's perspective).
@@ -163,7 +175,8 @@ func EncryptClientID(clientID, receiverPub []byte, sender *KeyPair) ([]byte, err
 }
 
 // DecryptClientID decrypts a client ID encrypted with EncryptClientID.
-// Rejects handshakes where |now - ts| > 300 seconds (replay protection).
+// Rejects handshakes where |now - ts| > ±300s (HandshakeDriftWindowSecs) —
+// operational freshness, not anti-replay by itself (replay protection).
 //
 // Wall-clock dependency (final audit 2026-05-03 T1 P3): the 300s drift check
 // uses `time.Now().Unix()` on both client and server. This is wall-clock,
@@ -219,7 +232,7 @@ func DecryptClientID(encrypted, senderPub []byte, receiver *KeyPair) ([]byte, er
 	}
 
 	ts := int64(binary.BigEndian.Uint64(decrypted[0:8]))
-	if diff := timeNow() - ts; diff > 300 || diff < -300 {
+	if diff := timeNow() - ts; diff > HandshakeDriftWindowSecs || diff < -HandshakeDriftWindowSecs {
 		return nil, errors.New("handshake timestamp expired")
 	}
 

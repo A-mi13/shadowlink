@@ -82,11 +82,22 @@ func (c *Chunk) Encrypt(key []byte) ([]byte, error) {
 	return out, nil
 }
 
-// EncryptWith serializes and encrypts the chunk using a pre-cached AES-256-GCM cipher.
-// This avoids re-creating aes.NewCipher + cipher.NewGCM on every call.
-// Nonce format: counter(8 bytes big-endian) + random(4 bytes).
-// Returns: nonce(12) + ciphertext_with_tag.
+// EncryptWith serializes and encrypts the chunk using a pre-cached AES-256-GCM
+// cipher with NO associated data (the legacy v0/v1 contract). This avoids
+// re-creating aes.NewCipher + cipher.NewGCM on every call.
+// Nonce format: counter(8 BE) ‖ zero(4). Returns: nonce(12) + ciphertext_with_tag.
 func (c *Chunk) EncryptWith(gcm cipher.AEAD, nonceCounter uint64) ([]byte, error) {
+	return c.EncryptWithAAD(gcm, nonceCounter, nil)
+}
+
+// EncryptWithAAD is EncryptWith with explicit associated data (M2, 2026-06-11,
+// GATED). aad==nil reproduces the legacy wire/AEAD context byte-for-byte
+// (EncryptWith delegates here with nil). A non-nil aad — produced by buildAEAD
+// for protoVersion>=2 — binds the chunk to its direction+version so it cannot be
+// reflected across the send/recv boundary; the AAD is authenticated but NOT
+// transmitted, so the wire size is unchanged. The peer MUST Open with the
+// identical aad or gcm.Open fails.
+func (c *Chunk) EncryptWithAAD(gcm cipher.AEAD, nonceCounter uint64, aad []byte) ([]byte, error) {
 	// Build plaintext: sess_id(4) + seq_num(4) + flags(1) + payload
 	ptSize := HeaderSize + len(c.Payload)
 	// Use pooled buffer for common sizes; fall back to heap for oversized chunks.
@@ -102,26 +113,37 @@ func (c *Chunk) EncryptWith(gcm cipher.AEAD, nonceCounter uint64) ([]byte, error
 	plaintext[8] = c.Flags
 	copy(plaintext[HeaderSize:], c.Payload)
 
-	// Nonce: counter(8 bytes big-endian) + random(4 bytes) — stack-allocated.
+	// Nonce: counter(8 BE) ‖ zero(4). L1 (2026-06-11): a monotonic 64-bit counter
+	// already guarantees per-key uniqueness (rekey at ~2^32 well before wrap);
+	// the former random 4-byte tail added no uniqueness and cost a crypto/rand
+	// syscall on the hot path. Deterministic 12-byte nonce, trivially auditable.
+	// WIRE-COMPAT: receiver reads 12 bytes regardless.
 	var nonce [NonceSize]byte
 	binary.BigEndian.PutUint64(nonce[:8], nonceCounter)
-	if _, err := rand.Read(nonce[8:]); err != nil {
-		PutBufferZero(ptBuf)
-		return nil, err
-	}
+	// nonce[8:12] stays zero — no rand.Read.
 
 	out := make([]byte, NonceSize, NonceSize+ptSize+gcm.Overhead())
 	copy(out, nonce[:])
-	out = gcm.Seal(out, nonce[:], plaintext, nil)
+	out = gcm.Seal(out, nonce[:], plaintext, aad)
 
 	// Zero and return plaintext buffer (contained unencrypted data).
 	PutBufferZero(ptBuf)
 	return out, nil
 }
 
-// DecryptWith decrypts and deserializes an encrypted chunk using a pre-cached GCM cipher.
-// Wire format is the same as DecryptChunk: nonce(12) + ciphertext_with_tag.
+// DecryptWith decrypts and deserializes an encrypted chunk using a pre-cached GCM
+// cipher with NO associated data (legacy v0/v1). Wire format is the same as
+// DecryptChunk: nonce(12) + ciphertext_with_tag.
 func DecryptWith(data []byte, gcm cipher.AEAD) (*Chunk, error) {
+	return DecryptWithAAD(data, gcm, nil)
+}
+
+// DecryptWithAAD is DecryptWith with explicit associated data (M2, 2026-06-11,
+// GATED). aad==nil reproduces the legacy contract (DecryptWith delegates here
+// with nil). The aad MUST match what the sender passed to EncryptWithAAD or
+// gcm.Open fails — that is the mechanism that makes the direction+version bind
+// cryptographic for protoVersion>=2.
+func DecryptWithAAD(data []byte, gcm cipher.AEAD, aad []byte) (*Chunk, error) {
 	if len(data) < MinChunk {
 		return nil, fmt.Errorf("chunk too short: %d < %d", len(data), MinChunk)
 	}
@@ -129,7 +151,7 @@ func DecryptWith(data []byte, gcm cipher.AEAD) (*Chunk, error) {
 	nonce := data[:NonceSize]
 	ciphertext := data[NonceSize:]
 
-	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, aad)
 	if err != nil {
 		return nil, err
 	}

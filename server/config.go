@@ -137,6 +137,12 @@ type Config struct {
 	// ReplayCacheWindow is the timestamp-bucket size for replay rejection.
 	// Zero/unset → 5*time.Minute. Larger windows rebuke replays for longer
 	// at the cost of LRU pressure (see ReplayCacheMaxSize).
+	//
+	// M3 (2026-06-11): MUST be >= core.HandshakeDriftWindowSecs (300s). A shorter
+	// window leaves a [cacheWindow, driftWindow] gap where a captured ClientHello
+	// re-decrypts (still inside its drift window) with no surviving cache entry.
+	// NewHandler clamps any shorter value UP to the drift window and logs a warn,
+	// so a misconfiguration cannot silently reopen the replay window.
 	ReplayCacheWindow time.Duration `yaml:"replay_cache_window"`
 
 	// HandshakeRateLimitPerMin caps new handshakes per minute per client IP.
@@ -152,6 +158,13 @@ type Config struct {
 	// deployments without YAML overrides keep working unchanged. Plan §C6
 	// (May audit, 2026-05-02).
 	RateLimit RateLimitConfig `yaml:"rate_limit"`
+
+	// FingerprintWeights defines relative weights for browser TLS fingerprint
+	// profiles used in population mimicry (C2, FP-mimicry feature).
+	// Keys are profile names (e.g. "chrome", "firefox"); values are relative
+	// weights. nil map → client defaults to chrome 100%.
+	// Propagated from FileConfig.FingerprintWeights via ApplyTo.
+	FingerprintWeights map[string]int
 }
 
 // RateLimitBucketSpec defines a single token-bucket: burst (max tokens) and
