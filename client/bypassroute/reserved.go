@@ -56,6 +56,53 @@ var reservedRanges = []reservedRange{
 	{"240.0.0.0/4", "RFC 1112 — reserved future use / 255.255.255.255 broadcast, drop", true},
 }
 
+// Reserved IPv6 ranges — the v6 mirror of reservedRanges (C2, audit 2026-06-11).
+//
+// The Trie above is IPv4-only (it stores 4-byte keys and silently skips v6), so
+// IPv6 classification is done by linear netip.Prefix.Contains over this small,
+// fixed list. The drop/direct split mirrors the IPv4 reasoning exactly:
+//
+//   - drop=true (DROP): addresses with no listener reachable via the physical
+//     NIC. Routing them to proxy.NewDirect() opens a socket against a host that
+//     never answers — the Bug #7 ephemeral-port-exhaustion / CONNECT_FAIL path,
+//     now on IPv6. Covers loopback (::1), link-local (fe80::/10), multicast
+//     (ff00::/8), the unspecified address (::/128), and IPv6 cloud metadata
+//     (fd00:ec2::254 — AWS IMDS over IPv6).
+//   - drop=false (DIRECT): ULA fc00::/7 — the v6 analogue of RFC1918 LAN. Real
+//     local machines reachable via the NIC; keep them outside the tunnel.
+//
+// Order matters: fd00:ec2::254/128 is itself inside fc00::/7 (ULA), so the
+// metadata /128 MUST be classified before the ULA /7. isUnreachableReservedIPv6
+// checks the drop subset first, which guarantees that precedence.
+var reservedRangesV6 = []reservedRange{
+	{"::1/128", "RFC 4291 — loopback; never via physical NIC, drop", true},
+	{"::/128", "RFC 4291 — unspecified address; no real destination, drop", true},
+	{"fe80::/10", "RFC 4291 — link-local; not reachable as unicast dst via NIC, drop", true},
+	{"ff00::/8", "RFC 4291 — multicast; no unicast listener via NIC, drop", true},
+	{"fd00:ec2::254/128", "AWS IMDS IPv6 metadata endpoint; per-VM-local, unreachable on non-cloud host, drop", true},
+	{"fc00::/7", "RFC 4193 — unique local address (ULA); user's LAN, reachable via NIC", false},
+}
+
+var (
+	reservedV6Once     sync.Once
+	reservedPrefixesV6 []netip.Prefix // all reservedRangesV6 (drop + direct)
+	unreachablePfxV6   []netip.Prefix // subset with drop=true
+)
+
+func buildReservedV6() {
+	for _, r := range reservedRangesV6 {
+		p, err := netip.ParsePrefix(r.cidr)
+		if err != nil {
+			panic("bypassroute: malformed reserved IPv6 CIDR " + r.cidr + ": " + err.Error())
+		}
+		p = p.Masked()
+		reservedPrefixesV6 = append(reservedPrefixesV6, p)
+		if r.drop {
+			unreachablePfxV6 = append(unreachablePfxV6, p)
+		}
+	}
+}
+
 var (
 	reservedTrieOnce sync.Once
 	reservedTrie     *Trie // all reserved ranges
@@ -114,4 +161,39 @@ func isUnreachableReserved(addr netip.Addr) bool {
 		return false
 	}
 	return unreachableTrieInstance().Match(addr)
+}
+
+// isReservedIPv6 reports whether addr matches any reservedRangesV6 entry (drop
+// or direct). addr MUST already be Unmap'd by the caller; non-v6 returns false.
+// IPv4-mapped v6 is handled on the IPv4 path after Unmap, not here.
+func isReservedIPv6(addr netip.Addr) bool {
+	if !addr.Is6() || addr.Is4In6() {
+		return false
+	}
+	reservedV6Once.Do(buildReservedV6)
+	for _, p := range reservedPrefixesV6 {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// isUnreachableReservedIPv6 reports whether addr is in an IPv6 reserved range
+// marked drop=true — a host unreachable via the physical NIC that must be
+// DROPPED rather than handed to the direct dialer (the v6 mirror of Bug #7).
+// addr MUST already be Unmap'd; non-v6 returns false. The drop subset is checked
+// independently of the direct set so that the metadata /128 (which lives inside
+// the ULA /7) is correctly classified as DROP regardless of list order.
+func isUnreachableReservedIPv6(addr netip.Addr) bool {
+	if !addr.Is6() || addr.Is4In6() {
+		return false
+	}
+	reservedV6Once.Do(buildReservedV6)
+	for _, p := range unreachablePfxV6 {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
