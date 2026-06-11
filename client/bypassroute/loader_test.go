@@ -28,6 +28,44 @@ func TestLoader_OverrideAdds(t *testing.T) {
 	}
 }
 
+func TestSnapshotPrefixes_ReturnsIncludeMinusExclude(t *testing.T) {
+	r, err := Load(Source{Embedded: true})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	ps := SnapshotPrefixes(r)
+	if len(ps) == 0 {
+		t.Fatalf("expected RU prefixes")
+	}
+	for _, p := range ps {
+		if !p.Addr().Is4() {
+			t.Fatalf("v4 only, got %s", p)
+		}
+	}
+}
+
+func TestSnapshotPrefixes_DropsExcluded(t *testing.T) {
+	override := AdminOverride{
+		Adds:     []netip.Prefix{netip.MustParsePrefix("100.99.99.0/24")},
+		Excludes: []netip.Prefix{netip.MustParsePrefix("100.99.99.0/24")},
+	}
+	r, err := Load(Source{Embedded: false, Override: &override})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for _, p := range SnapshotPrefixes(r) {
+		if p == netip.MustParsePrefix("100.99.99.0/24") {
+			t.Fatalf("excluded prefix must not appear in snapshot")
+		}
+	}
+}
+
+func TestSnapshotPrefixes_NilSafe(t *testing.T) {
+	if ps := SnapshotPrefixes(nil); ps != nil {
+		t.Fatalf("nil Resolved → nil snapshot, got %v", ps)
+	}
+}
+
 func TestLoader_OverrideExcludes(t *testing.T) {
 	// Setup: embedded carries 213.180.193.0/24. Override excludes 213.180.193.128/25.
 	override := AdminOverride{

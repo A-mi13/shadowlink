@@ -14,6 +14,23 @@ type State struct {
 	DNSBackup  DNSBackup       `json:"dns_backup"`
 	IPv6Backup IPv6Backup      `json:"ipv6_backup"`
 	KillSwitch KillSwitchState `json:"kill_switch"`
+
+	// SplitTunnel records whether explicit split-tunnel was active so restore
+	// is honest about what was applied.
+	SplitTunnel bool `json:"split_tunnel,omitempty"`
+	// WFPActive (Windows) is true when RU CIDR WFP filters were installed under
+	// our provider GUID and must be removed via DeleteByProvider on cleanup.
+	WFPActive bool `json:"wfp_active,omitempty"`
+	// PFEnabledByUs (Darwin) is true when we ran `pfctl -E` ourselves and must
+	// run `pfctl -d` on disable to restore the prior disabled state.
+	PFEnabledByUs bool `json:"pf_enabled_by_us,omitempty"`
+	// PFRulesPath (Darwin) is the on-disk pf rules file path (app-dir, not /tmp)
+	// to clean up.
+	PFRulesPath string `json:"pf_rules_path,omitempty"`
+	// ResolvConfWasSymlink (Linux) records that /etc/resolv.conf was a symlink
+	// (managed by resolved/NM) so restore re-creates it instead of writing.
+	ResolvConfWasSymlink bool   `json:"resolv_conf_was_symlink,omitempty"`
+	ResolvConfTarget     string `json:"resolv_conf_target,omitempty"`
 }
 
 // DNSBackup stores original DNS settings so they can be restored.

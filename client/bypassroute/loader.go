@@ -31,6 +31,11 @@ type Source struct {
 type Resolved struct {
 	include *Trie
 	exclude *Trie
+	// prefixes records every IPv4 include prefix inserted at Load time, in
+	// insertion order. Used by SnapshotPrefixes to export the RU CIDR list for
+	// leakguard split-tunnel allow-rules WITHOUT walking the trie. Excludes are
+	// applied at snapshot time (skip prefixes whose network is excluded).
+	prefixes []netip.Prefix
 }
 
 // Match returns true iff include matches AND exclude does not match.
@@ -74,25 +79,59 @@ func (r *Resolved) Excludes() int {
 func Load(src Source) (*Resolved, error) {
 	include := New()
 	exclude := New()
+	var prefixes []netip.Prefix
+	insert := func(p netip.Prefix) {
+		if !p.Addr().Is4() {
+			return
+		}
+		include.Insert(p)
+		prefixes = append(prefixes, p)
+	}
 	if src.Embedded {
-		prefixes, err := loadEmbedded()
+		embedded, err := loadEmbedded()
 		if err != nil {
 			return nil, fmt.Errorf("load embedded: %w", err)
 		}
-		for _, p := range prefixes {
-			include.Insert(p)
+		for _, p := range embedded {
+			insert(p)
 		}
 		for _, p := range extraRussianNetipPrefixes() {
-			include.Insert(p)
+			insert(p)
 		}
 	}
 	if src.Override != nil {
 		for _, p := range src.Override.Adds {
-			include.Insert(p)
+			insert(p)
 		}
 		for _, p := range src.Override.Excludes {
 			exclude.Insert(p)
 		}
 	}
-	return &Resolved{include: include, exclude: exclude}, nil
+	return &Resolved{include: include, exclude: exclude, prefixes: prefixes}, nil
+}
+
+// SnapshotPrefixes returns the IPv4 include prefixes (RU CIDR baseline + admin
+// adds) with excluded prefixes removed, for use by leakguard split-tunnel
+// allow-rules. Returns a fresh copy; safe to mutate. nil Resolved → nil.
+//
+// "Excluded" here means the prefix's network address is matched by the exclude
+// trie — a conservative drop that keeps fully-excluded prefixes out of the
+// allow-list (firewall fail-secure: when in doubt, do not allow).
+func SnapshotPrefixes(r *Resolved) []netip.Prefix {
+	if r == nil {
+		return nil
+	}
+	seen := make(map[netip.Prefix]struct{}, len(r.prefixes))
+	out := make([]netip.Prefix, 0, len(r.prefixes))
+	for _, p := range r.prefixes {
+		if r.exclude != nil && r.exclude.Match(p.Addr()) {
+			continue
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	return out
 }

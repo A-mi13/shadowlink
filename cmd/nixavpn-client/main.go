@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -228,42 +229,90 @@ func main() {
 				tun = tun.WithInProcessDialer(d)
 			}
 		}
-		if err := tun.Start(); err != nil {
-			fmt.Fprintf(os.Stderr, "ошибка запуска TUN-туннеля: %v\n", err)
-			_ = eng.Close()
-			os.Exit(1)
-		}
 
+		// H1/C3-b: create LeakGuard BEFORE tun.Start() so its crash-recovery
+		// (Windows New() → removeKillSwitch + WFP DeleteByProvider) clears any
+		// stale SL-Block-All / WFP filters left by a previous crash BEFORE any
+		// network activity — otherwise a leftover block could deadlock startup.
 		lg, err = leakguard.New(leakguardStatePath())
 		if err != nil {
 			slog.Warn("не удалось создать LeakGuard", "err", err)
 			lg = nil
 		}
 
-		if lg != nil {
-			tunName := tunDeviceName()
-			// Strip tun:// prefix for Windows Wintun device names.
-			tunName = strings.TrimPrefix(tunName, "tun://")
-
-			// Parse ALL resolved server IPs for firewall rules.
-			// CDN returns multiple IPs — kill switch must allow ALL of them
-			// or download stream ACKs to the "other" IP get blocked.
-			var parsedIPs []net.IP
-			for _, ipStr := range serverIPs {
-				if ip := net.ParseIP(ipStr); ip != nil {
-					parsedIPs = append(parsedIPs, ip)
-				}
+		// Build the LeakGuard config (incl. explicit split-tunnel) up front so
+		// PreLock and Enable share it.
+		tunName := tunDeviceName()
+		tunName = strings.TrimPrefix(tunName, "tun://")
+		// Parse ALL resolved server IPs for firewall rules. CDN returns multiple
+		// IPs — kill switch must allow ALL of them or download stream ACKs to the
+		// "other" IP get blocked.
+		var parsedIPs []net.IP
+		for _, ipStr := range serverIPs {
+			if ip := net.ParseIP(ipStr); ip != nil {
+				parsedIPs = append(parsedIPs, ip)
 			}
-			lgCfg := leakguard.LeakGuardConfig{
-				TunName:    tunName,
-				ServerPort: resolveServerPort(resolvedProtocol, cfg),
-				ServerIP:   parsedIPs[0],
-				ServerIPs:  parsedIPs,
-			}
+		}
 
+		// C3: explicit split-tunnel (default OFF = fail-secure). When ON and
+		// bypass is enabled, export the RU CIDR snapshot so the kill switch
+		// allows bypass ranges past it (LAN always; RU via WFP/nft/pf). This
+		// traffic is NOT protected by the kill switch — log a clear WARN.
+		splitTunnel := splitTunnelEnabledFromEnv()
+		var bypassRanges []netip.Prefix
+		if bypassOn && splitTunnel {
+			if resolved, rerr := bypassroute.Load(bypassroute.Source{Embedded: true, Override: override}); rerr == nil {
+				bypassRanges = bypassroute.SnapshotPrefixes(resolved)
+			} else {
+				slog.Warn("split-tunnel: не удалось загрузить bypass-диапазоны", "err", rerr)
+			}
+			slog.Warn("split-tunnel ВКЛЮЧЁН — bypass-трафик (RU CIDR + LAN) идёт МИМО kill-switch и НЕ защищён им",
+				"ranges", len(bypassRanges))
+		}
+
+		var lgCfg leakguard.LeakGuardConfig
+		if len(parsedIPs) > 0 {
+			lgCfg = leakguard.LeakGuardConfig{
+				TunName:      tunName,
+				ServerPort:   resolveServerPort(resolvedProtocol, cfg),
+				ServerIP:     parsedIPs[0],
+				ServerIPs:    parsedIPs,
+				SplitTunnel:  splitTunnel,
+				BypassRanges: bypassRanges,
+			}
+		}
+
+		// H2: pre-lock DNS+IPv6 BEFORE tun.Start() — closes the leak window
+		// between tun.Start() and the kill switch. PreLock is idempotent;
+		// Enable later installs the kill switch without redoing DNS/IPv6.
+		if lg != nil && len(parsedIPs) > 0 {
+			if err := lg.PreLock(lgCfg); err != nil {
+				slog.Warn("LeakGuard pre-lock не удался — продолжаем, Enable попробует снова", "err", err)
+			}
+		}
+
+		if err := tun.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "ошибка запуска TUN-туннеля: %v\n", err)
+			if lg != nil {
+				_ = lg.Disable() // roll back PreLock DNS/IPv6
+			}
+			_ = eng.Close()
+			os.Exit(1)
+		}
+
+		if lg != nil && len(parsedIPs) > 0 {
 			if err := lg.Enable(lgCfg); err != nil {
-				slog.Warn("не удалось включить LeakGuard", "err", err)
-				lg = nil
+				slog.Error("LeakGuard НЕ включён — VPN работает БЕЗ kill-switch/DNS-защиты", "err", err)
+				fmt.Fprintln(os.Stderr, "ВНИМАНИЕ: LeakGuard не активирован — защита от утечек ВЫКЛЮЧЕНА. "+
+					"Установите SHADOWLINK_LEAKGUARD_STRICT=1 чтобы прерывать запуск в этом случае.")
+				if leakguardStrictFromEnv() {
+					_ = lg.Disable()
+					_ = tun.Stop()
+					_ = eng.Close()
+					os.Exit(1)
+				}
+				// H2: НЕ обнуляем lg — сохраняем для гарантированного Disable() в
+				// shutdown, чтобы откатить частично применённые PreLock-настройки.
 			} else {
 				slog.Info("LeakGuard включён")
 			}
@@ -594,6 +643,31 @@ func adminOverrideEnabled() bool {
 		return false
 	default:
 		return true
+	}
+}
+
+// splitTunnelEnabledFromEnv reports whether explicit split-tunnel is enabled.
+// Default OFF (fail-secure): bypass ranges are NOT allowed past the kill switch
+// unless the user explicitly opts in. Only "1"/"true"/"yes"/"on" enable it.
+// Opt-IN semantics (opposite of bypassEnabledFromEnv) — safe value = off.
+func splitTunnelEnabledFromEnv() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SHADOWLINK_SPLIT_TUNNEL"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// leakguardStrictFromEnv reports whether a LeakGuard Enable failure should abort
+// startup (os.Exit) instead of continuing without leak protection. Default OFF.
+// Opt-IN: only "1"/"true"/"yes"/"on" enable strict mode.
+func leakguardStrictFromEnv() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SHADOWLINK_LEAKGUARD_STRICT"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
 	}
 }
 

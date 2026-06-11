@@ -5,27 +5,31 @@ package leakguard
 import (
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
 
-const (
-	pfRulesPath = "/tmp/shadowlink-pf.rules"
-	pfAnchor    = "shadowlink"
-)
+const pfAnchor = "shadowlink"
 
 // darwinGuard implements LeakGuard for macOS using networksetup and pf.
 type darwinGuard struct {
-	statePath string
+	statePath   string
+	preLocked   bool // PreLock applied DNS+IPv6 → Enable must not redo them
+	pfRulesPath string
+}
+
+// appDir returns the directory used for the pf rules file (state-file dir).
+func (g *darwinGuard) appDir() string {
+	return filepath.Dir(g.statePath)
 }
 
 // New returns a platform-specific LeakGuard implementation.
 // statePath is used for crash-recovery state persistence.
 func New(statePath string) (LeakGuard, error) {
-	g := &darwinGuard{statePath: statePath}
+	g := &darwinGuard{statePath: statePath, pfRulesPath: pfRulesPath(filepath.Dir(statePath))}
 
 	// If a previous state file exists, we may have crashed — try to restore.
 	if StateExists(statePath) {
@@ -40,6 +44,38 @@ func New(statePath string) (LeakGuard, error) {
 	return g, nil
 }
 
+// PreLock applies DNS+IPv6 protection BEFORE the TUN comes up (H2). Idempotent.
+func (g *darwinGuard) PreLock(cfg LeakGuardConfig) error {
+	if g.preLocked {
+		return nil
+	}
+	state := &State{EnabledAt: time.Now(), Platform: "darwin"}
+
+	dnsBackup, err := g.backupDNS()
+	if err != nil {
+		slog.Warn("leakguard: pre-lock DNS backup failed, continuing", "error", err)
+	} else {
+		state.DNSBackup = dnsBackup
+	}
+	if err := g.setDNS([]string{"1.1.1.1", "8.8.8.8"}); err != nil {
+		slog.Warn("leakguard: pre-lock set DNS failed, continuing", "error", err)
+	}
+	_ = g.flushDNS()
+
+	ipv6Backup, err := g.disableIPv6()
+	if err != nil {
+		slog.Warn("leakguard: pre-lock disable IPv6 failed, continuing", "error", err)
+	}
+	state.IPv6Backup = ipv6Backup
+
+	if err := SaveState(g.statePath, state); err != nil {
+		slog.Warn("leakguard: pre-lock save state failed", "error", err)
+	}
+	g.preLocked = true
+	slog.Info("leakguard: pre-lock applied (DNS+IPv6)")
+	return nil
+}
+
 // Enable activates DNS leak protection, disables IPv6, and installs pf kill-switch rules.
 func (g *darwinGuard) Enable(cfg LeakGuardConfig) error {
 	if err := cfg.Validate(); err != nil {
@@ -49,35 +85,41 @@ func (g *darwinGuard) Enable(cfg LeakGuardConfig) error {
 		"server", cfg.ServerIP, "port", cfg.ServerPort, "tun", cfg.TunName)
 
 	state := &State{
-		EnabledAt: time.Now(),
-		Platform:  "darwin",
+		EnabledAt:   time.Now(),
+		Platform:    "darwin",
+		SplitTunnel: cfg.SplitTunnel,
 	}
 
-	// --- DNS ---
-	dnsBackup, err := g.backupDNS()
-	if err != nil {
-		return fmt.Errorf("leakguard: backup DNS: %w", err)
-	}
-	state.DNSBackup = dnsBackup
+	if g.preLocked {
+		if prev, perr := LoadState(g.statePath); perr == nil {
+			state.DNSBackup = prev.DNSBackup
+			state.IPv6Backup = prev.IPv6Backup
+		}
+	} else {
+		// --- DNS ---
+		dnsBackup, err := g.backupDNS()
+		if err != nil {
+			return fmt.Errorf("leakguard: backup DNS: %w", err)
+		}
+		state.DNSBackup = dnsBackup
 
-	if err := g.setDNS([]string{"1.1.1.1", "8.8.8.8"}); err != nil {
-		slog.Warn("leakguard: failed to set DNS servers, continuing", "error", err)
-	}
+		if err := g.setDNS([]string{"1.1.1.1", "8.8.8.8"}); err != nil {
+			slog.Warn("leakguard: failed to set DNS servers, continuing", "error", err)
+		}
+		if err := g.flushDNS(); err != nil {
+			slog.Warn("leakguard: failed to flush DNS cache", "error", err)
+		}
 
-	if err := g.flushDNS(); err != nil {
-		slog.Warn("leakguard: failed to flush DNS cache", "error", err)
+		// --- IPv6 ---
+		ipv6Backup, err := g.disableIPv6()
+		if err != nil {
+			slog.Warn("leakguard: failed to disable IPv6, continuing", "error", err)
+		}
+		state.IPv6Backup = ipv6Backup
 	}
-
-	// --- IPv6 ---
-	ipv6Backup, err := g.disableIPv6()
-	if err != nil {
-		slog.Warn("leakguard: failed to disable IPv6, continuing", "error", err)
-	}
-	state.IPv6Backup = ipv6Backup
 
 	// --- Kill Switch (pf) ---
-	serverIP := cfg.ServerIP.String()
-	ksState, err := g.enableKillSwitch(serverIP, cfg.ServerPort, cfg.TunName, cfg.ExtraEscapeIPs)
+	ksState, pfEnabledByUs, err := g.enableKillSwitch(cfg)
 	if err != nil {
 		// Kill switch is critical — roll back and return error.
 		slog.Error("leakguard: kill switch failed, rolling back", "error", err)
@@ -86,6 +128,8 @@ func (g *darwinGuard) Enable(cfg LeakGuardConfig) error {
 		return fmt.Errorf("leakguard: enable kill switch: %w", err)
 	}
 	state.KillSwitch = ksState
+	state.PFEnabledByUs = pfEnabledByUs
+	state.PFRulesPath = g.pfRulesPath
 
 	// Persist state for crash recovery.
 	if err := SaveState(g.statePath, state); err != nil {
@@ -112,7 +156,15 @@ func (g *darwinGuard) Disable() error {
 	var firstErr error
 
 	// --- Kill Switch ---
-	if err := g.disableKillSwitch(); err != nil {
+	pfEnabledByUs := false
+	rulesPath := g.pfRulesPath
+	if state != nil {
+		pfEnabledByUs = state.PFEnabledByUs
+		if state.PFRulesPath != "" {
+			rulesPath = state.PFRulesPath
+		}
+	}
+	if err := g.disableKillSwitch(pfEnabledByUs, rulesPath); err != nil {
 		slog.Warn("leakguard: failed to disable kill switch", "error", err)
 		if firstErr == nil {
 			firstErr = err
@@ -300,63 +352,79 @@ func (g *darwinGuard) restoreIPv6(backup IPv6Backup) error {
 
 // ---------- Kill Switch (pf) helpers ----------
 
-// enableKillSwitch writes pf anchor rules and loads them.
-func (g *darwinGuard) enableKillSwitch(serverIP string, serverPort int, tunName string, extraIPs []net.IP) (KillSwitchState, error) {
-	// Order matters with "quick": first matching rule wins.
-	// pass rules MUST come before block, otherwise server escape route is blocked.
-	rules := []string{
-		fmt.Sprintf("pass out quick proto {tcp, udp} to %s port %d", serverIP, serverPort),
-		"pass out quick on lo0 all",
-		"pass out quick proto udp from any port 68 to any port 67",
-	}
-	// Allow UDP to TURN relay IPs (WB TURN escape route)
-	for _, ip := range extraIPs {
-		rules = append(rules, fmt.Sprintf("pass out quick proto udp to %s", ip.String()))
-	}
-	rules = append(rules,
-		fmt.Sprintf("pass out quick on %s all", tunName),
-		"block out all",
-	)
+// enableKillSwitch writes pf anchor rules (from the pure formatter) and loads
+// them. It verifies pf is enabled (M4); if disabled it runs `pfctl -E` and
+// records that we did so (PFEnabledByUs) for rollback on Disable. The rules
+// file lives in the app dir, not /tmp (M5). Returns the kill-switch state and
+// whether we enabled pf ourselves.
+func (g *darwinGuard) enableKillSwitch(cfg LeakGuardConfig) (KillSwitchState, bool, error) {
+	plan := BuildKillSwitchPlan(cfg, true /*pf table scales*/)
+	rules := darwinPFRules(plan)
 
+	rulesPath := g.pfRulesPath
 	content := strings.Join(rules, "\n") + "\n"
-	if err := os.WriteFile(pfRulesPath, []byte(content), 0600); err != nil {
-		return KillSwitchState{}, fmt.Errorf("write pf rules to %s: %w", pfRulesPath, err)
+	if err := os.WriteFile(rulesPath, []byte(content), 0600); err != nil {
+		return KillSwitchState{}, false, fmt.Errorf("write pf rules to %s: %w", rulesPath, err)
 	}
 
 	// Load rules into the shadowlink anchor.
-	// We intentionally do NOT run "pfctl -e" because pf is already enabled on macOS 10.15+.
-	out, err := exec.Command("pfctl", "-a", pfAnchor, "-f", pfRulesPath).CombinedOutput()
+	out, err := exec.Command("pfctl", "-a", pfAnchor, "-f", rulesPath).CombinedOutput()
 	if err != nil {
-		// Clean up the temp file on failure.
-		os.Remove(pfRulesPath)
-		return KillSwitchState{}, fmt.Errorf("pfctl load anchor: %w (output: %s)", err, string(out))
+		os.Remove(rulesPath)
+		return KillSwitchState{}, false, fmt.Errorf("pfctl load anchor: %w (output: %s)", err, string(out))
+	}
+
+	// M4: verify pf is actually enabled; if not, enable it ourselves and record.
+	pfEnabledByUs := false
+	info, _ := exec.Command("pfctl", "-s", "info").CombinedOutput()
+	if !parsePFEnabled(string(info)) {
+		if eout, eerr := exec.Command("pfctl", "-E").CombinedOutput(); eerr != nil {
+			slog.Warn("leakguard: pf is disabled and `pfctl -E` failed — kill switch may be inactive",
+				"error", eerr, "output", string(eout))
+		} else {
+			pfEnabledByUs = true
+			slog.Info("leakguard: pf was disabled, enabled by LeakGuard (will disable on cleanup)")
+		}
 	}
 
 	slog.Info("leakguard: pf kill switch enabled",
-		"anchor", pfAnchor, "tun", tunName, "server", serverIP)
+		"anchor", pfAnchor, "tun", cfg.TunName, "split_tunnel", cfg.SplitTunnel)
 
 	return KillSwitchState{
 		Rules:      rules,
-		ServerIP:   serverIP,
-		ServerPort: serverPort,
-		TunName:    tunName,
+		ServerIP:   strings.Join(plan.ServerIPs, ","),
+		ServerPort: cfg.ServerPort,
+		TunName:    cfg.TunName,
 		Backend:    "pf",
-	}, nil
+	}, pfEnabledByUs, nil
 }
 
-// disableKillSwitch flushes the pf anchor and removes the temp rules file.
-func (g *darwinGuard) disableKillSwitch() error {
+// disableKillSwitch flushes the pf anchor, optionally disables pf if we enabled
+// it, and removes the rules file.
+func (g *darwinGuard) disableKillSwitch(pfEnabledByUs bool, rulesPath string) error {
 	out, err := exec.Command("pfctl", "-a", pfAnchor, "-F", "all").CombinedOutput()
 	if err != nil {
 		slog.Warn("leakguard: pfctl flush anchor failed",
 			"error", err, "output", string(out))
 	}
 
-	if err := os.Remove(pfRulesPath); err != nil && !os.IsNotExist(err) {
+	if pfEnabledByUs {
+		if dout, derr := exec.Command("pfctl", "-d").CombinedOutput(); derr != nil {
+			slog.Warn("leakguard: pfctl -d (restore disabled) failed", "error", derr, "output", string(dout))
+		}
+	}
+
+	if rulesPath == "" {
+		rulesPath = g.pfRulesPath
+	}
+	if err := os.Remove(rulesPath); err != nil && !os.IsNotExist(err) {
 		slog.Warn("leakguard: failed to remove pf rules file",
-			"path", pfRulesPath, "error", err)
+			"path", rulesPath, "error", err)
 	}
 
 	slog.Info("leakguard: pf kill switch disabled")
 	return nil
 }
+
+// Ensure darwinGuard satisfies the interface at compile time.
+var _ LeakGuard = (*darwinGuard)(nil)

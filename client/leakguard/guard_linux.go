@@ -14,8 +14,11 @@ import (
 // linuxGuard implements LeakGuard for Linux using iptables/nftables,
 // resolv.conf/systemd-resolved for DNS, and sysctl for IPv6.
 type linuxGuard struct {
-	statePath string
-	backend   string // "iptables" or "nftables"
+	statePath     string
+	backend       string // "iptables" or "nftables"
+	preLocked     bool   // PreLock applied DNS+IPv6 → Enable must not redo them
+	wasSymlink    bool   // /etc/resolv.conf was a symlink at backup time (M2)
+	symlinkTarget string // resolved symlink target (for restore)
 }
 
 // New returns a platform-specific LeakGuard implementation.
@@ -34,6 +37,43 @@ func New(statePath string) (LeakGuard, error) {
 	return g, nil
 }
 
+// PreLock applies DNS+IPv6 protection BEFORE the TUN comes up (H2). Idempotent.
+func (g *linuxGuard) PreLock(cfg LeakGuardConfig) error {
+	if g.preLocked {
+		return nil
+	}
+	state := &State{EnabledAt: time.Now(), Platform: "linux"}
+
+	dnsBackup, err := g.backupDNS()
+	if err != nil {
+		slog.Warn("leakguard: pre-lock dns backup failed, continuing", "err", err)
+	} else {
+		state.DNSBackup = dnsBackup
+		state.ResolvConfWasSymlink = g.wasSymlink
+		state.ResolvConfTarget = g.symlinkTarget
+	}
+	if err := g.setDNS(); err != nil {
+		slog.Warn("leakguard: pre-lock set dns failed, continuing", "err", err)
+	}
+
+	ipv6Backup, err := g.backupIPv6()
+	if err != nil {
+		slog.Warn("leakguard: pre-lock ipv6 backup failed, continuing", "err", err)
+	} else {
+		state.IPv6Backup = ipv6Backup
+	}
+	if err := g.disableIPv6(); err != nil {
+		slog.Warn("leakguard: pre-lock disable ipv6 failed, continuing", "err", err)
+	}
+
+	if err := SaveState(g.statePath, state); err != nil {
+		slog.Warn("leakguard: pre-lock save state failed", "err", err)
+	}
+	g.preLocked = true
+	slog.Info("leakguard: pre-lock applied (DNS+IPv6)")
+	return nil
+}
+
 // Enable activates DNS leak protection, IPv6 disable, and kill switch.
 func (g *linuxGuard) Enable(cfg LeakGuardConfig) error {
 	if err := cfg.Validate(); err != nil {
@@ -41,11 +81,12 @@ func (g *linuxGuard) Enable(cfg LeakGuardConfig) error {
 	}
 	g.backend = detectBackend()
 	slog.Info("leakguard: enabling", "backend", g.backend, "tun", cfg.TunName,
-		"server", cfg.ServerIP, "port", cfg.ServerPort)
+		"server", cfg.ServerIP, "port", cfg.ServerPort, "split_tunnel", cfg.SplitTunnel)
 
 	state := &State{
-		EnabledAt: time.Now(),
-		Platform:  "linux",
+		EnabledAt:   time.Now(),
+		Platform:    "linux",
+		SplitTunnel: cfg.SplitTunnel,
 		KillSwitch: KillSwitchState{
 			ServerIP:   cfg.ServerIP.String(),
 			ServerPort: cfg.ServerPort,
@@ -54,31 +95,39 @@ func (g *linuxGuard) Enable(cfg LeakGuardConfig) error {
 		},
 	}
 
-	// 1. Backup and set DNS.
-	dnsBackup, err := g.backupDNS()
-	if err != nil {
-		slog.Warn("leakguard: dns backup failed, continuing", "err", err)
+	if g.preLocked {
+		// Reuse DNS/IPv6 backups captured by PreLock.
+		if prev, err := LoadState(g.statePath); err == nil {
+			state.DNSBackup = prev.DNSBackup
+			state.IPv6Backup = prev.IPv6Backup
+			state.ResolvConfWasSymlink = prev.ResolvConfWasSymlink
+			state.ResolvConfTarget = prev.ResolvConfTarget
+		}
 	} else {
-		state.DNSBackup = dnsBackup
+		dnsBackup, err := g.backupDNS()
+		if err != nil {
+			slog.Warn("leakguard: dns backup failed, continuing", "err", err)
+		} else {
+			state.DNSBackup = dnsBackup
+			state.ResolvConfWasSymlink = g.wasSymlink
+			state.ResolvConfTarget = g.symlinkTarget
+		}
+		if err := g.setDNS(); err != nil {
+			slog.Warn("leakguard: set dns failed, continuing", "err", err)
+		}
+
+		ipv6Backup, err := g.backupIPv6()
+		if err != nil {
+			slog.Warn("leakguard: ipv6 backup failed, continuing", "err", err)
+		} else {
+			state.IPv6Backup = ipv6Backup
+		}
+		if err := g.disableIPv6(); err != nil {
+			slog.Warn("leakguard: disable ipv6 failed, continuing", "err", err)
+		}
 	}
 
-	if err := g.setDNS(); err != nil {
-		slog.Warn("leakguard: set dns failed, continuing", "err", err)
-	}
-
-	// 2. Backup and disable IPv6.
-	ipv6Backup, err := g.backupIPv6()
-	if err != nil {
-		slog.Warn("leakguard: ipv6 backup failed, continuing", "err", err)
-	} else {
-		state.IPv6Backup = ipv6Backup
-	}
-
-	if err := g.disableIPv6(); err != nil {
-		slog.Warn("leakguard: disable ipv6 failed, continuing", "err", err)
-	}
-
-	// 3. Enable kill switch.
+	// Enable kill switch.
 	rules, err := g.enableKillSwitch(cfg)
 	if err != nil {
 		// Kill switch failure is critical — roll back what we did.
@@ -88,7 +137,6 @@ func (g *linuxGuard) Enable(cfg LeakGuardConfig) error {
 	}
 	state.KillSwitch.Rules = rules
 
-	// 4. Persist state for crash recovery.
 	if err := SaveState(g.statePath, state); err != nil {
 		return fmt.Errorf("leakguard: save state: %w", err)
 	}
@@ -108,6 +156,8 @@ func (g *linuxGuard) Disable() error {
 	}
 
 	g.backend = state.KillSwitch.Backend
+	g.wasSymlink = state.ResolvConfWasSymlink
+	g.symlinkTarget = state.ResolvConfTarget
 
 	var errs []string
 
@@ -161,8 +211,18 @@ func detectBackend() string {
 
 const resolvConfPath = "/etc/resolv.conf"
 
-// backupDNS reads /etc/resolv.conf and stores its full content.
+// backupDNS reads /etc/resolv.conf, recording whether it is a symlink (managed
+// by systemd-resolved / NetworkManager — M2) so restore re-creates the link
+// instead of clobbering a regular file in its place.
 func (g *linuxGuard) backupDNS() (DNSBackup, error) {
+	g.wasSymlink = false
+	g.symlinkTarget = ""
+	if fi, err := os.Lstat(resolvConfPath); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		g.wasSymlink = true
+		if tgt, lerr := os.Readlink(resolvConfPath); lerr == nil {
+			g.symlinkTarget = tgt
+		}
+	}
 	data, err := os.ReadFile(resolvConfPath)
 	if err != nil {
 		return DNSBackup{}, fmt.Errorf("read resolv.conf: %w", err)
@@ -177,17 +237,20 @@ func (g *linuxGuard) backupDNS() (DNSBackup, error) {
 	}, nil
 }
 
-// setDNS configures safe DNS servers. Uses systemd-resolved if active,
-// otherwise writes directly to /etc/resolv.conf.
+// setDNS configures safe DNS servers. When resolv.conf is a symlink or
+// systemd-resolved/NetworkManager are managing DNS, it defers to the manager
+// (resolvectl) instead of overwriting the (managed) file (M2/L5).
 func (g *linuxGuard) setDNS() error {
-	if isSystemdResolvedActive() {
+	plan := resolvConfWritePlan(g.wasSymlink, g.symlinkTarget)
+	if plan.useResolvectl || isSystemdResolvedActive() || isNetworkManagerActive() {
 		return runCmd("resolvectl", "dns", "1.1.1.1", "8.8.8.8")
 	}
 	content := "# Set by ShadowLink LeakGuard\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n"
 	return os.WriteFile(resolvConfPath, []byte(content), 0644)
 }
 
-// restoreDNS writes back the original resolv.conf content.
+// restoreDNS writes back the original resolv.conf content. If the file was a
+// symlink, it re-creates the symlink rather than leaving a regular file.
 func (g *linuxGuard) restoreDNS(backup DNSBackup) error {
 	if len(backup.Entries) == 0 || len(backup.Entries[0].Servers) == 0 {
 		return nil
@@ -197,8 +260,7 @@ func (g *linuxGuard) restoreDNS(backup DNSBackup) error {
 		return nil
 	}
 
-	if isSystemdResolvedActive() {
-		// Extract nameserver lines from the original content and pass to resolvectl.
+	if isSystemdResolvedActive() || isNetworkManagerActive() {
 		var servers []string
 		for _, line := range strings.Split(original, "\n") {
 			line = strings.TrimSpace(line)
@@ -213,6 +275,14 @@ func (g *linuxGuard) restoreDNS(backup DNSBackup) error {
 		return nil
 	}
 
+	// If the original was a symlink, re-create the link (M2). Best-effort.
+	if g.wasSymlink && g.symlinkTarget != "" {
+		_ = os.Remove(resolvConfPath)
+		if err := os.Symlink(g.symlinkTarget, resolvConfPath); err == nil {
+			return nil
+		}
+		// Fall through to writing the backed-up content if symlink fails.
+	}
 	return os.WriteFile(resolvConfPath, []byte(original), 0644)
 }
 
@@ -222,33 +292,78 @@ func isSystemdResolvedActive() bool {
 	return err == nil
 }
 
+// isNetworkManagerActive checks if NetworkManager is managing DNS (M2).
+func isNetworkManagerActive() bool {
+	err := exec.Command("systemctl", "is-active", "NetworkManager").Run()
+	return err == nil
+}
+
 // ---------------------------------------------------------------------------
 // IPv6
 // ---------------------------------------------------------------------------
 
-// backupIPv6 reads the current IPv6 disable sysctl value.
+// backupIPv6 records the original disable_ipv6 value for `all` (used as the
+// restore baseline). DisabledInterfaces holds the full set of sysctl keys we
+// will disable so restore re-enables exactly what we touched (M3).
 func (g *linuxGuard) backupIPv6() (IPv6Backup, error) {
 	out, err := exec.Command("sysctl", "-n", "net.ipv6.conf.all.disable_ipv6").CombinedOutput()
 	if err != nil {
 		return IPv6Backup{}, fmt.Errorf("sysctl read ipv6: %w", err)
 	}
+	keys := ipv6DisableSysctlKeys(listIPv6Interfaces())
 	return IPv6Backup{
-		DisabledInterfaces: []string{"all"},
+		DisabledInterfaces: keys,
 		OriginalSysctl:     strings.TrimSpace(string(out)),
 	}, nil
 }
 
-// disableIPv6 sets net.ipv6.conf.all.disable_ipv6=1.
+// disableIPv6 sets disable_ipv6=1 on all/default + every detected interface (M3).
 func (g *linuxGuard) disableIPv6() error {
-	return runCmd("sysctl", "-w", "net.ipv6.conf.all.disable_ipv6=1")
+	keys := ipv6DisableSysctlKeys(listIPv6Interfaces())
+	var firstErr error
+	for _, k := range keys {
+		if err := runCmd("sysctl", "-w", k+"=1"); err != nil {
+			slog.Warn("leakguard: disable ipv6 key failed", "key", k, "err", err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
 }
 
-// restoreIPv6 restores the original sysctl value for IPv6.
+// restoreIPv6 restores disable_ipv6 to its original value on every key we set.
 func (g *linuxGuard) restoreIPv6(backup IPv6Backup) error {
-	if backup.OriginalSysctl == "" {
+	val := backup.OriginalSysctl
+	if val == "" {
+		val = "0"
+	}
+	keys := backup.DisabledInterfaces
+	if len(keys) == 0 {
+		keys = []string{"net.ipv6.conf.all.disable_ipv6", "net.ipv6.conf.default.disable_ipv6"}
+	}
+	for _, k := range keys {
+		_ = runCmd("sysctl", "-w", k+"="+val)
+	}
+	return nil
+}
+
+// listIPv6Interfaces enumerates non-loopback network interfaces for per-iface
+// IPv6 disable. Best-effort; returns nil on error (all/default still covered).
+func listIPv6Interfaces() []string {
+	out, err := exec.Command("ls", "/proc/sys/net/ipv6/conf").CombinedOutput()
+	if err != nil {
 		return nil
 	}
-	return runCmd("sysctl", "-w", "net.ipv6.conf.all.disable_ipv6="+backup.OriginalSysctl)
+	var ifaces []string
+	for _, f := range strings.Fields(string(out)) {
+		switch f {
+		case "all", "default", "lo":
+			continue
+		}
+		ifaces = append(ifaces, f)
+	}
+	return ifaces
 }
 
 // ---------------------------------------------------------------------------
@@ -256,24 +371,15 @@ func (g *linuxGuard) restoreIPv6(backup IPv6Backup) error {
 // ---------------------------------------------------------------------------
 
 func (g *linuxGuard) enableKillSwitchIPTables(cfg LeakGuardConfig) ([]string, error) {
-	ip := cfg.ServerIP.String()
-	port := fmt.Sprintf("%d", cfg.ServerPort)
-	tun := cfg.TunName
-
-	cmds := [][]string{
-		{"iptables", "-N", "SHADOWLINK-KS"},
-		{"iptables", "-I", "OUTPUT", "-j", "SHADOWLINK-KS"},
-		{"iptables", "-A", "SHADOWLINK-KS", "-o", tun, "-j", "ACCEPT"},
-		{"iptables", "-A", "SHADOWLINK-KS", "-d", ip, "-p", "tcp", "--dport", port, "-j", "ACCEPT"},
-		{"iptables", "-A", "SHADOWLINK-KS", "-d", ip, "-p", "udp", "--dport", port, "-j", "ACCEPT"},
-		{"iptables", "-A", "SHADOWLINK-KS", "-o", "lo", "-j", "ACCEPT"},
-		{"iptables", "-A", "SHADOWLINK-KS", "-p", "udp", "--sport", "68", "--dport", "67", "-j", "ACCEPT"},
+	ipsetAvailable := false
+	if _, err := exec.LookPath("ipset"); err == nil {
+		ipsetAvailable = true
 	}
-	// Allow UDP to TURN relay IPs (WB TURN escape route)
-	for _, eip := range cfg.ExtraEscapeIPs {
-		cmds = append(cmds, []string{"iptables", "-A", "SHADOWLINK-KS", "-d", eip.String(), "-p", "udp", "-j", "ACCEPT"})
+	plan := BuildKillSwitchPlan(cfg, ipsetAvailable)
+	if cfg.SplitTunnel && len(cfg.BypassRanges) > 0 && !ipsetAvailable {
+		slog.Warn("leakguard: ipset unavailable — RU split-tunnel degraded to LAN-only (RU via TUN, fail-secure)")
 	}
-	cmds = append(cmds, []string{"iptables", "-A", "SHADOWLINK-KS", "-j", "DROP"})
+	cmds := linuxIPTablesCommands(plan, ipsetAvailable)
 
 	var rules []string
 	for _, args := range cmds {
@@ -292,6 +398,8 @@ func (g *linuxGuard) cleanupIPTables() error {
 	_ = runCmd("iptables", "-D", "OUTPUT", "-j", "SHADOWLINK-KS")
 	_ = runCmd("iptables", "-F", "SHADOWLINK-KS")
 	_ = runCmd("iptables", "-X", "SHADOWLINK-KS")
+	// Destroy the RU ipset if it exists (split-tunnel cleanup).
+	_ = runCmd("ipset", "destroy", "sl_ru")
 	return nil
 }
 
@@ -300,31 +408,8 @@ func (g *linuxGuard) cleanupIPTables() error {
 // ---------------------------------------------------------------------------
 
 func (g *linuxGuard) enableKillSwitchNFTables(cfg LeakGuardConfig) ([]string, error) {
-	ip := cfg.ServerIP.String()
-	port := fmt.Sprintf("%d", cfg.ServerPort)
-	tun := cfg.TunName
-
-	cmds := [][]string{
-		{"nft", "add", "table", "inet", "shadowlink"},
-		{"nft", "add", "chain", "inet", "shadowlink", "output",
-			"{ type filter hook output priority 0 ; policy accept ; }"},
-		{"nft", "add", "rule", "inet", "shadowlink", "output",
-			"oifname", tun, "accept"},
-		{"nft", "add", "rule", "inet", "shadowlink", "output",
-			"ip", "daddr", ip, "tcp", "dport", port, "accept"},
-		{"nft", "add", "rule", "inet", "shadowlink", "output",
-			"ip", "daddr", ip, "udp", "dport", port, "accept"},
-		{"nft", "add", "rule", "inet", "shadowlink", "output",
-			"oifname", "lo", "accept"},
-		{"nft", "add", "rule", "inet", "shadowlink", "output",
-			"udp", "sport", "68", "udp", "dport", "67", "accept"},
-	}
-	// Allow UDP to TURN relay IPs (WB TURN escape route)
-	for _, eip := range cfg.ExtraEscapeIPs {
-		cmds = append(cmds, []string{"nft", "add", "rule", "inet", "shadowlink", "output",
-			"ip", "daddr", eip.String(), "udp", "accept"})
-	}
-	cmds = append(cmds, []string{"nft", "add", "rule", "inet", "shadowlink", "output", "drop"})
+	// nft sets scale to thousands of prefixes → RU split always supported.
+	cmds := linuxNFTCommands(BuildKillSwitchPlan(cfg, true))
 
 	var rules []string
 	for _, args := range cmds {
@@ -377,6 +462,8 @@ func (g *linuxGuard) crashRecover() error {
 	}
 
 	g.backend = state.KillSwitch.Backend
+	g.wasSymlink = state.ResolvConfWasSymlink
+	g.symlinkTarget = state.ResolvConfTarget
 
 	var errs []string
 
@@ -418,3 +505,6 @@ func runCmd(name string, args ...string) error {
 	}
 	return nil
 }
+
+// Ensure linuxGuard satisfies the interface at compile time.
+var _ LeakGuard = (*linuxGuard)(nil)
