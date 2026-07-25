@@ -64,8 +64,29 @@ func main() {
 	genKey := flag.Bool("gen-key", false, "Generate a new server key and exit")
 	validateConfig := flag.String("validate-config", "", "parse YAML config file at PATH, exit 0 if OK / non-zero on error; no server starts")
 	decoySnapshotPaths := flag.String("decoy-snapshot-paths", "index.html", "comma-separated paths (relative to -decoy dir) of decoy HTML files to pre-bake for SentinelEmitter dual-carrier rate-limit responses")
-	decoySnapshotStrict := flag.Bool("decoy-snapshot-strict", false,
-		"if true, fail-fast on decoy snapshot loading errors (default: warn and continue header-only)")
+	// Раунд 18 / шаг 4a: default инвертирован на fail-fast.
+	//
+	// Раньше по умолчанию сервер тихо деградировал в header-only при любой
+	// ошибке загрузки снапшотов (обоснование — «prevents pl1 outage during
+	// rollout when templates may be partial»). Цена этой мягкости: состояние
+	// «body-marker не работает» становилось НЕЗАМЕТНЫМ, а body-marker — это
+	// CDN-safe и единственный wire-neutral носитель rate-limit сигнала.
+	// Header-only режим означает, что единственным носителем остаётся
+	// X-SL-RL — заголовок, которого не отдаёт ни один реальный сайт, то есть
+	// прямая сигнатура ShadowLink для активного зонда (находка H-1).
+	//
+	// Теперь сервер отказывается стартовать с шаблонами без Schema.org
+	// baseline. Это предусловие для удаления X-SL-RL (шаг 4c): пока нельзя
+	// доказать, что body-carrier работает, удалять заголовок опасно —
+	// клиент потеряет оба носителя и уйдёт в экспоненциальный backoff вместо
+	// фиксированного кулдауна (просадка ёмкости вместо защиты).
+	//
+	// Аварийный обход: -decoy-snapshot-strict=false для деплоя с частичными
+	// шаблонами. Тогда следите за shadowlink_ratelimit_emitted_by_body_missing_total.
+	decoySnapshotStrict := flag.Bool("decoy-snapshot-strict", true,
+		"fail-fast on decoy snapshot loading errors (default true). "+
+			"=false → warn and continue header-only, но тогда единственным носителем "+
+			"rate-limit сигнала остаётся заголовок X-SL-RL (сигнатура для зонда)")
 	flowMaxWindow := flag.Int("flow-max-window", 1048576, "Bug #8: max per-stream flow-control window (bytes) the server grants; 0 disables flow control")
 	streamMigration := flag.Bool("stream-migration", true, "Bug #9 §3.5: enable per-stream migration negotiation (server echoes the client's advertised capability). Default on")
 	originDeathTeardown := flag.Bool("origin-death-teardown", false, "Bug #10: signal FlagStreamClose to the client when a stream's origin TCP dies (broken pipe/EOF) so the app retries instead of hanging. Default OFF (first-canary safety); also settable via YAML origin_death_teardown")
@@ -214,23 +235,28 @@ func main() {
 	// writeRateLimitSentinelV2 header-only path.
 	if config.DecoyDir != "" {
 		snapshotPaths := strings.Split(*decoySnapshotPaths, ",")
-		// Graceful degradation: if snapshot loading fails (e.g., templates not
-		// yet updated with Schema.org baseline), log a clear warning and continue
-		// without the body-marker carrier. Header carrier (X-SL-RL) still works
-		// via the legacy path in failClosedToDecoyRateLimitedV2. This prevents
-		// pl1 outage during rollout when templates may be partial.
-		//
-		// To force fail-fast (e.g., in CI/staging where missing baseline is
-		// definitely a bug), set -decoy-snapshot-strict=true.
+		// Раунд 18 / шаг 4a: по умолчанию — fail-fast (см. флаг выше).
+		// Тихая деградация в header-only оставляла X-SL-RL единственным
+		// носителем сигнала, а это прямая сигнатура ShadowLink для активного
+		// зонда. Обход через -decoy-snapshot-strict=false остаётся для
+		// деплоя с частичными шаблонами, но теперь это осознанный выбор.
 		snapshots, snapErr := server.LoadDecoySnapshots(config.DecoyDir, snapshotPaths)
 		if snapErr != nil {
 			if *decoySnapshotStrict {
-				slog.Error("decoy snapshot loading failed (strict mode)", "err", snapErr)
+				slog.Error("decoy snapshot loading failed — сервер не стартует (fail-fast)",
+					"err", snapErr,
+					"hint", "обновите decoy-шаблоны Schema.org rl-state baseline "+
+						"(<script type=\"application/ld+json\"> с identifier.propertyID=\"rl-state\" "+
+						"и полем value фиксированной ширины), либо запустите с "+
+						"-decoy-snapshot-strict=false, приняв риск header-only режима")
 				os.Exit(1)
 			}
-			slog.Warn("decoy snapshot loading failed; body-marker carrier disabled, header-only mode active",
+			slog.Warn("decoy snapshot loading failed; body-marker carrier disabled, header-only mode active — "+
+				"единственным носителем rate-limit сигнала остаётся заголовок X-SL-RL, "+
+				"которого не отдаёт ни один реальный сайт (сигнатура для активного зонда)",
 				"err", snapErr,
-				"hint", "update decoy templates with Schema.org rl-state baseline, then restart")
+				"hint", "update decoy templates with Schema.org rl-state baseline, then restart",
+				"monitor", "shadowlink_ratelimit_emitted_by_body_missing_total")
 			snapshots = nil // SentinelEmitter handles nil → header-only path
 		}
 		srv.SetSentinelEmitter(server.NewSentinelEmitter(snapshots, srv.Metrics()))
