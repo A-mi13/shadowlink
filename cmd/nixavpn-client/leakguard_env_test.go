@@ -96,19 +96,40 @@ func TestSplitDNSEnabledFromEnv_GarbageWarns(t *testing.T) {
 	_ = os.Unsetenv("SHADOWLINK_SPLIT_DNS")
 }
 
+// Раунд 18 / C-3: default инвертирован на strict=ON (fail-secure). Прежняя
+// версия теста утверждала, что пустое значение даёт false — то есть
+// закрепляла fail-open как ожидаемое поведение.
 func TestLeakguardStrictFromEnv(t *testing.T) {
 	cases := map[string]bool{
-		"":     false,
-		"0":    false,
-		"no":   false,
-		"1":    true,
-		"true": true,
-		"on":   true,
+		// Аварийный opt-out — единственный способ получить fail-open.
+		"0":     false,
+		"false": false,
+		"no":    false,
+		"off":   false,
+		"OFF":   false, // регистронезависимо
+		" 0 ":   false, // пробелы обрезаются
+		// Default и всё нераспознанное → strict.
+		"":        true,
+		"1":       true,
+		"true":    true,
+		"on":      true,
+		"garbage": true, // мусор НЕ должен ослаблять защиту
 	}
 	for in, want := range cases {
 		t.Setenv("SHADOWLINK_LEAKGUARD_STRICT", in)
 		if got := leakguardStrictFromEnv(); got != want {
 			t.Errorf("leakguardStrictFromEnv(%q)=%v want %v", in, got, want)
 		}
+	}
+}
+
+// Отдельно и явно: при полностью неустановленной переменной защита включена.
+func TestLeakguardStrict_DefaultIsFailSecure(t *testing.T) {
+	t.Setenv("SHADOWLINK_LEAKGUARD_STRICT", "")
+	if err := os.Unsetenv("SHADOWLINK_LEAKGUARD_STRICT"); err != nil {
+		t.Fatalf("unsetenv: %v", err)
+	}
+	if !leakguardStrictFromEnv() {
+		t.Error("без переменной окружения strict-режим обязан быть ВКЛЮЧЁН (fail-secure, C-3)")
 	}
 }

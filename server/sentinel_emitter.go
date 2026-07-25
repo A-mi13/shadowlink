@@ -49,7 +49,18 @@ func NewSentinelEmitter(snapshots map[string]*DecoySnapshot, metrics *Metrics) *
 //
 // Header carrier (X-SL-RL) always emitted; body carrier emitted when
 // snapshot exists for the key. Missing snapshot → header-only + counter inc.
-func (e *SentinelEmitter) Emit(w http.ResponseWriter, sig RLSentinel, snapshotKey string) {
+//
+// Возвращает true, если ответ записан ПОЛНОСТЬЮ (статус + заголовки + тело).
+// false означает, что тело не записано и вызывающий ОБЯЗАН дописать его сам
+// (обычно — отдать decoy), иначе Go отдаст 200 с Content-Length: 0.
+//
+// Раунд 18 / C-2: раньше метод был void и на header-only пути молча
+// возвращался, ничего не записав. Вызывающий делал early return, и клиент
+// получал 200 с пустым телом — детерминированный оракул за 19 запросов
+// («сайт, который после серии быстрых запросов отдаёт пустое тело»). Путь
+// достижим в штатной работе: при ошибке LoadDecoySnapshots main.go оставляет
+// snapshots=nil, но emitter создаёт (graceful degradation роллаута).
+func (e *SentinelEmitter) Emit(w http.ResponseWriter, sig RLSentinel, snapshotKey string) bool {
 	if snapshotKey == "" {
 		snapshotKey = "index.html"
 	}
@@ -65,22 +76,18 @@ func (e *SentinelEmitter) Emit(w http.ResponseWriter, sig RLSentinel, snapshotKe
 	e.metrics.RateLimitSentinelEmitted.Add(1)
 
 	if snap == nil || len(snap.HTML) == 0 {
-		// Header-only fallback: no snapshot available or empty HTML.
+		// Снапшота нет — тело записать нечем. Заголовок уже проставлен и
+		// доедет вместе с телом, которое допишет вызывающий.
 		e.metrics.RateLimitEmittedByBodyMissing.Add(1)
-		// Header-only path: emits X-SL-RL only, no body. Caller does an early
-		// return after Emit on this path (no timing-pipeline wrapping in Phase 1).
-		// Timing-pipeline parity with legacy path is deferred to Phase 2 — see
-		// TODO in decoy_timing.go.failClosedToDecoyRateLimitedV2.
-		return
+		return false
 	}
 
 	// Produce the padded body value.
 	bodyVal, err := FormatRLStateValue(sig)
 	if err != nil {
 		// Defensive fallback: format error (should never happen with sane inputs).
-		// Fall back to header-only so the response isn't left hanging.
 		e.metrics.RateLimitEmittedByBodyMissing.Add(1)
-		return
+		return false
 	}
 
 	// Splice the value into the HTML using a pooled buffer. The substitution is
@@ -122,6 +129,7 @@ func (e *SentinelEmitter) Emit(w http.ResponseWriter, sig RLSentinel, snapshotKe
 	}
 
 	e.metrics.RateLimitEmittedByBody.Add(1)
+	return true
 }
 
 // formatRLStateHeader converts an RLSentinel into the X-SL-RL header value.

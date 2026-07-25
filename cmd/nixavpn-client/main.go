@@ -330,7 +330,8 @@ func main() {
 			if err := lg.Enable(lgCfg); err != nil {
 				slog.Error("LeakGuard НЕ включён — VPN работает БЕЗ kill-switch/DNS-защиты", "err", err)
 				fmt.Fprintln(os.Stderr, "ВНИМАНИЕ: LeakGuard не активирован — защита от утечек ВЫКЛЮЧЕНА. "+
-					"Установите SHADOWLINK_LEAKGUARD_STRICT=1 чтобы прерывать запуск в этом случае.")
+					"По умолчанию запуск прерывается (fail-secure). Запустите с "+
+					"SHADOWLINK_LEAKGUARD_STRICT=0, только если осознанно принимаете риск утечки реального IP.")
 				if leakguardStrictFromEnv() {
 					// tun.Stop ПЕРЕД lg.Disable — тот же инвариант, что и в
 					// shutdownTunnelAndGuard (LeakGuard восстанавливает истинный DNS последним).
@@ -804,14 +805,29 @@ func splitDNSEnabledFromEnv(bypassOn bool) bool {
 }
 
 // leakguardStrictFromEnv reports whether a LeakGuard Enable failure should abort
-// startup (os.Exit) instead of continuing without leak protection. Default OFF.
-// Opt-IN: only "1"/"true"/"yes"/"on" enable strict mode.
+// startup (os.Exit) instead of continuing without leak protection.
+//
+// Раунд 18 / C-3: default инвертирован на ON (fail-secure). Раньше строгий
+// режим был opt-IN, поэтому при любом сбое Enable (нет прав администратора,
+// WFP недоступен, netsh отказал, backup политики не прочитался) клиент писал
+// WARN и продолжал работу с поднятым туннелем и БЕЗ kill-switch. При
+// последующем обрыве туннеля трафик уходил через физический шлюз с реальным
+// IP — то есть самый глубоко проработанный контур защиты по умолчанию не
+// вставал именно тогда, когда он нужен.
+//
+// Теперь opt-OUT: "0"/"false"/"no"/"off" — явная аварийная ручка для случая
+// «нужно поднять туннель на машине, где LeakGuard не работает, и я осознаю
+// риск утечки». Всё прочее (включая пустое значение и мусор) → strict.
+//
+// Сравните с splitTunnelEnabledFromEnv: там opt-IN правилен, потому что
+// безопасное значение = off. Здесь безопасное значение = on, поэтому и
+// default обратный.
 func leakguardStrictFromEnv() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("SHADOWLINK_LEAKGUARD_STRICT"))) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
+	case "0", "false", "no", "off":
 		return false
+	default:
+		return true
 	}
 }
 

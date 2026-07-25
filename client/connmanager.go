@@ -205,6 +205,17 @@ func (cm *ConnManager) connect() {
 		if !cm.allowHTTP2 {
 			opts = append(opts, tls_client.WithForceHttp1())
 		}
+		// Раунд 18: страховка ALPN/ALPS-паритета с cold-path.
+		//
+		// Замерено (alps_parity_test.go): на текущих профилях 120/131/133 оба
+		// стека уже дают ALPN [h2, http/1.1] и ALPS [h2] — расхождения нет,
+		// заявленный в аудите ALPS ["h3","h2"] в hot-path НЕ подтвердился.
+		// WithDisableHttp3 здесь не исправляет существующий дефект, а
+		// фиксирует инвариант: если будущий бамп профиля (открытый пункт C3)
+		// принесёт h3 в ALPN/ALPS, он будет вычищен, а не уедет на провод при
+		// ALPN=http/1.1 — конфигурация, которой реальный Chrome не отправляет.
+		// Механика чистки: bogdanfinn/utls u_parrots.go:3278.
+		opts = append(opts, tls_client.WithDisableHttp3())
 		if cm.skipVerify {
 			opts = append(opts, tls_client.WithInsecureSkipVerify())
 		}

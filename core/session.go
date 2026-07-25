@@ -485,9 +485,21 @@ func (s *Session) LastActivity() time.Time {
 	return s.lastActivity
 }
 
-// HIGH-6 fix: use int loop variables to avoid uint32 underflow wrap-around.
-// The old code used uint32 loop variable which wraps at 0 → 0xFFFFFFFF,
-// causing incorrect bitmap state after sequence number jumps of 64+.
+// shiftBitmap продвигает окно вперёд на n позиций.
+//
+// Соглашение битмапа (см. setBit/getBit): бит с индексом d соответствует
+// seq, отстающему от recvHighest на d, то есть бит 0 — самый свежий seq, а
+// старшие биты — более старая история. Продвижение окна на n означает, что
+// каждый ранее виденный seq становится старше на n → его бит уезжает в
+// сторону СТАРШИХ индексов (влево), а освободившиеся младшие обнуляются.
+//
+// Раунд 18 / CRITICAL-1: здесь стоял сдвиг вправо (`>>=` и подмешивание из
+// [i-1] влево), из-за чего история не сдвигалась, а стиралась — anti-replay
+// не работал ни на одном пути. Регрессия закрыта тестами в
+// session_replay_window_test.go.
+//
+// HIGH-6: индексы циклов — int, не uint32, иначе i-- на нуле уходит в
+// 0xFFFFFFFF при прыжках seq на 64+.
 func (s *Session) shiftBitmap(n uint32) {
 	if n == 0 {
 		return
@@ -496,6 +508,8 @@ func (s *Session) shiftBitmap(n uint32) {
 	bitShift := n % 64
 	bitmapLen := len(s.recvBitmap)
 
+	// Пословный сдвиг влево: слово i получает содержимое слова i-ws.
+	// Идём от старших к младшим, чтобы не перезаписать источник до чтения.
 	if ws > 0 {
 		for i := bitmapLen - 1; i >= 0; i-- {
 			if i >= ws {
@@ -506,11 +520,13 @@ func (s *Session) shiftBitmap(n uint32) {
 		}
 	}
 
+	// Внутрисловный сдвиг влево с переносом старших бит предыдущего слова
+	// в младшие биты следующего.
 	if bitShift > 0 {
 		for i := bitmapLen - 1; i >= 0; i-- {
-			s.recvBitmap[i] >>= bitShift
+			s.recvBitmap[i] <<= bitShift
 			if i > 0 {
-				s.recvBitmap[i] |= s.recvBitmap[i-1] << (64 - bitShift)
+				s.recvBitmap[i] |= s.recvBitmap[i-1] >> (64 - bitShift)
 			}
 		}
 	}

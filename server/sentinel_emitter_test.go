@@ -99,14 +99,17 @@ func TestEmit_MissingSnapshot_HeaderOnly(t *testing.T) {
 	e := NewSentinelEmitter(snaps, m)
 
 	w := httptest.NewRecorder()
-	e.Emit(w, sentinelSig(), "nonexistent.html")
+	wrote := e.Emit(w, sentinelSig(), "nonexistent.html")
 
 	// Header still emitted.
 	xlrl := w.Header().Get("X-SL-RL")
 	require.NotEmpty(t, xlrl, "X-SL-RL header must be emitted even on missing snapshot")
 
-	// Body must be empty (no HTML body written).
-	assert.Empty(t, w.Body.Bytes(), "body must be empty on header-only path")
+	// Раунд 18 / C-2: Emit ОБЯЗАН сообщить, что тело не записано, чтобы
+	// вызывающий дописал decoy. Прежняя версия теста утверждала «body must be
+	// empty» и тем закрепляла оракул (200 + Content-Length: 0).
+	assert.False(t, wrote,
+		"Emit must return false when no snapshot is available (caller must write the body)")
 
 	// Missing counter incremented.
 	assert.EqualValues(t, 1, m.RateLimitEmittedByBodyMissing.Load(),
@@ -124,12 +127,13 @@ func TestEmit_NilSnapshots_HeaderOnly(t *testing.T) {
 	e := NewSentinelEmitter(nil, m)
 
 	w := httptest.NewRecorder()
-	e.Emit(w, sentinelSig(), "index.html")
+	wrote := e.Emit(w, sentinelSig(), "index.html")
 
 	xlrl := w.Header().Get("X-SL-RL")
 	require.NotEmpty(t, xlrl, "X-SL-RL header must be emitted with nil snapshots")
 
-	assert.Empty(t, w.Body.Bytes(), "body must be empty with nil snapshots")
+	// Раунд 18 / C-2: см. TestEmit_MissingSnapshot_HeaderOnly.
+	assert.False(t, wrote, "Emit must return false with nil snapshots")
 	assert.EqualValues(t, 1, m.RateLimitEmittedByBodyMissing.Load())
 }
 

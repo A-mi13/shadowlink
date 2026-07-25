@@ -200,7 +200,12 @@ func (h *Handler) failClosedToDecoyWithReason(w http.ResponseWriter, r *http.Req
 	// Sanitized placeholder: every failClosedToDecoy call resolves the decoy to
 	// GET "/" so the response size is constant. Raw `r` would echo POST body
 	// length / URL path into decoy routing and leak the failure mode.
-	h.decoy.ServeHTTP(w, httpPlaceholderRequest())
+	//
+	// Раунд 18 / H-5: путь санитизируем, но Host ПРОНОСИМ — иначе в
+	// multi-domain деплое fail-closed ответ приходит из default-каталога с
+	// default-персоной, тогда как обычный GET с тем же Host отдаёт каталог
+	// этого хоста. Разные security-заголовки и размер тела = дискриминатор.
+	h.decoy.ServeHTTP(w, decoyRequestFor(r))
 }
 
 // failClosedToDecoyRateLimitedV2 is failClosedToDecoy with one extra step: it
@@ -260,7 +265,16 @@ func (h *Handler) failClosedToDecoyRateLimitedV2(w http.ResponseWriter, r *http.
 		// CRITICAL invariant: early return here. The emitter wrote a complete
 		// 200 response including WriteHeader; chaining decoy.ServeHTTP would
 		// corrupt the response (double WriteHeader or appended bytes).
-		h.sentinelEmitter.Emit(w, info, "")
+		// Раунд 18 / C-2: Emit возвращает false, когда снапшота нет и тело не
+		// записано. Молча уходить в return нельзя — Go отдаст 200 с пустым
+		// телом, а это однозначный оракул. Дописываем тело обычным
+		// decoy-путём; заголовок X-SL-RL уже проставлен внутри Emit и уедет
+		// вместе с этим ответом.
+		if !h.sentinelEmitter.Emit(w, info, "") {
+			h.decoy.ServeHTTP(w, decoyRequestFor(r))
+			time.Sleep(ackJitter())
+			return
+		}
 		// Phase 1 timing parity (CRIT-finding 2026-05-14): match the legacy path's
 		// 5-1500ms tail latency profile to avoid creating a bimodal distribution
 		// that DPI ML can fingerprint as "fast = rate-limited via new emitter".

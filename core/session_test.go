@@ -35,12 +35,11 @@ func TestSessionSlidingWindowLimit(t *testing.T) {
 	assert.False(t, s.AcceptSeqNum(0), "too old — outside window")
 }
 
-func TestSessionSlidingWindowEdge(t *testing.T) {
-	s := NewSession(1, make([]byte, 32), make([]byte, 32))
-	assert.True(t, s.AcceptSeqNum(0))
-	assert.True(t, s.AcceptSeqNum(WindowSize-1)) // exactly at window edge
-	assert.True(t, s.AcceptSeqNum(0))            // still within window
-}
+// Раунд 18: прежняя версия этого теста утверждала, что seq=0 после
+// продвижения на WindowSize-1 принимается повторно («still within window») —
+// то есть закрепляла CRITICAL-1 как ожидаемое поведение. Корректная проверка
+// края окна живёт в TestSlidingWindowEdge_ReplayAtEdgeRejected
+// (session_replay_window_test.go).
 
 func TestSessionLargeJump(t *testing.T) {
 	s := NewSession(1, make([]byte, 32), make([]byte, 32))

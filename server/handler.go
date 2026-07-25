@@ -2224,6 +2224,33 @@ func httpPlaceholderRequest() *http.Request {
 	return r
 }
 
+// decoyRequestFor строит запрос для отдачи decoy-страницы вместо реального
+// запроса клиента: путь всегда "/", чтобы длина и содержимое тела не зависели
+// от r.URL.Path (URL-эхо иначе даёт разброс размеров ответа), но **Host
+// сохраняется**.
+//
+// Раунд 18 / H-5: httpPlaceholderRequest() выбрасывает Host вместе с путём, и
+// в multi-domain деплое (domain_decoy_map / DomainPersonaMap) это давало
+// дискриминатор: обычный GET с Host: blog.example.com отдавал каталог блога и
+// его персональные security-заголовки, а fail-closed путь с тем же Host —
+// default-каталог и default-персону. Зонд сравнивал два ответа и получал
+// бинарный признак «хост обслуживает не только статику».
+//
+// nil-safe: при r == nil ведёт себя как httpPlaceholderRequest.
+func decoyRequestFor(r *http.Request) *http.Request {
+	req := httpPlaceholderRequest()
+	if r == nil {
+		return req
+	}
+	// Host резолвит персону и каталог decoy (resolvePersona / resolveDecoyDir).
+	// http.Request.Host имеет приоритет над URL.Host при серверном роутинге.
+	req.Host = r.Host
+	if req.URL != nil && r.URL != nil {
+		req.URL.Host = r.URL.Host
+	}
+	return req
+}
+
 // TestEnqueueDownstream is a test-only hook that pushes one raw (pre-encryption)
 // payload onto the given session's tunnel.Outgoing channel. The handler's normal
 // dispatch (handleDataChunk) drains Outgoing, runs session.EncryptChunk on each
