@@ -8,7 +8,11 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"                       # shadowlink/
-OUT="../bin/shadowlink-server-linux"
+# Вывод в bin/ ВНУТРИ каталога shadowlink — единственный источник истины, который
+# ищет internal/slpath (см. $SHADOWLINK_DIR). Каталог может лежать вне дерева
+# NixaVPN, поэтому путь наружу (`../bin/`) больше не используется.
+OUT="bin/shadowlink-server-linux"
+mkdir -p bin
 STAMP="$(date +%Y%m%d-%H%M%S)"
 
 echo ">> компиляция всего модуля + vet серверной части"

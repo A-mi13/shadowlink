@@ -216,11 +216,25 @@ func main() {
 
 		// narrowEscape: enable /32-only escape when origin is pinned. resolveServerIPs
 		// already returns ONLY the origin IP in that case, so /16 sweep would have
-		// nothing legitimate to cover anyway.
-		narrowEscape := cfg.ShadowLink != nil && cfg.ShadowLink.Origin != ""
+		// nothing legitimate to cover anyway. F-5 (2026-06-13): gate on the SHARED
+		// originPinned predicate (valid IPv4), not mere non-emptiness — an invalid
+		// ?origin= is effectively CDN mode and must keep the /16 sweep.
+		narrowEscape := originPinned(cfg)
+		splitDNS := splitDNSEnabledFromEnv(bypassOn)
+		slog.Info("split-DNS forwarder", "enabled", splitDNS)
 		tun = NewTunnel(eng.SOCKSAddr(), cfg.ProxyUser, cfg.ProxyPass, serverIPs).
 			WithBypass(bypassOn, override).
-			WithNarrowEscape(narrowEscape)
+			WithNarrowEscape(narrowEscape).
+			WithSplitDNS(splitDNS)
+		// INT-H2 (2026-06-12): bootstrap-whitelist для split-DNS forwarder'а —
+		// серверный домен (CDN-режим) должен резолвиться по Yandex-only, когда
+		// CF-нога DoH мертва вместе с туннелем, иначе reconnect не может
+		// зарезолвить сервер и туннель не восстанавливается. Пусто при
+		// origin-pin / IP-литералах (DNS не участвует) — тогда не передаём.
+		if d := serverBootstrapDomain(resolvedProtocol, cfg); d != "" {
+			tun = tun.WithBootstrapDomains(d)
+			slog.Info("split-DNS bootstrap-домен сервера", "domain", d)
+		}
 		// Bug #5: prefer the engine's in-process dialer (no loopback socket per
 		// flow → no Windows ephemeral port exhaustion). Optional interface —
 		// only ShadowLink implements it; VLESS falls back to loopback SOCKS5.
@@ -231,9 +245,10 @@ func main() {
 		}
 
 		// H1/C3-b: create LeakGuard BEFORE tun.Start() so its crash-recovery
-		// (Windows New() → removeKillSwitch + WFP DeleteByProvider) clears any
-		// stale SL-Block-All / WFP filters left by a previous crash BEFORE any
-		// network activity — otherwise a leftover block could deadlock startup.
+		// (Windows New() → removeKillSwitch + policy restore + WFP
+		// DeleteByProvider) clears any stale SL-* rules / blockoutbound default
+		// policy / WFP filters left by a previous crash BEFORE any network
+		// activity — otherwise a leftover block could deadlock startup.
 		lg, err = leakguard.New(leakguardStatePath())
 		if err != nil {
 			slog.Warn("не удалось создать LeakGuard", "err", err)
@@ -261,6 +276,13 @@ func main() {
 		splitTunnel := splitTunnelEnabledFromEnv()
 		var bypassRanges []netip.Prefix
 		if bypassOn && splitTunnel {
+			// NB (I1, 2026-06-11): this bypassroute.Load is used ONLY to derive the
+			// kill-switch firewall BypassRanges (the WFP/nft/pf ranges allowed past
+			// the LeakGuard). It is NOT the split-DNS arbitration snapshot and does
+			// not break the "one Load for arbitration" invariant: the split-DNS
+			// Forwarder shares Tunnel.resolved, whose single Load lives in
+			// tunnel.go installBypassDialer. These two snapshots serve different
+			// subsystems (firewall vs DNS arbitration) and are intentionally separate.
 			if resolved, rerr := bypassroute.Load(bypassroute.Source{Embedded: true, Override: override}); rerr == nil {
 				bypassRanges = bypassroute.SnapshotPrefixes(resolved)
 			} else {
@@ -293,6 +315,10 @@ func main() {
 
 		if err := tun.Start(); err != nil {
 			fmt.Fprintf(os.Stderr, "ошибка запуска TUN-туннеля: %v\n", err)
+			// tun.Stop здесь не нужен: setTUNDNS — ПОСЛЕДНИЙ шаг Start, на
+			// упавшем Start туннель DNS не трогал, а остальное откатил
+			// rollbackStart внутри Start. lg.Disable откатывает PreLock —
+			// порядок-инвариант shutdownTunnelAndGuard не нарушается.
 			if lg != nil {
 				_ = lg.Disable() // roll back PreLock DNS/IPv6
 			}
@@ -306,8 +332,9 @@ func main() {
 				fmt.Fprintln(os.Stderr, "ВНИМАНИЕ: LeakGuard не активирован — защита от утечек ВЫКЛЮЧЕНА. "+
 					"Установите SHADOWLINK_LEAKGUARD_STRICT=1 чтобы прерывать запуск в этом случае.")
 				if leakguardStrictFromEnv() {
-					_ = lg.Disable()
-					_ = tun.Stop()
+					// tun.Stop ПЕРЕД lg.Disable — тот же инвариант, что и в
+					// shutdownTunnelAndGuard (LeakGuard восстанавливает истинный DNS последним).
+					shutdownTunnelAndGuard(tun, lg)
 					_ = eng.Close()
 					os.Exit(1)
 				}
@@ -358,18 +385,12 @@ func main() {
 		fmt.Printf("\nEngine упал: %v\nОтключение...\n", err)
 	}
 
-	// Graceful shutdown in reverse order.
-	if lg != nil {
-		if err := lg.Disable(); err != nil {
-			slog.Warn("ошибка отключения LeakGuard", "err", err)
-		}
-	}
-
+	// Graceful shutdown: tun.Stop ПЕРЕД lg.Disable (см. shutdownTunnelAndGuard).
+	var ts tunStopper
 	if tun != nil {
-		if err := tun.Stop(); err != nil {
-			slog.Warn("ошибка остановки TUN-туннеля", "err", err)
-		}
+		ts = tun
 	}
+	shutdownTunnelAndGuard(ts, lg)
 
 	cancel()
 	if err := eng.Close(); err != nil {
@@ -377,6 +398,43 @@ func main() {
 	}
 
 	slog.Info("отключено")
+}
+
+// tunStopper / lgDisabler — минимальные seam-интерфейсы, чтобы инвариант
+// порядка shutdown был unit-тестируемым (main_shutdown_order_test.go).
+type tunStopper interface{ Stop() error }
+type lgDisabler interface{ Disable() error }
+
+// shutdownTunnelAndGuard tears down the tunnel and LeakGuard in the REQUIRED
+// order: tun.Stop() BEFORE lg.Disable().
+//
+// Инвариант: LeakGuard владеет ИСТИННЫМ оригинальным DNS — его PreLock снял
+// бэкап ДО того, как туннель вообще трогал DNS. Поэтому restore LeakGuard'а
+// должен лечь ПОСЛЕДНИМ: tun.Stop восстанавливает свой бэкап (darwin: это
+// LOCK-значения 1.1.1.1/8.8.8.8, снятые setTUNDNS уже ПОСЛЕ PreLock), затем
+// lg.Disable поверх возвращает настоящие пользовательские значения
+// (DHCP/automatic). Обратный порядок навсегда оставлял хост на lock-значениях.
+// Когда lg==nil, PreLock не выполнялся → бэкап туннеля хранит истинные
+// значения, и tun.Stop одного достаточно.
+//
+// Окно между Stop и Disable (forwarder уже мёртв, kill-switch ещё жив) — это
+// краткий DNS-dead на shutdown: приемлемо и fail-secure. Сеть для Stop не
+// нужна — он выполняет только локальные exec (netsh/route/networksetup/
+// файловые операции resolv.conf), поэтому работающий kill-switch ему не мешает
+// (windows и darwin — одинаковое рассуждение).
+//
+// Оба шага best-effort: ошибка одного не пропускает другой.
+func shutdownTunnelAndGuard(tun tunStopper, lg lgDisabler) {
+	if tun != nil {
+		if err := tun.Stop(); err != nil {
+			slog.Warn("ошибка остановки TUN-туннеля", "err", err)
+		}
+	}
+	if lg != nil {
+		if err := lg.Disable(); err != nil {
+			slog.Warn("ошибка отключения LeakGuard", "err", err)
+		}
+	}
 }
 
 // loadConfig загружает конфиг из одного из трёх источников:
@@ -458,12 +516,15 @@ func resolveServerIPs(protocol string, cfg *Config) []string {
 			// CF edge IP — without this, a reconnect-handshake that for any
 			// reason resolved through DNS would still have a usable escape route
 			// and silently leak through CF. We make the leak path unroutable.
+			// F-5 (2026-06-13): gate on the SHARED originPinned predicate so the
+			// short-circuit here, narrowEscape and serverBootstrapDomain agree on
+			// exactly what counts as a pinned origin (valid IPv4).
+			if originPinned(cfg) {
+				slog.Info("сервер резолвлен для escape-маршрута (origin override)",
+					"origin", cfg.ShadowLink.Origin)
+				return []string{cfg.ShadowLink.Origin}
+			}
 			if cfg.ShadowLink.Origin != "" {
-				if parsed := net.ParseIP(cfg.ShadowLink.Origin); parsed != nil && parsed.To4() != nil {
-					slog.Info("сервер резолвлен для escape-маршрута (origin override)",
-						"origin", cfg.ShadowLink.Origin)
-					return []string{cfg.ShadowLink.Origin}
-				}
 				// Origin is set but not a valid IPv4 — fall through to normal
 				// resolution; log so the operator notices the config error.
 				slog.Warn("origin= задан, но не IPv4 — игнорируем, escape через DNS",
@@ -498,6 +559,10 @@ func resolveServerIPs(protocol string, cfg *Config) []string {
 	}
 
 	// Resolve domain to IPs for escape routing.
+	// Резолв до старта split-DNS forwarder — намеренно через системный резолвер:
+	// нужен реальный IP сервера для escape-маршрута, не split-DNS арбитраж.
+	// resolveServerIPs вызывается при инициализации, ДО tun.Start (forwarder ещё
+	// не слушает), поэтому net.LookupHost здесь не может уйти через split-DNS.
 	ips, err := net.LookupHost(host)
 	if err != nil || len(ips) == 0 {
 		slog.Error("не удалось резолвить сервер для escape-маршрута", "host", host, "err", err)
@@ -539,6 +604,62 @@ func resolveServerIPs(protocol string, cfg *Config) []string {
 
 	slog.Info("сервер резолвлен для escape-маршрута", "host", host, "ips", ipv4s)
 	return ipv4s
+}
+
+// originPinned reports whether the ShadowLink data path is pinned to a literal
+// origin IP — i.e. ?origin= holds a VALID IPv4. This is the SINGLE predicate
+// (F-5, 2026-06-13, final batch review) feeding narrowEscape, resolveServerIPs'
+// origin short-circuit, and serverBootstrapDomain. Previously narrowEscape keyed
+// off mere non-emptiness of Origin while the other two required a valid IPv4 —
+// so an INVALID ?origin= (config typo) silently disabled the /16 escape sweep in
+// what is effectively CDN mode, leaving CF edge rotation unroutable. Now an
+// invalid origin keeps the /16 sweep, consistent with the resolve/bootstrap
+// fall-through. (resolveServerIPs still logs its own Warn on the invalid value.)
+func originPinned(cfg *Config) bool {
+	if cfg == nil || cfg.ShadowLink == nil || cfg.ShadowLink.Origin == "" {
+		return false
+	}
+	parsed := net.ParseIP(cfg.ShadowLink.Origin)
+	return parsed != nil && parsed.To4() != nil
+}
+
+// serverBootstrapDomain — INT-H2 (2026-06-12): чистый хелпер, вычисляющий
+// серверный ДОМЕН для bootstrap-whitelist split-DNS forwarder'а. Выбор host'а
+// зеркалит resolveServerIPs (origin short-circuit → CDN → Server), но вместо
+// резолва возвращает само имя — и только когда это домен:
+//   - origin-pin (валидный IPv4 в ?origin=) → "" — dial идёт по литеральному
+//     IP, DNS в reconnect не участвует, bootstrap не нужен;
+//   - IP-литерал (VLESS address / ShadowLink server) → "" — по той же причине;
+//   - иначе → домен (CDN-режим / доменный server / VLESS-домен).
+func serverBootstrapDomain(protocol string, cfg *Config) string {
+	var host string
+	switch protocol {
+	case "vless":
+		if cfg.VLESS != nil {
+			host = cfg.VLESS.Address
+		}
+	case "shadowlink":
+		if cfg.ShadowLink == nil {
+			break
+		}
+		// Origin short-circuit — зеркало resolveServerIPs: валидный IPv4 в
+		// origin пиннит data path к литеральному IP, DNS-bootstrap не нужен.
+		// Невалидный origin (как и там) проваливается к обычному выбору host'а.
+		if originPinned(cfg) {
+			return ""
+		}
+		if cfg.ShadowLink.CDN != "" {
+			host = cfg.ShadowLink.CDN
+		} else if h, _, err := net.SplitHostPort(cfg.ShadowLink.Server); err == nil {
+			host = h
+		} else {
+			host = cfg.ShadowLink.Server
+		}
+	}
+	if host == "" || net.ParseIP(host) != nil {
+		return "" // нет host'а либо IP-литерал — DNS-bootstrap не нужен
+	}
+	return host
 }
 
 // resolveServerPort returns the VPN server's port for LeakGuard config.
@@ -656,6 +777,29 @@ func splitTunnelEnabledFromEnv() bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// splitDNSEnabledFromEnv reports whether the local split-DNS forwarder is
+// enabled. Default follows bypass: ON when bypass is ON (the forwarder needs
+// the shared RU snapshot to arbitrate), OFF when bypass is OFF. Explicit
+// SHADOWLINK_SPLIT_DNS=0/false/no/off force-disables; =1/true/yes/on
+// force-enables regardless of bypass. Mirrors bypassEnabledFromEnv semantics.
+// LG-L3: an unrecognized value keeps the follow-bypass default but logs a
+// Warn — a typo like "of" must be visible, not silently swallowed.
+func splitDNSEnabledFromEnv(bypassOn bool) bool {
+	raw := strings.TrimSpace(os.Getenv("SHADOWLINK_SPLIT_DNS"))
+	switch strings.ToLower(raw) {
+	case "0", "false", "no", "off":
+		return false
+	case "1", "true", "yes", "on":
+		return true
+	case "":
+		return bypassOn // unset: follow bypass
+	default:
+		slog.Warn("SHADOWLINK_SPLIT_DNS: нераспознанное значение — действует default (follow bypass)",
+			"value", raw, "bypass", bypassOn)
+		return bypassOn
 	}
 }
 

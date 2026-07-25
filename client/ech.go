@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,9 +12,20 @@ import (
 	"github.com/nixavpn/shadowlink/skins/browser"
 )
 
-// dohServerAddr — Cloudflare 1.1.1.1 DoH endpoint. Pinned IP avoids plaintext
-// DNS resolution of the resolver itself (would defeat the point of DoH).
-const dohServerAddr = "1.1.1.1:443"
+// dohServerIP — Cloudflare 1.1.1.1 DoH endpoint IP. The DoH client dials this
+// literal IP (no DNS) so resolving the resolver's own name can never happen.
+//
+// B1 (2026-06-11 split-DNS final review): this is now a HARD pin, not a hint.
+// Previously buildUTLSHTTPClient ignored its first arg (cfIP="") and dialed
+// whatever host the request URL pointed at — `cloudflare-dns.com` — via DNS.
+// In the split-DNS forwarder that name lookup re-enters the forwarder (TUN-DNS
+// is the forwarder once setTUNDNS runs) → Cloudflare branch → DoHQuery → resolve
+// `cloudflare-dns.com` → loop (cascade timeouts → SERVFAIL). Pinning the dial to
+// the literal 1.1.1.1 removes the DNS step entirely; the connect is a plain TCP
+// to 1.1.1.1 (not in the RU snapshot → routed through the tunnel by BypassDialer
+// → exits at the VPN server → reaches CF uncensored). The ECH cold-start path
+// also benefits — it stops resolving the resolver name too.
+const dohServerIP = "1.1.1.1"
 
 // dohSNI — the ServerName presented in the TLS handshake. Cloudflare's 1.1.1.1
 // DoH endpoint serves a cert valid for `cloudflare-dns.com` and `one.one.one.one`;
@@ -32,38 +44,71 @@ const dohSNI = "cloudflare-dns.com"
 //
 // This unifies the DoH client onto the same uTLS dialer used by the data path
 // (see buildUTLSHTTPClient + ws_transport / split_transport).
+//
+// B1 (2026-06-11): the client now dials the LITERAL 1.1.1.1 via
+// buildUTLSHTTPClientPinned — no DNS lookup of `cloudflare-dns.com`. This is
+// the cure for the split-DNS forwarder loop (see dohServerIP doc) and is also
+// correct for the ECH cold-start caller (1.1.1.1 is the right edge for the
+// cloudflare-dns.com cert, so pinning never hurts).
 func newDoHClient() *http.Client {
 	// Pick a Chrome fingerprint for DoH. Chrome is the most common browser
 	// fingerprint, so a Chrome JA3 hitting 1.1.1.1 is the highest-volume
 	// background traffic to blend into.
 	fp := browser.NewFingerprint(browser.ProfileChrome)
-	return buildUTLSHTTPClient(dohServerAddr, dohSNI, fp, false, 5*time.Second, "http/1.1")
+	return buildUTLSHTTPClientPinned(dohServerIP, dohSNI, fp, false, 5*time.Second, "http/1.1")
 }
 
-// ResolveECHConfig queries DNS HTTPS record (type 65) for domain
-// and extracts ECHConfigList from the ech= SvcParam.
-// Uses DNS-over-HTTPS (DoH) to prevent plaintext DNS leaking the target domain.
-func ResolveECHConfig(domain string) ([]byte, error) {
-	m := new(dns.Msg)
-	m.SetQuestion(dns.Fqdn(domain), dns.TypeHTTPS)
-	m.RecursionDesired = true
+// NewDoHKeepAliveClient возвращает долгоживущий DoH-клиент с ВКЛЮЧЁННЫМ
+// keep-alive для dnsproxy-форвардера. DNS-M6 (2026-06-12): one-shot клиент на
+// каждый DNS-запрос = полный TCP+uTLS хендшейк к 1.1.1.1 через туннель на
+// КАЖДОЕ имя страницы (шторм Chrome-ClientHello по пулу слотов) и поведенчески
+// неправдоподобен — реальный браузер держит одно DoH-соединение. Вызывающий
+// держит ОДИН инстанс на весь свой lifecycle и обязан звать
+// CloseIdleConnections при остановке (Forwarder.Stop → dohResolver.Close).
+// Тот же IP-пин 1.1.1.1 и тот же Chrome-fingerprint, что у newDoHClient;
+// ECH bootstrap путь (DoHQueryRaw → newDoHClient) НЕ переводится и остаётся
+// one-shot, как был.
+func NewDoHKeepAliveClient() *http.Client {
+	fp := browser.NewFingerprint(browser.ProfileChrome)
+	return buildUTLSHTTPClientPinnedKeepAlive(dohServerIP, dohSNI, fp, false, 5*time.Second, "http/1.1")
+}
 
+// DoHQueryRaw sends an arbitrary DNS message over DNS-over-HTTPS to Cloudflare
+// (1.1.1.1) and returns the parsed response dns.Msg regardless of its Rcode.
+// The query is routed via the uTLS DoH client — see newDoHClient.
+//
+// DNS-H1 (2026-06-12): the dnsproxy forwarder needs NXDOMAIN / NOERROR-NODATA
+// back as valid *dns.Msg responses (to propagate and negative-cache them), so
+// the Rcode check lives in the DoHQuery wrapper below, NOT here. An error from
+// DoHQueryRaw means transport/protocol failure only (HTTP error, unpack
+// failure) — a parsed DNS answer with any Rcode is a success at this layer.
+//
+// NEW-2: the request is assembled by hand (not http.Client.Post) so that the
+// Chrome User-Agent + sec-ch-ua header set can be attached; stdlib Post sends
+// no UA, which would leave a uTLS Chrome ClientHello followed by a UA-less POST.
+func DoHQueryRaw(ctx context.Context, m *dns.Msg) (*dns.Msg, error) {
+	// One-shot клиент per-call — поведение ECH bootstrap пути сохранено как
+	// есть (DNS-M6 меняет только dnsproxy-путь через DoHQueryRawWith).
+	httpClient := newDoHClient()
+	defer httpClient.CloseIdleConnections()
+	return DoHQueryRawWith(ctx, m, httpClient)
+}
+
+// DoHQueryRawWith — тело DoHQueryRaw с клиентом от вызывающего. DNS-M6
+// (2026-06-12): dnsproxy-форвардер передаёт сюда свой ЕДИНСТВЕННЫЙ
+// долгоживущий keep-alive клиент (NewDoHKeepAliveClient) — соединение к
+// 1.1.1.1 переиспользуется между запросами вместо хендшейка на каждый.
+// CloseIdleConnections здесь НЕ вызывается — lifecycle клиента принадлежит
+// вызывающему. http.Client безопасен для конкурентного использования;
+// uTLS-дайлер под ним создаёт всё состояние per-dial (см. buildUTLSDialTLS).
+func DoHQueryRawWith(ctx context.Context, m *dns.Msg, httpClient *http.Client) (*dns.Msg, error) {
 	// Pack the DNS message for DoH POST
 	packed, err := m.Pack()
 	if err != nil {
 		return nil, fmt.Errorf("dns pack failed: %w", err)
 	}
 
-	// Send via DNS-over-HTTPS to Cloudflare (encrypted, no plaintext domain leak).
-	// uTLS-routed (A2-MED-1 fix) — see newDoHClient godoc.
-	//
-	// 2026-05-02 wire-trigger followup NEW-2: build the request manually so we
-	// can attach the Chrome User-Agent + sec-ch-ua header set. Stdlib
-	// http.Client.Post sends no UA, leaving a uTLS Chrome ClientHello followed
-	// by a UA-less POST — internally inconsistent.
-	httpClient := newDoHClient()
-	defer httpClient.CloseIdleConnections()
-	req, err := http.NewRequest(http.MethodPost, "https://"+dohSNI+"/dns-query", bytes.NewReader(packed))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+dohSNI+"/dns-query", bytes.NewReader(packed))
 	if err != nil {
 		return nil, fmt.Errorf("doh build request: %w", err)
 	}
@@ -91,8 +136,38 @@ func ResolveECHConfig(domain string) ([]byte, error) {
 		return nil, fmt.Errorf("dns unpack failed: %w", err)
 	}
 
+	return r, nil
+}
+
+// DoHQuery is DoHQueryRaw plus the strict-success contract: a non-Success
+// Rcode is treated as an error. Used by ResolveECHConfig (TypeHTTPS), which
+// expects a failed resolve in that case. Callers that must distinguish
+// NXDOMAIN/NODATA from transport failure (the dnsproxy forwarder) use
+// DoHQueryRaw directly.
+func DoHQuery(ctx context.Context, m *dns.Msg) (*dns.Msg, error) {
+	r, err := DoHQueryRaw(ctx, m)
+	if err != nil {
+		return nil, err
+	}
+
 	if r.Rcode != dns.RcodeSuccess {
 		return nil, fmt.Errorf("dns query returned %s", dns.RcodeToString[r.Rcode])
+	}
+
+	return r, nil
+}
+
+// ResolveECHConfig queries DNS HTTPS record (type 65) for domain
+// and extracts ECHConfigList from the ech= SvcParam.
+// Uses DNS-over-HTTPS (DoH) to prevent plaintext DNS leaking the target domain.
+func ResolveECHConfig(domain string) ([]byte, error) {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(domain), dns.TypeHTTPS)
+	m.RecursionDesired = true
+
+	r, err := DoHQuery(context.Background(), m)
+	if err != nil {
+		return nil, fmt.Errorf("resolve ech for %s: %w", domain, err)
 	}
 
 	for _, ans := range r.Answer {

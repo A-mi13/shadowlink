@@ -4,7 +4,10 @@ package leakguard
 
 import (
 	"net/netip"
+	"strings"
 	"testing"
+
+	"github.com/nixavpn/shadowlink/client/dnsproxy"
 )
 
 // ---------------------------------------------------------------------------
@@ -70,8 +73,54 @@ func mustContainArg(t *testing.T, args []string, want string) {
 func TestWindowsRules_FailSecure_NoBypassAllow(t *testing.T) {
 	rules := windowsFirewallRules(BuildKillSwitchPlan(baseCfg(), true)) // SplitTunnel=false
 	names := ruleNames(rules)
-	mustHave(t, names, "SL-Block-All", "SL-Allow-TUN", "SL-Allow-Server-TCP", "SL-Allow-Loopback", "SL-Allow-DHCP")
+	mustHave(t, names, "SL-Allow-TUN", "SL-Allow-Server-TCP", "SL-Allow-Loopback", "SL-Allow-DHCP", "SL-Allow-DNS-RU")
 	mustNotHave(t, names, "SL-Allow-LAN")
+}
+
+// LG-H1 — Windows Firewall evaluates explicit block rules BEFORE allow rules,
+// so an explicit block-all rule would always beat our allows and cut the
+// tunnel itself. The deny-by-default semantics must come from the default
+// outbound POLICY (set by the guard), never from a block rule.
+func TestWindowsRules_NoExplicitBlockRule(t *testing.T) {
+	cfg := baseCfg()
+	cfg.SplitTunnel = true
+	cfg.BypassRanges = []netip.Prefix{netip.MustParsePrefix("77.88.0.0/18")}
+	rules := windowsFirewallRules(BuildKillSwitchPlan(cfg, true))
+	mustNotHave(t, ruleNames(rules), "SL-Block-All")
+	for _, r := range rules {
+		for _, a := range r.args {
+			if a == "action=block" {
+				t.Errorf("rule %q uses action=block — explicit block rules override allow rules", r.name)
+			}
+		}
+	}
+}
+
+// LG-H2 — the split-DNS forwarder's Yandex branch goes DIRECT off-TUN
+// (src = physical NIC IP), so the kill switch needs a minimal udp/53 permit
+// to exactly the resolver IPs from the dnsproxy single source of truth.
+func TestWindowsRules_DNSRU_ExactYandexIPs(t *testing.T) {
+	rules := windowsFirewallRules(BuildKillSwitchPlan(baseCfg(), true))
+	r := findRule(t, rules, "SL-Allow-DNS-RU")
+	mustContainArg(t, r.args, "dir=out")
+	mustContainArg(t, r.args, "action=allow")
+	mustContainArg(t, r.args, "protocol=udp")
+	mustContainArg(t, r.args, "remoteport=53")
+	mustContainArg(t, r.args, "remoteip="+strings.Join(dnsproxy.DefaultYandexIPs(), ","))
+}
+
+// SL-Allow-DNS-RU must be in the well-known crash-recovery name list so a
+// stale rule is removed even when the state file is lost.
+func TestKillSwitchRuleNames_ContainsDNSRU(t *testing.T) {
+	found := false
+	for _, n := range killSwitchRuleNames {
+		if n == "SL-Allow-DNS-RU" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("SL-Allow-DNS-RU missing from killSwitchRuleNames: %v", killSwitchRuleNames)
+	}
 }
 
 func TestWindowsRules_Split_AddsLANAllow(t *testing.T) {

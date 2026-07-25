@@ -18,6 +18,12 @@ type State struct {
 	// SplitTunnel records whether explicit split-tunnel was active so restore
 	// is honest about what was applied.
 	SplitTunnel bool `json:"split_tunnel,omitempty"`
+	// FirewallPolicyBackup (Windows) stores the per-profile default firewall
+	// actions captured BEFORE the kill switch flipped the default outbound
+	// policy to Block (LG-H1), so Disable/crash recovery can restore them
+	// verbatim. Empty while KillSwitch.Rules is non-empty = backup read failed
+	// at enable → restore falls back to the Windows factory default.
+	FirewallPolicyBackup []FirewallProfilePolicy `json:"firewall_policy_backup,omitempty"`
 	// WFPActive (Windows) is true when RU CIDR WFP filters were installed under
 	// our provider GUID and must be removed via DeleteByProvider on cleanup.
 	WFPActive bool `json:"wfp_active,omitempty"`
@@ -49,6 +55,16 @@ type DNSEntry struct {
 type IPv6Backup struct {
 	DisabledInterfaces []string `json:"disabled_interfaces"`
 	OriginalSysctl     string   `json:"original_sysctl,omitempty"`
+}
+
+// FirewallProfilePolicy records the default in/outbound actions of a single
+// Windows Firewall profile (Domain/Private/Public) as reported by PowerShell
+// Get-NetFirewallProfile (locale-independent enum names: Allow / Block /
+// NotConfigured). Stored verbatim so restore reproduces the exact original.
+type FirewallProfilePolicy struct {
+	Name     string `json:"name"`
+	Inbound  string `json:"inbound"`
+	Outbound string `json:"outbound"`
 }
 
 // KillSwitchState stores firewall rules so they can be removed on cleanup.

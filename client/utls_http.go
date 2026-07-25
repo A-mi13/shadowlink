@@ -178,6 +178,70 @@ func buildUTLSHTTPClient(
 	timeout time.Duration,
 	nextProto string,
 ) *http.Client {
+	// cfIP="" — the helper resolves whatever host the request URL points at via
+	// DNS; cold-path callers don't need CF edge pinning the way SplitTransport
+	// does. sni is set to the cert domain so verification succeeds.
+	return buildUTLSHTTPClientCommon("", sni, fp, skipVerify, timeout, nextProto, true)
+}
+
+// buildUTLSHTTPClientPinned is the IP-pinned sibling of buildUTLSHTTPClient: it
+// dials the literal cfIP (no DNS) while presenting sni as the TLS ServerName,
+// so the cert still validates against the canonical domain.
+//
+// B1 (2026-06-11 split-DNS final review): the forwarder's DoH path must NOT
+// resolve `cloudflare-dns.com` via DNS — once setTUNDNS points the TUN at the
+// forwarder, that lookup re-enters the forwarder's own Cloudflare branch, which
+// calls DoHQuery again → resolve `cloudflare-dns.com` → … (cascade of timeouts
+// → SERVFAIL). Pinning the dial target to the literal 1.1.1.1 breaks the loop:
+// the TCP connect goes straight to the edge IP (which is not in the RU snapshot,
+// so BypassDialer routes it through the tunnel to the exit server → out to CF),
+// with zero DNS involvement.
+//
+// cfIP MUST be a bare IP (no port) — buildUTLSDialTLS re-joins it with the port
+// taken from the request URL.
+func buildUTLSHTTPClientPinned(
+	cfIP, sni string,
+	fp *browser.Fingerprint,
+	skipVerify bool,
+	timeout time.Duration,
+	nextProto string,
+) *http.Client {
+	return buildUTLSHTTPClientCommon(cfIP, sni, fp, skipVerify, timeout, nextProto, true)
+}
+
+// buildUTLSHTTPClientPinnedKeepAlive — IP-пиннутый клиент с ВКЛЮЧЁННЫМ
+// keep-alive. DNS-M6 (2026-06-12): dnsproxy-форвардер шлёт DoH-запросы на
+// каждое DNS-имя страницы — one-shot клиент превращал это в шторм
+// Chrome-ClientHello к 1.1.1.1 через пул слотов (и поведенчески неправдоподобен:
+// реальный браузер держит ОДНО DoH-соединение). Этот вариант предназначен для
+// одного долгоживущего клиента на весь lifecycle вызывающего; вызывающий обязан
+// звать CloseIdleConnections при остановке, чтобы сокеты не утекали.
+// Существующие one-shot вызыватели (ECH bootstrap, cold-path probes) НЕ
+// переводятся — их поведение не меняется.
+func buildUTLSHTTPClientPinnedKeepAlive(
+	cfIP, sni string,
+	fp *browser.Fingerprint,
+	skipVerify bool,
+	timeout time.Duration,
+	nextProto string,
+) *http.Client {
+	return buildUTLSHTTPClientCommon(cfIP, sni, fp, skipVerify, timeout, nextProto, false)
+}
+
+// buildUTLSHTTPClientCommon is the shared body of buildUTLSHTTPClient (cfIP="")
+// and buildUTLSHTTPClientPinned (cfIP=literal edge IP). cfIP empty → resolve the
+// request URL host via DNS; cfIP set → dial that literal IP, keeping sni as the
+// TLS ServerName so cert verification still succeeds. disableKeepAlives=true
+// keeps the historical one-shot behavior; false enables connection reuse for
+// long-lived callers (DNS-M6 — see buildUTLSHTTPClientPinnedKeepAlive).
+func buildUTLSHTTPClientCommon(
+	cfIP, sni string,
+	fp *browser.Fingerprint,
+	skipVerify bool,
+	timeout time.Duration,
+	nextProto string,
+	disableKeepAlives bool,
+) *http.Client {
 	if nextProto == "" {
 		nextProto = "http/1.1"
 	}
@@ -187,18 +251,19 @@ func buildUTLSHTTPClient(
 		KeepAlive: 30 * time.Second,
 	}
 
-	// cfIP="" — the helper resolves whatever host the request URL points at via
-	// DNS; cold-path callers don't need CF edge pinning the way SplitTransport
-	// does. sni is set to the cert domain so verification succeeds.
-	dialTLS := buildUTLSDialTLS("", sni, fp, dialer, skipVerify, nextProto)
+	dialTLS := buildUTLSDialTLS(cfIP, sni, fp, dialer, skipVerify, nextProto)
 
 	return &http.Client{
 		Timeout: timeout,
 		Transport: &http.Transport{
-			DialTLSContext:      dialTLS,
-			DisableCompression:  false,
-			DisableKeepAlives:   true,
-			ForceAttemptHTTP2:   false,
+			DialTLSContext:     dialTLS,
+			DisableCompression: false,
+			DisableKeepAlives:  disableKeepAlives,
+			ForceAttemptHTTP2:  false,
+			// IdleConnTimeout matters only when keep-alives are enabled
+			// (pooled idle conns are dropped after this); mirrors the
+			// stdlib DefaultTransport value. No-op for one-shot clients.
+			IdleConnTimeout:     90 * time.Second,
 			TLSHandshakeTimeout: 5 * time.Second,
 		},
 	}
