@@ -9,7 +9,9 @@ Steganographic VPN. Go 1.25, `module github.com/nixavpn/shadowlink`. Отдел�
 1. **НЕ предлагать CDN / Cloudflare / domain fronting.** Прод = DIRECT к голому
    origin IP. РКН режет диапазоны CDN целиком.
 2. **НЕ рандомизировать TLS fingerprint.** uTLS прибит к Chrome 133 намеренно.
-   Только Chrome (Firefox/Safari РКН банит первыми).
+   Только Chrome. ⚠ Тезис «Firefox/Safari РКН банит первыми» — форумный и
+   **оспорен** (Xray-core#6293, 2026-06: обратная рекомендация). Не менять
+   lockstep по форумному сигналу, но и не считать доказанным — нужен замер по AS.
 3. **Горячий путь = WebSocket binary frames.** JSON-envelope только на handshake
    POST + cover.
 4. **nginx обязателен** — Go `net/http` шлёт non-browser HTTP/2 SETTINGS (JA3-риск).
@@ -17,7 +19,11 @@ Steganographic VPN. Go 1.25, `module github.com/nixavpn/shadowlink`. Отдел�
    Вторая копия однажды дала silent «binary identical, skipping upload».
 6. **Windows-dev: `-race` недоступен** (нет gcc). Зелёный локальный прогон ≠ нет гонки.
 7. **Коммиты и push делает пользователь.** Не коммитить без явной просьбы.
-8. Тайминговые константы — производные от TSPU age-окна ~130–190 с; не менять «на глаз».
+8. Тайминговые константы — производные от TSPU age-окна ~130–190 с; не менять
+   «на глаз». ⚠ **Само окно НЕ подтверждено** (раунд 18): peer-reviewed
+   источников нет, публичный корпус (net4people#490) указывает на триггер по
+   **объёму** (~16–20 КБ), а цифра 130–190 с похожа на перенос замера GFW.
+   Открытый P0 — инструментальный замер age-vs-bytes.
 
 ## Architecture
 
