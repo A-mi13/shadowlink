@@ -1,6 +1,10 @@
 package leakguard
 
-import "net/netip"
+import (
+	"net/netip"
+
+	"github.com/nixavpn/shadowlink/client/dnsproxy"
+)
 
 // LANRanges возвращает RFC1918 LAN-диапазоны, разрешаемые при split-tunnel.
 // Источник истины дублирует bypassroute drop==false reserved, НО держим
@@ -45,6 +49,25 @@ type KillSwitchPlan struct {
 	SplitTunnel bool           // явный split-tunnel включён
 	LANAllow    []netip.Prefix // RFC1918 при split-tunnel
 	RUAllow     []netip.Prefix // RU CIDR при split-tunnel (если OS поддерживает)
+
+	// DNSAllow — резолверы, которым нужен plain-UDP/53 МИМО туннеля.
+	//
+	// H-13 (раунд 18): правило существовало только в rules_windows.go, где IP
+	// брались напрямую из dnsproxy.DefaultYandexIPs(). Linux и Darwin его не
+	// имели ВООБЩЕ, при этом setupRoutes (tunnel.go) ставит /32 escape-маршруты
+	// для Yandex БЕЗУСЛОВНО на всех платформах: пакеты уходили мимо TUN и
+	// упирались в финальный `drop` (nft/iptables) / `block out all` (pf).
+	// Итог — Yandex-нога арбитража мертва при поднятом kill-switch, dnsproxy
+	// всегда получал !yOK и деградировал в CF-only. Направление fail-secure (не
+	// утечка), но анти-цензурная функция не работала на двух платформах из трёх.
+	//
+	// Поле в плане, а не обращение к dnsproxy внутри каждого генератора: ровно
+	// тот «единый источник истины», который декларировал комментарий
+	// Windows-правила. Паритет сторожится TestKillSwitchPlan_DNSAllow* в
+	// rules_test.go — кросс-платформенном файле БЕЗ build-тега, потому что
+	// per-platform тесты под тегами и были причиной, по которой дрейф не
+	// замечали (§7.4).
+	DNSAllow []string
 }
 
 // BuildKillSwitchPlan детерминированно строит план из config + флага поддержки
@@ -66,6 +89,11 @@ func BuildKillSwitchPlan(cfg LeakGuardConfig, ruBypassSupported bool) KillSwitch
 	for _, ip := range cfg.ExtraEscapeIPs {
 		plan.ExtraEscape = append(plan.ExtraEscape, ip.String())
 	}
+	// H-13: единый источник истины для DNS-резолверов, идущих plain-UDP мимо
+	// туннеля. Те же IP, что dnsproxy использует как plain-UDP цели и для
+	// которых tunnel.go ставит /32 escape-маршруты. Заполняется на ВСЕХ
+	// платформах — раньше правило было только в netsh-генераторе Windows.
+	plan.DNSAllow = append(plan.DNSAllow, dnsproxy.DefaultYandexIPs()...)
 	if cfg.SplitTunnel {
 		plan.LANAllow = LANRanges()
 		if ruBypassSupported {

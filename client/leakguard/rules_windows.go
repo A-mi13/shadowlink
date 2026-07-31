@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-
-	"github.com/nixavpn/shadowlink/client/dnsproxy"
 )
 
 // firewallRule is a netsh advfirewall rule: a name plus the args passed to netsh.
@@ -63,21 +61,29 @@ func windowsFirewallRules(plan KillSwitchPlan) []firewallRule {
 				fmt.Sprintf("remoteport=%s", port),
 				"protocol=udp"},
 		},
-		// LG-H2: the split-DNS forwarder's Yandex branch goes DIRECT off-TUN by
-		// design (escape /32 routes via the physical gateway, src = physical NIC
-		// IP), so neither SL-Allow-TUN (localip 198.18/15) nor SL-Allow-Server-UDP
-		// (server IP:port) permits it. Scope is minimal: udp/53 to the exact
-		// resolver IPs from dnsproxy.DefaultYandexIPs() — the single source of
-		// truth shared with the resolver targets and tunnel.go escape routes
-		// (never duplicate the literals). Plaintext DNS to Yandex off-tunnel is
-		// the split-DNS design itself, not a leak.
-		{
+	}
+
+	// LG-H2: the split-DNS forwarder's Yandex branch goes DIRECT off-TUN by
+	// design (escape /32 routes via the physical gateway, src = physical NIC
+	// IP), so neither SL-Allow-TUN (localip 198.18/15) nor SL-Allow-Server-UDP
+	// (server IP:port) permits it. Scope is minimal: udp/53 to the exact
+	// resolver IPs. Plaintext DNS to Yandex off-tunnel is the split-DNS design
+	// itself, not a leak.
+	//
+	// H-13 (раунд 18): the IP list now comes from plan.DNSAllow instead of a
+	// direct dnsproxy.DefaultYandexIPs() call here. This rule used to exist ONLY
+	// on Windows — Linux and Darwin had no equivalent at all, so the same
+	// packets died on their final drop/block. Routing it through the plan makes
+	// the three platforms share one source of truth, which is what this comment
+	// already claimed.
+	if len(plan.DNSAllow) > 0 {
+		rules = append(rules, firewallRule{
 			name: "SL-Allow-DNS-RU",
 			args: []string{"advfirewall", "firewall", "add", "rule",
 				"name=SL-Allow-DNS-RU", "dir=out", "action=allow",
 				"protocol=udp", "remoteport=53",
-				fmt.Sprintf("remoteip=%s", strings.Join(dnsproxy.DefaultYandexIPs(), ","))},
-		},
+				fmt.Sprintf("remoteip=%s", strings.Join(plan.DNSAllow, ","))},
+		})
 	}
 
 	if plan.Loopback {

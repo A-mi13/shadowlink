@@ -26,6 +26,12 @@ func darwinPFRules(plan KillSwitchPlan) []string {
 	for _, eip := range plan.ExtraEscape {
 		rules = append(rules, fmt.Sprintf("pass out quick proto udp to %s", eip))
 	}
+	// H-13: plain-UDP/53 к RU-резолверам идёт DIRECT мимо TUN by design
+	// (escape /32 через физический шлюз). Без этого pass пакеты упирались в
+	// `block out all` → Yandex-нога split-DNS не работала на macOS.
+	for _, dip := range plan.DNSAllow {
+		rules = append(rules, fmt.Sprintf("pass out quick proto udp to %s port 53", dip))
+	}
 
 	if plan.SplitTunnel {
 		for _, p := range plan.LANAllow {

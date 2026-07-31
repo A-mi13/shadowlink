@@ -30,6 +30,14 @@ func linuxNFTCommands(plan KillSwitchPlan) [][]string {
 	for _, eip := range plan.ExtraEscape {
 		cmds = append(cmds, []string{"nft", "add", "rule", "inet", "shadowlink", "output", "ip", "daddr", eip, "udp", "accept"})
 	}
+	// H-13: plain-UDP/53 к RU-резолверам идёт DIRECT мимо TUN by design
+	// (escape /32 через физический шлюз). Без этого accept пакеты доходили до
+	// финального `drop` ниже → Yandex-нога split-DNS не работала на Linux.
+	// Scope минимальный: udp dport 53 к точным IP из plan.DNSAllow.
+	for _, dip := range plan.DNSAllow {
+		cmds = append(cmds, []string{"nft", "add", "rule", "inet", "shadowlink", "output",
+			"ip", "daddr", dip, "udp", "dport", "53", "accept"})
+	}
 
 	// Split-tunnel: LAN accepts + RU set (named interval set scales to thousands).
 	if plan.SplitTunnel {
@@ -88,6 +96,11 @@ func linuxIPTablesCommands(plan KillSwitchPlan, ipsetAvailable bool) [][]string 
 	}
 	for _, eip := range plan.ExtraEscape {
 		cmds = append(cmds, []string{"iptables", "-A", "SHADOWLINK-KS", "-d", eip, "-p", "udp", "-j", "ACCEPT"})
+	}
+	// H-13: см. комментарий в linuxNFTCommands — то же правило для iptables.
+	for _, dip := range plan.DNSAllow {
+		cmds = append(cmds, []string{"iptables", "-A", "SHADOWLINK-KS", "-d", dip,
+			"-p", "udp", "--dport", "53", "-j", "ACCEPT"})
 	}
 
 	if plan.SplitTunnel {
