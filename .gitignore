@@ -4,6 +4,16 @@
 shadowlink-client-mac
 shadowlink-server-linux
 shadowlink-server
+nixavpn-client-mac-arm64
+shadowlink-metrics-dump-linux
+
+# Build-script backups (build-*.sh stamps a copy before each rebuild)
+*.bak-*
+
+# Deploy credentials — NEVER commit. Real secrets live outside the repo
+# (see deploy-round18.sh / DEPLOY.md).
+.deploy-env
+*.creds
 
 # Third-party binaries
 tun2socks*

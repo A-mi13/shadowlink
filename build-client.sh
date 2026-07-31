@@ -6,13 +6,20 @@
 # его с `-log debug`, а strip убирает символы из стектрейсов. CGO выключен —
 # чистая Go-сборка, gcc не нужен.
 #
-# Каталог вывода задаётся $CLIENT_BIN_DIR. По умолчанию — d:/NIXAVPN/bin/, где
-# рядом лежат wintun.dll и connect-vpn-*.bat: клиент без них не запускается,
-# поэтому бинарь кладётся к ним, а не в bin/ каталога shadowlink.
+# Каталог вывода — bin/ ВНУТРИ каталога shadowlink: проект самодостаточен,
+# запускать всё можно из него одного. Рядом с бинарём лежат wintun.dll (без него
+# TUN не поднимется) и connect-vpn-*.bat (запускают exe через %~dp0, то есть из
+# своей же папки).
+#
+# Изменено 2026-07-31: до этого дефолтом был /d/NIXAVPN/bin — рантайм-каталог
+# дерева NixaVPN, потому что там исторически лежало окружение клиента. Окружение
+# скопировано сюда, поэтому внешний каталог больше не нужен. Для сборки в него
+# (например, чтобы обновить прежнюю установку) передайте CLIENT_BIN_DIR:
+#   CLIENT_BIN_DIR=/d/NIXAVPN/bin bash build-client.sh
 set -euo pipefail
 
 cd "$(dirname "$0")"                       # shadowlink/
-CLIENT_BIN_DIR="${CLIENT_BIN_DIR:-/d/NIXAVPN/bin}"
+CLIENT_BIN_DIR="${CLIENT_BIN_DIR:-$(pwd)/bin}"
 mkdir -p "$CLIENT_BIN_DIR"
 OUT="$CLIENT_BIN_DIR/nixavpn-client-graceful-drain.exe"
 STAMP="$(date +%Y%m%d-%H%M%S)"
@@ -31,4 +38,14 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
   go build -trimpath -o "$OUT" ./cmd/nixavpn-client/
 
 ls -la "$OUT"
-echo ">> готово. Запускать: $CLIENT_BIN_DIR/connect-vpn-DEBUG.bat (от администратора)"
+echo ">> готово."
+echo ">> Запускать ОТ АДМИНИСТРАТОРА (нужен TUN):"
+echo "     $CLIENT_BIN_DIR/connect-vpn-DEBUG.bat          # с -log debug"
+echo "     $CLIENT_BIN_DIR/connect-vpn-graceful-drain.bat  # обычный"
+# Самодостаточность каталога — не декоративное свойство: без wintun.dll клиент не
+# поднимет TUN, а .bat запускает exe через %~dp0, то есть строго из своей папки.
+for need in wintun.dll connect-vpn-DEBUG.bat connect-vpn-graceful-drain.bat; do
+  if [ ! -f "$CLIENT_BIN_DIR/$need" ]; then
+    echo ">> ВНИМАНИЕ: в $CLIENT_BIN_DIR нет $need — клиент не запустится." >&2
+  fi
+done
