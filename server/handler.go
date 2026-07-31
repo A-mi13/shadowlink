@@ -721,7 +721,11 @@ proceed:
 		h.failClosedToDecoyWithReason(w, r, DecoyReasonAuthFail)
 		return
 	}
-	if !h.clientAuth.CheckDeviceLimit(string(clientID)) {
+	// Раунд 18: AdmitSession выполняет проверку квоты И регистрацию как ОДНУ
+	// атомарную операцию. Раньше здесь стояла CheckDeviceLimit, а регистрация
+	// (OnSessionCreated) — двадцатью строками ниже: N одновременных handshake
+	// проходили проверку до первого append и превышали лимит на N-1.
+	if !h.clientAuth.AdmitSession(string(clientID), session.ID) {
 		// Not AuthFailed: authenticated client, rejected only by device quota.
 		h.metrics.HandshakesFailed.Add(1)
 		h.sessions.Remove(session.ID)
@@ -741,7 +745,6 @@ proceed:
 	h.tunnels[session.ID] = tunnel
 	h.tunnelsMu.Unlock()
 
-	h.clientAuth.OnSessionCreated(string(clientID), session.ID)
 	// Plan §C4 (May audit, 2026-05-02): record this clientID in the
 	// exemption LRU AFTER X25519 decrypt + auth + device-limit checks
 	// pass. First handshake from a fresh clientID still pays the per-IP
@@ -1470,18 +1473,19 @@ func (h *Handler) handleConnect(w http.ResponseWriter, session *core.Session, ch
 
 	// Optimistic CONNECT: register stream entry BEFORE dial so incoming data
 	// is buffered (not dropped). Mirrors WS path behavior.
-	tunnel.mu.Lock()
-	if tunnel.streams == nil {
-		tunnel.streams = make(map[uint16]*StreamConn)
-	}
-	if len(tunnel.streams) >= maxStreamsPerSession {
-		tunnel.mu.Unlock()
+	//
+	// H-9 (раунд 18): registerPOSTStream enforces the per-session cap AND
+	// rejects a duplicate streamID in one critical section. The insert used to be
+	// unconditional, which both leaked the overwritten stream's FD and kept the
+	// cap from ever firing (len(map) does not grow on key rewrite).
+	stream := &StreamConn{StreamID: streamID} // TargetConn=nil — pending state
+	if !registerPOSTStream(tunnel, streamID, stream) {
+		slog.Warn("CONNECT rejected", "stream", streamID,
+			"limit", maxStreamsPerSession,
+			"reason", "duplicate streamID or per-session cap reached")
 		h.sendConnectResult(w, session, tunnel, streamID, "CONNECT_FAIL")
 		return
 	}
-	stream := &StreamConn{StreamID: streamID} // TargetConn=nil — pending state
-	tunnel.streams[streamID] = stream
-	tunnel.mu.Unlock()
 
 	// A3-S-HIGH-3 (2026-04-25): bind the dial context to tunnel.done so
 	// that closeTunnel during a slow CONNECT cancels the in-flight dial
@@ -2204,17 +2208,26 @@ func encodeServerHello(sh *core.ServerHello) []byte {
 		ProtoVersion: sh.ProtoVersion,
 		Deprecated:   sh.ProtoVersion == nil, // legacy path → mark deprecated
 		FW:           sh.FingerprintWeights,
-		UA: map[string]string{
-			// Chrome UA mirrors browser.LockedChromeUA() (Chrome/133) so the
-			// server-issued client config stays consistent with the four
-			// wire surfaces.
-			//
-			// 2026-05-05: non-Chrome fingerprints retired (TSPU блокирует
-			// Safari/Firefox/Edge). Из map выкинуты "safari" и "firefox" —
-			// клиент и так теперь принимает только chrome (см.
-			// allowedUAKeys в client/client.go), но не отдаём лишнего в JSON.
-			"chrome": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-		},
+		// UA для КАЖДОГО зарегистрированного профиля, а не только Chrome/133.
+		//
+		// 2026-07-31 (найдено полевым логом): здесь стоял единственный литерал
+		// `"chrome": ...Chrome/133...`, тогда как клиент выбирает профиль из
+		// пула 133/131/120 с весами 60/30/10. Валидация
+		// isValidUAForProfile (client/client.go) требует совпадения мажора,
+		// поэтому клиент с chrome131 или chrome120 отвергал серверный UA:
+		//
+		//   WARN rejected UA from server: profile mismatch  selected=chrome131
+		//
+		// То есть в ~40% запусков механизм UpdateUserAgents не работал, а WARN
+		// выглядел как ошибка при диагностике. Защита C4 при этом вела себя
+		// правильно — она и создана, чтобы сервер не мог перефингерпринтить
+		// клиента; проблема была в несогласованности источников.
+		//
+		// Берём из реестра профилей (единый источник истины), а не литералами:
+		// добавление профиля в skins/browser автоматически попадает сюда.
+		// Non-Chrome семейства в реестре отсутствуют с 2026-05-05 (TSPU
+		// блокирует Safari/Firefox/Edge), так что лишнего в JSON не уезжает.
+		UA: browser.ProfileUAs(),
 	})
 	return data
 }

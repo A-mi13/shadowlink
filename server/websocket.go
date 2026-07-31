@@ -316,6 +316,54 @@ type wsStream struct {
 
 const pendingBufMax = 64 // max queued chunks before TCP dial completes
 
+// registerWSStreamLocked inserts s under streamID, enforcing both the
+// per-session stream cap and the no-duplicate invariant. Returns false if the
+// CONNECT must be rejected. Caller MUST hold the streams mutex.
+//
+// H-9 (раунд 18): the insert used to be unconditional
+// (`streams[streamID] = pendingStream`), which broke two things at once.
+// The overwritten stream was dropped from the map but its targetConn was never
+// closed and its writer goroutine kept running (it only exits via s.done, and
+// nothing held a reference to call Close()) — so every repeat leaked an FD and a
+// goroutine. Worse, the cap check reads len(streams), which does not grow when
+// the same key is rewritten, so maxStreamsPerSession never fired at all: a
+// client looping FlagConnect(streamID=1) exhausted process FDs — including the
+// listener — and took the server down for everyone.
+//
+// Policy is REJECT, not "close the old stream and take over". A legitimate
+// client cannot produce a duplicate: NextStreamID (client/client.go:789) hands
+// out IDs monotonically and skips any ID still live in either stream map. Taking
+// over would instead hand an authenticated client a way to tear down its own
+// in-flight connections by replaying a streamID.
+func registerWSStreamLocked(streams map[uint16]*wsStream, streamID uint16, s *wsStream) bool {
+	if _, dup := streams[streamID]; dup {
+		return false
+	}
+	if len(streams) >= maxStreamsPerSession {
+		return false
+	}
+	streams[streamID] = s
+	return true
+}
+
+// registerPOSTStream is the POST-path counterpart of registerWSStreamLocked
+// (handler.go CONNECT). Takes tunnel.mu itself. Same invariant, same rationale.
+func registerPOSTStream(tunnel *Tunnel, streamID uint16, s *StreamConn) bool {
+	tunnel.mu.Lock()
+	defer tunnel.mu.Unlock()
+	if tunnel.streams == nil {
+		tunnel.streams = make(map[uint16]*StreamConn)
+	}
+	if _, dup := tunnel.streams[streamID]; dup {
+		return false
+	}
+	if len(tunnel.streams) >= maxStreamsPerSession {
+		return false
+	}
+	tunnel.streams[streamID] = s
+	return true
+}
+
 // newPendingWSStream creates a stream in "pending" state (no target conn yet).
 // Data written via Write() is buffered until Activate() is called.
 func newPendingWSStream() *wsStream {
@@ -470,9 +518,21 @@ func (s *wsStream) CloseKeepTarget() {
 // Post-auth, runWebSocketSession owns the per-session relay loop.
 func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if !IsAllowedWSPath(r.URL.Path) {
-		// Direct decoy serve OK — non-WS path matches generic random-GET decoy
-		// behavior; no additional sanitation needed (path is not WS-leaky).
-		h.decoy.ServeHTTP(w, r)
+		// H-6 (раунд 18): this used to be a bare h.decoy.ServeHTTP(w, r) — the one
+		// decoy serve in server/ that skipped BOTH decoyWithTimingParity and
+		// failClosedToDecoy*. Every other path pays runSyntheticDispatch (3×
+		// X25519 ScalarMult) + ackJitter(), so `GET /random-path` answered in
+		// microseconds WITH an Upgrade header and in milliseconds without one,
+		// bodies identical. "Adding Upgrade: websocket makes the server answer an
+		// order of magnitude faster" is nonsense for static content behind nginx —
+		// a free discriminator for an active probe.
+		//
+		// The comment that used to sit here ("no additional sanitation needed")
+		// was written before timing-parity existed and stopped being true when it
+		// landed. PathMismatch is the right reason label: it already exists, and
+		// routing through failClosedToDecoyWithReason also sanitizes the URL echo
+		// so the body length cannot depend on how long a path was probed.
+		h.failClosedToDecoyWithReason(w, r, DecoyReasonPathMismatch)
 		return
 	}
 	clientIP := h.clientIP(r)
@@ -919,29 +979,37 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 					continue
 				}
 
-				// SEC-H3 fix: limit concurrent streams per session to prevent resource exhaustion
+				// Optimistic CONNECT: create pending stream BEFORE dial so data
+				// arriving from client is buffered (not dropped). This eliminates
+				// the round-trip wait that blocks system VPN through CF CDN.
+				//
+				// SEC-H3: cap concurrent streams per session. H-9 (раунд 18): the
+				// cap check and the insert are now ONE critical section in
+				// registerWSStreamLocked, which also rejects a duplicate streamID.
+				// Previously the insert was unconditional, so a repeated streamID
+				// silently overwrote a live stream (leaking its FD + writer
+				// goroutine) and kept len(streams) at 1 — meaning the cap never
+				// fired. See registerWSStreamLocked for the full rationale.
+				pendingStream := newPendingWSStream()
 				streamsMu.Lock()
 				streamCount := len(streams)
+				admitted := registerWSStreamLocked(streams, streamID, pendingStream)
 				streamsMu.Unlock()
 				slog.Info("WS CONNECT received", "stream", streamID, "target", target,
 					"activeStreams", streamCount)
-				if streamCount >= maxStreamsPerSession {
-					slog.Warn("max streams per session exceeded", "limit", maxStreamsPerSession)
+				if !admitted {
+					slog.Warn("WS CONNECT rejected",
+						"stream", streamID, "activeStreams", streamCount,
+						"limit", maxStreamsPerSession,
+						"reason", "duplicate streamID or per-session cap reached")
 					errChunk := core.NewStreamDataChunk(session.ID, session.NextSeqNum(), streamID, []byte("CONNECT_FAIL"))
 					if enc, err := session.EncryptChunk(errChunk); err == nil {
 						writeMsg(enc)
 					}
 					core.PutBuffer(errChunk.Payload)
+					pendingStream.Close() // release the freshly created stream
 					continue
 				}
-
-				// Optimistic CONNECT: create pending stream BEFORE dial so data
-				// arriving from client is buffered (not dropped). This eliminates
-				// the round-trip wait that blocks system VPN through CF CDN.
-				pendingStream := newPendingWSStream()
-				streamsMu.Lock()
-				streams[streamID] = pendingStream
-				streamsMu.Unlock()
 
 				// Bug #8: allocate per-stream credit bucket when flow control is active.
 				if flowEnabled {

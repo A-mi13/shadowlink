@@ -172,9 +172,66 @@ func (ca *ClientAuth) SetUserLimit(userID string, max int) {
 	ca.userLimits[userID] = max
 }
 
-// CheckDeviceLimit returns true if the user (derived from clientID) has room
-// for another device session. In open mode, always returns true.
-// If the clientID already has an active session (reconnecting), always returns true.
+// AdmitSession atomically checks the per-user device quota AND registers the
+// session. Returns false if the quota is exhausted (caller must reject).
+//
+// This replaces the CheckDeviceLimit + OnSessionCreated pair, which had two
+// defects the split itself made possible (раунд 18):
+//
+//	(а) TOCTOU. The check took RLock, read, released; registration happened in a
+//	    separate call ~20 lines later (handler.go:724 → :744). N concurrent
+//	    handshakes all passed the check before the first append and overshot the
+//	    limit by N-1. Measured: 5 of 5 admitted against a limit of 2.
+//
+//	(б) The "reconnecting client always allowed" fast-path keyed on the full
+//	    clientID and returned early, so one clientID got UNBOUNDED sessions:
+//	    OnSessionCreated appended to activeSessions[userID] every time while
+//	    overwriting clientSession[clientID], leaving the old sessionID stranded in
+//	    activeSessions forever (OnSessionDestroyed could no longer pair it up).
+//	    Measured: 50 sessions and 50 stranded entries against a limit of 2 — one
+//	    user could occupy all MaxClients=500 and starve everyone else into decoy.
+//
+// A reconnect is still always admitted — that behaviour is deliberate, a client
+// whose transport died must be able to come back without waiting for a sweep —
+// but it now REPLACES its previous session instead of adding one, so the quota
+// stays honest. The asymmetry that made (б) possible (quota counted per userID,
+// fast-path keyed per clientID) is gone: both now go through the same accounting.
+func (ca *ClientAuth) AdmitSession(clientID string, sessionID uint32) bool {
+	if ca.openMode {
+		return true
+	}
+	ca.mu.Lock()
+	defer ca.mu.Unlock()
+
+	userID := parseUserID(clientID)
+
+	// Reconnect: replace this clientID's own slot rather than consuming a new one.
+	if prev, has := ca.clientSession[clientID]; has {
+		ca.removeSessionLocked(userID, prev)
+		ca.activeSessions[userID] = append(ca.activeSessions[userID], sessionID)
+		ca.clientSession[clientID] = sessionID
+		return true
+	}
+
+	limit := ca.defaultMax
+	if ul, ok := ca.userLimits[userID]; ok {
+		limit = ul
+	}
+	if len(ca.activeSessions[userID]) >= limit {
+		return false
+	}
+
+	ca.activeSessions[userID] = append(ca.activeSessions[userID], sessionID)
+	ca.clientSession[clientID] = sessionID
+	return true
+}
+
+// CheckDeviceLimit reports whether the user has room for another device session,
+// WITHOUT registering anything.
+//
+// Deprecated: prefer AdmitSession — a bare check is racy by construction (see the
+// TOCTOU note there). Kept for read-only callers (management API / metrics) that
+// only want to surface remaining quota.
 func (ca *ClientAuth) CheckDeviceLimit(clientID string) bool {
 	if ca.openMode {
 		return true
@@ -182,9 +239,8 @@ func (ca *ClientAuth) CheckDeviceLimit(clientID string) bool {
 	ca.mu.RLock()
 	defer ca.mu.RUnlock()
 
-	// Reconnecting client always allowed.
 	if _, has := ca.clientSession[clientID]; has {
-		return true
+		return true // reconnect replaces its own slot, so room is guaranteed
 	}
 
 	userID := parseUserID(clientID)
@@ -195,12 +251,35 @@ func (ca *ClientAuth) CheckDeviceLimit(clientID string) bool {
 	return len(ca.activeSessions[userID]) < limit
 }
 
+// removeSessionLocked drops sessionID from activeSessions[userID].
+// Caller MUST hold ca.mu for writing.
+func (ca *ClientAuth) removeSessionLocked(userID string, sessionID uint32) {
+	sessions := ca.activeSessions[userID]
+	for i, sid := range sessions {
+		if sid == sessionID {
+			ca.activeSessions[userID] = append(sessions[:i], sessions[i+1:]...)
+			break
+		}
+	}
+	if len(ca.activeSessions[userID]) == 0 {
+		delete(ca.activeSessions, userID)
+	}
+}
+
 // OnSessionCreated records that clientID has established a session with the given ID.
+//
+// Deprecated: use AdmitSession, which performs the quota check and this
+// registration as one atomic operation. Retained for callers that have already
+// been admitted through another gate.
 func (ca *ClientAuth) OnSessionCreated(clientID string, sessionID uint32) {
 	ca.mu.Lock()
 	defer ca.mu.Unlock()
 
 	userID := parseUserID(clientID)
+	// Replace this clientID's previous session instead of stranding it.
+	if prev, has := ca.clientSession[clientID]; has {
+		ca.removeSessionLocked(userID, prev)
+	}
 	ca.activeSessions[userID] = append(ca.activeSessions[userID], sessionID)
 	ca.clientSession[clientID] = sessionID
 }
@@ -212,17 +291,7 @@ func (ca *ClientAuth) OnSessionDestroyed(clientID string, sessionID uint32) {
 
 	userID := parseUserID(clientID)
 
-	// Remove sessionID from activeSessions slice.
-	sessions := ca.activeSessions[userID]
-	for i, sid := range sessions {
-		if sid == sessionID {
-			ca.activeSessions[userID] = append(sessions[:i], sessions[i+1:]...)
-			break
-		}
-	}
-	if len(ca.activeSessions[userID]) == 0 {
-		delete(ca.activeSessions, userID)
-	}
+	ca.removeSessionLocked(userID, sessionID)
 
 	// Remove from clientSession.
 	if ca.clientSession[clientID] == sessionID {
@@ -285,17 +354,7 @@ func (ca *ClientAuth) GetAndDestroyClientSession(clientID string) (uint32, bool)
 
 	userID := parseUserID(clientID)
 
-	// Remove sessionID from activeSessions slice.
-	sessions := ca.activeSessions[userID]
-	for i, sid := range sessions {
-		if sid == sessionID {
-			ca.activeSessions[userID] = append(sessions[:i], sessions[i+1:]...)
-			break
-		}
-	}
-	if len(ca.activeSessions[userID]) == 0 {
-		delete(ca.activeSessions, userID)
-	}
+	ca.removeSessionLocked(userID, sessionID)
 
 	// Remove from clientSession.
 	delete(ca.clientSession, clientID)
