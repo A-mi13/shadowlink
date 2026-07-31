@@ -45,6 +45,34 @@ func LookupProfile(name string) (BrowserProfile, bool) {
 	return BrowserProfile{}, false
 }
 
+// ProfileUAs возвращает карту {имя профиля → User-Agent} для ВСЕХ
+// зарегистрированных профилей.
+//
+// Нужна серверу, чтобы отдать в ServerHello UA для каждого мажора пула, а не
+// только для одного. Найдено полевым логом 2026-07-31: сервер отдавал
+// исключительно `Chrome/133` под ключом `chrome`, тогда как клиент выбирает
+// профиль из 133/131/120 с весами 60/30/10 (DefaultFPWeights). Валидация
+// isValidUAForProfile требует совпадения мажора, поэтому в ~40% запусков
+// серверный UA отвергался с WARN — механизм UpdateUserAgents был мёртв для
+// этой доли клиентов.
+//
+// Legacy-ключ "chrome" НЕ включается: он резолвится в chrome133 через
+// LookupProfile, и его присутствие рядом с явным "chrome133" дало бы две записи
+// с одинаковым UA.
+//
+// Возвращается копия — реестр после init() только читается, и отдавать его
+// наружу нельзя.
+func ProfileUAs() map[string]string {
+	out := make(map[string]string, len(profileRegistry))
+	for name, p := range profileRegistry {
+		if p.UAString == "" {
+			continue
+		}
+		out[name] = p.UAString
+	}
+	return out
+}
+
 // IsChromeFamily сообщает, относится ли профиль с данным именем к семейству
 // Chrome. Безопасно для неизвестных имён (false). Legacy "chrome" резолвится
 // через LookupProfile fallback в chrome133 (chrome-family).
