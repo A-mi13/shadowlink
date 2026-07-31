@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/nixavpn/shadowlink/client/slotobs"
 	"github.com/nixavpn/shadowlink/core"
 	"github.com/nixavpn/shadowlink/skins/browser"
 )
@@ -923,6 +924,19 @@ func WritePromMetrics(w io.Writer) {
 	fmt.Fprintf(w, "# TYPE shadowlink_capacity_dip_total counter\n")
 	fmt.Fprintf(w, "shadowlink_capacity_dip_total %d\n", Stats.CapacityDipTotal.Load())
 
+	// Раунд 18 P0 (переформулирован 2026-07-31): распределение смертей слотов.
+	//
+	// Существующие счётчики (age_cut_reconnects_total и т.д.) отвечают «сколько»,
+	// но не «где порог» — а именно порог зашит константой, не подтверждённой ни
+	// одним источником. Эти серии показывают РАЗБРОС по двум осям: у той оси, по
+	// которой реально режет цензор, коэффициент вариации будет заметно НИЖЕ
+	// (жёсткий порог даёт кластер на своей оси и разброс на чужой).
+	//
+	// Считываются на месте (без агрегации по времени) — назначение
+	// диагностическое: понять ось и порядок величины ДО того, как проектировать
+	// адаптацию. Подробнее: client/slotobs, FIELD-CHECKS.md §2.
+	emitSlotDeathDistribution(w)
+
 	// D1 A/B metric: age-cut events split by TLS fingerprint profile (Task D1, 2026-06-09).
 	// If Firefox-cohort cuts exceed Chrome-cohort in a region → that TSPU targets Firefox
 	// specifically; use this signal to reweight the FP pool toward Chrome.
@@ -949,6 +963,53 @@ func WritePromMetrics(w io.Writer) {
 	fmt.Fprintf(w, "shadowlink_fingerprint_chrome_major_active{major=\"120\"} %d\n", Stats.ActiveProfileChrome120.Load())
 	fmt.Fprintf(w, "shadowlink_fingerprint_chrome_major_active{major=\"131\"} %d\n", Stats.ActiveProfileChrome131.Load())
 	fmt.Fprintf(w, "shadowlink_fingerprint_chrome_major_active{major=\"133\"} %d\n", Stats.ActiveProfileChrome133.Load())
+}
+
+// emitSlotDeathDistribution exposes the slot-death distribution collected by
+// client/slotobs (раунд 18 P0, reframed 2026-07-31).
+//
+// The point of these series is to answer "which AXIS does the censor key on",
+// which no existing counter can: the CV (coefficient of variation) is LOW on the
+// axis carrying a hard threshold and HIGH on the other. Percentiles then give
+// the order of magnitude. Together they replace the unverified 130-190s constant
+// with something derived from this user's own network.
+//
+// Emits zeros when no pool is published or nothing has died yet — a scrape must
+// never fail just because the sample is empty.
+func emitSlotDeathDistribution(w io.Writer) {
+	var s slotobs.Summary
+	if pool := globalPoolForStatsPtr.Load(); pool != nil && pool.slotDeaths != nil {
+		s = pool.slotDeaths.Summarize()
+	}
+
+	fmt.Fprintf(w, "# HELP shadowlink_slot_death_samples Slot deaths currently held in the observation ring (bounded; oldest overwritten).\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_slot_death_samples gauge\n")
+	fmt.Fprintf(w, "shadowlink_slot_death_samples %d\n", s.Count)
+
+	fmt.Fprintf(w, "# HELP shadowlink_slot_death_age_ms Slot age at death, percentiles over the observation ring. p10 is the actionable one for a future rotation threshold (rotate before the EARLIEST deaths, not the median).\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_slot_death_age_ms gauge\n")
+	fmt.Fprintf(w, "shadowlink_slot_death_age_ms{quantile=\"0.1\"} %d\n", s.AgeP10)
+	fmt.Fprintf(w, "shadowlink_slot_death_age_ms{quantile=\"0.5\"} %d\n", s.AgeP50)
+	fmt.Fprintf(w, "shadowlink_slot_death_age_ms{quantile=\"0.9\"} %d\n", s.AgeP90)
+
+	fmt.Fprintf(w, "# HELP shadowlink_slot_death_down_bytes Downlink bytes carried at death, percentiles. Compare against the ~16-20 KB volume trigger described by net4people#490.\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_slot_death_down_bytes gauge\n")
+	fmt.Fprintf(w, "shadowlink_slot_death_down_bytes{quantile=\"0.1\"} %d\n", s.BytesP10)
+	fmt.Fprintf(w, "shadowlink_slot_death_down_bytes{quantile=\"0.5\"} %d\n", s.BytesP50)
+	fmt.Fprintf(w, "shadowlink_slot_death_down_bytes{quantile=\"0.9\"} %d\n", s.BytesP90)
+
+	fmt.Fprintf(w, "# HELP shadowlink_slot_death_cv Coefficient of variation (stddev/mean) of slot deaths per axis. The LOWER axis is the one the censor keys on: a hard threshold clusters values on its own axis and scatters them on the other. Needs >=2 samples; 0 otherwise.\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_slot_death_cv gauge\n")
+	fmt.Fprintf(w, "shadowlink_slot_death_cv{axis=\"age\"} %.6f\n", s.AgeCV)
+	fmt.Fprintf(w, "shadowlink_slot_death_cv{axis=\"down_bytes\"} %.6f\n", s.BytesCV)
+
+	fmt.Fprintf(w, "# HELP shadowlink_slot_death_by_close_kind Slot deaths by classified close shape. Separates middlebox teardown (close_other / reset) from our own read deadline (io_timeout) — needed so noise is not mistaken for censorship.\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_slot_death_by_close_kind gauge\n")
+	// Фиксированный порядок меток: карта в Go итерируется случайно, а
+	// нестабильный порядок строк ломает diff'ы и пин alert-правил на список.
+	for _, kind := range frameAnomalyReasons {
+		fmt.Fprintf(w, "shadowlink_slot_death_by_close_kind{kind=%q} %d\n", kind, s.ByCloseKind[kind])
+	}
 }
 
 // StartStatsLogger launches a goroutine that logs counter deltas every
@@ -1018,6 +1079,110 @@ func StartStatsLogger(ctx context.Context, interval time.Duration) {
 			lastSocks, lastUp, lastDown = socks, up, down
 			lastWriterExits, lastReaderExits = writerExits, readerExits
 			lastBypassMatch, lastBypassMiss = bypassMatch, bypassMiss
+
+			logSlotDeathSummary()
 		}
 	}()
 }
+
+// logSlotDeathSummary emits the slot-death distribution to the log (раунд 18 P0).
+//
+// The Prometheus exporter (WritePromMetrics) is NOT reachable on the client — no
+// call site anywhere in cmd/, so the linker drops it and the client exposes no
+// /metrics endpoint at all. The stats logger is the only channel the client
+// actually has, so the distribution goes here or it is unobservable. Without this
+// the recorder would collect data nobody can read — the same silent-failure shape
+// this audit round kept finding.
+//
+// Emitted as a snapshot (not a delta): percentiles and CV are properties of the
+// whole window, and subtracting them between ticks is meaningless.
+//
+// Silent until there are at least minSlotDeathSamplesToLog observations. Below
+// that the CV is noise, and printing it would invite reading a threshold off two
+// data points — exactly the mistake this rework exists to prevent.
+func logSlotDeathSummary() {
+	pool := globalPoolForStatsPtr.Load()
+	if pool == nil || pool.slotDeaths == nil {
+		return
+	}
+	s := pool.slotDeaths.Summarize()
+	if s.Count < minSlotDeathSamplesToLog {
+		return
+	}
+
+	// Which axis clusters tighter is THE question: a hard threshold produces a
+	// tight cluster on its own axis and scatter on the other. Reported as a plain
+	// label so the log line is readable without doing the comparison by hand —
+	// but it is a hint, not a verdict (see slotobs docs).
+	axisHint := "inconclusive"
+	switch {
+	case s.AgeCV > 0 && s.BytesCV > 0 && s.AgeCV*2 < s.BytesCV:
+		axisHint = "age"
+	case s.AgeCV > 0 && s.BytesCV > 0 && s.BytesCV*2 < s.AgeCV:
+		axisHint = "down_bytes"
+	}
+
+	slog.Info("slot death distribution (snapshot)",
+		"samples", s.Count,
+		"total_deaths", pool.slotDeaths.Total(),
+		"age_p10_ms", s.AgeP10,
+		"age_p50_ms", s.AgeP50,
+		"age_p90_ms", s.AgeP90,
+		"down_p10_kb", s.BytesP10/1024,
+		"down_p50_kb", s.BytesP50/1024,
+		"down_p90_kb", s.BytesP90/1024,
+		"cv_age", fmt.Sprintf("%.4f", s.AgeCV),
+		"cv_down_bytes", fmt.Sprintf("%.4f", s.BytesCV),
+		"tighter_axis", axisHint,
+		"by_close_kind", s.ByCloseKind,
+	)
+
+	// Вывод порога (P0 шаг 2). Отдельной строкой, потому что это ВЫВОД с
+	// допущениями, а не описание данных: их надо читать раздельно. Инференс
+	// отсеивает шум (age=0, closed_local, io_timeout), поэтому его `samples`
+	// меньше, чем в сводке выше — по этой разнице видно, сколько отброшено.
+	//
+	// НИЧЕГО не применяет: ротацией по-прежнему управляют maxSlotAge /
+	// stickyMaxDrainAge. Автоприменение — шаг 3, и оно требует гистерезиса,
+	// иначе порог будет дёргаться на каждой смене сети.
+	v := pool.slotDeaths.Infer()
+
+	// P0 шаг 3: скармливаем вердикт адаптеру. Он сам решает, менять ли порог —
+	// требует подтверждений, только сжимает, держит пол и гистерезис.
+	changed := pool.ageAdapter.Observe(v)
+	adaptedAge, configuredAge, adaptChanges, adaptReason := pool.ageAdapter.Stats()
+
+	slog.Info("slot death inference",
+		"axis", v.Axis.String(),
+		"threshold_age", v.Threshold.Age,
+		"threshold_bytes", v.Threshold.Bytes,
+		"samples_used", v.Samples,
+		"rejected_zero_age", v.Rejected.ZeroAge,
+		"rejected_local_close", v.Rejected.LocalClose,
+		"rejected_timeout", v.Rejected.Timeout,
+		"applied_max_slot_age", adaptedAge,
+		"configured_max_slot_age", configuredAge,
+		"adapt_changes", adaptChanges,
+		"sticky_max_drain", pool.stickyMaxDrainAge,
+		"worst_case_teardown", adaptedAge+pool.stickyMaxDrainAge,
+		"reason", v.Reason,
+	)
+
+	// Изменение порога — отдельной строкой на уровне WARN: это смена поведения
+	// транспорта, её нельзя терять в потоке INFO при разборе инцидента.
+	if changed {
+		slog.Warn("rotation threshold adapted",
+			"applied", adaptedAge,
+			"configured", configuredAge,
+			"changes_total", adaptChanges,
+			"worst_case_teardown", adaptedAge+pool.stickyMaxDrainAge,
+			"reason", adaptReason,
+		)
+	}
+}
+
+// minSlotDeathSamplesToLog is the floor below which the distribution stays
+// unlogged. 12 is well short of a statistically comfortable sample but enough
+// that a CV comparison is not pure noise; the log line carries `samples` so the
+// reader can judge for themselves.
+const minSlotDeathSamplesToLog = 12

@@ -476,7 +476,12 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 				// negative value reaches the watchdog's `<= 0` kill gate. Unset
 				// env → envDurationDefault returns 10m (not 0), so the default
 				// path is unaffected (final review M-1).
-				stickyMaxDrainAge := envDurationDefault("SHADOWLINK_STICKY_MAX_DRAIN_AGE", 10*time.Minute)
+				// Дефолт из client — единый источник. Раньше здесь была вторая
+				// копия литерала 10m: правка в одном месте не затрагивала
+				// другое. 2026-07-31 значение пересчитано по замеру age-cut,
+				// см. client.DefaultStickyMaxDrainAge.
+				stickyMaxDrainAge := envDurationDefault("SHADOWLINK_STICKY_MAX_DRAIN_AGE",
+					client.DefaultStickyMaxDrainAge)
 				if stickyMaxDrainAge == 0 {
 					stickyMaxDrainAge = -1
 				}

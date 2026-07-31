@@ -16,6 +16,7 @@ import (
 
 	"golang.org/x/time/rate"
 
+	"github.com/nixavpn/shadowlink/client/slotobs"
 	"github.com/nixavpn/shadowlink/core"
 	"github.com/nixavpn/shadowlink/skins/browser"
 )
@@ -1069,6 +1070,13 @@ func looksLikeHTTPPrefix(msg string) bool {
 // natural (exponential backoff + meltdown feed).
 const ageCutMinAgeMs = 60_000
 
+// DefaultStickyMaxDrainAge caps how long a draining slot may be held open for an
+// ACTIVE download before it is torn down anyway. See the rationale at the
+// assignment site in NewWSPoolTransport: derived from measured cut behaviour
+// (earliest observed age-cut 85.3s), not from the unverified ~130s window the
+// earlier tuning assumed.
+const DefaultStickyMaxDrainAge = 15 * time.Second
+
 // ageCutReconnectJitter bounds the near-zero initial delay (U(0, jitter)) the
 // fast age-cut reconnect sleeps before its first connect attempt. A small spread
 // avoids a synchronized JA4 handshake burst when several mature slots are cut
@@ -1173,6 +1181,29 @@ type WSPoolTransport struct {
 	staggerStep       time.Duration // per-slot grid interval (0 → slotRotationStaggerStep)
 	staggerOffsetCap  time.Duration // max staggerOffset regardless of idx (0 → no cap)
 	ageCutMinAge      time.Duration // age-cut classification floor (0 → ageCutMinAgeMs default)
+
+	// ageAdapter сжимает порог ротации по наблюдаемому поведению сети
+	// пользователя (P0 шаг 3). Только сжимает, никогда не поднимает выше
+	// cfg.MaxSlotAge; с гистерезисом и требованием подтверждений. nil →
+	// используется сконфигурированный порог как раньше.
+	//
+	// Зачем: зашитые 75 s против выведенных 66–71 s по трём полевым выборкам.
+	// worst-case teardown был 90 s при самой ранней наблюдённой смерти 82.9 s —
+	// разрыв, который правкой константы не закрыть, потому что у другого
+	// провайдера окно другое (ACM IMC 2022).
+	ageAdapter *slotobs.Adapter
+
+	// slotDeaths records HOW slots die, so a future rotation threshold can be
+	// derived from this user's own network instead of the global constant
+	// (раунд 18 P0, reframed 2026-07-31 — see client/slotobs and
+	// docs/audit/2026-07-25-round18/FIELD-CHECKS.md §2).
+	//
+	// Observation only: nothing reads this to make a decision yet. The
+	// MaxSlotAge / ageCutMinAge constants still drive rotation exactly as
+	// before. Wiring the inference (axis detection → adaptive threshold →
+	// hysteresis) is a separate design step; recording first means the data is
+	// trustworthy before anything acts on it.
+	slotDeaths *slotobs.Recorder
 	// byteBudgetMinInterval — wall-clock floor before a byte-budget rotation
 	// may fire on a freshly-(re)connected slot (Bug #4 storm fix). 0 disables
 	// the floor. Defaults to byteBudgetMinRotationInterval when byte budget is
@@ -1641,9 +1672,28 @@ func NewWSPoolTransport(cl *Client, cfg WSPoolConfig) *WSPoolTransport {
 	}
 	// Bug #6 sticky stream defaults. StickyMaxDrainAge<=0 is the kill switch:
 	// the deadline branch degrades to the legacy blind hard-cap teardown.
+	//
+	// Default 10min → 15s (2026-07-31), from MEASUREMENT rather than assumption.
+	// Slot-death telemetry (client/slotobs, 19 age-cuts in one field session)
+	// showed the middlebox cuts on the AGE axis (CV 0.18 vs 2.20 for bytes) with
+	// the EARLIEST death at 85.3s — not the ~130s the previous tuning assumed.
+	// A 10-minute sticky window let a draining slot live to 75s+10min, i.e. far
+	// inside the observed cut window; the field log recorded 36 sticky-backstop
+	// teardowns and 136 forcibly severed streams.
+	//
+	// Cutting it is safe because stream MIGRATION does the job better: the same
+	// session logged 320 successful migrations with 0 failures and only 5 real
+	// data losses. Holding a stale slot buys almost nothing and exposes it to the
+	// cut. 75s rotation + 15s sticky = 90s worst-case teardown.
+	//
+	// This is still a hard-coded number and therefore still wrong for someone
+	// else's network — 90s exceeds the 85.3s seen here, so the margin is not
+	// positive even now. The real fix is deriving the threshold per-AS from
+	// slotobs observations (P0 step 2, docs/audit/2026-07-25-round18/FIELD-CHECKS.md §2);
+	// this default only stops the pathological case until then.
 	stickyMaxDrainAge := cfg.StickyMaxDrainAge
 	if stickyMaxDrainAge == 0 {
-		stickyMaxDrainAge = 10 * time.Minute
+		stickyMaxDrainAge = DefaultStickyMaxDrainAge
 	}
 	// negative stays negative → sticky disabled (kill switch).
 	stickyMaxTotalBytes := cfg.StickyMaxTotalBytes
@@ -1670,6 +1720,8 @@ func NewWSPoolTransport(cl *Client, cfg WSPoolConfig) *WSPoolTransport {
 		staggerStep:           cfg.StaggerStep,
 		staggerOffsetCap:      cfg.StaggerOffsetCap,
 		ageCutMinAge:          cfg.AgeCutMinAge,
+		slotDeaths:            slotobs.NewRecorder(0), // 0 → DefaultCapacity
+		ageAdapter:            slotobs.NewAdapter(cfg.MaxSlotAge),
 		byteBudgetMinInterval: byteBudgetMinInterval,
 		gracefulDrain:         cfg.GracefulDrain,
 		drainHardCap:          drainHardCap,
@@ -1918,7 +1970,19 @@ func (p *WSPoolTransport) rotationWatchdogSweep() {
 		}
 
 		// Per-slot age threshold = max-age + per-session frozen grid jitter.
-		effectiveMaxAge := p.maxSlotAge.Nanoseconds() + slot.staggerOffsetNs.Load()
+		//
+		// P0 шаг 3 (2026-07-31): базу берём у адаптера, а не напрямую из
+		// p.maxSlotAge. Адаптер только СЖИМАЕТ порог по наблюдаемому поведению
+		// сети (см. slotobs.Adapter) и никогда не поднимает выше
+		// сконфигурированного, поэтому подстановка безопасна: при отсутствии
+		// подтверждённого вывода Threshold() возвращает ровно p.maxSlotAge.
+		// Stagger-джиттер добавляется поверх как раньше — он про размазывание
+		// ротаций по сетке, а не про порог.
+		baseMaxAge := p.maxSlotAge
+		if adapted := p.ageAdapter.Threshold(); adapted > 0 {
+			baseMaxAge = adapted
+		}
+		effectiveMaxAge := baseMaxAge.Nanoseconds() + slot.staggerOffsetNs.Load()
 		if nowNs-started < effectiveMaxAge {
 			continue
 		}
@@ -3319,6 +3383,25 @@ func (p *WSPoolTransport) slotReaderWithClient(ctx context.Context, cl *Client, 
 				"writer_exits", Stats.WriterExits.Load(),
 				"mode", mode,
 			)
+
+			// Раунд 18 P0: те же три поля, но в агрегируемую структуру, а не
+			// только в лог-строку. Из логов нельзя ни посчитать перцентили, ни
+			// сохранить историю между запусками — а именно распределение
+			// (кластеризуется возраст или объём) отвечает на вопрос, по какой ОСИ
+			// режет цензор. Наблюдение не влияет на решения: ротацией по-прежнему
+			// управляют maxSlotAge / ageCutMinAge.
+			//
+			// `Mature: cause == deathCauseAgeCut` записывается, но доверять ему
+			// нельзя — это ВЫВОД того самого порога, который мы проверяем.
+			if p.slotDeaths != nil {
+				p.slotDeaths.Record(slotobs.Observation{
+					AgeMs:          slotAgeMs,
+					DownBytes:      slot.downBytes.Load(),
+					LastWriteAgeMs: lastWriteAgeMs,
+					CloseKind:      anomaly,
+					Mature:         cause == deathCauseAgeCut,
+				})
+			}
 			p.handleSlotDeath(cl, idx, cause)
 			return
 		}
