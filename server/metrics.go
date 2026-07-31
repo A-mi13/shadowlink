@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"runtime"
 	"strings"
@@ -280,6 +281,13 @@ type Metrics struct {
 	// unrelated tests. Tests inject a fixed snapshot via withMemStats(). Nil →
 	// real runtime stats (production).
 	memStatsFn func(*runtime.MemStats)
+
+	// Cached memory snapshot behind BackpressureCheck (H-15). Float64 bits are
+	// held in atomic.Uint64 so the hot path stays lock-free; memStatsAt is the
+	// unix-nano timestamp of the last refresh (0 = never read).
+	memAllocMB atomic.Uint64
+	memSysMB   atomic.Uint64
+	memStatsAt atomic.Int64
 
 	// T1.7 (Phase 2, 2026-04-26) — BroadcastStreamClose drain instrumentation.
 	// Master spec exit criterion: P99 wall-clock < 2s for a 10k-tunnel drain.
@@ -665,12 +673,33 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 	}
 }
 
-// BackpressureCheck evaluates memory pressure and updates backpressure state.
-// Returns the recommended max connections per client.
-// Per spec section 9:
-//   - RAM > 80% → reduce max_conns_per_client to 4
-//   - RAM > 90% → reject new connections (503)
-func (m *Metrics) BackpressureCheck(maxConnsDefault int) (maxConns int, rejectNew bool) {
+// backpressureCacheTTL bounds how stale the memory snapshot behind
+// BackpressureCheck may be. 250ms is far shorter than any plausible
+// OOM-approach ramp (heap growth to a 0.8 ratio takes seconds at minimum) yet
+// collapses a per-handshake STW storm into at most 4 reads/second.
+//
+// H-15 (раунд 18): runtime.ReadMemStats is stop-the-world and was called on
+// EVERY handshake (handler.go), before any cryptography and with no cache —
+// measured at ~10.8µs per call. A cheap junk POST therefore bought a guaranteed
+// STW pause that stalled every goroutine including live relays: the overload
+// guard was itself an overload amplifier.
+const backpressureCacheTTL = 250 * time.Millisecond
+
+// memSnapshot returns (allocMB, sysMB), reading real memory stats at most once
+// per backpressureCacheTTL. Concurrent callers within the window observe the
+// cached pair.
+//
+// Racing readers may both decide to refresh; that is harmless (both write a
+// fresh, valid snapshot) and cheaper than serializing every caller on a mutex.
+// The published values are only ever a consistent pair per store because each
+// refresher writes both fields before advancing the timestamp.
+func (m *Metrics) memSnapshot() (allocMB, sysMB float64) {
+	nowNS := time.Now().UnixNano()
+	if at := m.memStatsAt.Load(); at != 0 && nowNS-at < int64(backpressureCacheTTL) {
+		return math.Float64frombits(m.memAllocMB.Load()),
+			math.Float64frombits(m.memSysMB.Load())
+	}
+
 	var memStats runtime.MemStats
 	if m.memStatsFn != nil {
 		m.memStatsFn(&memStats)
@@ -680,8 +709,44 @@ func (m *Metrics) BackpressureCheck(maxConnsDefault int) (maxConns int, rejectNe
 
 	// Use Go's heap stats — Sys is total OS memory, Alloc is in-use
 	// For a 2GB VPS, we target staying under ~1.5GB for Go process
-	allocMB := float64(memStats.Alloc) / 1024 / 1024
-	sysMB := float64(memStats.Sys) / 1024 / 1024
+	allocMB = float64(memStats.Alloc) / 1024 / 1024
+	sysMB = float64(memStats.Sys) / 1024 / 1024
+
+	m.memAllocMB.Store(math.Float64bits(allocMB))
+	m.memSysMB.Store(math.Float64bits(sysMB))
+	m.memStatsAt.Store(nowNS)
+	return allocMB, sysMB
+}
+
+// BackpressureCheck evaluates memory pressure and updates backpressure state.
+//
+// Returns (recommendedMaxConns, rejectNew). Thresholds are relative to
+// MemStats.Sys: Alloc > 0.9·Sys → reject; Alloc > 0.8·Sys → recommend a reduced
+// per-client connection count.
+//
+// H-15 (раунд 18), two corrections to the historical docblock:
+//
+//  1. It used to cite "spec section 9: RAM > 80% → reduce max_conns_per_client".
+//     That is NOT what this implements. The comparison is Alloc against a
+//     fraction of Sys — process heap-in-use against memory the process has
+//     obtained from the OS — not against a machine or container RAM limit. The
+//     audit read the old wording and concluded the branch was unreachable
+//     ("Alloc < Sys always"); a measurement disproved that (Alloc/Sys reached
+//     0.983 under heap pressure), but the wording was still misleading and is
+//     now gone. If a %-of-host-RAM policy is wanted, that is a different
+//     function with a different input (cgroup limit / sysinfo).
+//
+//  2. maxConns is DELIBERATELY ignored by the only caller (handler.go). This is
+//     not an oversight: MaxConnsPerClient is not a server-side gate at all — the
+//     server has no mechanism that counts or limits a client's connections. It
+//     is a value ADVERTISED to the client in ServerHello, from which the client
+//     sizes its WS pool. Honouring the reduced value would mean advertising a
+//     smaller pool under memory pressure, i.e. changing protocol behaviour and
+//     interacting with slot rotation / anti-TSPU timings — a product decision,
+//     not a bug fix. Reviewed and left as-is 2026-07-31. Only rejectNew is
+//     load-bearing; it routes the handshake to the decoy.
+func (m *Metrics) BackpressureCheck(maxConnsDefault int) (maxConns int, rejectNew bool) {
+	allocMB, sysMB := m.memSnapshot()
 
 	// Adaptive thresholds based on system memory
 	// Use Sys as rough indicator of available memory

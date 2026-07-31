@@ -8,6 +8,11 @@ import (
 	"strings"
 )
 
+// mgmtMaxBodyBytes bounds a management request body. Управляющие запросы — это
+// короткий JSON ({"client_id":"u42:d1"}), 64 KB даётся с запасом на будущие
+// bulk-операции. Применяется в ServeHTTP, до делегирования в mux (раунд 18).
+const mgmtMaxBodyBytes = 64 << 10
+
 // ManagementHandler exposes an HTTP API for controlling client authorization
 // and device limits at runtime. Protected by X-Management-Key header
 // (X-API-Key also accepted as alias for Prometheus scrapers that only support
@@ -75,6 +80,14 @@ func (mh *ManagementHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
 		return
 	}
+	// Раунд 18 (MEDIUM): post-auth все три POST-хендлера читали тело через
+	// json.NewDecoder(r.Body) без MaxBytesReader — аутентифицированный, но
+	// ошибающийся (или враждебный) клиент мог отправить сколь угодно большое
+	// тело и заставить декодер тянуть его в память. Ограничение стоит здесь, в
+	// единой точке, а не в трёх хендлерах: любой новый маршрут получает его
+	// автоматически. Управляющие запросы — это короткий JSON вида
+	// {"client_id":"u42:d1"}, так что 64 KB с огромным запасом.
+	r.Body = http.MaxBytesReader(w, r.Body, mgmtMaxBodyBytes)
 	mh.mux.ServeHTTP(w, r)
 }
 

@@ -56,6 +56,15 @@ func main() {
 	maxClients := flag.Int("max-clients", 500, "Maximum concurrent client sessions")
 	maxConns := flag.Int("max-conns", 8, "Maximum connections per client")
 	chunkSize := flag.Int("chunk-size", 12288, "Max chunk payload size in bytes")
+	// H-18: idle-таймаут сессии и период sweep'а. Дефолты 0 = «не переопределять»,
+	// значения берутся из DefaultConfig (90s/10s) либо из YAML. Раньше main.go
+	// безусловно ставил 5m/30s — те самые значения, что ретроспектива инцидента
+	// 2026-05-17 называет причиной decoy lockout, — и изменить их без пересборки
+	// было нельзя.
+	sessionTimeoutSec := flag.Int("session-timeout", 0,
+		"Session idle timeout in seconds (0 = use config default, currently 90)")
+	cleanupIntervalSec := flag.Int("cleanup-interval", 0,
+		"Session cleanup sweep interval in seconds (0 = use config default, currently 10)")
 	behindProxy := flag.Bool("behind-proxy", false, "Trust X-Forwarded-For (when behind nginx/CDN)")
 	mgmtPort := flag.Int("mgmt-port", 0, "Management API port (0=disabled)")
 	mgmtBind := flag.String("mgmt-bind", "127.0.0.1", "Management API bind address")
@@ -127,9 +136,21 @@ func main() {
 
 	// Start from production defaults, then apply YAML file (if provided),
 	// then let explicitly-passed CLI flags win.
+	// H-18 (раунд 18): здесь стояло безусловное
+	//   config.SessionTimeout  = 5 * time.Minute
+	//   config.CleanupInterval = 30 * time.Second
+	// — то есть DefaultConfig'овые 90s/10s отменялись двумя строками сразу после
+	// вызова, и прод гарантированно работал на 5m/30s. Это ровно те значения,
+	// которые ретроспектива инцидента 2026-05-17 (докблок server.DefaultConfig)
+	// называет причиной decoy lockout: ghost-сессии от EOF reader exit'ов
+	// накапливались быстрее, чем их убирал sweep. Ни YAML-, ни CLI-ключа не
+	// существовало, поэтому изменить было нельзя без пересборки, а комментарий в
+	// config.go описывал значения, которые в проде не применялись.
+	//
+	// Теперь дефолты приходят из DefaultConfig, а переопределяются через
+	// `session_timeout_sec` / `cleanup_interval_sec` в YAML либо
+	// -session-timeout / -cleanup-interval в CLI.
 	config := server.DefaultConfig()
-	config.SessionTimeout = 5 * time.Minute
-	config.CleanupInterval = 30 * time.Second
 
 	if *configFile != "" {
 		fc, err := server.LoadConfigFile(*configFile)
@@ -175,6 +196,15 @@ func main() {
 	}
 	if explicitly["chunk-size"] {
 		config.ChunkSize = *chunkSize
+	}
+	// H-18: применяем только положительные значения — `-session-timeout 0`
+	// означало бы «сессии не истекают никогда», а `-cleanup-interval 0` — busy-loop
+	// в sweeper'е. Ноль (дефолт флага) = «не переопределять».
+	if explicitly["session-timeout"] && *sessionTimeoutSec > 0 {
+		config.SessionTimeout = time.Duration(*sessionTimeoutSec) * time.Second
+	}
+	if explicitly["cleanup-interval"] && *cleanupIntervalSec > 0 {
+		config.CleanupInterval = time.Duration(*cleanupIntervalSec) * time.Second
 	}
 	if explicitly["behind-proxy"] {
 		config.BehindProxy = *behindProxy

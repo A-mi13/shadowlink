@@ -18,11 +18,15 @@ import (
 // backpressure tests are flaky under `go test -shuffle`/`-count`: other tests
 // in the same binary inflate Alloc, tripping the heuristic. allocMB/sysMB are
 // the values BackpressureCheck compares (it uses Alloc vs Sys*0.8/0.9).
+// H-15: сбрасывает кэш снимка памяти (backpressureCacheTTL), иначе повторная
+// инъекция в пределах TTL не наблюдалась бы — тесты меняют значение и сразу
+// ожидают новый вердикт. На прод-путь не влияет: там memStatsFn == nil.
 func withMemStats(m *Metrics, allocMB, sysMB float64) {
 	m.memStatsFn = func(ms *runtime.MemStats) {
 		ms.Alloc = uint64(allocMB * 1024 * 1024)
 		ms.Sys = uint64(sysMB * 1024 * 1024)
 	}
+	m.memStatsAt.Store(0) // invalidate cache so the new snapshot is read at once
 }
 
 func TestMetricsSnapshot(t *testing.T) {

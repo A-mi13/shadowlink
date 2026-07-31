@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	lru "github.com/hashicorp/golang-lru/v2/expirable"
 )
 
 // DecoyReason identifies WHY a request was routed through failClosedToDecoy.
@@ -70,14 +72,38 @@ var AllDecoyReasons = []DecoyReason{
 // lines per minute. Token-bucket-light: per-IP counter that resets on
 // window roll-over.
 //
-// The cache is intentionally simple — no LRU eviction, no TTL sweeper.
-// The map grows linearly with distinct source IPs since process start.
-// At 100B per entry × 1M unique IPs ≈ 100 MB; for the workloads ShadowLink
-// targets this is comfortably below RAM budget. A future LRU upgrade is
-// trivial (replace the map with a linked-hash) but unnecessary for now.
+// H-14 (раунд 18): the cache used to be a bare map with no eviction and no TTL,
+// growing linearly with distinct source IPs for the process lifetime. The old
+// comment estimated 100 B/entry → 100 MB per 1M IPs and called that acceptable;
+// the estimate was accurate (measured: 105.9 B/entry) but the conclusion was not.
+// logDecoyServed fires on EVERY failClosedToDecoy*, including
+// DecoyReasonBodyInvalid — i.e. on any junk POST with application/json — and a
+// single /64 IPv6 subnet supplies 2^64 source addresses. At 10M IPs that is
+// ~0.99 GB on a box DefaultConfig documents as "2 vCPU / 2 GB RAM VPS".
+//
+// It was also the ONLY unbounded structure in server/: TokenBucket uses an
+// expirable LRU capped at 10k, ClientIDExemption an LRU with an eviction
+// callback, RateLimiter a 10000 cap. This now follows the same expirable-LRU
+// pattern as tokenbucket.go / clientid_exempt.go.
+//
+// Tradeoff, deliberate: an IP evicted by LRU pressure gets a fresh window when it
+// comes back, so it can emit up to decoyLogPerIPLimit more lines. A bounded
+// memory ceiling matters more than exact journal-limit fidelity — and an attacker
+// rotating a /64 already spends one entry per address, where previously the same
+// flood grew the map without limit. Locked in by
+// TestDecoyLog_EvictionResetsWindow_DocumentedTradeoff.
 const (
 	decoyLogPerIPLimit  = 10
 	decoyLogPerIPWindow = time.Minute
+
+	// decoyLogMaxIPs bounds the per-IP cache. Matches the 10k ceiling used by
+	// TokenBucket / RateLimiter so all per-IP state in the package shares one
+	// order of magnitude. At ~106 B/entry this caps the cache near 1 MB.
+	decoyLogMaxIPs = 10000
+
+	// decoyLogIdleTTL drops entries idle longer than this. Well above
+	// decoyLogPerIPWindow so a rolling window is never truncated mid-flight.
+	decoyLogIdleTTL = 10 * time.Minute
 )
 
 type decoyLogIPState struct {
@@ -88,10 +114,23 @@ type decoyLogIPState struct {
 
 var (
 	decoyLogMu      sync.Mutex
-	decoyLogPerIP   = make(map[string]*decoyLogIPState)
+	decoyLogPerIP   = newDecoyLogCache()
 	decoyLogTotal   uint64 // total log emissions (after rate-limit) across all IPs
 	decoyLogDropped uint64 // total drops across all IPs
 )
+
+// newDecoyLogCache builds the bounded per-IP cache. No eviction callback needed —
+// entries hold no external resource (mirrors the tbEntry rationale).
+func newDecoyLogCache() *lru.LRU[string, *decoyLogIPState] {
+	return lru.NewLRU[string, *decoyLogIPState](decoyLogMaxIPs, nil, decoyLogIdleTTL)
+}
+
+// decoyLogCacheLen reports the current entry count. Test helper for the bound.
+func decoyLogCacheLen() int {
+	decoyLogMu.Lock()
+	defer decoyLogMu.Unlock()
+	return decoyLogPerIP.Len()
+}
 
 // shouldLogForIP returns true when this IP is below the per-window cap.
 // Increments the per-IP counter on `true`, the suppressed counter on `false`.
@@ -101,10 +140,11 @@ func shouldLogForIP(ip string, now time.Time) (allow bool, suppressedSinceLastAl
 	decoyLogMu.Lock()
 	defer decoyLogMu.Unlock()
 
-	state, ok := decoyLogPerIP[ip]
+	state, ok := decoyLogPerIP.Get(ip)
 	if !ok {
 		state = &decoyLogIPState{windowStart: now}
-		decoyLogPerIP[ip] = state
+		// Add may evict the least-recently-used entry — that is the bound (H-14).
+		decoyLogPerIP.Add(ip, state)
 	}
 	if now.Sub(state.windowStart) >= decoyLogPerIPWindow {
 		// Window rolled over — reset count + start, but PRESERVE suppressed
@@ -187,7 +227,7 @@ func DecoyLogStats() (logged, dropped uint64) {
 func ResetDecoyLogStateForTest() {
 	decoyLogMu.Lock()
 	defer decoyLogMu.Unlock()
-	decoyLogPerIP = make(map[string]*decoyLogIPState)
+	decoyLogPerIP = newDecoyLogCache()
 	decoyLogTotal = 0
 	decoyLogDropped = 0
 }

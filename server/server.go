@@ -15,6 +15,11 @@ import (
 	"github.com/nixavpn/shadowlink/core"
 )
 
+// minManagementKeyLen — минимальная длина ключа management API (раунд 18).
+// 32 символа ≈ 128+ бит при hex/base64, что делает перебор бессмысленным.
+// Проверка жёсткая при не-loopback bind, иначе WARN — см. Start().
+const minManagementKeyLen = 32
+
 // Server is the main ShadowLink server with TLS, routing, and lifecycle management.
 //
 // IMPORTANT: In production, deploy behind a real nginx reverse proxy:
@@ -93,8 +98,45 @@ func (s *Server) Start() (string, error) {
 		if bind == "" {
 			bind = "127.0.0.1"
 		}
+		// Раунд 18 (MEDIUM): минимальная длина ManagementKey не проверялась
+		// вообще. ConstantTimeCompare защищает от timing-атаки, но не от
+		// короткого ключа — его просто перебирают. Порог применяется жёстко
+		// только когда порт выставлен НЕ на loopback: уронить старт из-за
+		// унаследованного короткого ключа на localhost-биндe было бы хуже, чем
+		// сам риск, поэтому там — громкий WARN.
+		if len(s.config.ManagementKey) < minManagementKeyLen {
+			if bind != "127.0.0.1" && bind != "localhost" && bind != "::1" {
+				return "", fmt.Errorf(
+					"management key too short: %d chars, minimum %d when -mgmt-bind is not loopback (bind=%q)",
+					len(s.config.ManagementKey), minManagementKeyLen, bind)
+			}
+			slog.Warn("management key is shorter than recommended minimum — "+
+				"brute-forceable if the port is ever exposed; rotate to a longer random key",
+				"len", len(s.config.ManagementKey), "min", minManagementKeyLen, "bind", bind)
+		}
+
 		mgmtAddr := fmt.Sprintf("%s:%d", bind, s.config.ManagementPort)
-		s.mgmtSrv = &http.Server{Addr: mgmtAddr, Handler: mgmtHandler}
+		// Раунд 18 (MEDIUM): раньше здесь стоял голый
+		// &http.Server{Addr, Handler} — ни одного таймаута, ни MaxHeaderBytes,
+		// тогда как основной сервер их имеет (см. startTLS/startPlain).
+		//
+		// Ключ management API проверяется в ManagementHandler.ServeHTTP, то есть
+		// ПОСЛЕ того, как net/http дочитал заголовки, — без ReadHeaderTimeout это
+		// pre-auth slowloris: неаутентифицированный peer пинит горутину, посылая
+		// заголовки по байту. Bind по умолчанию loopback, но -mgmt-bind позволяет
+		// вывести порт наружу, поэтому «только localhost» не является защитой.
+		//
+		// Таймауты строже основного сервера намеренно: здесь нет ни WebSocket, ни
+		// длинных стримов — только короткие JSON-запросы и scrape метрик.
+		s.mgmtSrv = &http.Server{
+			Addr:              mgmtAddr,
+			Handler:           mgmtHandler,
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       15 * time.Second,
+			WriteTimeout:      30 * time.Second, // scrape метрик может быть крупным
+			IdleTimeout:       60 * time.Second,
+			MaxHeaderBytes:    1 << 14, // 16 KB — управляющим запросам хватает
+		}
 		go func() {
 			if err := s.mgmtSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				slog.Error("management API error", "error", err)

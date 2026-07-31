@@ -6,6 +6,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -51,6 +52,19 @@ type FileConfig struct {
 	MaxClients        *int                 `yaml:"max_clients"`
 	MaxConns          *int                 `yaml:"max_conns"`
 	ChunkSize         *int                 `yaml:"chunk_size"`
+
+	// SessionTimeoutSec / CleanupIntervalSec — idle-таймаут сессии и период
+	// sweep'а, в секундах.
+	//
+	// H-18 (раунд 18): этих ключей не существовало ни в YAML, ни в CLI, а
+	// main.go сразу после DefaultConfig() присваивал 5m/30s — ровно те значения,
+	// которые ретроспектива инцидента 2026-05-17 (см. докблок DefaultConfig)
+	// называет причиной decoy lockout. Прод гарантированно работал на 5m/30s,
+	// изменить было нельзя без пересборки, а комментарий в config.go описывал
+	// значения, которые в проде не применялись. Хардкод снят, значения
+	// настраиваемы.
+	SessionTimeoutSec  *int `yaml:"session_timeout_sec"`
+	CleanupIntervalSec *int `yaml:"cleanup_interval_sec"`
 	BehindProxy       *bool                `yaml:"behind_proxy"`
 	TrustedProxies    []string             `yaml:"trusted_proxies"`
 	Management        *MgmtConfig          `yaml:"management"`
@@ -351,6 +365,15 @@ func (fc *FileConfig) ApplyTo(cfg *Config) {
 	}
 	if fc.ChunkSize != nil {
 		cfg.ChunkSize = *fc.ChunkSize
+	}
+	// H-18: idle-таймаут и период sweep'а. Нулевые/отрицательные значения
+	// игнорируются — иначе `session_timeout_sec: 0` отключил бы уборку сессий
+	// целиком (сессии живут вечно) или дал бы busy-loop в sweeper'е.
+	if fc.SessionTimeoutSec != nil && *fc.SessionTimeoutSec > 0 {
+		cfg.SessionTimeout = time.Duration(*fc.SessionTimeoutSec) * time.Second
+	}
+	if fc.CleanupIntervalSec != nil && *fc.CleanupIntervalSec > 0 {
+		cfg.CleanupInterval = time.Duration(*fc.CleanupIntervalSec) * time.Second
 	}
 	if fc.BehindProxy != nil {
 		cfg.BehindProxy = *fc.BehindProxy
