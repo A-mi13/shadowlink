@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -122,6 +123,20 @@ type Session struct {
 	// See core/mimicry_session.go for the contract. T2.4 (Phase 3 Plan A).
 	MimicrySession *MimicrySession
 
+	// destroyed latches to true the first time key material is zeroed, on ANY
+	// of the four teardown paths (Destroy, isExpiredAndDestroy,
+	// CleanupNewbornOrphans, the detached-grace sweep). Once set, the crypto
+	// entry points fail closed.
+	//
+	// H-11 (раунд 18): ZeroBytes зануляет байты НА МЕСТЕ, не меняя длину, поэтому
+	// после зануления SendKey — это 32 нулевых байта, а не nil.
+	// aes.NewCipher(32 нуля) успешно создаёт шифр, так что без этого флага
+	// EncryptChunk уходил в fallback-ветку и шифровал под ПУБЛИЧНО ИЗВЕСТНЫМ
+	// нулевым ключом, а DecryptChunkSafe симметрично ПРИНИМАЛ такие кадры.
+	// Флаг атомарный, а не под mu: EncryptChunk намеренно lock-free на горячем
+	// пути (A1-M2), и добавлять туда мьютекс нельзя.
+	destroyed atomic.Bool
+
 	// MigrateNonce is a 16-byte crypto/rand nonce stamped at session creation.
 	// It is the per-device binding discriminator for Bug #9 stream-migration
 	// proof-of-ownership (§4.1, F2): the stream secret is
@@ -131,6 +146,38 @@ type Session struct {
 	// forge a proof for a stream it does not own. MUST be crypto/rand — NEVER
 	// derived from session.ID (sequential, guessable). Read-only after creation.
 	MigrateNonce [16]byte
+}
+
+// ErrSessionDestroyed is returned by every crypto entry point once the session's
+// key material has been zeroed. Callers MUST treat it as terminal for the
+// session: the peer's keys are gone, so no retry can succeed. Fail closed —
+// never fall back to the zeroed key material (H-11, раунд 18).
+var ErrSessionDestroyed = errors.New("session destroyed: key material zeroed")
+
+// IsDestroyed reports whether key material has been zeroed on any teardown path.
+func (s *Session) IsDestroyed() bool {
+	return s.destroyed.Load()
+}
+
+// zeroKeyMaterialLocked zeroes all key material and latches the destroyed flag.
+// Caller MUST hold s.mu.
+//
+// H-11 (раунд 18): этот блок существовал в ЧЕТЫРЁХ скопированных экземплярах
+// (Destroy, isExpiredAndDestroy, CleanupNewbornOrphans, detached-grace sweep).
+// Дублирование и было причиной, по которой дефект расползся: фикс только в
+// Destroy() оставил бы три пути, на которых сессия остаётся «рабочей» с нулевым
+// ключом. Единая точка гарантирует, что флаг ставится всегда.
+func (s *Session) zeroKeyMaterialLocked() {
+	ZeroBytes(s.SendKey)
+	ZeroBytes(s.RecvKey)
+	if s.oldRecvKey != nil {
+		ZeroBytes(s.oldRecvKey)
+		s.oldRecvKey = nil
+	}
+	s.sendEpochPtr.Store(nil)
+	s.recvGCM = nil
+	s.oldRecvGCM = nil
+	s.destroyed.Store(true)
 }
 
 // newGCM creates an AES-GCM cipher from a key.
@@ -183,6 +230,11 @@ func NewSession(id uint32, sendKey, recvKey []byte) *Session {
 func (s *Session) InitSendEpoch() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// H-11: never resurrect a destroyed session — SendKey is all zeros, so
+	// newGCM would happily build a cipher under a publicly known key.
+	if s.destroyed.Load() {
+		return ErrSessionDestroyed
+	}
 	if s.sendEpochPtr.Load() != nil {
 		return nil // already cached (server Create, or idempotent re-call)
 	}
@@ -257,15 +309,7 @@ func (s *Session) isExpiredAndDestroy(timeout time.Duration) bool {
 		return false
 	}
 	// Expired — zero keys while still holding lock
-	ZeroBytes(s.SendKey)
-	ZeroBytes(s.RecvKey)
-	if s.oldRecvKey != nil {
-		ZeroBytes(s.oldRecvKey)
-		s.oldRecvKey = nil
-	}
-	s.sendEpochPtr.Store(nil)
-	s.recvGCM = nil
-	s.oldRecvGCM = nil
+	s.zeroKeyMaterialLocked()
 	return true
 }
 
@@ -288,6 +332,11 @@ func (s *Session) Rekey(newSendKey, newRecvKey []byte) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// H-11: a destroyed session must stay destroyed — Rekey would otherwise
+	// install fresh working keys and put it back in service.
+	if s.destroyed.Load() {
+		return ErrSessionDestroyed
+	}
 	s.oldRecvKey = s.RecvKey // keep ref for grace period
 	s.oldRecvGCM = s.recvGCM
 	s.oldKeyExpiry = time.Now().Add(10 * time.Second)
@@ -382,6 +431,13 @@ func SetStatsCallbacks(onEncrypt, onDecrypt, onDecryptFail func()) {
 // fresh epoch with counter=0; concurrent encrypters observe a consistent (gcm, counter)
 // pair with no nonce reuse risk.
 func (s *Session) EncryptChunk(chunk *Chunk) ([]byte, error) {
+	// H-11: fail closed BEFORE any key use. Checked first so the destroyed
+	// session can never reach the fallback branch below, which would otherwise
+	// encrypt under the zeroed (all-zero, publicly known) SendKey.
+	if s.destroyed.Load() {
+		return nil, ErrSessionDestroyed
+	}
+
 	if cbs := sessionStatsCallbacks.Load(); cbs != nil && cbs.onEncrypt != nil {
 		cbs.onEncrypt()
 	}
@@ -403,6 +459,13 @@ func (s *Session) EncryptChunk(chunk *Chunk) ([]byte, error) {
 	// only for tests that build a Session via NewSession without InitSendEpoch and
 	// that exercise the random-nonce path deliberately.
 	s.mu.Lock()
+	// H-11: re-check under the lock. A concurrent Destroy() may have latched the
+	// flag after the check at the top of this function; this branch is the one
+	// that would read the zeroed bytes, so it must not race with zeroing.
+	if s.destroyed.Load() {
+		s.mu.Unlock()
+		return nil, ErrSessionDestroyed
+	}
 	key := make([]byte, len(s.SendKey))
 	copy(key, s.SendKey)
 	s.mu.Unlock()
@@ -411,11 +474,24 @@ func (s *Session) EncryptChunk(chunk *Chunk) ([]byte, error) {
 
 // DecryptChunkSafe decrypts a chunk safely using cached GCM if available.
 func (s *Session) DecryptChunkSafe(data []byte) (*Chunk, error) {
+	// H-11: fail closed. Without this a destroyed session ACCEPTED frames
+	// encrypted under the all-zero key — it became a receiver for anyone who
+	// knows the session was torn down.
+	if s.destroyed.Load() {
+		return nil, ErrSessionDestroyed
+	}
+
 	if cbs := sessionStatsCallbacks.Load(); cbs != nil && cbs.onDecrypt != nil {
 		cbs.onDecrypt()
 	}
 
 	s.mu.Lock()
+	// H-11: re-check under the lock — a concurrent teardown may have latched the
+	// flag after the check above, and the branches below read key material.
+	if s.destroyed.Load() {
+		s.mu.Unlock()
+		return nil, ErrSessionDestroyed
+	}
 	gcm := s.recvGCM
 	oldGCM := s.oldRecvGCM
 	var oldKey []byte
@@ -666,19 +742,16 @@ func (sm *SessionManager) ReattachClearDetached(id uint32) bool {
 	return true
 }
 
-// Destroy securely zeroes all key material in the session.
+// Destroy securely zeroes all key material and puts the session out of service:
+// every subsequent EncryptChunk/DecryptChunkSafe/Rekey/InitSendEpoch returns
+// ErrSessionDestroyed. Idempotent.
+//
+// H-11 (раунд 18): раньше Destroy только зануляло байты, а сессия оставалась
+// «рабочей» — см. zeroKeyMaterialLocked и ErrSessionDestroyed.
 func (s *Session) Destroy() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ZeroBytes(s.SendKey)
-	ZeroBytes(s.RecvKey)
-	if s.oldRecvKey != nil {
-		ZeroBytes(s.oldRecvKey)
-		s.oldRecvKey = nil
-	}
-	s.sendEpochPtr.Store(nil)
-	s.recvGCM = nil
-	s.oldRecvGCM = nil
+	s.zeroKeyMaterialLocked()
 }
 
 // Cleanup removes expired sessions and returns the count removed.
@@ -780,15 +853,7 @@ func (sm *SessionManager) CleanupNewbornOrphans(now time.Time, maxAge time.Durat
 		}
 		// Zero key material under the session lock (mirrors Destroy).
 		s.mu.Lock()
-		ZeroBytes(s.SendKey)
-		ZeroBytes(s.RecvKey)
-		if s.oldRecvKey != nil {
-			ZeroBytes(s.oldRecvKey)
-			s.oldRecvKey = nil
-		}
-		s.sendEpochPtr.Store(nil)
-		s.recvGCM = nil
-		s.oldRecvGCM = nil
+		s.zeroKeyMaterialLocked()
 		s.mu.Unlock()
 		delete(sm.sessions, c.id)
 		sm.mu.Unlock()
@@ -875,15 +940,7 @@ func (sm *SessionManager) CleanupDetachedGhosts(now time.Time, grace time.Durati
 		}
 		// Zero key material under the session lock (mirrors Destroy).
 		s.mu.Lock()
-		ZeroBytes(s.SendKey)
-		ZeroBytes(s.RecvKey)
-		if s.oldRecvKey != nil {
-			ZeroBytes(s.oldRecvKey)
-			s.oldRecvKey = nil
-		}
-		s.sendEpochPtr.Store(nil)
-		s.recvGCM = nil
-		s.oldRecvGCM = nil
+		s.zeroKeyMaterialLocked()
 		s.mu.Unlock()
 		delete(sm.sessions, id)
 		sm.mu.Unlock()
