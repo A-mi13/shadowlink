@@ -481,3 +481,82 @@ Per phase см. spec §11.
 
 - Spec: `shadowlink/docs/superpowers/specs/2026-05-02-shadowlink-bypass-and-coldstart-design.md`
 - Plan: `docs/superpowers/plans/2026-05-02-shadowlink-bypass-and-coldstart.md`
+
+---
+
+## Rotation Budget Honesty — P0 шаг 4 (2026-08-07)
+
+Полевой день на одном AS: три сессии, пять исправленных дефектов. Общая нить —
+**механизмы существовали, логи о них рассказывали, но рассказывали неправду**
+(класс H-15). Ни один из пяти не был найден чтением кода: все всплыли при
+сверке лога с арифметикой.
+
+Полный разбор с числами — `docs/audit/2026-07-25-round18/FIELD-CHECKS.md`,
+раздел «Результаты полевых замеров 2026-08-07».
+
+### Status
+
+- **`worstCaseTeardown()`** (`client/ws_pool.go`) — единственный источник истины
+  для бюджета: `base + stagger + sweep + defer + tear`. Прежняя формула в
+  `stats.go` (`adaptedAge + stickyMaxDrainAge`) занижала результат в 1.6 раза и
+  была верна лишь по совпадению настроек `hard_cap == sticky == 15s`.
+- **`staggerSpan()`** — верхняя граница вклада сетки (`cap + step/2`).
+- **`ageCutFloor()`** — вынесен из `isAgeCut`, чтобы порог классификации
+  age-cut имел один источник; его же спрашивает инференс.
+- **`slotobs.InferWithMinAge(minAgeMs)`** — отсев доцензурных наблюдений.
+  `Infer()` сохранён как `InferWithMinAge(0)` (прежнее поведение).
+- **`slotobs.Verdict.AgeMinMs`** — минимум по ОЧИЩЕННОЙ выборке;
+  `Summary.AgeMin` — по сырой. Бюджет сравнивается только с первым.
+- **`RejectionStats.TooYoung`** — новый счётчик отсева.
+- **Лог `slot death inference`** пополнен: `stagger_span`,
+  `effective_max_age_max`, `sweep_tick`, `defer_backoff`, `teardown_cap`,
+  `age_min_clean_ms`, `margin_to_age_min`, `rejected_too_young`.
+- **WARN `rotation budget exceeded`** — при отрицательном запасе. Молчащий
+  сломанный бюджет — та же болезнь H-15.
+- **WARN `sticky drain backstop is UNREACHABLE`** — в конструкторе пула при
+  `sticky <= hard_cap`. Настройка НЕ подменяется молча: говорим вслух,
+  поведение оставляем как настроено.
+
+### Конфигурация (`.bat`, вне репозитория — в `.gitignore`)
+
+| ключ | было | стало | почему |
+|---|---|---|---|
+| `SHADOWLINK_STICKY_MAX_DRAIN_AGE` | 15s | **25s** | при равенстве с `hard_cap` ветка продления недостижима |
+| `SHADOWLINK_STAGGER_STEP` | 6s (дефолт) | **1s** | лестница должна укладываться в cap без клампа |
+| `SHADOWLINK_STAGGER_OFFSET_CAP` | 45s (дефолт) | **15s** | при 16 ячейках cap=45s склеивал idx 8..15 в одно значение |
+
+### Metrics
+
+- `no free cell`: **9 → 0** за сопоставимую сессию — дефицит ячеек был
+  следствием синхронности ротаций, а не размера пула.
+- Тройные пачки ротаций в одну секунду: **1 → 0**.
+- `sticky_active`: **0 → до 4** — механизм заработал впервые.
+- Естественные завершения дренажа: 61 против 38 sticky-teardown.
+- `decrypt_fails=0`, `meltdowns_1m=0`, `dead=0` во всех трёх сессиях.
+
+### Rollback
+
+- Правки в коде — только наблюдаемость и очистка выборки; поведение ротации не
+  менялось. Откат не требуется, но безопасен: `InferWithMinAge(0)` возвращает
+  прежнее поведение фильтра.
+- Конфиг: вернуть `STAGGER_STEP=6s`, `STAGGER_OFFSET_CAP=45s`,
+  `STICKY_MAX_DRAIN_AGE=15s` в `.bat`. ⚠ Возврат sticky к 15s снова сделает
+  механизм недостижимым — тест `TestStickyDrainBudget_HardCapNotBelowSticky`
+  станет красным намеренно.
+
+### Открытое
+
+Бюджет **всё ещё отрицательный**: 141.5 s расчётных против `age_min` ~82 s.
+Доминирует `drainRevertBackoff=30s`. Шаги «снизить teardown» и «снизить
+`thresholdSafetyFraction` 0.8 → 0.55» посчитаны и **отвергнуты**: вместе дают
+111.4 s (запас −29 s) ценой ~1250 conn/час, то есть лечат не то слагаемое.
+Следующая цель — устранить причину `no free cell` (сессия 3 показала 0, нужна
+проверка устойчивости) и `drainTargetOverAged`, который берёт сконфигурированный
+порог 150 s при смертях на 82–126 s, отчего tier-2 эвикция, похоже, недостижима.
+
+### References
+
+- Тесты: `client/rotation_budget_test.go`, `client/slotobs/infer_test.go`,
+  `client/sticky_drain_budget_test.go`
+- Коммиты: `fad8bf4` (формула бюджета), `fff6f4f` (сверка доков с продом),
+  `7519617` (очистка выборки, отсрочка, lockstep)
