@@ -282,3 +282,76 @@ func TestInfer_AgeMinZeroWhenNoVerdict(t *testing.T) {
 		t.Errorf("AgeMinMs = %d при AxisUnknown, ожидался 0", v.AgeMinMs)
 	}
 }
+
+// Дыра, которую НЕ закрывал прежний filterNoise: наблюдение с ненулевым, но
+// заведомо доцензурным возрастом и обычным CloseKind.
+//
+// Полевой замер 2026-08-07: `close 1000 (normal)` при старте слота дал
+// AgeMs=2, CloseKind="close_other". Прежний фильтр резал только AgeMs<=0,
+// поэтому наблюдение проходило и становилось минимумом. Итог — age_min=2ms в
+// 67 строках лога из 74 и WARN о превышении бюджета, срабатывающий всегда.
+func TestInfer_TooYoungRejected(t *testing.T) {
+	const floorMs = 45_000 // ageCutMinAge из клиента
+
+	r := NewRecorder(0)
+	r.Record(Observation{AgeMs: 2, DownBytes: 0, CloseKind: "close_other"})
+	r.Record(Observation{AgeMs: 1200, DownBytes: 900, CloseKind: "close_other"})
+
+	ages := []int64{82338, 83469, 86320, 88309, 92223, 94031,
+		96500, 99200, 101400, 104524, 108900, 112300, 126019}
+	for i, a := range ages {
+		r.Record(Observation{
+			AgeMs:     a,
+			DownBytes: int64(i*900_000 + 1756),
+			CloseKind: "close_other",
+		})
+	}
+
+	// Без порога шум проходит фильтр и портит выборку. Здесь он вдобавок ломает
+	// сам вывод: два наблюдения с крошечным возрастом раздувают CV возраста
+	// настолько, что оси перестают разделяться и Infer честно отвечает «не знаю».
+	// Это лучше неверного порога, но означает, что контур молчит — а данных
+	// достаточно, и молчать он не должен.
+	if noFloor := r.InferWithMinAge(0); noFloor.Axis != AxisUnknown {
+		t.Errorf("без порога Axis = %v, ожидался unknown (шум ломает разделение); "+
+			"AgeMinMs=%d", noFloor.Axis, noFloor.AgeMinMs)
+	}
+
+	v := r.InferWithMinAge(floorMs)
+	if v.Axis != AxisAge {
+		t.Fatalf("Axis = %v, ожидалась age (reason: %s)", v.Axis, v.Reason)
+	}
+	if v.Rejected.TooYoung != 2 {
+		t.Errorf("Rejected.TooYoung = %d, ожидалось 2", v.Rejected.TooYoung)
+	}
+	if v.AgeMinMs != 82338 {
+		t.Errorf("AgeMinMs = %d, ожидалось 82338 — доцензурные смерти не отсеяны",
+			v.AgeMinMs)
+	}
+	if v.Samples != len(ages) {
+		t.Errorf("Samples = %d, ожидалось %d", v.Samples, len(ages))
+	}
+}
+
+// Порог не должен съедать нормальные наблюдения: смерть ровно на границе — это
+// уже age-cut по определению самой границы.
+func TestInfer_TooYoungBoundaryInclusive(t *testing.T) {
+	const floorMs = 45_000
+
+	r := NewRecorder(0)
+	for i := range 14 {
+		r.Record(Observation{
+			AgeMs:     floorMs + int64(i)*1000,
+			DownBytes: int64(i*800_000 + 500),
+			CloseKind: "close_other",
+		})
+	}
+	v := r.InferWithMinAge(floorMs)
+	if v.Rejected.TooYoung != 0 {
+		t.Errorf("Rejected.TooYoung = %d, ожидалось 0 — граница исключающая",
+			v.Rejected.TooYoung)
+	}
+	if v.AgeMinMs != floorMs {
+		t.Errorf("AgeMinMs = %d, ожидалось %d", v.AgeMinMs, floorMs)
+	}
+}

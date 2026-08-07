@@ -43,7 +43,7 @@ func TestWorstCaseTeardown_IncludesStaggerAndSweep(t *testing.T) {
 	}
 	p.slots = make([]*poolSlot, p.poolSize*2)
 
-	base, stagger, sweep, tear, total := p.worstCaseTeardown()
+	base, stagger, sweep, deferred, tear, total := p.worstCaseTeardown()
 
 	if base != 75*time.Second {
 		t.Errorf("base = %v, want 75s (адаптер не подключён → сконфигурированный порог)", base)
@@ -58,6 +58,10 @@ func TestWorstCaseTeardown_IncludesStaggerAndSweep(t *testing.T) {
 	if tear != 15*time.Second {
 		t.Errorf("teardown cap = %v, want 15s", tear)
 	}
+	// Отсрочка при «no free cell» — 9 таких событий за 11 минут в поле.
+	if deferred != drainRevertBackoff {
+		t.Errorf("deferred = %v, want %v", deferred, drainRevertBackoff)
+	}
 
 	// Ключевое утверждение: сумма НЕ равна наивным base+sticky.
 	naive := base + p.stickyMaxDrainAge
@@ -65,7 +69,8 @@ func TestWorstCaseTeardown_IncludesStaggerAndSweep(t *testing.T) {
 		t.Fatalf("worst-case %v совпал с наивным base+sticky %v — "+
 			"stagger и sweep снова выпали из расчёта", total, naive)
 	}
-	if want := 75*time.Second + 48*time.Second + 5*time.Second + 15*time.Second; total != want {
+	if want := 75*time.Second + 48*time.Second + 5*time.Second +
+		drainRevertBackoff + 15*time.Second; total != want {
 		t.Errorf("worst-case = %v, want %v", total, want)
 	}
 	t.Logf("наивная формула дала бы %v, честная = %v (расхождение %v)",
@@ -85,7 +90,7 @@ func TestWorstCaseTeardown_UsesAdaptedThreshold(t *testing.T) {
 	p.slots = make([]*poolSlot, p.poolSize*2)
 	p.ageAdapter = slotobs.NewAdapter(75 * time.Second)
 
-	base, _, _, _, _ := p.worstCaseTeardown()
+	base, _, _, _, _, _ := p.worstCaseTeardown()
 	if base != 75*time.Second {
 		t.Fatalf("без подтверждённого вывода base = %v, want 75s", base)
 	}
@@ -100,7 +105,7 @@ func TestWorstCaseTeardown_UsesAdaptedThreshold(t *testing.T) {
 		p.ageAdapter.Observe(v)
 	}
 
-	base2, _, _, _, _ := p.worstCaseTeardown()
+	base2, _, _, _, _, _ := p.worstCaseTeardown()
 	if base2 >= 75*time.Second {
 		t.Errorf("после сжатия адаптером base = %v, ожидалось меньше 75s", base2)
 	}
@@ -132,7 +137,7 @@ func TestWorstCaseTeardown_TeardownCapPicksLarger(t *testing.T) {
 				stickyMaxDrainAge: c.sticky,
 			}
 			p.slots = make([]*poolSlot, p.poolSize*2)
-			_, _, _, tear, _ := p.worstCaseTeardown()
+			_, _, _, _, tear, _ := p.worstCaseTeardown()
 			if tear != c.wantTear {
 				t.Errorf("teardown cap = %v, want %v", tear, c.wantTear)
 			}
@@ -210,10 +215,11 @@ func TestRotationBudget_FieldConfigIsNegative(t *testing.T) {
 		p.ageAdapter.Observe(v)
 	}
 
-	base, stagger, sweep, tear, total := p.worstCaseTeardown()
+	base, stagger, sweep, deferred, tear, total := p.worstCaseTeardown()
 	margin := observedAgeMin - total
 
-	t.Logf("base=%v stagger=%v sweep=%v tear=%v → worst=%v", base, stagger, sweep, tear, total)
+	t.Logf("base=%v stagger=%v sweep=%v deferred=%v tear=%v → worst=%v",
+		base, stagger, sweep, deferred, tear, total)
 	t.Logf("самая ранняя наблюдённая смерть = %v, запас = %v", observedAgeMin, margin)
 
 	if margin > 0 {
@@ -227,4 +233,87 @@ func TestRotationBudget_FieldConfigIsNegative(t *testing.T) {
 		t.Fatalf("наивная %v не меньше честной %v — формула сломана", naive, total)
 	}
 	t.Logf("наивная формула скрывала %v дефицита", total-naive)
+}
+
+// Lockstep: ячейки не должны получать ОДИНАКОВЫЙ stagger-offset.
+//
+// Замер 2026-08-07 показал дефект конфигурации: при step=6s и cap=45s лестница
+// min(idx*step, cap) упирается в потолок с idx=8, поэтому восемь ячеек из
+// шестнадцати получают одинаковую базу 45s и ротируются синхронно. В логе это
+// видно как пачки drain в одну секунду. Stagger существует ровно затем, чтобы
+// такого не было: всплеск одновременных TCP-хендшейков к origin IP — тот самый
+// counting-сигнал, от которого он защищает.
+//
+// Тест проверяет БАЗУ (без джиттера), потому что джиттер ±step/2 маскирует
+// проблему в наблюдении, но не устраняет её: средние моменты ротации совпадают.
+func TestStaggerLadder_NoLockstepAtFieldConfig(t *testing.T) {
+	ladderBase := func(idx int, step, cap time.Duration) time.Duration {
+		if idx <= 0 {
+			return 0
+		}
+		b := time.Duration(idx) * step
+		if cap > 0 && b > cap {
+			b = cap
+		}
+		return b
+	}
+
+	countClamped := func(cells int, step, cap time.Duration) (distinct, maxSame int) {
+		seen := map[time.Duration]int{}
+		for idx := range cells {
+			seen[ladderBase(idx, step, cap)]++
+		}
+		for _, n := range seen {
+			if n > maxSame {
+				maxSame = n
+			}
+		}
+		return len(seen), maxSame
+	}
+
+	const cells = 16 // 2*poolSize при poolSize=8
+
+	t.Run("прежние дефолты — lockstep", func(t *testing.T) {
+		distinct, maxSame := countClamped(cells, 6*time.Second, 45*time.Second)
+		t.Logf("step=6s cap=45s → различных значений %d из %d, худший кластер %d",
+			distinct, cells, maxSame)
+		if maxSame < 2 {
+			t.Error("ожидался lockstep на прежних дефолтах — воспроизведение дефекта")
+		}
+	})
+
+	t.Run("новая конфигурация — лестница без клампа", func(t *testing.T) {
+		const step, cap = 1 * time.Second, 15 * time.Second
+		distinct, maxSame := countClamped(cells, step, cap)
+		t.Logf("step=1s cap=15s → различных значений %d из %d, худший кластер %d",
+			distinct, cells, maxSame)
+		if distinct != cells {
+			t.Errorf("различных offset'ов %d, ожидалось %d — кламп срабатывает, "+
+				"lockstep сохранился", distinct, cells)
+		}
+		// Инвариант конфигурации: лестница обязана укладываться в cap.
+		if want := time.Duration(cells-1) * step; want > cap {
+			t.Errorf("лестница %v выше cap %v — старшие ячейки склеятся", want, cap)
+		}
+	})
+}
+
+// staggerSpan обязан падать вместе с cap — иначе бюджет считается по старому
+// потолку и WARN не увидит улучшения.
+func TestStaggerSpan_ShrinksWithCap(t *testing.T) {
+	mk := func(step, cap time.Duration) *WSPoolTransport {
+		p := &WSPoolTransport{poolSize: 8, staggerStep: step, staggerOffsetCap: cap}
+		p.slots = make([]*poolSlot, p.poolSize*2)
+		return p
+	}
+	old := mk(6*time.Second, 45*time.Second).staggerSpan()
+	nw := mk(1*time.Second, 15*time.Second).staggerSpan()
+
+	if want := 48 * time.Second; old != want {
+		t.Errorf("прежний span = %v, want %v", old, want)
+	}
+	if want := 15*time.Second + 500*time.Millisecond; nw != want {
+		t.Errorf("новый span = %v, want %v", nw, want)
+	}
+	t.Logf("span: %v → %v (бюджет освобождает %v)", old, nw, old-nw)
 }

@@ -1146,7 +1146,10 @@ func logSlotDeathSummary() {
 	// НИЧЕГО не применяет: ротацией по-прежнему управляют maxSlotAge /
 	// stickyMaxDrainAge. Автоприменение — шаг 3, и оно требует гистерезиса,
 	// иначе порог будет дёргаться на каждой смене сети.
-	v := pool.slotDeaths.Infer()
+	// Порог «слишком молодой слот» — тот же ageCutMinAge, по которому клиент
+	// классифицирует age-cut. Передаём его, а не заводим копию в slotobs: две
+	// правды об одном пороге разъедутся при первой же правке.
+	v := pool.slotDeaths.InferWithMinAge(pool.ageCutFloor().Milliseconds())
 
 	// P0 шаг 3: скармливаем вердикт адаптеру. Он сам решает, менять ли порог —
 	// требует подтверждений, только сжимает, держит пол и гистерезис.
@@ -1160,7 +1163,7 @@ func logSlotDeathSummary() {
 	// реальный worst-case был 129s против напечатанных 84s — полтора раза.
 	// Именно это расхождение скрыло, что 15 ячеек из 16 ротируются позже
 	// медианы смертей.
-	wcBase, wcStagger, wcSweep, wcTear, wcTotal := pool.worstCaseTeardown()
+	wcBase, wcStagger, wcSweep, wcDeferred, wcTear, wcTotal := pool.worstCaseTeardown()
 
 	// Запас до самой ранней смерти. Отрицательный = худшая ячейка гарантированно
 	// не доживает до своей ротации, её рвёт посредник.
@@ -1182,6 +1185,7 @@ func logSlotDeathSummary() {
 		"rejected_zero_age", v.Rejected.ZeroAge,
 		"rejected_local_close", v.Rejected.LocalClose,
 		"rejected_timeout", v.Rejected.Timeout,
+		"rejected_too_young", v.Rejected.TooYoung,
 		"applied_max_slot_age", adaptedAge,
 		"configured_max_slot_age", configuredAge,
 		"adapt_changes", adaptChanges,
@@ -1190,6 +1194,7 @@ func logSlotDeathSummary() {
 		"stagger_span", wcStagger,
 		"effective_max_age_max", wcBase+wcStagger,
 		"sweep_tick", wcSweep,
+		"defer_backoff", wcDeferred,
 		"teardown_cap", wcTear,
 		"worst_case_teardown", wcTotal,
 		"age_min_clean_ms", v.AgeMinMs,
@@ -1211,6 +1216,7 @@ func logSlotDeathSummary() {
 			"base", wcBase,
 			"stagger_span", wcStagger,
 			"sweep_tick", wcSweep,
+			"defer_backoff", wcDeferred,
 			"teardown_cap", wcTear,
 		)
 	}

@@ -100,10 +100,16 @@ type RejectionStats struct {
 	// Timeout — истёк НАШ read deadline. Возможный признак реза, но
 	// неотличимый от обычного столла, поэтому в вывод порога не берём.
 	Timeout int
+	// TooYoung — слот умер раньше, чем возраст вообще считается признаком
+	// age-cut. Отдельно от ZeroAge: там нулевой возраст (отказ при подключении),
+	// здесь — ненулевой, но заведомо доцензурный.
+	TooYoung int
 }
 
 // Total возвращает общее число отброшенных наблюдений.
-func (r RejectionStats) Total() int { return r.ZeroAge + r.LocalClose + r.Timeout }
+func (r RejectionStats) Total() int {
+	return r.ZeroAge + r.LocalClose + r.Timeout + r.TooYoung
+}
 
 // Параметры инференса. Значения намеренно консервативны: цена ложного
 // «уверен» — ротация не в том месте, цена «не знаю» — сохранение текущего
@@ -134,10 +140,17 @@ const (
 // Никогда не паникует и никогда не возвращает порог, в который сам не уверен:
 // при недостатке данных или слабом разделении осей возвращается AxisUnknown с
 // заполненным Reason.
-func (r *Recorder) Infer() Verdict {
+func (r *Recorder) Infer() Verdict { return r.InferWithMinAge(0) }
+
+// InferWithMinAge — Infer с явным порогом «слишком молодой слот» (мс).
+//
+// Порог передаётся снаружи намеренно: это `ageCutMinAge` из клиента, и
+// заводить здесь вторую копию значило бы завести вторую правду. minAgeMs <= 0
+// отключает отсев по возрасту — поведение до 2026-08-07.
+func (r *Recorder) InferWithMinAge(minAgeMs int64) Verdict {
 	obs := r.Snapshot()
 
-	clean, rej := filterNoise(obs)
+	clean, rej := filterNoise(obs, minAgeMs)
 	v := Verdict{Samples: len(clean), Rejected: rej}
 
 	if len(clean) < MinSamplesForInference {
@@ -210,12 +223,24 @@ func (r *Recorder) Infer() Verdict {
 // AgeMs=0 поднимают CV возраста с 0.18 до 0.4546 — то есть шум почти скрыл
 // разделение осей и мог бы привести к вердикту «оси не разделяются» на данных,
 // где разделение фактически 12-кратное.
-func filterNoise(obs []Observation) (clean []Observation, rej RejectionStats) {
+func filterNoise(obs []Observation, minAgeMs int64) (clean []Observation, rej RejectionStats) {
 	for _, o := range obs {
 		switch {
 		case o.AgeMs <= 0:
 			// Смерть в момент подключения — сетевой отказ, не age-cut.
 			rej.ZeroAge++
+		case minAgeMs > 0 && o.AgeMs < minAgeMs:
+			// Возраст ниже порога классификации age-cut. Такой слот умер
+			// раньше, чем рез вообще возможен по нашей же модели, поэтому он
+			// не наблюдение о поведении посредника.
+			//
+			// Замер 2026-08-07 показал цену пропуска: наблюдение AgeMs=2 с
+			// CloseKind="close_other" (штатное закрытие 1000 при старте слота)
+			// проходило прежний фильтр — он резал только AgeMs<=0. В итоге
+			// age_min стал 2 мс в 67 строках лога из 74, margin показал
+			// −2m24s, и WARN о превышении бюджета срабатывал ВСЕГДА,
+			// то есть не значил ничего.
+			rej.TooYoung++
 		case o.CloseKind == "closed_local":
 			// Наш собственный Close(), поведение посредника тут ни при чём.
 			rej.LocalClose++

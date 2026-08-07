@@ -606,10 +606,15 @@ func (p *WSPoolTransport) staggerSpan() time.Duration {
 //   - base    — действующий порог ротации (адаптированный, если адаптер сжал)
 //   - stagger — максимальный вклад сетки размазывания, см. staggerSpan
 //   - sweep   — задержка обнаружения: rotationWatchdogSweep тикает раз в 5s
+//   - defer_  — отложенная ротация: если claimFreeSlot не нашёл свободную
+//     ячейку, слот возвращается в slotReady и ждёт drainRevertBackoff (30s),
+//     продолжая стареть. Замер 2026-08-07: 9 событий «no free cell» за 11 минут,
+//     то есть путь рабочий, а не теоретический. Без этого слагаемого бюджет
+//     занижен на 30s — больше, чем весь выигрыш от правки stagger.
 //   - tear    — удержание дренажа: рвёт ТОТ, ЧЕЙ ДЕДЛАЙН РАНЬШЕ. Дедлайн стоит
 //     на drainHardCap (ws_pool_drain.go), а stickyMaxDrainAge проверяется лишь
 //     ПО ЕГО СРАБАТЫВАНИИ — поэтому sticky меньше hard_cap не участвует вовсе.
-func (p *WSPoolTransport) worstCaseTeardown() (base, stagger, sweep, tear, total time.Duration) {
+func (p *WSPoolTransport) worstCaseTeardown() (base, stagger, sweep, deferred, tear, total time.Duration) {
 	base = p.maxSlotAge
 	if adapted := p.ageAdapter.Threshold(); adapted > 0 {
 		base = adapted
@@ -617,6 +622,12 @@ func (p *WSPoolTransport) worstCaseTeardown() (base, stagger, sweep, tear, total
 	stagger = p.staggerSpan()
 	sweep = rotationWatchdogTick
 	if p.gracefulDrain {
+		// Одна отсрочка: слот, не нашедший ячейку, ждёт backoff и ротируется на
+		// следующем заходе. Отсрочек подряд может быть больше, но это уже не
+		// «худший нормальный случай», а деградация — её ловит счётчик
+		// no-free-cell, а не бюджет.
+		deferred = drainRevertBackoff
+
 		tear = p.drainHardCap
 		// sticky продлевает дренаж только когда он БОЛЬШЕ hard_cap: дедлайн
 		// ставится на hard_cap, sticky проверяется по его срабатывании.
@@ -624,7 +635,8 @@ func (p *WSPoolTransport) worstCaseTeardown() (base, stagger, sweep, tear, total
 			tear = p.stickyMaxDrainAge
 		}
 	}
-	return base, stagger, sweep, tear, base + stagger + sweep + tear
+	return base, stagger, sweep, deferred, tear,
+		base + stagger + sweep + deferred + tear
 }
 
 func (p *WSPoolTransport) slotStaggerOffset(idx int) time.Duration {
@@ -1209,11 +1221,20 @@ func (p *WSPoolTransport) isAgeCut(err error, slotAgeMs int64) bool {
 	if err == nil {
 		return false
 	}
-	floorMs := int64(ageCutMinAgeMs)
+	return slotAgeMs >= p.ageCutFloor().Milliseconds()
+}
+
+// ageCutFloor — возраст, ниже которого close-1006 НЕ считается age-cut.
+//
+// Вынесено из isAgeCut, чтобы у порога был один источник: его же спрашивает
+// slotobs.InferWithMinAge при очистке выборки. Пока порог жил только внутри
+// isAgeCut, инференс о нём не знал и принимал за наблюдение реза смерть
+// двухмиллисекундного слота (замер 2026-08-07).
+func (p *WSPoolTransport) ageCutFloor() time.Duration {
 	if p.ageCutMinAge > 0 {
-		floorMs = p.ageCutMinAge.Milliseconds()
+		return p.ageCutMinAge
 	}
-	return slotAgeMs >= floorMs
+	return ageCutMinAgeMs * time.Millisecond
 }
 
 // slotBackoffDuration returns reconnect wait for a per-slot reconnect attempt.
