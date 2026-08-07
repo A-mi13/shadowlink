@@ -1125,6 +1125,7 @@ func logSlotDeathSummary() {
 	slog.Info("slot death distribution (snapshot)",
 		"samples", s.Count,
 		"total_deaths", pool.slotDeaths.Total(),
+		"age_min_ms", s.AgeMin, // сырой: включает шум, для чтения человеком
 		"age_p10_ms", s.AgeP10,
 		"age_p50_ms", s.AgeP50,
 		"age_p90_ms", s.AgeP90,
@@ -1152,6 +1153,27 @@ func logSlotDeathSummary() {
 	changed := pool.ageAdapter.Observe(v)
 	adaptedAge, configuredAge, adaptChanges, adaptReason := pool.ageAdapter.Stats()
 
+	// worst_case_teardown берётся из pool.worstCaseTeardown() — единственного
+	// источника истины. До 2026-08-07 здесь стояло `adaptedAge + stickyMaxDrainAge`,
+	// и эта строка ВРАЛА: она не знала про stagger (до +48s) и про тик watchdog
+	// (+5s), а из двух teardown-пределов брала не тот. При stagger cap=45s
+	// реальный worst-case был 129s против напечатанных 84s — полтора раза.
+	// Именно это расхождение скрыло, что 15 ячеек из 16 ротируются позже
+	// медианы смертей.
+	wcBase, wcStagger, wcSweep, wcTear, wcTotal := pool.worstCaseTeardown()
+
+	// Запас до самой ранней смерти. Отрицательный = худшая ячейка гарантированно
+	// не доживает до своей ротации, её рвёт посредник.
+	//
+	// Берём v.AgeMinMs (ОЧИЩЕННАЯ выборка), а не s.AgeMin (сырая): 2026-08-07
+	// сырой минимум оказался 2 мс — это `close 1000 (normal)` при старте слота,
+	// а не рез. Сравнение бюджета с таким «минимумом» давало −2m24s дефицита и
+	// обесценивало WARN. Минимум обязан быть из тех же данных, что и порог.
+	var wcMargin time.Duration
+	if v.AgeMinMs > 0 {
+		wcMargin = time.Duration(v.AgeMinMs)*time.Millisecond - wcTotal
+	}
+
 	slog.Info("slot death inference",
 		"axis", v.Axis.String(),
 		"threshold_age", v.Threshold.Age,
@@ -1164,9 +1186,34 @@ func logSlotDeathSummary() {
 		"configured_max_slot_age", configuredAge,
 		"adapt_changes", adaptChanges,
 		"sticky_max_drain", pool.stickyMaxDrainAge,
-		"worst_case_teardown", adaptedAge+pool.stickyMaxDrainAge,
+		"drain_hard_cap", pool.drainHardCap,
+		"stagger_span", wcStagger,
+		"effective_max_age_max", wcBase+wcStagger,
+		"sweep_tick", wcSweep,
+		"teardown_cap", wcTear,
+		"worst_case_teardown", wcTotal,
+		"age_min_clean_ms", v.AgeMinMs,
+		"margin_to_age_min", wcMargin,
 		"reason", v.Reason,
 	)
+
+	// Отрицательный запас — не «плохая метрика», а доказанная невозможность:
+	// худшая ячейка не может дожить до плановой ротации, значит её рвёт
+	// посредник, и это видно в поле как всплеск close_1006/age_cut. Печатаем
+	// WARN, потому что молчащий сломанный бюджет — та же болезнь H-15, что и
+	// молчащий кламп в адаптере.
+	if s.AgeMin > 0 && wcMargin <= 0 {
+		slog.Warn("rotation budget exceeded — worst cell cannot survive to its own rotation",
+			"worst_case_teardown", wcTotal,
+			"age_min_clean", time.Duration(v.AgeMinMs)*time.Millisecond,
+			"age_min_raw", time.Duration(s.AgeMin)*time.Millisecond,
+			"deficit", -wcMargin,
+			"base", wcBase,
+			"stagger_span", wcStagger,
+			"sweep_tick", wcSweep,
+			"teardown_cap", wcTear,
+		)
+	}
 
 	// Изменение порога — отдельной строкой на уровне WARN: это смена поведения
 	// транспорта, её нельзя терять в потоке INFO при разборе инцидента.

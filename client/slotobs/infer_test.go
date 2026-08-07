@@ -220,3 +220,65 @@ func TestInfer_ThresholdBelowP10(t *testing.T) {
 		t.Errorf("порог %v не ниже p10 %dms", v.Threshold.Age, s.AgeP10)
 	}
 }
+
+// AgeMinMs обязан считаться по ОЧИЩЕННОЙ выборке, а не по сырой.
+//
+// Полевой замер 2026-08-07 показал цену ошибки: в выборку попало наблюдение
+// `close 1000 (normal)` с возрастом 2 мс — штатное закрытие слота при старте,
+// не рез посредника. Summary.AgeMin (сырой) стал 2 мс, и проверка бюджета
+// показала дефицит −2m24s на ровном месте, обесценив WARN.
+//
+// Минимум, с которым сравнивается worst-case teardown, обязан приходить из тех
+// же данных, на которых построен порог.
+func TestInfer_AgeMinExcludesNoise(t *testing.T) {
+	r := NewRecorder(0)
+
+	// Шум: мгновенное штатное закрытие. filterNoise режет его по AgeMs <= 0
+	// только если возраст нулевой, поэтому берём именно ненулевой-но-крошечный
+	// с локальным закрытием — как в поле.
+	r.Record(Observation{AgeMs: 2, DownBytes: 0, CloseKind: "closed_local"})
+
+	// Реальные резы по возрасту, разброс по байтам широкий.
+	ages := []int64{82338, 83469, 86320, 88309, 92223, 94031,
+		96500, 99200, 101400, 104524, 108900, 112300, 126019}
+	for i, a := range ages {
+		r.Record(Observation{
+			AgeMs:     a,
+			DownBytes: int64(i*900_000 + 1756),
+			CloseKind: "close_other",
+		})
+	}
+
+	v := r.Infer()
+	if v.Axis != AxisAge {
+		t.Fatalf("Axis = %v, ожидалась age (reason: %s)", v.Axis, v.Reason)
+	}
+	if v.AgeMinMs != 82338 {
+		t.Errorf("AgeMinMs = %d, ожидалось 82338 — минимум взят из сырой выборки "+
+			"вместе с шумом", v.AgeMinMs)
+	}
+	if v.Rejected.LocalClose != 1 {
+		t.Errorf("Rejected.LocalClose = %d, ожидалось 1", v.Rejected.LocalClose)
+	}
+
+	// Сырой Summary честно показывает 2 мс — это не баг, а разные величины.
+	if got := r.Summarize().AgeMin; got != 2 {
+		t.Errorf("Summary.AgeMin = %d, ожидалось 2 (сырой минимум включает шум)", got)
+	}
+}
+
+// При AxisUnknown минимум не публикуется: нет вывода — нет и величины, с которой
+// что-то сравнивать.
+func TestInfer_AgeMinZeroWhenNoVerdict(t *testing.T) {
+	r := NewRecorder(0)
+	for range 3 {
+		r.Record(Observation{AgeMs: 90000, DownBytes: 5000, CloseKind: "close_other"})
+	}
+	v := r.Infer()
+	if v.Axis != AxisUnknown {
+		t.Fatalf("Axis = %v, ожидалась unknown при %d наблюдениях", v.Axis, v.Samples)
+	}
+	if v.AgeMinMs != 0 {
+		t.Errorf("AgeMinMs = %d при AxisUnknown, ожидался 0", v.AgeMinMs)
+	}
+}

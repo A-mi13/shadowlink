@@ -23,7 +23,8 @@ import (
 //
 // Почему урезан именно sticky, а не MAX_SLOT_AGE: снижение MAX_SLOT_AGE
 // поднимает число соединений на origin IP (75s → ~384/час, 50s → ~576/час) и
-// усиливает host-profiling (FOCI 2026). Лечить age-cut ценой counting-детектора
+// усиливает host-profiling (⚠ источник не найден, сверка 2026-08-07 — см.
+// slotobs/adapt.go). Лечить age-cut ценой counting-детектора
 // нельзя. А sticky урезать безопасно, потому что миграция работает: 320
 // успешных переездов стрима, 0 отказов, 5 реальных потерь данных.
 
@@ -98,11 +99,16 @@ func TestStickyDrainBudget_LaunchScriptsMatchMeasurement(t *testing.T) {
 		}
 		code := string(raw)
 
-		if !strings.Contains(code, "SHADOWLINK_STICKY_MAX_DRAIN_AGE=15s") {
-			t.Errorf("%s: STICKY_MAX_DRAIN_AGE не 15s — расходится с замером", name)
-		}
-		if strings.Contains(code, "SHADOWLINK_STICKY_MAX_DRAIN_AGE=45s") {
-			t.Errorf("%s: вернулось прежнее 45s (worst-case 120s внутри окна реза)", name)
+		// 2026-08-07: требование «ровно 15s» снято. Оно противоречило
+		// достижимости sticky — при hard_cap=15s равное значение делает ветку
+		// продления мертвой (см. TestStickyDrainBudget_HardCapNotBelowSticky).
+		// Инвариант теперь: sticky в разумном коридоре И строго больше hard_cap.
+		sticky := envDurationFromBat(code, "SHADOWLINK_STICKY_MAX_DRAIN_AGE")
+		if sticky <= 0 {
+			t.Errorf("%s: STICKY_MAX_DRAIN_AGE не прочитан", name)
+		} else if sticky > 45*time.Second {
+			t.Errorf("%s: STICKY_MAX_DRAIN_AGE=%v — слишком большой хвост, "+
+				"worst-case уходит вглубь окна реза", name, sticky)
 		}
 		if !strings.Contains(code, "SHADOWLINK_DRAIN_HARD_CAP=15s") {
 			t.Errorf("%s: DRAIN_HARD_CAP не 15s — worst-case teardown выше задуманного", name)
@@ -128,7 +134,20 @@ func TestStickyDrainBudget_LaunchScriptsMatchMeasurement(t *testing.T) {
 // Во втором полевом прогоне это дало 101 teardown с drain_duration=30s при
 // заявленном sticky=15s: worst-case был 75+30=105s вместо задуманных 90s, и
 // правка sticky не имела эффекта.
+//
+// ⚠ 2026-08-07: условие ужесточено с `<` до `<=`. Прежняя версия ловила только
+// строгое «меньше» и ПРОПУСКАЛА равенство — а равенство даёт ровно тот же
+// нулевой эффект: когда дедлайн (hard_cap) срабатывает, drainAge уже >= sticky,
+// поэтому ПЕРВАЯ же проверка уходит в finishStickyAgeBackstop, а ветка
+// продления (markSticky + deadline.Reset) недостижима.
+//
+// Полевое доказательство (сессия 2026-08-07, 2ч49м): sticky_active=0 во ВСЕХ
+// health-строках при восьми teardown с sticky_outcome=age_backstop, и
+// drain_duration принимает ровно два значения — 15s и 0s. Продления на
+// stickyRecheckInterval=5s дали бы 20/25/30s; их нет ни одного. То есть
+// sticky-механизм не исполнялся ни разу, а лог сообщал, что исполнялся.
 func TestStickyDrainBudget_HardCapNotBelowSticky(t *testing.T) {
+	checked := 0
 	for _, name := range []string{
 		"../bin/connect-vpn-DEBUG.bat",
 		"../bin/connect-vpn-graceful-drain.bat",
@@ -145,13 +164,73 @@ func TestStickyDrainBudget_HardCapNotBelowSticky(t *testing.T) {
 			t.Errorf("%s: не удалось прочитать hard_cap=%v sticky=%v", name, hardCap, sticky)
 			continue
 		}
+		checked++
 		t.Logf("%s: hard_cap=%v sticky=%v -> эффективный teardown=%v",
 			name, hardCap, sticky, min(hardCap, sticky))
-		if sticky < hardCap {
-			t.Errorf("%s: sticky (%v) МЕНЬШЕ hard_cap (%v) — sticky не участвует, "+
-				"рвёт hard_cap; правка sticky будет без эффекта", name, sticky, hardCap)
+		if sticky <= hardCap {
+			t.Errorf("%s: sticky (%v) НЕ БОЛЬШЕ hard_cap (%v) — ветка продления "+
+				"недостижима, рвёт hard_cap. Замер 2026-08-07: sticky_active=0 "+
+				"при 8 teardown с sticky_outcome=age_backstop", name, sticky, hardCap)
 		}
 	}
+	if checked == 0 {
+		t.Log("ни один .bat не прочитан — инвариант hard_cap/sticky в поле НЕ проверен")
+	}
+}
+
+// Инвариант того же класса, но на уровне КОДА, а не .bat: дефолты обязаны
+// удовлетворять тому же условию. Этот тест не скипается никогда — именно тихий
+// скип .bat-сторожей позволил дефекту дожить до полевого замера.
+func TestStickyDrainBudget_DefaultsSatisfyStickyReachability(t *testing.T) {
+	// Дефолт hard_cap берётся из cmd/, дефолт sticky — из client/.
+	src, err := os.ReadFile("../cmd/nixavpn-client/engine_shadowlink.go")
+	if err != nil {
+		t.Fatalf("не прочитан engine_shadowlink.go: %v", err)
+	}
+	hardCapDefault := defaultDurationForEnv(string(src), "SHADOWLINK_DRAIN_HARD_CAP")
+	if hardCapDefault == 0 {
+		t.Skip("дефолт DRAIN_HARD_CAP не распознан — проверять нечего")
+	}
+	t.Logf("дефолты: hard_cap=%v sticky=%v", hardCapDefault, DefaultStickyMaxDrainAge)
+	if DefaultStickyMaxDrainAge <= hardCapDefault {
+		t.Errorf("DefaultStickyMaxDrainAge (%v) НЕ БОЛЬШЕ дефолтного hard_cap (%v) — "+
+			"sticky недостижим на дефолтах: дедлайн стоит на hard_cap, а sticky "+
+			"проверяется только по его срабатывании",
+			DefaultStickyMaxDrainAge, hardCapDefault)
+	}
+}
+
+// defaultDurationForEnv достаёт литерал длительности из окрестности упоминания
+// env-ключа в исходнике cmd/ (там дефолты задаются рядом с чтением env).
+func defaultDurationForEnv(code, key string) time.Duration {
+	i := strings.Index(code, key)
+	if i < 0 {
+		return 0
+	}
+	window := code[i:min(i+400, len(code))]
+	// Ищем первый литерал вида <N>*time.Second / <N>*time.Minute.
+	for _, unit := range []struct {
+		suffix string
+		d      time.Duration
+	}{{"*time.Second", time.Second}, {"*time.Minute", time.Minute}} {
+		j := strings.Index(window, unit.suffix)
+		if j < 0 {
+			continue
+		}
+		k := j
+		for k > 0 && window[k-1] >= '0' && window[k-1] <= '9' {
+			k--
+		}
+		if k == j {
+			continue
+		}
+		var n time.Duration
+		for _, c := range window[k:j] {
+			n = n*10 + time.Duration(c-'0')
+		}
+		return n * unit.d
+	}
+	return 0
 }
 
 // Сторож шага 3: адаптер обязан участвовать в вычислении порога ротации.

@@ -23,6 +23,24 @@
 // design pass. Keeping observation separate means the data is trustworthy before
 // anything acts on it.
 //
+// Field result (2026-08-07, n=222, single AS): the axis IS age — CV 0.26 vs 8.73
+// on bytes, a 33x tighter cluster; slots die at 0 KB too, so the net4people#490
+// volume trigger does not reproduce here. The window is 84-118s (p10 84.1 /
+// p50 97.6 / p90 118.0), NOT the 130-190s this codebase was tuned against.
+//
+// ⚠ KNOWN BIAS — the sample is CENSORED. Record is called from exactly one site
+// (the reader-error path in ws_pool.go), so slots torn down by our OWN planned
+// rotation never enter it. Two consequences, both easy to get wrong:
+//
+//	1. ByCloseKind cannot yield "what fraction of slots the censor cut" — planned
+//	   rotations are absent from the denominator by construction.
+//	2. Percentiles are biased UPWARD: we only observe slots the censor reached
+//	   BEFORE our rotation did, so the right tail is truncated by our own policy.
+//	   The true window may be tighter than measured.
+//
+// This is why AgeMin exists: a minimum is a fact, a percentile over a censored
+// sample is an estimate. Budget checks should prefer the former.
+//
 // Privacy: observations never leave the device. No addresses, no hostnames, no
 // payload — only timings, byte counts and a close-shape label. The buffer lives
 // in memory only; persistence (step 5) will be an explicit, separate decision.
@@ -155,6 +173,14 @@ type Summary struct {
 	// future threshold: rotate before the earliest deaths, not the median.
 	AgeP10, AgeP50, AgeP90 int64
 
+	// AgeMin is the earliest death observed (ms). The threshold exists to stay
+	// LEFT of the death distribution, so the leftmost point is the one datum that
+	// can falsify a budget — yet it was the one this Summary did not publish
+	// (round-18 field review 2026-08-07). P10 is an estimate over a censored
+	// sample; AgeMin is a fact. When AgeMin sits below the computed worst-case
+	// teardown, the budget is provably wrong regardless of what P10 says.
+	AgeMin int64
+
 	// Percentiles of downlink bytes at death.
 	BytesP10, BytesP50, BytesP90 int64
 
@@ -195,6 +221,7 @@ func (r *Recorder) Summarize() Summary {
 
 	return Summary{
 		Count:       len(obs),
+		AgeMin:      ages[0], // sorted ascending above
 		AgeP10:      percentileInt64(ages, 10),
 		AgeP50:      percentileInt64(ages, 50),
 		AgeP90:      percentileInt64(ages, 90),

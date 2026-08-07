@@ -72,7 +72,8 @@ func TestAdapter_NeverExceedsConfigured(t *testing.T) {
 }
 
 // Пол: ниже minAdaptiveAge не опускаемся — частая ротация сама становится
-// сигналом для counting-детектора (FOCI 2026).
+// сигналом для counting-детектора (⚠ источник не найден, сверка 2026-08-07 —
+// см. комментарий к Adapter в adapt.go).
 func TestAdapter_RespectsFloor(t *testing.T) {
 	a := NewAdapter(75 * time.Second)
 	for range adaptConfirmations * 2 {

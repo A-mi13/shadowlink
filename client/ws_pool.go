@@ -538,12 +538,95 @@ const slotRotationStaggerStep = 15 * time.Second
 //
 // Step / cap (BLOCKER-1): the grid interval is p.staggerStep (falling back
 // to slotRotationStaggerStep when unset) and the linear base is clamped to
-// p.staggerOffsetCap when that is > 0. The cap exists because the
-// uniform-cells slice runs idx 0..2*poolSize-1 — at poolSize=8 the
-// uncapped ladder would add up to 15*step on top of MaxSlotAge, pushing the
-// highest-idx slot into the ~130s TSPU direct-TCP freeze window. Capping
-// keeps every slot rotating before the freeze. cap=0 preserves the legacy
-// unbounded ladder.
+// p.staggerOffsetCap when that is > 0. The cap bounds the ladder, which
+// otherwise adds 15*step on top of MaxSlotAge at poolSize=8.
+//
+// ⚠ The cap does NOT make rotation safe — it only makes the overshoot finite.
+// This offset is ADDED to the rotation threshold, so at cap=45s and step=6s the
+// worst cell rotates 48s LATER than MaxSlotAge suggests. Field measurement
+// 2026-08-07: applied threshold 69s + 48s = 114s against a p10 death age of 84s,
+// i.e. cells idx 8..15 could not survive to their own rotation and were cut by
+// the middlebox instead. The old comment claimed the cap "keeps every slot
+// rotating before the freeze"; that was true only under the unverified 130-190s
+// window, and is false under the measured 84-118s one.
+//
+// A second, subtler cost: every idx past cap/step gets the SAME base (all of
+// idx 8..15 land on 45s), so those cells rotate in lockstep — the opposite of
+// what staggering is for. Visible in the field log as bursts of same-second
+// teardowns.
+//
+// Always size this through WSPoolTransport.worstCaseTeardown(), never by
+// eyeballing MaxSlotAge. cap=0 preserves the legacy unbounded ladder.
+// rotationWatchdogTick — период обхода слотов на предмет перезревания.
+// Слагаемое worst-case: слот, перешедший порог сразу после тика, ждёт до целого
+// периода, прежде чем ротация вообще будет замечена.
+const rotationWatchdogTick = 5 * time.Second
+
+// staggerSpan — МАКСИМАЛЬНЫЙ вклад stagger-джиттера в возраст слота, по всем
+// ячейкам слайса. Ровно та величина, которой не хватало в расчёте worst-case.
+//
+// Почему это отдельная функция, а не «примерно cap»: slotStaggerOffset даёт
+// base+jitter, где base клампится cap'ом, а jitter ∈ [-step/2, +step/2). Верхняя
+// граница = cap + step/2, и при отсутствии cap'а — (2*poolSize-1)*step + step/2,
+// потому что uniform-cells идут idx 0..2*poolSize-1 (см. поле p.slots).
+//
+// Замер 2026-08-07 показал, зачем это нужно явно: при staggerStep=6s и
+// staggerOffsetCap=45s восемь ячеек из шестнадцати (idx 8..15) получают
+// ОДИНАКОВЫЙ base=45s, то есть порог ротации 69+45=114s при наблюдаемом p10
+// смертей 84s. Эти ячейки физически не доживали до собственной ротации, а лог
+// worst_case_teardown про них не знал — он складывал только maxSlotAge+sticky.
+func (p *WSPoolTransport) staggerSpan() time.Duration {
+	step := p.staggerStep
+	if step <= 0 {
+		step = slotRotationStaggerStep
+	}
+	maxIdx := len(p.slots) - 1
+	if maxIdx < 0 {
+		maxIdx = 0
+	}
+	base := time.Duration(maxIdx) * step
+	if p.staggerOffsetCap > 0 && base > p.staggerOffsetCap {
+		base = p.staggerOffsetCap
+	}
+	return base + step/2 // jitter полуоткрыт сверху: [-step/2, +step/2)
+}
+
+// worstCaseTeardown — полное время жизни TCP-соединения худшей ячейки, от
+// подключения до принудительного разрыва. ЕДИНСТВЕННЫЙ источник истины: и лог, и
+// будущие проверки бюджета обязаны спрашивать здесь, а не складывать слагаемые
+// заново по месту.
+//
+// Почему функция, а не выражение в лог-строке (урок раунда 18, H-15): до
+// 2026-08-07 stats.go печатал `adaptedAge + stickyMaxDrainAge` и был прав только
+// по совпадению — при hard_cap == sticky == 15s. Поднятие DRAIN_HARD_CAP не
+// изменило бы ни одной цифры в логе, а реальность уехала бы на 15s. Контур,
+// который рассказывает о себе неправду, хуже отсутствующего.
+//
+// Слагаемые:
+//   - base    — действующий порог ротации (адаптированный, если адаптер сжал)
+//   - stagger — максимальный вклад сетки размазывания, см. staggerSpan
+//   - sweep   — задержка обнаружения: rotationWatchdogSweep тикает раз в 5s
+//   - tear    — удержание дренажа: рвёт ТОТ, ЧЕЙ ДЕДЛАЙН РАНЬШЕ. Дедлайн стоит
+//     на drainHardCap (ws_pool_drain.go), а stickyMaxDrainAge проверяется лишь
+//     ПО ЕГО СРАБАТЫВАНИИ — поэтому sticky меньше hard_cap не участвует вовсе.
+func (p *WSPoolTransport) worstCaseTeardown() (base, stagger, sweep, tear, total time.Duration) {
+	base = p.maxSlotAge
+	if adapted := p.ageAdapter.Threshold(); adapted > 0 {
+		base = adapted
+	}
+	stagger = p.staggerSpan()
+	sweep = rotationWatchdogTick
+	if p.gracefulDrain {
+		tear = p.drainHardCap
+		// sticky продлевает дренаж только когда он БОЛЬШЕ hard_cap: дедлайн
+		// ставится на hard_cap, sticky проверяется по его срабатывании.
+		if p.stickyMaxDrainAge > tear {
+			tear = p.stickyMaxDrainAge
+		}
+	}
+	return base, stagger, sweep, tear, base + stagger + sweep + tear
+}
+
 func (p *WSPoolTransport) slotStaggerOffset(idx int) time.Duration {
 	if idx <= 0 {
 		return 0
@@ -1695,6 +1778,27 @@ func NewWSPoolTransport(cl *Client, cfg WSPoolConfig) *WSPoolTransport {
 	if stickyMaxDrainAge == 0 {
 		stickyMaxDrainAge = DefaultStickyMaxDrainAge
 	}
+	// ⚠ Достижимость sticky. Дедлайн дренажа ставится на drainHardCap, и ветка
+	// `drainAge >= stickyMaxDrainAge` проверяется только ПО ЕГО СРАБАТЫВАНИИ.
+	// Поэтому sticky <= hard_cap не продлевает дренаж НИ НА СЕКУНДУ: первая же
+	// проверка уходит в finishStickyAgeBackstop, а markSticky + deadline.Reset
+	// недостижимы. Хуже всего, что лог при этом пишет sticky_outcome=age_backstop,
+	// то есть механизм ВЫГЛЯДИТ работающим.
+	//
+	// Замер 2026-08-07 (2ч49м, hard_cap=sticky=15s): sticky_active=0 во всех
+	// health-строках при 8 teardown с sticky_outcome=age_backstop; drain_duration
+	// принимал ровно два значения — 15s и 0s, ни одного продления на
+	// stickyRecheckInterval. Механизм не исполнялся ни разу.
+	//
+	// Не «чиним» значение молча: подмена настройки за спиной оператора — тот же
+	// класс отказа. Говорим вслух, поведение оставляем как настроено.
+	if cfg.GracefulDrain && stickyMaxDrainAge > 0 && drainHardCap > 0 && stickyMaxDrainAge <= drainHardCap {
+		slog.Warn("sticky drain backstop is UNREACHABLE — sticky <= hard_cap",
+			"sticky_max_drain_age", stickyMaxDrainAge,
+			"drain_hard_cap", drainHardCap,
+			"effect", "дренаж рвёт hard_cap; sticky_outcome в логах вводит в заблуждение",
+			"fix", "SHADOWLINK_STICKY_MAX_DRAIN_AGE > SHADOWLINK_DRAIN_HARD_CAP, либо sticky<0 для явного выключения")
+	}
 	// negative stays negative → sticky disabled (kill switch).
 	stickyMaxTotalBytes := cfg.StickyMaxTotalBytes
 	if stickyMaxTotalBytes <= 0 {
@@ -1907,8 +2011,7 @@ func (p *WSPoolTransport) Connect(ctx context.Context) error {
 // state atomically. There is no lock contention with slotReader because
 // every shared field is atomic.
 func (p *WSPoolTransport) rotationWatchdogLoop() {
-	const tickInterval = 5 * time.Second
-	ticker := time.NewTicker(tickInterval)
+	ticker := time.NewTicker(rotationWatchdogTick)
 	defer ticker.Stop()
 	for {
 		select {
