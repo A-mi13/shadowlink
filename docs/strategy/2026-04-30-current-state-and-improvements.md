@@ -58,7 +58,9 @@
 
 ### 1.5 Operational state
 
-- **Server:** datacanvases.com:443, sha=24d1edb4, systemd unit + nginx reverse proxy на unix socket
+- **Server:** datacanvases.com:443, sha=24d1edb4, systemd unit + nginx reverse proxy
+  (⚠ снимок на 2026-04-30; сверка 2026-08-07: проксирование идёт на TCP
+  `127.0.0.1:10443`, а не на unix-сокет — CDN-ветка тоже более неактуальна)
 - **Client binary:** `bin/nixavpn-client.exe` 51 MB, Apr 30 20:36, fixes shipped
 - **Tests:** все unit + integration зелёные (`./client/`, `./server/`, `./core/`)
 - **Известная VPS лимитация:** превышен лимит трафика → throttle от хостера → cascade failures под нагрузкой. **Это не код, это hosting-уровень.**

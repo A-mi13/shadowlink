@@ -7,10 +7,35 @@ description: Use when working on slot rotation, graceful drain, connection age w
 
 ## Модель угрозы, из которой растут все константы
 
-TSPU режет долгие TCP-соединения к голому origin IP **по возрасту соединения** —
-окно заморозки ~**130–190 с**. Отсюда: слоты ротируются до того, как соединение
-доживёт до окна. Все тайминговые константы ниже — производные от этого числа,
-менять их «на глаз» нельзя.
+Долгие TCP-соединения к голому origin IP режутся **по возрасту соединения**.
+Ось подтверждена замером; величина окна — нет.
+
+⚠ **Окно ~130–190 с неверно.** Полевой замер 2026-08-07 (n=222, один AS):
+
+| | значение |
+|---|---|
+| окно реза | **84–118 с** (p10 84.1 / p50 97.6 / p90 118.0) |
+| ось | **возраст** — CV 0.26 против 8.73 по байтам |
+| объём как триггер | не воспроизводится: умирают и слоты с 0 КБ |
+
+Число валидно для одного AS: ТСПУ неоднородна по операторам (ACM IMC 2022),
+поэтому «измерить и зашить» задачу не решает. Курс — адаптация per-AS
+(`client/slotobs`).
+
+### Бюджет считать ТОЛЬКО через `worstCaseTeardown()`
+
+```
+base + stagger + sweep + teardown_cap
+```
+
+До 2026-08-07 лог складывал `base + sticky` и **врал в 1.6 раза**: выпадал
+`staggerOffsetCap` (до +48 с) и тик watchdog (+5 с). Следствие — 8 ячеек из 16
+имели порог ротации 114 с при p10 смертей 84 с, то есть не доживали до
+собственной ротации. Никогда не складывать слагаемые по месту.
+
+⚠ **Выборка цензурирована.** `slotobs.Record` вызывается только на ошибке чтения,
+плановые ротации в неё не попадают. Долю «срезано посредником» из `by_close_kind`
+вывести нельзя, а p10 смещён вверх.
 
 ## ENV-флаги (активные)
 
@@ -22,8 +47,8 @@ TSPU режет долгие TCP-соединения к голому origin IP 
 | `SHADOWLINK_SPLIT_DNS` | follows-bypass | split-DNS forwarder (Yandex-vs-CF арбитраж); default следует за bypass |
 | `SHADOWLINK_GRACEFUL_DRAIN` | ON | `=0` → legacy hard-rotation. GOAWAY-style drain: активные стримы переживают ротацию |
 | `SHADOWLINK_DRAIN_HARD_CAP` | 90s (поле: 30s) | макс время слота в `slotDraining` до forced teardown |
-| `SHADOWLINK_STAGGER_STEP` / `_STAGGER_OFFSET_CAP` / `_AGE_CUT_MIN_AGE` / `_MAX_SLOT_AGE` | tuned | TSPU age-window tuning (рез голого IP по возрасту ~130-190с) |
-| `SHADOWLINK_STICKY_MAX_DRAIN_AGE` / `_MAX_TOTAL_BYTES` / `_MAX_SLOTS` | 10m / 256MiB / auto | sticky-stream adaptive backstop (большие файлы) |
+| `SHADOWLINK_STAGGER_STEP` / `_STAGGER_OFFSET_CAP` / `_AGE_CUT_MIN_AGE` / `_MAX_SLOT_AGE` | tuned | age-window tuning. ⚠ `_STAGGER_OFFSET_CAP` **прибавляется к порогу ротации**, а не размазывает внутри него: cap=45s + step/2 даёт +48s к возрасту старших ячеек |
+| `SHADOWLINK_STICKY_MAX_DRAIN_AGE` / `_MAX_TOTAL_BYTES` / `_MAX_SLOTS` | 15s / 256MiB / auto | sticky-stream backstop. ⚠ **Обязан быть СТРОГО больше `_DRAIN_HARD_CAP`** — иначе не работает вовсе (см. ниже). В поле 25s |
 | `SHADOWLINK_FLOW_WINDOW` | 4 MiB | per-stream flow-control окно (negotiation = `min(client, server)`) |
 | `SHADOWLINK_RL_TOKENBUCKET` / `_RL_CLIENTID_EXEMPT` | on (server) | rate-limit v2 / clientID exemption |
 | `SHADOWLINK_PHASED_WARMUP` / `_SOCKS5_COALESCE` / `_ADMIN_OVERRIDE` | on | cold-start cascade митигации |
@@ -41,10 +66,33 @@ TSPU режет долгие TCP-соединения к голому origin IP 
 
 ## Sticky-stream backstop
 
-Большая закачка не должна умирать от ротации. Backstop адаптивный, три
-независимых предела (возраст drain / суммарные байты / число слотов) — срабатывает
-первый достигнутый. Ослабление любого из трёх увеличивает шанс попасть в
-age-cut окно.
+Большая закачка не должна умирать от ротации. Три независимых предела (возраст
+drain / суммарные байты / число слотов) — срабатывает первый достигнутый.
+Ослабление любого увеличивает шанс попасть в age-cut окно.
+
+### ⚠ Ловушка: sticky ≤ hard_cap выключает механизм молча
+
+Дедлайн дренажа ставится на `drainHardCap`, и ветка `drainAge >= stickyMaxDrainAge`
+проверяется **только по его срабатывании**. Поэтому при `sticky <= hard_cap`
+первая же проверка уходит в teardown, а продление (`markSticky` +
+`deadline.Reset`) недостижимо. **Равенство ломает так же, как «меньше»** — на это
+наступали дважды (2026-07-31 и 2026-08-07).
+
+Коварство в том, что лог при этом пишет `sticky_outcome=age_backstop`, то есть
+механизм **выглядит работающим**. Как отличить по логу:
+
+| Признак | Sticky мёртв | Sticky жив |
+|---|---|---|
+| `sticky_active` в health | всегда 0 | > 0 |
+| `drain_duration` | ровно = hard_cap | 20s/25s/… |
+
+Замер 2026-08-07 (2ч49м, hard_cap=sticky=15s): `sticky_active=0` во всех
+health-строках при 8 teardown с `sticky_outcome=age_backstop`; `drain_duration`
+принимал ровно два значения — 15s и 0s. Механизм не исполнялся ни разу.
+
+Сторожа: `TestStickyDrainBudget_HardCapNotBelowSticky` (проверяет `.bat`) и
+`TestStickyDrainBudget_DefaultsSatisfyStickyReachability` (проверяет дефолты и
+не скипается). Клиент печатает WARN `sticky drain backstop is UNREACHABLE`.
 
 ## Flow control v2
 
@@ -62,7 +110,8 @@ Per-stream окно, negotiation = `min(client, server)`. Спека —
 
 ## Правило при изменении констант
 
-Любая правка тайминга должна быть обоснована относительно окна 130–190 с и
+Любая правка тайминга должна быть обоснована относительно НАБЛЮДАЕМОГО окна
+(замер 2026-08-07: 84–118 с), а не относительно прежней константы 130–190 с, и
 проверена тестами в `core/` (`session_*_test.go`, `migrate_*_test.go`). Тесты
 на тайминги в этом проекте исторически флейковали под `-shuffle`/`-count` —
 см. skill `testing-rules`.

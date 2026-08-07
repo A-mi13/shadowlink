@@ -35,25 +35,44 @@ bash build-client.sh    # → $CLIENT_BIN_DIR (default /d/NIXAVPN/bin), windows/
 
 ## nginx (обязателен)
 
+⚠ **Сверено с прод-сервером 2026-08-07.** До этого здесь был `proxy_pass` на
+unix-сокет `/run/shadowlink.sock` — такого сокета на сервере нет и не было.
+Реальная схема: Go слушает **TCP `127.0.0.1:10443`** (`listen` в
+`/etc/shadowlink/config.yaml`), nginx проксирует туда. Файл конфига на сервере —
+`/etc/nginx/sites-available/shadowlink-443`.
+
 ```nginx
 server {
     listen 443 ssl;  # NO http2 — WS upgrade требует HTTP/1.1
-    server_name your-domain.com;
-    ssl_certificate     /etc/letsencrypt/live/your-domain.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/your-domain.com/privkey.pem;
+    server_name datacanvases.com;
+    ssl_certificate     /etc/letsencrypt/live/datacanvases.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/datacanvases.com/privkey.pem;
+
+    location /_mgmt/ {
+        proxy_pass http://127.0.0.1:9443/;   # management API, только с localhost
+    }
+
     location / {
-        proxy_pass http://unix:/run/shadowlink.sock;
+        proxy_pass http://127.0.0.1:10443;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
+
+        # ОБЯЗАТЕЛЬНО. Дефолт nginx — 60s, и он попадает внутрь интервала
+        # серверного WS-ping (22.5–90s, см. server/websocket.go). Без явных
+        # значений nginx сам рвал бы долгие WS-соединения, и это было бы
+        # неотличимо от age-cut посредником.
+        proxy_read_timeout 86400;
+        proxy_send_timeout 86400;
     }
 }
 ```
 
-Причина обязательности — Go `net/http` шлёт non-browser HTTP/2 SETTINGS (JA3-риск).
+Причина обязательности nginx — Go `net/http` шлёт non-browser HTTP/2 SETTINGS
+(JA3-риск).
 
 ## systemd
 

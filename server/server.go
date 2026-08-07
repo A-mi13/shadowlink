@@ -24,7 +24,7 @@ const minManagementKeyLen = 32
 //
 // IMPORTANT: In production, deploy behind a real nginx reverse proxy:
 //
-//	nginx (TLS + h2 termination, port 443) → Go server (plain HTTP, unix socket)
+//	nginx (TLS termination, port 443) → Go server (plain HTTP, 127.0.0.1:10443)
 //
 // This is required because Go's net/http sends non-browser HTTP/2 SETTINGS frames.
 // A real nginx handles TLS and h2 with genuine nginx fingerprint, making the server
