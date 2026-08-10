@@ -9,16 +9,21 @@ description: Use when building, deploying, or troubleshooting a running server/c
 
 ```bash
 bash build-server.sh    # → bin/shadowlink-server-linux (linux/amd64, CGO off, стрипуется)
-bash build-client.sh    # → $CLIENT_BIN_DIR (default /d/NIXAVPN/bin), windows/amd64, CGO off, НЕ стрипуется
+bash build-client.sh    # → $CLIENT_BIN_DIR (default ./bin), windows/amd64, CGO off, НЕ стрипуется
 ```
 
 Оба скрипта сами делают `go build ./...` + `go vet` перед сборкой и бэкапят
 предыдущий бинарь с таймстампом.
 
 **Клиент не стрипуется намеренно** — `connect-vpn-DEBUG.bat` гоняет его с
-`-log debug`, strip убил бы символы в стектрейсах. Кладётся в
-`/d/NIXAVPN/bin` рядом с `wintun.dll` и `connect-vpn-*.bat`: без них не
-запускается.
+`-log debug`, strip убил бы символы в стектрейсах.
+
+**Рабочий каталог клиента — `D:\shadowlink\bin`** (`./bin` этого репозитория),
+рядом с `wintun.dll` и `connect-vpn-*.bat`: без них не запускается. Дефолт
+сменили 2026-07-31, но здесь и в CLAUDE.md до 2026-08-10 висел прежний
+`/d/NIXAVPN/bin` — расхождение сбивало с толку при сборке. В `/d/NIXAVPN/bin`
+лежит **устаревшая** копия (31 июля); туда собирать только осознанно, через
+`CLIENT_BIN_DIR=/d/NIXAVPN/bin bash build-client.sh`.
 
 ## Правило единственного бинаря (важно)
 

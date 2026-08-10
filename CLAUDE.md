@@ -74,7 +74,7 @@ protection. Стеганография на HTTP-уровне, не TLS-уров
 go test ./... -count=1          # Windows: без -race
 go build ./... && go vet ./...
 bash build-server.sh           # → bin/shadowlink-server-linux
-bash build-client.sh           # → $CLIENT_BIN_DIR (default /d/NIXAVPN/bin)
+bash build-client.sh           # → $CLIENT_BIN_DIR (default ./bin = D:\shadowlink\bin)
 ```
 
 ## Triggers → load skills
