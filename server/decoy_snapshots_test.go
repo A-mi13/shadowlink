@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nixavpn/shadowlink/core"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -84,11 +85,63 @@ func TestLoadDecoySnapshots_MissingIdentifier(t *testing.T) {
 	assert.Contains(t, err.Error(), "Schema.org JSON-LD baseline validation failed")
 }
 
-// TestLoadDecoySnapshots_WrongPropertyID verifies that an identifier with
-// propertyID != "rl-state" causes a fail-fast error.
-func TestLoadDecoySnapshots_WrongPropertyID(t *testing.T) {
-	// Use correct width but wrong propertyID.
-	val := strings.Repeat("x", RLStateValueWidth)
+// TestLoadDecoySnapshots_AcceptsAnyPropertyID replaces the former
+// TestLoadDecoySnapshots_WrongPropertyID, which asserted that anything other
+// than the literal "rl-state" was rejected.
+//
+// That assertion is now wrong by design (2026-08-08). The identifier is
+// derived per host (core.DeriveRLPropertyID) precisely so it is NOT the same
+// string everywhere — a fleet-wide constant meant one scan for one substring
+// enumerated every server we run. The loader runs at startup with no request
+// Host available, and a multi-domain process legitimately serves several
+// hosts, so it cannot know which literal to expect and must accept the shape.
+//
+// Telling detail from the old test: its "wrong" fixture used propertyID
+// "ISBN" — a real Schema.org vendor identifier, i.e. exactly the kind of
+// value the new derivation is built to imitate.
+func TestLoadDecoySnapshots_AcceptsAnyPropertyID(t *testing.T) {
+	val := MakeBaselineValue()
+
+	for _, propertyID := range []string{
+		"ISBN",                  // real-world vocabulary example
+		"sku-417",               // derived shape
+		core.LegacyRLPropertyID, // legacy literal still loads
+		core.DeriveRLPropertyID("datacanvases.com"),
+	} {
+		t.Run(propertyID, func(t *testing.T) {
+			html := fmt.Sprintf(`<!DOCTYPE html>
+<html><head>
+<script type="application/ld+json">
+{
+  "@context":"https://schema.org",
+  "@type":"Book",
+  "identifier":{
+    "@type":"PropertyValue",
+    "propertyID":%q,
+    "value":"%s"
+  }
+}
+</script>
+</head><body></body></html>`, propertyID, val)
+
+			dir := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "index.html"), []byte(html), 0644))
+
+			snaps, err := LoadDecoySnapshots(dir, []string{"index.html"})
+			require.NoError(t, err)
+			require.Contains(t, snaps, "index.html")
+			assert.Equal(t, propertyID, snaps["index.html"].PropertyID,
+				"loader must report back the propertyID it found, for startup logging")
+		})
+	}
+}
+
+// TestLoadDecoySnapshots_EmptyPropertyID pins the one propertyID rule that
+// survives: presence. An empty ID yields a malformed JSON-LD block that no
+// client carrier will match, so the sentinel would be written into a slot
+// nobody reads — silent loss of the rate-limit channel.
+func TestLoadDecoySnapshots_EmptyPropertyID(t *testing.T) {
+	val := MakeBaselineValue()
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html><head>
 <script type="application/ld+json">
@@ -97,7 +150,7 @@ func TestLoadDecoySnapshots_WrongPropertyID(t *testing.T) {
   "@type":"Book",
   "identifier":{
     "@type":"PropertyValue",
-    "propertyID":"ISBN",
+    "propertyID":"",
     "value":"%s"
   }
 }
@@ -247,9 +300,10 @@ func TestFindIdentifierValueOffset_HappyPath(t *testing.T) {
 	html := makeDecoyHTML(baseline)
 	htmlBytes := []byte(html)
 
-	offset, length, ok := findIdentifierValueOffset(htmlBytes)
+	offset, length, propertyID, ok := findIdentifierValueOffset(htmlBytes)
 	require.True(t, ok, "findIdentifierValueOffset must succeed on valid HTML")
 	assert.Equal(t, RLStateValueWidth, length)
+	assert.NotEmpty(t, propertyID, "propertyID must be reported back to the caller")
 
 	// Confirm the offset points to the actual value in the HTML.
 	require.GreaterOrEqual(t, offset, 0)

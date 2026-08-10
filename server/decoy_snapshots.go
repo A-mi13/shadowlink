@@ -51,6 +51,14 @@ type DecoySnapshot struct {
 	// Always RLStateValueWidth for snapshots loaded by LoadDecoySnapshots.
 	IdentifierValueLength int
 
+	// PropertyID is the identifier.propertyID this template actually carries.
+	// Recorded for observability only — the emitter overwrites the value slot
+	// and never inspects the ID. Logging it at startup is how an operator
+	// notices a template that was copied between hosts without re-deriving
+	// (core.DeriveRLPropertyID), which would silently recreate the fleet-wide
+	// constant this field exists to eliminate.
+	PropertyID string
+
 	// SourcePath is the path relative to the decoy directory.
 	SourcePath string
 
@@ -59,16 +67,32 @@ type DecoySnapshot struct {
 }
 
 // LoadDecoySnapshots reads the given paths under decoyDir and validates each
-// has a Schema.org JSON-LD baseline with PropertyValue identifier
-// (propertyID="rl-state"). Returns a map keyed by relative path.
+// has a Schema.org JSON-LD baseline with a PropertyValue identifier.
+// Returns a map keyed by relative path.
 //
 // CRITICAL invariants (enforced fail-fast at startup):
 //  1. Each file must contain a <script type="application/ld+json"> tag
 //  2. The JSON-LD payload must contain a top-level "identifier" object
 //  3. identifier.@type must == "PropertyValue"
-//  4. identifier.propertyID must == "rl-state"
+//  4. identifier.propertyID must be non-empty (any value — see below)
 //  5. identifier.value must be EXACTLY RLStateValueWidth bytes long
 //  6. Total file size <= 256 KB sanity cap
+//
+// # Why propertyID is no longer pinned to a literal (2026-08-08)
+//
+// It used to require exactly "rl-state" on every server. That made one
+// internet-wide scan for a fixed substring enumerate the entire fleet: find
+// one host, find all of them. The identifier is now derived per host
+// (core.DeriveRLPropertyID), so it differs between deployments — and this
+// loader therefore cannot know which literal to expect. It runs at startup,
+// where the request Host does not exist yet, and a multi-domain deployment
+// legitimately serves several hosts from one process.
+//
+// So validation checks the SHAPE, not the value: a PropertyValue identifier
+// with a non-empty propertyID and a fixed-width value slot. Whether the
+// template carries the right per-host string is not something this function
+// can answer; that is the deploy step's job (deploy-round18.sh) and the
+// client's, which derives the same ID from the host it dialled.
 //
 // If any invariant fails, LoadDecoySnapshots returns a precise error
 // indicating which file and which invariant. Server start halts.
@@ -88,11 +112,11 @@ func LoadDecoySnapshots(decoyDir string, paths []string) (map[string]*DecoySnaps
 				relPath, len(data), maxDecoyFileSize)
 		}
 
-		offset, length, ok := findIdentifierValueOffset(data)
+		offset, length, propertyID, ok := findIdentifierValueOffset(data)
 		if !ok {
 			return nil, fmt.Errorf("LoadDecoySnapshots %s: Schema.org JSON-LD baseline validation failed — "+
 				"file must contain <script type=\"application/ld+json\"> with identifier.@type=PropertyValue, "+
-				"identifier.propertyID=\"rl-state\", and identifier.value of exactly %d bytes",
+				"a non-empty identifier.propertyID, and identifier.value of exactly %d bytes",
 				relPath, RLStateValueWidth)
 		}
 
@@ -100,6 +124,7 @@ func LoadDecoySnapshots(decoyDir string, paths []string) (map[string]*DecoySnaps
 			HTML:                  data,
 			IdentifierValueOffset: offset,
 			IdentifierValueLength: length,
+			PropertyID:            propertyID,
 			SourcePath:            relPath,
 			Size:                  len(data),
 		}
@@ -132,11 +157,11 @@ type jsonLDIdentifier struct {
 //
 // Strategy: parse JSON once to validate, then use byte-precise search
 // in original HTML to find the value string's position.
-func findIdentifierValueOffset(html []byte) (offset int, length int, ok bool) {
+func findIdentifierValueOffset(html []byte) (offset int, length int, propertyID string, ok bool) {
 	// Find the JSON-LD script block.
 	scriptStart := findJSONLDScriptContent(html)
 	if scriptStart == nil {
-		return 0, 0, false
+		return 0, 0, "", false
 	}
 
 	// scriptStart is the slice of HTML starting at the content after the opening tag.
@@ -146,28 +171,32 @@ func findIdentifierValueOffset(html []byte) (offset int, length int, ok bool) {
 	// Find the closing </script> tag and slice the JSON content.
 	jsonContent, _, ok := bytes.Cut(scriptStart, []byte("</script>"))
 	if !ok {
-		return 0, 0, false
+		return 0, 0, "", false
 	}
 
 	// Parse the JSON-LD block.
 	var block jsonLDBlock
 	if err := json.Unmarshal(bytes.TrimSpace(jsonContent), &block); err != nil {
-		return 0, 0, false
+		return 0, 0, "", false
 	}
 
 	// Validate invariants.
 	if block.Identifier == nil {
-		return 0, 0, false
+		return 0, 0, "", false
 	}
 	if block.Identifier.Type != "PropertyValue" {
-		return 0, 0, false
+		return 0, 0, "", false
 	}
-	if block.Identifier.PropertyID != "rl-state" {
-		return 0, 0, false
+	// propertyID is per-host (core.DeriveRLPropertyID) and this loader has no
+	// Host to compare against — see the LoadDecoySnapshots doc comment. Only
+	// presence is checked: an empty ID would make the block malformed and
+	// unmatched by the client carrier.
+	if block.Identifier.PropertyID == "" {
+		return 0, 0, "", false
 	}
 	valueStr := block.Identifier.Value
 	if len(valueStr) != RLStateValueWidth {
-		return 0, 0, false
+		return 0, 0, "", false
 	}
 
 	// Find the byte position of the value string inside the original HTML.
@@ -176,11 +205,11 @@ func findIdentifierValueOffset(html []byte) (offset int, length int, ok bool) {
 	idxInContent := bytes.Index(jsonContent, needle)
 	if idxInContent < 0 {
 		// Should not happen if JSON was parsed from this content, but guard anyway.
-		return 0, 0, false
+		return 0, 0, "", false
 	}
 
 	absoluteOffset := scriptContentStart + idxInContent
-	return absoluteOffset, RLStateValueWidth, true
+	return absoluteOffset, RLStateValueWidth, block.Identifier.PropertyID, true
 }
 
 // findJSONLDScriptContent scans html for the first
