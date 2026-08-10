@@ -3,8 +3,8 @@ package browser
 import "testing"
 
 // TestDefaultCoverPaths_PoolSize pins the pool size at 10 entries (Wave
-// 2.4, 2026-05-17 — 6 Mixpanel/SDK telemetry paths + 4 static asset paths
-// for multi-resource decoy mimicry). The chooseWarmupCount cap (≤4 via
+// 2.4, 2026-05-17 — 4 first-party API paths + 6 static asset paths for
+// multi-resource decoy mimicry). The chooseWarmupCount cap (≤4 via
 // `min(4, len(pool))` in `client/ws_transport.go`) and the
 // `ws_transport_warmup_test.go` order-entropy expectations both rely on
 // the pool being large enough to permit shuffled prefixes; growing the
@@ -34,11 +34,10 @@ func TestDefaultCoverPaths_ExportedCopy(t *testing.T) {
 
 // TestDefaultCoverPaths_IncludesAssetPaths guards Wave 2.4 closure
 // (multi-resource decoy mimicry, 2026-05-17): real SPAs request a mix of
-// SDK telemetry endpoints AND static page assets (CSS / JS bundle / hero
-// image / favicon) before opening a long-lived socket. A pool consisting
-// solely of telemetry paths is itself a fingerprintable shape — adding
-// static-asset paths broadens the prefix distribution observed by a
-// passive logger.
+// API endpoints AND static page assets (CSS / JS bundle / hero image /
+// favicon) before opening a long-lived socket. A pool consisting solely of
+// API paths is itself a fingerprintable shape — adding static-asset paths
+// broadens the prefix distribution observed by a passive logger.
 func TestDefaultCoverPaths_IncludesAssetPaths(t *testing.T) {
 	want := []string{"/assets/main.css", "/assets/app.js", "/favicon.ico", "/assets/hero.webp"}
 	for _, p := range want {
@@ -82,19 +81,30 @@ func TestCoverPathsPool_Combines(t *testing.T) {
 	}
 }
 
-// TestDefaultCoverPaths_NoNonMixpanelPaths guards C1 closure (may-audit,
-// 2026-05-02): `/health` and `/api/v2/feature-flags` are NOT Mixpanel SDK
-// paths and would be detectable via correlation analysis against a Mixpanel
-// reference fixture. Regression here means someone re-added a non-Mixpanel
-// shape into the warmup pool.
-func TestDefaultCoverPaths_NoNonMixpanelPaths(t *testing.T) {
+// TestDefaultCoverPaths_NoThirdPartySDKPaths guards the 2026-08-08 closure:
+// the warmup pool must contain no third-party analytics-SDK endpoints. A
+// browser fetches those from the vendor's own origin, but WarmupRequests
+// sends them same-origin with our own Origin/Referer (`request.go`) — a
+// shape with no real-world counterpart, and a strong correlation handle for
+// anyone holding a reference capture of the vendor's SDK.
+//
+// `/health` and `/api/v2/feature-flags` stay forbidden from the earlier C1
+// closure (may-audit, 2026-05-02) for the same reason: they were shapes the
+// legend did not account for.
+func TestDefaultCoverPaths_NoThirdPartySDKPaths(t *testing.T) {
 	forbidden := map[string]bool{
+		"/decide":               true, // PostHog feature-flag endpoint
+		"/lib.min.js":           true, // vendor JS SDK bundle
+		"/tag.js":               true, // tag-manager script
+		"/pixel.gif":            true, // vendor pixel beacon
+		"/sdk-config.json":      true, // vendor SDK config
+		"/api/v2/sdk/version":   true, // vendor SDK version probe
 		"/health":               true,
 		"/api/v2/feature-flags": true,
 	}
 	for _, p := range defaultCoverPaths {
 		if forbidden[p] {
-			t.Errorf("defaultCoverPaths contains forbidden non-Mixpanel path %q", p)
+			t.Errorf("defaultCoverPaths contains forbidden third-party/SDK path %q", p)
 		}
 	}
 }

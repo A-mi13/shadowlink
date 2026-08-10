@@ -109,7 +109,7 @@ type uploadEvent struct {
 //
 // Historical note (2026-04 DPI audit, vector V3): earlier versions carried
 // config_version / experiment_id / variant fields in every response. Those
-// fields were JSON-fingerprintable — real GA4/Mixpanel APIs do not attach
+// fields were JSON-fingerprintable — real analytics APIs do not attach
 // A/B experiment metadata to every analytics ack. TSPU-class DPI can detect
 // the pattern with a single JSON parser. Removed. Only next_poll remains
 // (legitimate in most analytics APIs and harmless as a single optional field).
@@ -482,13 +482,19 @@ func ReadBodyLimited(r io.Reader, maxBytes int64) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(r, maxBytes))
 }
 
-// eventTypePool — расширенный enum реалистичных Mixpanel/SPA-аналитических
-// событий. Финал-аудит 2026-05-03 P2-6: предыдущий enum из 6 entries
-// (`page_view`, `click`, `scroll`, `session_ping`, `form_submit`, `nav`)
-// давал ML-детектору body-content однозначный сигнал — реальные SPA emit
-// десятки видов событий с долгим хвостом. Новый pool 17 entries покрывает
-// доминантные паттерны: pageview-семейство (`$pageview` mirror у Mixpanel SDK),
-// session lifecycle, click-семейство, медиа/форма/поиск/конверсия.
+// eventTypePool — расширенный enum реалистичных SPA-аналитических событий.
+// Финал-аудит 2026-05-03 P2-6: предыдущий enum из 6 entries (`page_view`,
+// `click`, `scroll`, `session_ping`, `form_submit`, `nav`) давал ML-детектору
+// body-content однозначный сигнал — реальные SPA emit десятки видов событий
+// с долгим хвостом. Новый pool 17 entries покрывает доминантные паттерны:
+// pageview-семейство, session lifecycle, click-семейство,
+// медиа/форма/поиск/конверсия.
+//
+// Имена вида `$pageview` — общепринятая конвенция «служебного» события у
+// аналитических библиотек, а не отсылка к конкретному вендору: персона
+// стороннего SDK отменена 2026-04-28, и тела POST противник не расшифровывает.
+// Пул живёт здесь ради разнообразия содержимого, а не ради сходства с чьим-то
+// форматом.
 //
 // Weighted distribution (target spread):
 //   - page_view family    ≈ 30% (page_view 15% + $pageview 15%)

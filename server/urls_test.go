@@ -68,7 +68,7 @@ func TestAllWSPaths_ReturnsCopy(t *testing.T) {
 //   - /_next/webpack-hmr — Next.js HMR is a development-time only WS endpoint,
 //     production deploys never serve it. Including it created a "developer
 //     preview deploy" tell.
-//   - /track/realtime — Mixpanel-specific public tracking endpoint shape; not
+//   - /track/realtime — vendor-specific public tracking endpoint shape; not
 //     a realtime SaaS pattern that mimics general analytics behavior.
 // Both paths remain accepted by IsAllowedWSPath via legacyAcceptedWSPaths
 // for backward-compat with already-installed clients (see TestIsAllowedWSPath_BackwardCompat).
@@ -78,7 +78,7 @@ func TestWSURLPool_NoDevEndpoints(t *testing.T) {
 			t.Errorf("WS pool contains dev-only endpoint: %s", p)
 		}
 		if strings.HasPrefix(p, "/track/") {
-			t.Errorf("WS pool contains Mixpanel-track endpoint: %s", p)
+			t.Errorf("WS pool contains vendor-track endpoint: %s", p)
 		}
 	}
 	if len(wsURLPool) < 5 {

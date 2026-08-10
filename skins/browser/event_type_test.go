@@ -22,7 +22,7 @@ func TestRandomEventType_PoolWellFormed(t *testing.T) {
 		uniq[name] = struct{}{}
 	}
 	if len(uniq) < 15 {
-		t.Fatalf("eventTypePool unique-count too small: got %d unique names, want >=15 (P2-6: peer Mixpanel SDK emits dozens)",
+		t.Fatalf("eventTypePool unique-count too small: got %d unique names, want >=15 (P2-6: real SPA analytics emits dozens)",
 			len(uniq))
 	}
 }

@@ -26,7 +26,7 @@ import (
 // project-specific. Equally important: none of them is just "/ws" — that
 // single string is the fingerprint we are removing.
 var wsURLPool = []string{
-	"/socket.io/",                           // Socket.IO default mount (Mixpanel, Intercom, many SaaS)
+	"/socket.io/",                           // Socket.IO default mount (Intercom, many SaaS)
 	"/socket.io/?EIO=4&transport=websocket", // Socket.IO v4 polling-then-upgrade explicit form
 	"/api/v2/realtime",                      // generic v2 analytics realtime channel
 	"/api/v1/socket",                        // v1 socket endpoint (PostHog-shape)
@@ -48,7 +48,7 @@ var wsURLPool = []string{
 //
 // Removed paths:
 //   - /_next/webpack-hmr — Next.js HMR endpoint, dev-only on real deployments.
-//   - /track/realtime    — Mixpanel-specific public tracking endpoint shape.
+//   - /track/realtime    — vendor-specific public tracking endpoint shape.
 var legacyAcceptedWSPaths = map[string]struct{}{
 	"/_next/webpack-hmr": {},
 	"/track/realtime":    {},

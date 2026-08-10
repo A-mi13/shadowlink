@@ -8,8 +8,8 @@ import (
 // A6 anti-TSPU debt fix (2026-05-18). Pre-A6 the server emitted a
 // constant chunk_size (12288 bytes, server config default) — every
 // data WS frame on the wire was ~12288 bytes plus AES-GCM overhead,
-// a regular pattern that real Mixpanel/SDK analytics traffic does NOT
-// exhibit (real flows have variable-size JSON 600-3000 byte bursts).
+// a regular pattern that ordinary application traffic does NOT exhibit
+// (real flows carry variable-size bursts).
 //
 // Sampling uniformly from {6144, 8192, 10240, 12288} per session
 // gives the data-frame size distribution four discrete peaks instead
@@ -32,18 +32,20 @@ import (
 //     the wire-shape histogram four equal peaks.
 //
 // Why uniform (not log-normal or weighted): the goal is to break a
-// unimodal signature, not to match real-world distribution shape.
-// Real SDK traffic is heavy-tail tiny (≤4KB dominant) — we cannot
-// match that without crippling throughput. Four uniform peaks at
+// unimodal signature, not to match some reference distribution shape.
+// Bulk web traffic is heavy-tail tiny (≤4KB dominant) — we cannot match
+// that without crippling throughput. Four uniform peaks at
 // {6, 8, 10, 12 KB} is the minimum effort that breaks the unimodal
-// pattern; matching real shape is a Phase 5 calibration task per
-// the audit doc.
+// pattern. Chasing an exact real-world histogram was a Phase 5 item
+// tied to the analytics-vendor persona; that persona is retired
+// (2026-04-28 pivot — TSPU does not parse encrypted bodies), so the
+// bar here is "not unimodal", not "matches vendor X".
 //
-// Why pin per-session (not per-chunk): real Mixpanel SDK has a single
-// chunk-size negotiated at session start (it's a property of the
-// transport, not per-call). Per-chunk variation would itself be a
-// signature ("client whose chunk size changes mid-session"). The
-// per-session pinning matches plausible SDK behavior.
+// Why pin per-session (not per-chunk): a transport's frame size is
+// negotiated once at session start, not per call. Per-chunk variation
+// would itself be a signature ("client whose chunk size changes
+// mid-session"), so per-session pinning is what plausible application
+// behaviour looks like.
 //
 // Wire-format compatibility: chunk_size is already a uint16 field in
 // the ServerHello JSON (`"cs"`). Changing the emitted value per

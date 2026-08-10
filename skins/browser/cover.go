@@ -2,9 +2,9 @@ package browser
 
 // defaultCoverPaths is the path pool used by WarmupRequests
 // (`client/ws_transport.go::WarmupRequests`). The endpoints intentionally
-// look like SDK telemetry + feature-flag fetches a real SPA would emit
-// before opening a long-lived WebSocket — this seeds the pre-upgrade
-// burst that mimics legitimate browser cold-start.
+// look like the config + feature-flag fetches a real SPA would emit against
+// its own backend before opening a long-lived WebSocket — this seeds the
+// pre-upgrade burst that mimics legitimate browser cold-start.
 //
 // Originally this pool was shared with the cover-GET scheduler that fired
 // periodic GETs alongside the active WS session. The scheduler was retired
@@ -15,24 +15,34 @@ package browser
 // not part of that retirement; it produces a one-shot burst (1-4 GETs)
 // before the WS upgrade, not a periodic interleave.
 //
-// Pool entries are a mix of Mixpanel-aligned SDK endpoints (may-audit C1,
-// 2026-05-02) and static page assets (Wave 2.4, 2026-05-17 — multi-resource
-// decoy mimicry). A real SPA cold-start emits both shapes before opening a
-// long-lived socket, so the warmup burst draws from both classes:
+// Pool entries are a mix of first-party application endpoints and static page
+// assets (Wave 2.4, 2026-05-17 — multi-resource decoy mimicry). A real SPA
+// cold-start emits both shapes before opening a long-lived socket, so the
+// warmup burst draws from both classes:
 //
-// SDK / telemetry (Mixpanel-aligned):
-//   - `/sdk-config.json`     — config endpoint
-//   - `/api/v2/sdk/version`  — SDK version probe
-//   - `/tag.js`              — tag-manager script
-//   - `/pixel.gif`           — pixel beacon
-//   - `/decide`              — feature-flag / config lookup
-//   - `/lib.min.js`          — JS SDK bundle
+// First-party application endpoints:
+//   - `/api/v2/config`       — client bootstrap config
+//   - `/api/v2/session`      — session/identity probe
+//   - `/api/v2/flags`        — feature-flag lookup
+//   - `/api/v2/telemetry`    — telemetry ingest
 //
 // Static page assets (Wave 2.4):
 //   - `/assets/main.css`     — stylesheet
 //   - `/assets/app.js`       — page JS bundle
+//   - `/assets/vendor.js`    — vendor bundle
 //   - `/assets/hero.webp`    — hero image
+//   - `/assets/logo.svg`     — logo
 //   - `/favicon.ico`         — favicon
+//
+// Third-party SDK endpoints removed 2026-08-08: `/decide`, `/lib.min.js`,
+// `/tag.js`, `/pixel.gif` and `/sdk-config.json` are PostHog/Mixpanel-shaped
+// paths. A browser fetches those from the SDK vendor's own origin, never from
+// the site's domain — and `BuildTrackingPayload` sends Origin/Referer of our
+// own baseURL (`request.go`), so a same-origin request to a vendor path had no
+// real-world counterpart. The analytics-vendor persona is retired (2026-04-28
+// pivot: TSPU does not parse encrypted bodies); the legend is now a
+// self-contained SPA talking to its own backend, which same-origin traffic
+// actually matches.
 //
 // Pool size is pinned at 10 by `TestDefaultCoverPaths_PoolSize`. The
 // `chooseWarmupCount` clamp (`client/ws_transport.go`) caps the burst at
@@ -41,15 +51,15 @@ package browser
 // `WarmupRequests`, strengthening order-entropy without changing the
 // burst-length distribution observed on the wire.
 var defaultCoverPaths = []string{
-	"/sdk-config.json",
-	"/api/v2/sdk/version",
-	"/tag.js",
-	"/pixel.gif",
-	"/decide",
-	"/lib.min.js",
+	"/api/v2/config",
+	"/api/v2/session",
+	"/api/v2/flags",
+	"/api/v2/telemetry",
 	"/assets/main.css",
 	"/assets/app.js",
+	"/assets/vendor.js",
 	"/assets/hero.webp",
+	"/assets/logo.svg",
 	"/favicon.ico",
 }
 

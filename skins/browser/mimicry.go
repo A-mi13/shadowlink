@@ -14,7 +14,7 @@ const maxCoverBudget = 65536
 // --- PayloadDistribution ---
 
 // PayloadDistribution generates analytics-realistic payload sizes matching
-// GA4/Mixpanel traffic patterns to defeat ML-based DPI classification.
+// analytics/telemetry traffic patterns to defeat ML-based DPI classification.
 type PayloadDistribution struct{}
 
 // NewPayloadDistribution creates a new payload distribution generator.
@@ -22,7 +22,7 @@ func NewPayloadDistribution() *PayloadDistribution {
 	return &PayloadDistribution{}
 }
 
-// UploadSize returns a target size from GA4-like distribution:
+// UploadSize returns a target size from an analytics-like distribution:
 //
 //	80-150 bytes  (45%)
 //	151-350 bytes (35%)
