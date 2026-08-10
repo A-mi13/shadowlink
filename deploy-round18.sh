@@ -93,8 +93,28 @@ DECOY="$(yamlval decoy)"
 echo "decoy_dir=$DECOY"
 echo "mgmt_bind=$(yamlval bind)"
 echo "mgmt_key_len=$(yamlval key | tr -d '\n' | wc -c)"
-if [ -n "$DECOY" ] && grep -q rl-state "$DECOY/index.html" 2>/dev/null; then
+# Проверка СТРУКТУРНАЯ, не по литералу (2026-08-08). Раньше здесь стоял
+# `grep -q rl-state`: этот идентификатор был одинаков на всех серверах, и один
+# интернет-скан по подстроке находил весь парк. Теперь propertyID выводится из
+# хоста (core.DeriveRLPropertyID), то есть у каждого сервера свой, и искать
+# фиксированную строку больше нельзя — иначе деплой будет валиться именно на
+# правильно сгенерированных шаблонах.
+#
+# Ищем то, что действительно обязано присутствовать: JSON-LD блок с
+# PropertyValue-идентификатором. Ширину value проверяет сам сервер при старте
+# (LoadDecoySnapshots), дублировать её разбором HTML в bash смысла нет.
+if [ -n "$DECOY" ] && [ -f "$DECOY/index.html" ] &&
+   grep -q 'application/ld+json' "$DECOY/index.html" 2>/dev/null &&
+   grep -q 'PropertyValue' "$DECOY/index.html" 2>/dev/null; then
   echo "baseline=present"
+  # Отдельный сигнал: шаблон всё ещё несёт fleet-wide литерал. Не ошибка
+  # (сервер стартует, клиент такой маркер понимает), но свойство «нашли один
+  # ≠ нашли все» при этом не работает.
+  if grep -q '"propertyID"[[:space:]]*:[[:space:]]*"rl-state"' "$DECOY/index.html" 2>/dev/null; then
+    echo "baseline_propertyid=LEGACY"
+  else
+    echo "baseline_propertyid=per-host"
+  fi
 else
   echo "baseline=MISSING"
 fi
@@ -109,8 +129,15 @@ echo "$PRE" | sed 's/^/   /'
 
 # H-1 шаг 4a: -decoy-snapshot-strict теперь true. Без Schema.org baseline сервер
 # НЕ СТАРТУЕТ — намеренный fail-fast (раньше тихо деградировал в header-only).
+if echo "$PRE" | grep -q 'baseline_propertyid=LEGACY'; then
+  warn "decoy-шаблон несёт legacy propertyID \"rl-state\" — он одинаков на всех"
+  warn "серверах, и один скан по этой строке перечисляет весь парк."
+  warn "Перегенерируйте шаблон под свой хост (core.DeriveRLPropertyID)."
+  warn "Деплой продолжается: сервер стартует, клиент такой маркер понимает."
+fi
+
 if echo "$PRE" | grep -q 'baseline=MISSING'; then
-  warn "Schema.org baseline (rl-state) НЕ найден в decoy-шаблоне."
+  warn "Schema.org baseline (JSON-LD + PropertyValue) НЕ найден в decoy-шаблоне."
   warn "Сервер не поднимется со strict=true. Варианты:"
   warn "  а) обновить шаблоны decoy — правильный путь"
   warn "  б) добавить -decoy-snapshot-strict=false в ExecStart — временно"
@@ -137,6 +164,25 @@ fi
 say "заливка бинаря"
 "${SCP_CMD[@]}" "$BIN" "${TARGET}:${REMOTE_BIN}.new"
 
+# Сверка хеша залитой копии с локальной. Добавлено 2026-08-10 после инцидента:
+# деплой 8 августа выглядел успешным, но на прод не доехал — сервер двое суток
+# работал на бинаре от 31 июля, и заметили это только случайной сверкой md5.
+# Без этой проверки "тихий недодеплой" неотличим от успешного: скрипт печатает
+# ГОТОВО, systemd рапортует active, а в бою старый код.
+#
+# Проверяем ДО остановки сервиса: если копия побилась, прод не трогаем вовсе.
+LOCAL_MD5="$(md5sum "$BIN" | cut -d' ' -f1)"
+{
+  echo 'set -eu'
+  echo "md5sum \"${REMOTE_BIN}.new\" | cut -d' ' -f1"
+} >"$TMPD/verify_upload.sh"
+REMOTE_MD5="$(rrun "$TMPD/verify_upload.sh" | tr -d '\r' | tail -1)"
+if [ "$LOCAL_MD5" != "$REMOTE_MD5" ]; then
+  rsh "rm -f ${REMOTE_BIN}.new" || true
+  die "хеш залитого бинаря не совпал: локально $LOCAL_MD5, на сервере $REMOTE_MD5 — прод не тронут"
+fi
+echo "   ok — хеш совпал: $LOCAL_MD5"
+
 # --- 3. H-18: таймауты -------------------------------------------------------
 # Idle-таймаут сужается 5m → 90s (значения DefaultConfig; ретроспектива инцидента
 # 2026-05-17 называет прежние 5m/30s причиной decoy lockout).
@@ -150,8 +196,10 @@ if [ "${SL_KEEP_OLD_TIMEOUTS:-0}" = "1" ]; then
   } >"$TMPD/timeouts.sh"
   rrun "$TMPD/timeouts.sh"
 else
-  warn "H-18: сервер поедет на НОВЫХ 90s/10s (idle-таймаут сужается с 5m)."
-  warn "      Это цель фикса. Следите за active_clients первый час."
+  warn "H-18: сервер поедет на значениях DefaultConfig (90s/10s), если в YAML"
+  warn "      нет session_timeout_sec/cleanup_interval_sec. Фактическое значение"
+  warn "      печатает сам сервер при старте — см. session_timeout_sec_runtime"
+  warn "      в блоке «стартовые предупреждения» ниже, а не это сообщение."
   warn "      Откат: SL_KEEP_OLD_TIMEOUTS=1 bash deploy-round18.sh"
 fi
 
@@ -174,21 +222,36 @@ rrun "$TMPD/switch.sh"
 sleep 3
 
 # --- 5. Проверка, что поднялся ----------------------------------------------
-cat >"$TMPD/status.sh" <<'STATUS'
-set -u
+{
+  echo 'set -u'
+  echo "BINP=\"$REMOTE_BIN\""
+  cat <<'STATUS'
 if systemctl is-active --quiet shadowlink; then
   echo "STATE=active"
 else
   echo "STATE=dead"
 fi
+echo "RUNNING_MD5=$(md5sum "$BINP" | cut -d' ' -f1)"
 systemctl status shadowlink --no-pager 2>/dev/null | head -5
+echo "--- фактические тайминги из лога сервера ---"
+journalctl -u shadowlink -n 80 --no-pager 2>/dev/null | grep -oE "session_timeout_sec_runtime=[0-9]+ cleanup_interval_sec_runtime=[0-9]+" | tail -1 ||
+  echo "нет строки mimicry config — старый бинарь? (до 2026-08-10 лог печатал зашитое 300)"
 echo "--- стартовые предупреждения ---"
 journalctl -u shadowlink -n 80 --no-pager 2>/dev/null | grep -iE "snapshot|open mode|management key|too short|panic" || echo "нет - это хорошо"
 STATUS
+} >"$TMPD/status.sh"
 
 say "статус после старта"
 ST="$(rrun "$TMPD/status.sh" || true)"
 echo "$ST" | sed 's/^/   /'
+
+# Вторая половина защиты от тихого недодеплоя: под нагрузкой сверяем не то, что
+# залили, а то, что реально лежит на боевом пути после mv.
+RUNNING_MD5="$(echo "$ST" | sed -n 's/^RUNNING_MD5=//p' | tr -d '\r' | tail -1)"
+if [ -n "$RUNNING_MD5" ] && [ "$RUNNING_MD5" != "$LOCAL_MD5" ]; then
+  die "на боевом пути НЕ наш бинарь: ожидали $LOCAL_MD5, лежит $RUNNING_MD5"
+fi
+echo "   ok — в бою наш бинарь: $LOCAL_MD5"
 
 if ! echo "$ST" | grep -q 'STATE=active'; then
   echo 'journalctl -u shadowlink -n 40 --no-pager' >"$TMPD/logs.sh"

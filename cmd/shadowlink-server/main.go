@@ -30,6 +30,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -275,10 +276,12 @@ func main() {
 			if *decoySnapshotStrict {
 				slog.Error("decoy snapshot loading failed — сервер не стартует (fail-fast)",
 					"err", snapErr,
-					"hint", "обновите decoy-шаблоны Schema.org rl-state baseline "+
-						"(<script type=\"application/ld+json\"> с identifier.propertyID=\"rl-state\" "+
-						"и полем value фиксированной ширины), либо запустите с "+
-						"-decoy-snapshot-strict=false, приняв риск header-only режима")
+					"hint", "обновите decoy-шаблоны: <script type=\"application/ld+json\"> с "+
+						"identifier.@type=\"PropertyValue\", НЕПУСТЫМ identifier.propertyID и полем "+
+						"value фиксированной ширины (80 байт, см. MakeBaselineValue). Значение "+
+						"propertyID выводится из хоста (core.DeriveRLPropertyID); литерал "+
+						"\"rl-state\" ещё принимается, но одинаков на всех серверах. Либо "+
+						"запустите с -decoy-snapshot-strict=false, приняв риск header-only режима")
 				os.Exit(1)
 			}
 			slog.Warn("decoy snapshot loading failed; body-marker carrier disabled, header-only mode active — "+
@@ -290,7 +293,37 @@ func main() {
 			snapshots = nil // SentinelEmitter handles nil → header-only path
 		}
 		srv.SetSentinelEmitter(server.NewSentinelEmitter(snapshots, srv.Metrics()))
-		slog.Info("SentinelEmitter initialized", "snapshot_count", len(snapshots))
+		// propertyID выводится из хоста (core.DeriveRLPropertyID) и обязан
+		// отличаться между серверами: раньше литерал "rl-state" был одинаков
+		// на всех, и один скан по подстроке перечислял весь парк. Логируем
+		// фактически найденные значения — если тут видно "rl-state" или один
+		// и тот же ID на разных хостах, значит шаблон скопировали без
+		// перегенерации, и свойство "нашли один ≠ нашли все" потеряно.
+		if len(snapshots) > 0 {
+			ids := make([]string, 0, len(snapshots))
+			seen := make(map[string]struct{}, len(snapshots))
+			legacy := false
+			for _, snap := range snapshots {
+				if snap.PropertyID == core.LegacyRLPropertyID {
+					legacy = true
+				}
+				if _, dup := seen[snap.PropertyID]; !dup {
+					seen[snap.PropertyID] = struct{}{}
+					ids = append(ids, snap.PropertyID)
+				}
+			}
+			sort.Strings(ids)
+			if legacy {
+				slog.Warn("decoy-шаблон несёт legacy propertyID \"rl-state\" — "+
+					"он одинаков на всех серверах, и один интернет-скан по этой строке "+
+					"находит весь парк; перегенерируйте шаблон под свой хост",
+					"property_ids", ids)
+			}
+			slog.Info("SentinelEmitter initialized",
+				"snapshot_count", len(snapshots), "property_ids", ids)
+		} else {
+			slog.Info("SentinelEmitter initialized", "snapshot_count", len(snapshots))
+		}
 	} else {
 		slog.Info("no decoy dir configured — SentinelEmitter disabled, using header-only rate-limit fallback")
 	}
@@ -337,9 +370,17 @@ func validateConfigAndExit(path string) error {
 // fields are logged with the raw FileConfig pointer (or "default" when nil)
 // to flag that the operator's choice is currently inert.
 func logMimicryConfig(fc *server.FileConfig, cfg *server.Config) {
+	// Значение берётся из cfg, а не из литерала. До 2026-08-10 здесь стояло
+	// жёстко зашитое 300 с комментарием «Wave 2.3 hardcoded» — оно пережило
+	// H-18, где DefaultConfig сузил SessionTimeout до 90s, и лог продолжал
+	// печатать 300. Расхождение стоило ложного вывода при деплое: по логу
+	// решили, что фикс не выкачен, хотя рантайм давно работал на 90s.
+	// Литерал в логе не показывает механизм — он показывает то, что кто-то
+	// однажды набрал руками.
 	attrs := []any{
 		"inflation_wired", cfg.UseInflatedResponses,
-		"idle_timeout_sec_runtime", 300, // Wave 2.3 hardcoded; wiring deferred
+		"session_timeout_sec_runtime", int(cfg.SessionTimeout.Seconds()),
+		"cleanup_interval_sec_runtime", int(cfg.CleanupInterval.Seconds()),
 	}
 
 	if fc.IdleTimeoutSec != nil {
