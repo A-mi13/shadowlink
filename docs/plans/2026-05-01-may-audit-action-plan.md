@@ -287,7 +287,7 @@
 
 ## P2 — Medium (backlog после P1)
 
-### C1. Cover GET path realism vs Mixpanel (Track 2 F3) ✅ DONE 2026-05-02 (partial — calibration deferred to S5)
+### C1. Cover GET path realism (Track 2 F3) ✅ DONE 2026-05-02 · калибровка ОТМЕНЕНА 2026-08-08 (S5 закрыт)
 
 **Что делать:** capture реальную Mixpanel SDK trace из test SPA; заменить `defaultCoverPaths` в `skins/browser/cover.go:14-26` на subset реальных paths. Drop `/health` + `/api/v2/feature-flags` (не Mixpanel). Pick ОДНА persona (Mixpanel) и align cadence.
 
@@ -352,7 +352,7 @@
 
 ---
 
-### C5. AckJitter soft cap + Pareto tail (Track 2 F7) ✅ DONE 2026-05-02 (best-guess shift, calibration deferred to S5)
+### C5. AckJitter soft cap + Pareto tail (Track 2 F7) ✅ DONE 2026-05-02 (best-guess shift; S5 закрыт 2026-08-08 — калибровка по CDN-nginx неактуальна, прод DIRECT)
 
 **Что делать:** `server/handler.go:178-198::ackJitter` — заменить hard cap 150ms на soft cap (continue exp + small Pareto tail для heavy right tail >1s). Lower median to ~5ms; calibrate против real CDN-fronted nginx ack distribution.
 
@@ -369,7 +369,7 @@
 
 ---
 
-### C6. Padding constants refit (Track 2 F4) ✅ DONE 2026-05-02 (placeholder shift, calibration deferred to S5)
+### C6. Padding constants refit (Track 2 F4) ✅ DONE 2026-05-02 · константы ПЕРЕОБОСНОВАНЫ 2026-08-08 (S5 закрыт, эталона нет)
 
 **Что делать:** `skins/browser/padding.go:17-29, 44-56` — pre-flight для Plan B (wire format work) — refit constants vs реальных Mixpanel `/track` POST sizes (600-3000 bytes vs наши placeholder 16-512).
 
@@ -558,13 +558,27 @@
 
 ---
 
-### S5. Mixpanel schema lock (refresh of D.9)
+### S5. ~~Mixpanel schema lock (refresh of D.9)~~ ❌ ЗАКРЫТ БЕЗ ИСПОЛНЕНИЯ 2026-08-08
 
-**Что делать:** zero-shot decision: lock cover GET / padding / persona на Mixpanel reference fixture. Refit C1+C6 одной сессией.
+**Было:** lock cover GET / padding / persona на Mixpanel reference fixture, refit C1+C6 одной сессией.
 
-**Почему strategic:** reinforced threat — endpoint-side VPN-detect (Track 5 §5.1.3) + cross-correlated traffic mimicry threat.
+**Почему закрыт:** предпосылка ложна. Персона стороннего SDK отменена ещё
+2026-04-28 (TSPU не разбирает зашифрованные тела — сходство с эталоном не
+наблюдаемо противником), а cover GET retired там же (F3). Задача требовала
+подгонки под эталон, которого не существует и который никто не увидит.
 
-**Effort:** M.
+**Что сделано вместо** (2026-08-08): вендорская легенда вычищена из кода.
+Cover-пути переведены на first-party (`/decide`, `/lib.min.js`, `/tag.js`,
+`/pixel.gif` удалены — same-origin запрос к пути вендора не имеет аналога в
+реальном вебе). Диапазоны паддинга сохранены, но переобоснованы через
+правдоподобную зону JSON-тела и расхождение handshake/data, а не через
+сходство с вендором. Инфраструктура захвата `skins/browser/testdata/capture/`
+удалена. Сторожа: `TestDefaultCoverPaths_NoThirdPartySDKPaths`,
+`TestPaddingBands_NoVendorPersonaReference`.
+
+**Открытым остаётся** не «повторить чужой формат», а согласованность легенды с
+реальным decoy-сайтом: пути в `cover_paths_gen.go` сгенерированы из
+синтетического 588-байтного снапшота, а не из живого прод-HTML.
 
 ---
 
