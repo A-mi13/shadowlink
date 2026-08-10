@@ -570,6 +570,30 @@ func (t *WebSocketTransport) UpgradeToWS(token []byte, session *core.Session) er
 		if !t.flowControlEnabled {
 			Stats.FlowNegotiationTimeout.Add(1)
 		}
+		// Ошибка чтения ack ТЕРМИНАЛЬНА для слота (2026-08-10). Раньше ackErr
+		// молча игнорировался: считали метрику и отдавали conn читателю. Но
+		// readErr в gorilla ЛИПКИЙ — `for c.readErr == nil` (conn.go:1008) и
+		// `return noFrame, nil, c.readErr` (conn.go:1033); SetReadDeadline его не
+		// очищает, hideTempErr только оборачивает. Поэтому slotReader на первом
+		// же ReadMessage получал закешированный таймаут МГНОВЕННО, при
+		// slot_age_ms=0.
+		//
+		// Полевая цена (два прогона 2026-08-10): 14 таких событий, и связь
+		// однозначная — все 14 имели anomaly=io_timeout, и ни один io_timeout не
+		// имел age>0. Все — свежие слоты-замены дренажа, умиравшие в ту же
+		// миллисекунду, что и `reader started`. Последствия: (1) сводка
+		// slotobs отравлена — age_min_ms=0, age_p10_ms=0, cv_age раздут
+		// 0.08 → 0.50; (2) ложная атрибуция cause=natural кормила
+		// meltdown-детектор и давала экспоненциальный backoff (~10 с простоя
+		// ячейки) вместо fast-reconnect.
+		//
+		// Закрываем conn и возвращаем ошибку: connectReserveSlot освободит
+		// ячейку штатно, а пул подключит замену без ложного «слот умер сам».
+		if ackErr != nil {
+			conn.Close()
+			t.sendBestEffortSessionFIN(token, session)
+			return fmt.Errorf("ws upgrade: flowctl ack read: %w", ackErr)
+		}
 	}
 
 	// Async writer with priority channels: CONNECT/FIN/keepalive use the
