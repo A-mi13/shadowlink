@@ -735,12 +735,13 @@ func (e *relayEntry) routeDownFrame(data []byte, closeCh <-chan struct{}) (*bind
 // CAS). reassociate is now pure drain, so there is exactly ONE publication point
 // for B.
 //
-// Concurrency: the buffer is drained under perEntryMu (held only for the
-// snapshot, not for the enqueue) to avoid holding the lock across
-// encrypt/enqueue. After the drain we Broadcast bufCond so a relay loop that
-// blocked on a full downBuffer during the no-binding window wakes, sees the
-// now-non-nil binding / freed buffer, and resumes — no deadlock because
-// reassociate does not hold perEntryMu while enqueuing.
+// Concurrency: the buffer is drained AND flushed under perEntryMu — the lock is
+// held across the encrypt/enqueue of the snapshot, because routeDownFrame's fast
+// path is the competing producer on the same writer and must not interleave a
+// higher seq into the middle of the flush (see the ORDERING note in the body).
+// The Broadcast then happens under that same lock hold, so a relay loop blocked
+// on a full downBuffer during the no-binding window wakes only after the flush is
+// complete, sees the freed buffer and the live binding, and resumes in order.
 //
 // originDeathTeardown gates the Component-4 RESUME-fallback (Bug #10 Task 7):
 // when true AND e.destClosed is set, after the drain a FlagStreamClose is sent
@@ -762,18 +763,33 @@ func (e *relayEntry) reassociate(b *binding, migrateEnabled, aDead, originDeathT
 	// mutex) wakes it, or (b) already in Wait — Broadcast wakes it. Either way
 	// it re-checks under the lock and finds the drained (empty) buffer. Closing
 	// the lost-wakeup window is why drainAll + Broadcast share one lock hold.
-	cond.Broadcast()
-	e.perEntryMu.Unlock()
-
+	//
 	// Drain buffered-during-no-binding first, then resend the unacked tail. The
 	// client reassembler dedups by f.seq < expectedSeq (§5.4) so a frame that
 	// arrived on both A (in-flight) and B (resend) is idempotent.
+	//
+	// ORDERING (fixed 2026-08-10, caught under -race on Linux): the flush runs
+	// STILL UNDER perEntryMu. Previously the lock was released before this loop,
+	// which opened a reorder window: drainAll had already emptied downBuffer, so a
+	// relayLoop woken by the Broadcast saw bufferEmpty==true plus a live binding,
+	// took the fast path in routeDownFrame, and enqueued its fresh (higher) seq
+	// onto the SAME writer while frames 1..N of this snapshot were still being
+	// enqueued here. Two producers, one FIFO writer queue → interleaving, e.g.
+	// enqueue order DRAIN:1 DRAIN:2 LOOP:4 DRAIN:3, which the client sees as
+	// "seq gap: got seq=4 after 2". No frame was ever lost — purely order. Holding
+	// the lock across the flush makes this snapshot atomic w.r.t. routeDownFrame,
+	// which is the only other producer. Note the enqueue is non-blocking enough
+	// for this: WSAsyncWriter.Enqueue only blocks when the outbound channel is
+	// full, and the flow-control credit gate bounds in-flight downlink to one
+	// window, so the flush cannot deadlock against the loop it is excluding.
 	for _, f := range buffered {
 		e.enqueueDownFrame(b, migrateEnabled, f)
 	}
 	for _, f := range resend {
 		e.enqueueDownFrame(b, migrateEnabled, f)
 	}
+	cond.Broadcast()
+	e.perEntryMu.Unlock()
 	// Bug #10 Component 4 (RESUME-fallback): if the origin died while this relay
 	// was orphaned (destClosed is set), the immediate FlagStreamClose either was
 	// never sent (read-EOF orphaned path) or went to a dead writer ("both TCP

@@ -1,6 +1,0 @@
-.venv/
-*.log
-flows/
-__pycache__/
-*.pyc
-mitmproxy_dump_raw.json

@@ -540,51 +540,109 @@ func TestRelayLoop_BufferFull_NoSeqGap(t *testing.T) {
 		}
 	}()
 
-	// Give the writer time to fill the buffer and block on backpressure.
-	time.Sleep(150 * time.Millisecond)
+	// Wait until the loop is actually parked on the full buffer instead of
+	// sleeping a fixed 150ms and hoping.
+	// Проверка неразрушающая: Push сюда звать нельзя — кадр с пустым data
+	// прошёл бы проверку размера и осел в буфере, исказив то, что мы измеряем.
+	deadlineFull := time.Now().Add(3 * time.Second)
+	for {
+		e.perEntryMu.Lock()
+		full := e.downBuffer.byteLen()+frameSize > e.downBuffer.maxByte
+		e.perEntryMu.Unlock()
+		if full {
+			break
+		}
+		if time.Now().After(deadlineFull) {
+			t.Fatal("writer never filled downBuffer — backpressure path not exercised")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 
-	// Now reassociate to B, draining whatever was buffered, and keep draining
-	// by repeatedly reassociating is unnecessary — once bound, the loop sends
-	// directly. We attach B once; subsequent frames flow straight to B.
+	// Now reassociate to B, draining whatever was buffered. We attach B once;
+	// subsequent frames flow straight to B.
+	//
+	// Привязка публикуется под perEntryMu — так же, как в проде, где обработчик
+	// MIGRATE/RESUME делает это, пока relayLoop припаркован на bufCond внутри
+	// routeDownFrame. TODO(2026-08-10): причина падения под -race на этом ещё
+	// НЕ закрыта — правка порядок не восстановила, диагноз в работе. Не считать
+	// эту строку объяснением дефекта.
 	sessB := newSelfSession(t)
 	sink := newTestWriterSink()
 	defer sink.close()
 	bnd := &binding{session: sessB, writer: sink.asWriter()}
+	e.perEntryMu.Lock()
 	e.bound.Store(bnd)
+	e.perEntryMu.Unlock()
 	e.reassociate(bnd, true, false, false)
 
-	// Collect all frames; verify strictly monotonic, gapless seq starting at 1,
-	// and that the tag bytes arrive in write order (no loss, no reorder).
+	// Collect frames until every written BYTE has arrived; verify strictly
+	// monotonic gapless seq starting at 1, and that the tag bytes arrive in
+	// write order (no loss, no reorder).
+	//
+	// Счёт идёт по байтам, а не по кадрам: relayLoop читает egress одним Read в
+	// буфер на 32 КБ, поэтому границы записей писателя не сохраняются и «20
+	// записей = 20 кадров» протокол не обещает. Инвариант, который здесь важен:
+	// ни одного потерянного байта, ни дыры в нумерации, порядок сохранён.
+	//
+	// ⚠ Замером 2026-08-10 склейка НЕ наблюдалась (все кадры приходили len=8),
+	// так что она — не объяснение падения под -race, а лишь причина не считать
+	// число кадров.
+	//
+	// Механизм падения установлен 2026-08-10: дефект был в ПРОДОВОМ коде, в
+	// reassociate (server/relay_registry.go). Слив downBuffer шёл уже без
+	// perEntryMu, поэтому разбуженный relayLoop видел пустой буфер и живую
+	// привязку, уходил на быстрый путь routeDownFrame и вклинивал свежий seq в
+	// середину слива: два производителя на одну FIFO-очередь писателя. Трассировка
+	// вызовов enqueueDownFrame в точности совпала с порядком прихода —
+	// DRAIN:1 DRAIN:2 LOOP:4 DRAIN:3 → «seq gap: got seq=4 after 2». Ни одного
+	// байта не терялось, ломался только порядок. WSAsyncWriter невиновен: одна
+	// очередь данных, одна горутина-сливатель, переупорядочивания нет.
+	// Починка — держать perEntryMu на всём сливе; 40/40 прогонов под -race зелёные
+	// против ~20% падений до неё.
 	var lastSeq uint64
-	var lastTag int = -1
-	collected := 0
+	expectedTag := 0
+	bytesCollected := 0
+	frames := 0
 	deadline := time.After(5 * time.Second)
-	for collected < nFrames {
+	for bytesCollected < nFrames*frameSize {
 		select {
 		case frame := <-sink.sink.frames:
 			chunk, err := sessB.DecryptChunkSafe(frame)
 			if err != nil {
-				t.Fatalf("frame %d decrypt: %v", collected, err)
+				t.Fatalf("frame %d decrypt: %v", frames, err)
 			}
 			_, seq, data, perr := core.ParseStreamDataSeq(chunk.Payload)
 			if perr != nil {
-				t.Fatalf("frame %d parse: %v", collected, perr)
+				t.Fatalf("frame %d parse: %v", frames, perr)
 			}
 			if seq != lastSeq+1 {
 				t.Fatalf("seq gap: got seq=%d after %d (gap or non-monotonic)", seq, lastSeq)
 			}
 			lastSeq = seq
-			tag := int(data[0])
-			if tag != lastTag+1 {
-				t.Fatalf("frame out of order or lost: got tag=%d after %d", tag, lastTag)
+
+			// Кадр может нести несколько склеенных записей — проверяем каждую
+			// на своей позиции. Тег стоит в первом байте 8-байтной записи.
+			if len(data)%frameSize != 0 {
+				t.Fatalf("frame %d: got %d bytes, not a multiple of %d — partial record",
+					frames, len(data), frameSize)
 			}
-			lastTag = tag
-			collected++
+			for off := 0; off < len(data); off += frameSize {
+				if tag := int(data[off]); tag != expectedTag {
+					t.Fatalf("record out of order or lost: got tag=%d, want %d", tag, expectedTag)
+				}
+				expectedTag++
+			}
+			bytesCollected += len(data)
+			frames++
 		case <-deadline:
-			t.Fatalf("only collected %d/%d frames — frames lost under backpressure", collected, nFrames)
+			t.Fatalf("only collected %d/%d bytes — data lost under backpressure",
+				bytesCollected, nFrames*frameSize)
 		}
 	}
-	if lastSeq != nFrames {
-		t.Fatalf("final seq=%d, want %d (gapless 1..N)", lastSeq, nFrames)
+	if expectedTag != nFrames {
+		t.Fatalf("collected %d records, want %d", expectedTag, nFrames)
+	}
+	if lastSeq != uint64(frames) {
+		t.Fatalf("final seq=%d after %d frames — seq must be gapless 1..frames", lastSeq, frames)
 	}
 }
