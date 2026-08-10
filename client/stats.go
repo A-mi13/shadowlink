@@ -1085,6 +1085,25 @@ func StartStatsLogger(ctx context.Context, interval time.Duration) {
 	}()
 }
 
+// shouldWarnRotationBudget решает, печатать ли WARN о превышении бюджета.
+//
+// Гейт обязан висеть на ОЧИЩЕННОМ минимуме (`v.AgeMinMs`) — тех же данных, из
+// которых посчитан margin. Раньше здесь стоял СЫРОЙ `s.AgeMin > 0`, и это была
+// ровно та болезнь H-15, от которой лечится соседний расчёт margin: в поле
+// 2026-08-10 дефицит держался все 86 минут (последняя строка `slot death
+// inference` в 17:20:48 печатает margin_to_age_min=-1m3.789s), но WARN замолчал
+// на 20-й минуте. Причина — в 16:36:18 в сырую выборку попала смерть с age=0
+// (`cause=natural`, close в момент подключения), сырой минимум стал 0 и заглушил
+// предупреждение. Дефицит не исчез — о нём перестали говорить: 237 WARN вместо
+// ~772 возможных.
+//
+// Вынесено в функцию, а не оставлено выражением в `if`, чтобы гейт был проверяем
+// тестом отдельно от глобального пула и slog: молчащий контур наблюдаемости
+// нельзя сторожить тестом, который его не вызывает.
+func shouldWarnRotationBudget(ageMinCleanMs int64, margin time.Duration) bool {
+	return ageMinCleanMs > 0 && margin <= 0
+}
+
 // logSlotDeathSummary emits the slot-death distribution to the log (раунд 18 P0).
 //
 // The Prometheus exporter (WritePromMetrics) is NOT reachable on the client — no
@@ -1207,7 +1226,7 @@ func logSlotDeathSummary() {
 	// посредник, и это видно в поле как всплеск close_1006/age_cut. Печатаем
 	// WARN, потому что молчащий сломанный бюджет — та же болезнь H-15, что и
 	// молчащий кламп в адаптере.
-	if s.AgeMin > 0 && wcMargin <= 0 {
+	if shouldWarnRotationBudget(v.AgeMinMs, wcMargin) {
 		slog.Warn("rotation budget exceeded — worst cell cannot survive to its own rotation",
 			"worst_case_teardown", wcTotal,
 			"age_min_clean", time.Duration(v.AgeMinMs)*time.Millisecond,
