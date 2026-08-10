@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+
+	"github.com/nixavpn/shadowlink/core"
 )
 
 // DetectionContext carries everything carriers need to inspect a response.
@@ -16,6 +18,15 @@ type DetectionContext struct {
 	// Accepted values: "handshake" (POST path), "ws_upgrade" (WS Dial path).
 	// Empty string → no per-path counters incremented (aggregate-only mode, back-compat).
 	Path string
+
+	// Host is the server host this response came from (SNI host, or dial
+	// address). BodyMarkerCarrier derives the expected Schema.org propertyID
+	// from it — the marker is per-host by design, so without this the carrier
+	// can only recognise the legacy fleet-wide literal.
+	//
+	// Empty is safe: the carrier still accepts core.LegacyRLPropertyID, which
+	// is what a not-yet-redeployed server emits.
+	Host string
 }
 
 // RateLimitCarrier — single carrier that may extract a signal from response.
@@ -31,6 +42,31 @@ type BodyMarkerCarrier struct{}
 func (BodyMarkerCarrier) Name() string { return "body" }
 
 var jsonLDRe = regexp.MustCompile(`<script[^>]*type="application/ld\+json"[^>]*>(\{[^<]+\})</script>`)
+
+// acceptsPropertyID reports whether id is the marker this client should read
+// for the given host.
+//
+// Two are accepted during the migration window (2026-08-08):
+//
+//   - core.DeriveRLPropertyID(host) — the per-host identifier. Servers used to
+//     embed the literal "rl-state" on every host, so one internet-wide scan
+//     for that substring enumerated the whole fleet. Deriving from the host
+//     removes that: find one, you have found one.
+//   - core.LegacyRLPropertyID — what a server that has not been redeployed
+//     yet still emits. A new client must keep understanding it, or upgrading
+//     the client ahead of the servers silently kills the rate-limit channel
+//     and the pool degrades into blind exponential backoff.
+//
+// Drop the legacy arm once the fleet has rolled over.
+func acceptsPropertyID(id, host string) bool {
+	if id == "" {
+		return false
+	}
+	if id == core.LegacyRLPropertyID {
+		return true
+	}
+	return host != "" && id == core.DeriveRLPropertyID(host)
+}
 
 func (BodyMarkerCarrier) Detect(ctx *DetectionContext) *RateLimitSignal {
 	head := ctx.BodyHead
@@ -56,7 +92,7 @@ func (BodyMarkerCarrier) Detect(ctx *DetectionContext) *RateLimitSignal {
 		if payload.Identifier.AtType != "PropertyValue" {
 			continue
 		}
-		if payload.Identifier.PropertyID != "rl-state" {
+		if !acceptsPropertyID(payload.Identifier.PropertyID, ctx.Host) {
 			continue
 		}
 

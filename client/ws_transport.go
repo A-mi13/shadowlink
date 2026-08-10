@@ -135,20 +135,22 @@ func (t *WebSocketTransport) pickDialURL(host string) string {
 //
 // In useTLS=false mode (unit tests against an httptest server) we fall back
 // to a stdlib client because there is no TLS to fingerprint.
+// signalHost returns the host this transport presents to the server: the SNI
+// override when set (origin-IP dialling with a domain SNI), otherwise the host
+// part of the dial address.
+//
+// This is the value the server sees as its own Host, which is what both sides
+// feed into core.DeriveRLPropertyID — so the per-host rate-limit marker only
+// matches when this agrees with the server's view.
+func (t *WebSocketTransport) signalHost() string {
+	return core.SignalHost(t.sniHost, t.serverAddr)
+}
+
 func (t *WebSocketTransport) buildColdPathClient(fp *browser.Fingerprint, timeout time.Duration) *http.Client {
 	if !t.useTLS {
 		return &http.Client{Timeout: timeout}
 	}
-	sni := t.sniHost
-	if sni == "" {
-		host, _, err := net.SplitHostPort(t.serverAddr)
-		if err != nil || host == "" {
-			sni = t.serverAddr
-		} else {
-			sni = host
-		}
-	}
-	return buildUTLSHTTPClient(t.serverAddr, sni, fp, t.skipVerify, timeout, "http/1.1")
+	return buildUTLSHTTPClient(t.serverAddr, t.signalHost(), fp, t.skipVerify, timeout, "http/1.1")
 }
 
 func (t *WebSocketTransport) Name() string { return "websocket" }
@@ -509,7 +511,7 @@ func (t *WebSocketTransport) UpgradeToWS(token []byte, session *core.Session) er
 				bodyHead, _ = io.ReadAll(io.LimitReader(resp.Body, 4096))
 				resp.Body.Close()
 			}
-			detCtx := &DetectionContext{Response: resp, BodyHead: bodyHead, Path: "ws_upgrade"}
+			detCtx := &DetectionContext{Response: resp, BodyHead: bodyHead, Path: "ws_upgrade", Host: t.signalHost()}
 			if sig := t.rlDetector.DetectCarriersOnly(detCtx); sig != nil {
 				// Counter increment lives in reconnectLoop (single decision
 				// point) so upgrade-path + handshake-POST-path don't double-

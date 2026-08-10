@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/nixavpn/shadowlink/core"
 )
 
 // ---- parseRLStateValue tests ----
@@ -42,9 +44,10 @@ func TestParseRLStateValue_BaselineReturnsNil(t *testing.T) {
 }
 
 func TestParseRLStateValue_PaddedString(t *testing.T) {
-	// Body carrier pads to 80 chars with trailing semicolons
-	core := "v1;bucket=handshake;refill_in=60;burst_left=0;exempt=0"
-	padded := core + strings.Repeat(";", 80-len(core))
+	// Body carrier pads to 80 chars with trailing semicolons.
+	// (Named `state`, not `core` — the latter now shadows the imported package.)
+	state := "v1;bucket=handshake;refill_in=60;burst_left=0;exempt=0"
+	padded := state + strings.Repeat(";", 80-len(state))
 	sig := parseRLStateValue(padded)
 	if sig == nil {
 		t.Fatal("expected non-nil signal for padded string")
@@ -99,7 +102,7 @@ func TestParseRLStateLegacyHeader_HappyPath(t *testing.T) {
 
 func TestParseRLStateLegacyHeader_MissingFields(t *testing.T) {
 	cases := []string{
-		"",                        // empty
+		"",                                   // empty
 		"burst_left=3,refill_in=5s,exempt=0", // no bucket
 		"bucket=none,burst_left=3,refill_in=5s,exempt=0", // bucket=none
 	}
@@ -156,14 +159,77 @@ func TestBodyMarkerCarrier_Detect_BaselineReturnsNil(t *testing.T) {
 }
 
 func TestBodyMarkerCarrier_Detect_WrongPropertyID(t *testing.T) {
-	// propertyID=ISBN — not rl-state, should be ignored
+	// propertyID=ISBN — a genuine Schema.org identifier belonging to some
+	// other site, matching neither the legacy literal nor this host's derived
+	// ID, so it must be ignored. Since real pages carry JSON-LD of their own,
+	// this is the ordinary case, not an exotic one.
 	json := `{"@context":"https://schema.org","@type":"Book","identifier":{"@type":"PropertyValue","propertyID":"ISBN","value":"978-3-16-148410-0"}}`
 	html := fmt.Sprintf(`<!DOCTYPE html><html><head><script type="application/ld+json">%s</script></head></html>`, json)
-	ctx := &DetectionContext{BodyHead: []byte(html)}
+	ctx := &DetectionContext{BodyHead: []byte(html), Host: "datacanvases.com"}
 	sig := BodyMarkerCarrier{}.Detect(ctx)
 	if sig != nil {
 		t.Errorf("expected nil for wrong propertyID, got %+v", sig)
 	}
+}
+
+// TestBodyMarkerCarrier_PerHostPropertyID covers the 2026-08-08 migration.
+//
+// The marker used to be the literal "rl-state" on every server, so one scan
+// for one substring enumerated the fleet. It is now derived from the host
+// (core.DeriveRLPropertyID). Both must be readable during rollout: a client
+// upgraded ahead of the servers still meets the legacy literal, and a client
+// talking to a redeployed server meets the derived one.
+func TestBodyMarkerCarrier_PerHostPropertyID(t *testing.T) {
+	const host = "datacanvases.com"
+	value := "v1;bucket=handshake;refill_in=30;burst_left=0;exempt=0"
+
+	build := func(propertyID string) []byte {
+		payload := fmt.Sprintf(
+			`{"@context":"https://schema.org","@type":"Book","identifier":{"@type":"PropertyValue","propertyID":%q,"value":%q}}`,
+			propertyID, value)
+		return []byte(fmt.Sprintf(
+			`<!DOCTYPE html><html><head><script type="application/ld+json">%s</script></head></html>`, payload))
+	}
+
+	t.Run("derived id matches", func(t *testing.T) {
+		ctx := &DetectionContext{BodyHead: build(core.DeriveRLPropertyID(host)), Host: host}
+		if sig := (BodyMarkerCarrier{}).Detect(ctx); sig == nil {
+			t.Fatal("derived propertyID not recognised — a redeployed server's signal would be missed")
+		}
+	})
+
+	t.Run("legacy id still accepted", func(t *testing.T) {
+		ctx := &DetectionContext{BodyHead: build(core.LegacyRLPropertyID), Host: host}
+		if sig := (BodyMarkerCarrier{}).Detect(ctx); sig == nil {
+			t.Fatal("legacy propertyID rejected — upgrading clients first would kill the channel")
+		}
+	})
+
+	t.Run("another host's id is ignored", func(t *testing.T) {
+		// The whole point: a marker minted for a different deployment must not
+		// be honoured here, otherwise per-host derivation buys nothing.
+		other := core.DeriveRLPropertyID("some-other-host.example")
+		if other == core.DeriveRLPropertyID(host) {
+			t.Skip("hosts collided in the shape table; not what this test is about")
+		}
+		ctx := &DetectionContext{BodyHead: build(other), Host: host}
+		if sig := (BodyMarkerCarrier{}).Detect(ctx); sig != nil {
+			t.Errorf("accepted another host's propertyID %q, got %+v", other, sig)
+		}
+	})
+
+	t.Run("empty host falls back to legacy only", func(t *testing.T) {
+		// Host unknown (older call site that does not populate it): the legacy
+		// literal must still work so behaviour degrades rather than breaks.
+		ctx := &DetectionContext{BodyHead: build(core.LegacyRLPropertyID)}
+		if sig := (BodyMarkerCarrier{}).Detect(ctx); sig == nil {
+			t.Fatal("legacy marker must remain readable when Host is unset")
+		}
+		ctx = &DetectionContext{BodyHead: build(core.DeriveRLPropertyID(host))}
+		if sig := (BodyMarkerCarrier{}).Detect(ctx); sig != nil {
+			t.Error("derived marker matched without a Host to derive from")
+		}
+	})
 }
 
 // ---- HeaderCarrier tests ----

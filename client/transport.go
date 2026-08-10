@@ -72,6 +72,12 @@ type DirectTransport struct {
 	baseURL     string // scheme://DIAL_HOST:PORT — drives DNS/dial + default SNI
 	publicURL   string // scheme://VISIBLE_HOST:PORT — used in Origin/Referer headers
 	publicHost  string // VISIBLE_HOST used as HTTP Host header (== sniOverride when set, else dial host)
+	// signalHost is the host fed to core.DeriveRLPropertyID for the per-host
+	// rate-limit marker. Distinct from publicHost, which is deliberately empty
+	// when there is no SNI override (the Host header is then left to the URL).
+	// Reusing publicHost here would have restricted the no-SNI path to the
+	// legacy fleet-wide marker without any visible failure.
+	signalHost string
 	urlPool     *browser.URLPool
 	connManager *ConnManager
 
@@ -167,6 +173,7 @@ func newDirectTransportFull(serverAddr string, useTLS bool, skipVerify bool, ech
 		baseURL:     baseURL,
 		publicURL:   publicURL,
 		publicHost:  publicHost,
+		signalHost:  core.SignalHost(sniOverride, serverAddr),
 		urlPool:     browser.NewURLPool(),
 		connManager: cm,
 		rlDetector:  DefaultDetector(&Stats),
@@ -394,7 +401,7 @@ func (t *DirectTransport) SendHandshake(ctx context.Context, hello *core.ClientH
 	// fhttp.Header is map[string][]string identical in layout to net/http.Header;
 	// the DetectionContext only reads the "X-SL-RL" header, so a shallow copy suffices.
 	stdResp := &stdhttp.Response{Header: stdhttp.Header(resp.Header)}
-	detCtx := &DetectionContext{Response: stdResp, BodyHead: respBytes, Path: "handshake"}
+	detCtx := &DetectionContext{Response: stdResp, BodyHead: respBytes, Path: "handshake", Host: t.signalHost}
 	if sig := t.rlDetector.DetectCarriersOnly(detCtx); sig != nil {
 		IncHandshakeDecoyReceived()
 		return nil, &RateLimitError{Signal: sig}
@@ -511,7 +518,7 @@ func (t *DirectTransport) SendHandshakeRaw(ctx context.Context, payload []byte) 
 	// ErrRateLimited; a markerless decoy falls through to the HTML guard.
 	// fhttp.Header is map[string][]string; DetectionContext only reads "X-SL-RL".
 	stdRespRaw := &stdhttp.Response{Header: stdhttp.Header(resp.Header)}
-	detCtx := &DetectionContext{Response: stdRespRaw, BodyHead: respBytes, Path: "handshake"}
+	detCtx := &DetectionContext{Response: stdRespRaw, BodyHead: respBytes, Path: "handshake", Host: t.signalHost}
 	if sig := t.rlDetector.DetectCarriersOnly(detCtx); sig != nil {
 		IncHandshakeDecoyReceived()
 		return nil, &RateLimitError{Signal: sig}
