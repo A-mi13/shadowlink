@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/nixavpn/shadowlink/core"
+	"github.com/nixavpn/shadowlink/testutil"
 )
 
 // migrate_perf_test.go — Bug #9 Task 21, Part 2 (perf acceptance). After a
@@ -196,6 +197,17 @@ func BenchmarkRelayContention_SpreadBaseline(b *testing.B) {
 func TestSessionMuContention_NoThroughputCliff(t *testing.T) {
 	if testing.Short() {
 		t.Skip("contention timing test skipped in -short")
+	}
+	// Порог тут — тайминговый, а race-детектор инструментирует каждый доступ к
+	// памяти и дорожает непропорционально именно там, где потоки сходятся на
+	// одном мьютексе, то есть в измеряемом варианте all-on-one. Замер
+	// 2026-08-10 на 2 vCPU: без -race ratio=0.946 (spread 231k, all-on-one 219k
+	// кадров/с, 71–75 мс), под -race ratio=0.214 при том же коде и прогон 140 с
+	// вместо 1,7 с. Порог 0.25 под детектором мерит стоимость инструментации, а
+	// не наличие обрыва пропускной способности, поэтому здесь он неприменим.
+	// Корректностная часть пакета под -race гоняется как обычно.
+	if testutil.RaceEnabled {
+		t.Skip("contention timing test skipped under -race: detector overhead dominates the measurement")
 	}
 	const (
 		n              = 256

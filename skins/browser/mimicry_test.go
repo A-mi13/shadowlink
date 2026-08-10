@@ -129,24 +129,52 @@ func TestRatioControllerReset(t *testing.T) {
 	assert.Equal(t, 0, budget, "after reset, download is 0 → budget 0")
 }
 
+// TestChunkPayload проверяет инвариант реассембла на размере, где число чанков
+// не детерминировано, и отдельно — сам факт дробления на размере, где верхняя
+// граница распределения его гарантирует.
+//
+// Почему не одним утверждением про 1300 байт (флейк пойман 2026-08-10 под
+// -race на Linux): UploadSize() в 5% случаев возвращает 801+rand(1200), то есть
+// до 2000. Если первый вызов дал ≥1300, вся нагрузка легитимно уходит одним
+// чанком, и require.Greater(len, 1) падает — примерно 3% прогонов. Тест
+// утверждал про случайную величину то, что верно лишь в 97% случаев; код при
+// этом исправен. Правка не трогает распределение: менять форму потока ради
+// зелёного теста значит чинить измеритель вместо измеряемого.
 func TestChunkPayload(t *testing.T) {
 	pd := NewPayloadDistribution()
 
-	// 1300 bytes — should split into multiple chunks
+	// 1300 байт: число чанков зависит от выборки, но склейка обязана сойтись
+	// при любом раскладе — это и есть инвариант.
 	data := make([]byte, 1300)
 	for i := range data {
 		data[i] = byte(i % 256)
 	}
 
 	chunks := pd.ChunkForUpload(data)
-	require.Greater(t, len(chunks), 1, "1300B should split into >1 chunks")
+	require.NotEmpty(t, chunks, "непустой вход обязан дать хотя бы один чанк")
 
-	// Reassembly must match original
 	var reassembled []byte
 	for _, chunk := range chunks {
 		reassembled = append(reassembled, chunk...)
 	}
 	assert.Equal(t, data, reassembled, "reassembled chunks must match original data")
+
+	// Дробление как таковое: 2001 байт строго больше максимума UploadSize
+	// (801+1199=2000), поэтому одним чанком не уйдёт никогда.
+	big := make([]byte, 2001)
+	for i := range big {
+		big[i] = byte(i % 256)
+	}
+
+	bigChunks := pd.ChunkForUpload(big)
+	require.Greater(t, len(bigChunks), 1,
+		"2001B превышает максимум UploadSize (2000) — обязан делиться")
+
+	var bigReassembled []byte
+	for _, chunk := range bigChunks {
+		bigReassembled = append(bigReassembled, chunk...)
+	}
+	assert.Equal(t, big, bigReassembled, "reassembled chunks must match original data")
 }
 
 func TestChunkPayloadSmall(t *testing.T) {
