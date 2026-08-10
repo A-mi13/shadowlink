@@ -58,9 +58,12 @@ func TestWorstCaseTeardown_IncludesStaggerAndSweep(t *testing.T) {
 	if tear != 15*time.Second {
 		t.Errorf("teardown cap = %v, want 15s", tear)
 	}
-	// Отсрочка при «no free cell» — 9 таких событий за 11 минут в поле.
+	// Отсрочка — ХУДШАЯ из ветвей, no-free-cell (30s), а не частая storm-brake
+	// (5s): слот уже перешагнул порог, но возвращён в slotReady, продолжает
+	// принимать стримы и 30s запрещён к ротации. См. worstCaseTeardown.
 	if deferred != drainRevertBackoff {
-		t.Errorf("deferred = %v, want %v", deferred, drainRevertBackoff)
+		t.Errorf("deferred = %v, want %v (no-free-cell — худшая ветвь)",
+			deferred, drainRevertBackoff)
 	}
 
 	// Ключевое утверждение: сумма НЕ равна наивным base+sticky.
@@ -73,8 +76,25 @@ func TestWorstCaseTeardown_IncludesStaggerAndSweep(t *testing.T) {
 		drainRevertBackoff + 15*time.Second; total != want {
 		t.Errorf("worst-case = %v, want %v", total, want)
 	}
-	t.Logf("наивная формула дала бы %v, честная = %v (расхождение %v)",
-		naive, total, total-naive)
+
+	// Сторож против замены суммы на max(deferred, tear). Попытка была 2026-08-10:
+	// в одном вызове startDrain это действительно взаимоисключающие ветки, но
+	// бюджет моделирует полный путь ячейки, где отсрочка НЕ отменяет ротацию —
+	// слот платит deferred, потом на следующем заходе tear. Полевая проверка:
+	// max() дала бы 111.5s, а наблюдённые p90=118s и max=122s (n=766) её
+	// пробивают; сумма 141.5s границу держит.
+	hold := deferred
+	if tear > hold {
+		hold = tear
+	}
+	if maxForm := base + stagger + sweep + hold; total == maxForm {
+		t.Errorf("worst-case %v равен max-форме — deferred и tear перестали "+
+			"складываться; занижение на %v, при этом наблюдённый p90 её пробивает",
+			total, deferred+tear-hold)
+	}
+	t.Logf("наивная формула дала бы %v, честная = %v (расхождение %v); "+
+		"max-форма дала бы %v", naive, total, total-naive,
+		base+stagger+sweep+hold)
 }
 
 // TestWorstCaseTeardown_UsesAdaptedThreshold — если адаптер сжал порог, бюджет
@@ -233,6 +253,68 @@ func TestRotationBudget_FieldConfigIsNegative(t *testing.T) {
 		t.Fatalf("наивная %v не меньше честной %v — формула сломана", naive, total)
 	}
 	t.Logf("наивная формула скрывала %v дефицита", total-naive)
+}
+
+// Гейт WARN «rotation budget exceeded» обязан висеть на ОЧИЩЕННОМ минимуме.
+//
+// Полевой разбор 2026-08-10 (86 минут, 1.39 ГБ): дефицит держался весь прогон —
+// последняя строка `slot death inference` в 17:20:48 печатает
+// margin_to_age_min=-1m3.789s. Но WARN замолчал в 16:36:13 и больше не появился:
+// в 16:36:18 в СЫРУЮ выборку попала смерть с age_ms=0 (`cause=natural`, close при
+// старте слота), age_min_ms в snapshot прыгнул 78711 → 0, и гейт `s.AgeMin > 0`
+// заглушил предупреждение. Итог — 237 WARN вместо ~772: контур замолчал не потому,
+// что бюджет сошёлся, а потому, что сравнивал с полем, которое сам же объявил
+// ненадёжным двадцатью строками выше (v.AgeMinMs vs s.AgeMin).
+//
+// Класс отказа — снова H-15: молчание, неотличимое от здоровья.
+func TestRotationBudgetWarn_GateUsesCleanMinNotRaw(t *testing.T) {
+	r := slotobs.NewRecorder(64)
+
+	// Настоящие резы посредника — полевые возрасты 2026-08-10 (cause=age_cut).
+	// Байты гуляют на порядки при узком коридоре возраста: это и даёт axis=age.
+	ages := []int64{78711, 82791, 83594, 84558, 86939, 86955, 87252, 87331,
+		87501, 87605, 88864, 89348, 90487}
+	for i, age := range ages {
+		r.Record(slotobs.Observation{
+			AgeMs:     age,
+			DownBytes: int64(1<<uint(i%20)) * 977, // разброс на порядки → CV байтов велик
+			CloseKind: "close_other",
+		})
+	}
+	// Шум: слот, умерший в момент подключения. Именно он обнулял СЫРОЙ минимум.
+	r.Record(slotobs.Observation{
+		AgeMs: 0, DownBytes: 0, CloseKind: "close_other",
+	})
+
+	s := r.Summarize()
+	v := r.InferWithMinAge(0)
+
+	if s.AgeMin != 0 {
+		t.Fatalf("сырой минимум = %d, ожидался 0 — фикстура не воспроизводит поле", s.AgeMin)
+	}
+	if v.AgeMinMs <= 0 {
+		t.Fatalf("очищенный минимум = %d, ожидался > 0 — фильтр шума не сработал", v.AgeMinMs)
+	}
+
+	// Полевой дефицит: worst_case 2m21.5s против age_min_clean 1m18.711s.
+	const margin = -1*time.Minute - 2789*time.Millisecond
+
+	// Главное утверждение: при живом дефиците и зашумлённой сырой выборке WARN
+	// обязан звучать. Гейт на s.AgeMin здесь молчал — это и была регрессия.
+	if !shouldWarnRotationBudget(v.AgeMinMs, margin) {
+		t.Error("WARN подавлен при отрицательном запасе — гейт снова смотрит " +
+			"на сырой минимум вместо очищенного (H-15, поле 2026-08-10)")
+	}
+	if shouldWarnRotationBudget(s.AgeMin, margin) {
+		t.Error("гейт по сырому минимуму сработал — фикстура не воспроизводит " +
+			"полевое замолчание, тест перестал сторожить регрессию")
+	}
+
+	// Обратная сторона: при положительном запасе WARN не должен звучать, иначе
+	// «исправление» выродится в постоянный шум.
+	if shouldWarnRotationBudget(v.AgeMinMs, 5*time.Second) {
+		t.Error("WARN при положительном запасе — гейт потерял смысл")
+	}
 }
 
 // Lockstep: ячейки не должны получать ОДИНАКОВЫЙ stagger-offset.
