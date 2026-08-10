@@ -1243,11 +1243,18 @@ func logSlotDeathSummary() {
 	// Изменение порога — отдельной строкой на уровне WARN: это смена поведения
 	// транспорта, её нельзя терять в потоке INFO при разборе инцидента.
 	if changed {
+		// worst_case_teardown берётся из уже посчитанного wcTotal — того же
+		// единственного источника истины, что и строка выше. До 2026-08-10 здесь
+		// стояло `adaptedAge + pool.stickyMaxDrainAge`: ровно наивная формула,
+		// которую признали ложью и убрали 60 строками выше, но в этой строке она
+		// пережила правку. В поле обе строки печатались в ОДНУ секунду и
+		// противоречили друг другу — 1m32s против 2m30.5s, расхождение 58.5s.
+		// При разборе инцидента читатель верит той, что попалась первой.
 		slog.Warn("rotation threshold adapted",
 			"applied", adaptedAge,
 			"configured", configuredAge,
 			"changes_total", adaptChanges,
-			"worst_case_teardown", adaptedAge+pool.stickyMaxDrainAge,
+			"worst_case_teardown", wcTotal,
 			"reason", adaptReason,
 		)
 	}
