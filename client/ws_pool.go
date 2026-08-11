@@ -1491,6 +1491,42 @@ type WSPoolTransport struct {
 	// Spec 2026-05-23 (introduced) + 2026-05-24 (kept aggregate).
 	drainDeferrals1m atomic.Int32
 
+	// slotDeaths1m — НАБЛЮДАТЕЛЬНЫЙ счётчик смертей слотов за ~60s, по всем
+	// причинам без исключения. Ничего не исполняет.
+	//
+	// Существует отдельно от recentDeaths потому, что тот кормит
+	// meltdown-кулдаун и намеренно пропускает age-cut: штатный каскад резов
+	// не должен ставить реконнекты на паузу. Исполнительно это верно, но
+	// наблюдателя оно ослепляет.
+	//
+	// Замер 2026-08-11 15:48: origin стал недоступен, 8 слотов умерли за
+	// 3.6s, пул лёг целиком (alive=0, active_streams=0, 45 отказов "no ready
+	// slots", 24 стрима задето). Шесть смертей из восьми имели возраст
+	// 55-79s > ageCutMinAge=45s и были классифицированы как age_cut, поэтому
+	// recentDeaths увидел 2 при пороге 6 — health напечатал meltdowns_1m=0.
+	// Полный отказ пула не отразился НИ В ОДНОМ счётчике.
+	//
+	// Разведение наблюдаемости и исполнения — прямое требование урока H-15:
+	// контур, про который нельзя сказать, работает ли он, хуже отсутствующего.
+	slotDeaths1m atomic.Int32
+
+	// revivalMu / revivalCh — broadcast «origin снова отвечает».
+	//
+	// Замер 2026-08-11: origin упал в 15:48:34, вернулся к 15:49:19, но
+	// слоты 2 и 11 к тому моменту уже сидели на attempt=3 (пауза 60s) и
+	// простояли лишние ~50s по здоровой сети. Лестница 5s·2^N правильно
+	// защищает origin от шторма хендшейков, но она слепа: единственный её
+	// вход — время, хотя факт «сеть жива» в системе уже есть — это успешный
+	// connect соседнего слота.
+	//
+	// Канал, а не atomic-флаг: нужен именно broadcast (восстановление
+	// origin — событие всего пула), и нужно, чтобы сигнал НЕ копился.
+	// Закрытие будит всех ждущих разом; на его месте сразу создаётся новый
+	// канал, поэтому слот, зашедший в ожидание позже, ждёт следующего
+	// события, а не срабатывает на прошлом.
+	revivalMu sync.Mutex
+	revivalCh chan struct{}
+
 	// lastInflightCapLogNs / lastCapacityFloorLogNs — per-gate UnixNano
 	// timestamp of the most recent INFO emission of "drain deferred".
 	// Used by shouldLogDeferred to rate-limit the human-readable log
@@ -1928,6 +1964,7 @@ func NewWSPoolTransport(cl *Client, cfg WSPoolConfig) *WSPoolTransport {
 		log:                   slog.Default(),
 	}
 	p.flowDesiredWindow = flowWindowFromEnv(1 << 20)
+	p.initRevivalSignal()
 	p.allocSlots()
 	return p
 }
@@ -2247,6 +2284,10 @@ func (p *WSPoolTransport) emitHealthSummary() {
 		"rate_limited_recent", rateLimited,
 		"active_streams", totalStreams,
 		"meltdowns_1m", p.meltdowns1m.Load(),
+		// slot_deaths_1m — все смерти, включая age-cut, который meltdowns_1m
+		// намеренно не считает. Без этого поля полный отказ пула (замер
+		// 2026-08-11 15:48: alive=0 при meltdowns_1m=0) не виден нигде.
+		"slot_deaths_1m", p.slotDeaths1m.Load(),
 		"rotations_1m", p.rotations1m.Load(),
 		"inflight_drains", p.inflightDrains.Load(),
 		"inflight_cap_deferred_total", Stats.InflightCapDeferredTotal.Load(),
@@ -2618,12 +2659,23 @@ func (p *WSPoolTransport) reconnectLoopInner(idx int, fastFirstAttempt bool) {
 			d := slotBackoffDurationForTest(attempt)
 			p.log.Debug("WS pool reconnecting slot", "slot", idx, "backoff", d, "attempt", attempt)
 
-			timer := time.NewTimer(d)
+			// Пауза прерывается, если origin ответил соседнему слоту.
+			// Замер 2026-08-11: без этого слоты 2 и 11 досиживали 60s
+			// (attempt=3) уже по здоровой сети — origin вернулся на ~50s
+			// раньше их пробуждения.
+			if p.waitBackoffOrRevival(d) {
+				p.log.Info("WS pool reconnect woken early — another slot connected",
+					"slot", idx, "backoff_skipped", d, "attempt", attempt)
+				// Лестница сбрасывается: держать её после доказанного
+				// успеха соседа значило бы наказывать слот за прошлое
+				// состояние сети. Шторма не будет — сюда попадают только
+				// те, кто реально ждал, и связность уже подтверждена.
+				attempt = -1 // ++ в заголовке цикла вернёт 0
+			}
 			select {
 			case <-p.ctx.Done():
-				timer.Stop()
 				return
-			case <-timer.C:
+			default:
 			}
 		}
 
@@ -2656,6 +2708,9 @@ func (p *WSPoolTransport) reconnectLoopInner(idx int, fastFirstAttempt bool) {
 				Stats.AgeCutReconnectsTotal.Add(1)
 			}
 			p.log.Info("WS pool slot reconnected", "slot", idx)
+			// Связность подтверждена — будим слоты, сидящие в паузе после
+			// того же отказа origin.
+			p.signalNetworkRevival()
 			go p.slotReader(idx)
 			return
 		}
@@ -3871,6 +3926,92 @@ func (p *WSPoolTransport) bumpRotations1m() {
 	}()
 }
 
+// initRevivalSignal готовит broadcast-канал. Вызывается из
+// NewWSPoolTransport; отдельным методом — чтобы тесты могли собрать пул
+// напрямую структурным литералом, не поднимая весь конструктор.
+func (p *WSPoolTransport) initRevivalSignal() {
+	p.revivalMu.Lock()
+	defer p.revivalMu.Unlock()
+	if p.revivalCh == nil {
+		p.revivalCh = make(chan struct{})
+	}
+}
+
+// signalNetworkRevival сообщает пулу, что origin снова отвечает: будит все
+// слоты, сидящие в backoff-паузе.
+//
+// Вызывается на УСПЕШНОМ connect. Сигнал не копится — закрытый канал сразу
+// заменяется новым, поэтому слот, зашедший в ожидание после события, ждёт
+// следующего, а не просыпается на прошлом.
+//
+// Лестницу это не отменяет: разбуженный слот идёт на обычную попытку
+// подключения, и если origin всё-таки мёртв, он снова уйдёт в паузу. Защита
+// от шторма хендшейков сохраняется, потому что будить может только реальный
+// успех — а он означает, что origin принимает соединения.
+func (p *WSPoolTransport) signalNetworkRevival() {
+	p.revivalMu.Lock()
+	defer p.revivalMu.Unlock()
+	if p.revivalCh == nil {
+		p.revivalCh = make(chan struct{})
+		return
+	}
+	close(p.revivalCh)
+	p.revivalCh = make(chan struct{})
+}
+
+// waitBackoffOrRevival ждёт d, но просыпается раньше, если другой слот
+// успешно подключился. Возвращает true, если разбудил сигнал.
+//
+// Возврат по ctx.Done даёт false: пул останавливается, «оживления» не было.
+func (p *WSPoolTransport) waitBackoffOrRevival(d time.Duration) bool {
+	p.revivalMu.Lock()
+	if p.revivalCh == nil {
+		p.revivalCh = make(chan struct{})
+	}
+	ch := p.revivalCh // снимок ДО ожидания: следующий close() относится к нему
+	p.revivalMu.Unlock()
+
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-p.ctx.Done():
+		return false
+	case <-ch:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// bumpSlotDeaths1m считает смерть слота в наблюдательный счётчик — по ЛЮБОЙ
+// причине, включая age-cut и наши собственные teardown'ы.
+//
+// Намеренно НЕ трогает recentDeaths / meltdownUntil: кулдаун остаётся
+// глухим к age-cut, как и задумано (иначе штатный каскад резов пришлось бы
+// оплачивать паузой всех реконнектов). Здесь только наблюдение — см.
+// докстринг поля slotDeaths1m про полевой отказ 2026-08-11, который не
+// отразился ни в одном счётчике.
+//
+// Причина принимается параметром, а не выводится внутри, чтобы вызов стоял
+// в диспетчере рядом с ветвлением по cause и не разъезжался с ним. Сейчас
+// счётчик агрегатный: разбивка по причинам добавила бы состояние без
+// операционной ценности — вопрос оператора «пул лёг?», а не «чем именно».
+//
+// Lock-free, тот же контракт распада, что у bumpRotations1m: decay-goroutine
+// выходит по ctx, таймеры не текут при остановке пула.
+func (p *WSPoolTransport) bumpSlotDeaths1m(_ slotDeathCause) {
+	p.slotDeaths1m.Add(1)
+	go func() {
+		timer := time.NewTimer(60 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-p.ctx.Done():
+		case <-timer.C:
+			p.slotDeaths1m.Add(-1)
+		}
+	}()
+}
+
 // bumpDrainDeferrals1m mirrors bumpRotations1m for storm-brake drain
 // deferrals. Lock-free Int32 Add with a 60s decay goroutine that
 // exits cleanly on pool ctx cancel. Spec 2026-05-23.
@@ -4064,6 +4205,11 @@ func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int, cause slotDeathCa
 	if slot.transport != nil {
 		slot.transport.Close()
 	}
+
+	// Наблюдательный счётчик — ДО ветвления, чтобы он не зависел от того,
+	// какая ветка что решит. Кулдаун по-прежнему кормится только из
+	// deathCauseNatural ниже.
+	p.bumpSlotDeaths1m(cause)
 
 	// Post-cleanup dispatch by cause. See slotDeathCause doc-comment for the
 	// rationale behind each branch.
