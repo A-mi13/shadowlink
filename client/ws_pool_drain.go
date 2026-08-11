@@ -755,6 +755,46 @@ func (p *WSPoolTransport) drainWatchdog(cl *Client, oldIdx int, oldSlot *poolSlo
 	idleThreshold := p.drainIdleThreshold
 	idleEnabled := idleThreshold > 0
 
+	// isPhantomCounter: счётчик слота держит стримы, которых в streamMap нет.
+	//
+	// Карта здесь ground truth, счётчик — производное от неё. При расхождении
+	// верить надо карте: она перечисляет привязки поимённо, счётчик же лишь
+	// суммирует инкременты, и утёкший декремент делает его монотонно неверным
+	// до конца жизни слота.
+	//
+	// Без этой проверки закрыты ОБЕ ранние ветки выхода:
+	//   - `streams.Load() == 0` ложно (счётчик протёк);
+	//   - `allStreamsIdle` возвращает `found && allIdle`, а при пустой карте
+	//     found=false → тоже ложно.
+	// Слот доезжает до sticky-дедлайна и держит ячейку весь teardown_cap.
+	//
+	// Замер 2026-08-11 (3ч38м): 408 из 431 sticky-teardown с таким
+	// расхождением, 396 из них ровно по 25s. Ни один natural finish (0 из
+	// 158) расхождения не имел — корреляция полная. Воспроизводится во всех
+	// пяти сохранённых прогонах с 08-07.
+	//
+	// Чинится ПОСЛЕДСТВИЕ. Причина утечки (путь, которым запись уходит из
+	// streamMap мимо декремента) не найдена и требует -race на сервере:
+	// Windows-dev гонки не ловит (CLAUDE.md hard rule 6). Поэтому расхождение
+	// логируется, а не молча исправляется — иначе причину не найдут никогда.
+	isPhantomCounter := func(now time.Time) bool {
+		counter := oldSlot.streams.Load()
+		if counter <= 0 {
+			return false // обычный пустой слот — им занимается finishStreamsZero
+		}
+		return snapshotDrainStreams(p, oldIdx, now).total == 0
+	}
+
+	logPhantom := func(counter int32, duration time.Duration) {
+		Stats.DrainPhantomCounterTotal.Add(1)
+		p.log.Warn("WS pool slot drain: phantom stream counter — torn down by map, not counter",
+			"slot", oldIdx, "reason", reason,
+			"counter_streams", counter,
+			"map_streams", 0,
+			"drain_duration", duration.Truncate(time.Second),
+		)
+	}
+
 	for {
 		select {
 		case <-p.ctx.Done():
@@ -778,6 +818,13 @@ func (p *WSPoolTransport) drainWatchdog(cl *Client, oldIdx int, oldSlot *poolSlo
 			drainAge := now.Sub(drainStart) // монотонные часы
 			drainBytes := oldSlot.downBytes.Load()
 			switch {
+			case isPhantomCounter(now):
+				// Счётчик врёт, привязок нет — рвём как пустой слот, не
+				// оплачивая sticky-предел. Проверка стоит ПЕРВОЙ: ниже
+				// каждая ветка так или иначе доверяет счётчику.
+				logPhantom(oldSlot.streams.Load(), time.Since(drainStart))
+				tearDown(finishStreamsZero)
+				return
 			case oldSlot.streams.Load() == 0:
 				// последний стрим закрылся между ticker-тиком и deadline.C —
 				// рвём как пустой слот (симметрично ticker-ветке). Без этого
@@ -812,6 +859,13 @@ func (p *WSPoolTransport) drainWatchdog(cl *Client, oldIdx int, oldSlot *poolSlo
 		case <-ticker.C:
 			streams := oldSlot.streams.Load()
 			if streams == 0 {
+				tearDown(finishStreamsZero)
+				return
+			}
+			// Фантом ловим на тике, а не только на дедлайне: иначе слот всё
+			// равно ждал бы hard_cap впустую, просто рвался бы потом быстрее.
+			if now := time.Now(); isPhantomCounter(now) {
+				logPhantom(streams, time.Since(drainStart))
 				tearDown(finishStreamsZero)
 				return
 			}

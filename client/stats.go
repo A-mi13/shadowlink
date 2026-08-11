@@ -223,6 +223,16 @@ type statsRegistry struct {
 	// DrainStickyQuotaDeniedTotal — sticky drains torn down because the
 	// sticky quota / readyCapacity gate denied (or revoked) the extension.
 	DrainStickyQuotaDeniedTotal atomic.Uint64
+	// DrainPhantomCounterTotal — дренажи, порванные по КАРТЕ при ненулевом
+	// счётчике слота: slot.streams держит привязки, которых в streamMap уже
+	// нет (утёкший декремент).
+	//
+	// Счётчик диагностический, а не декоративный: пока причина утечки не
+	// найдена, он единственный способ увидеть, жив ли дефект. Замер
+	// 2026-08-11 (3ч38м): 408 из 431 sticky-teardown были такими, 396 из них
+	// стоили полных 25s удержания ячейки. Если после починки утечки это
+	// значение не упадёт до нуля — починили не то.
+	DrainPhantomCounterTotal atomic.Uint64
 	// DrainDurationSeconds — distribution of drain durations from
 	// startDrain → terminal teardown (either natural finish or hard
 	// cap). Bucket boundaries 1/5/10/30/60/90/120s match the operational
@@ -796,6 +806,9 @@ func WritePromMetrics(w io.Writer) {
 	fmt.Fprintf(w, "# HELP shadowlink_drain_sticky_quota_denied_total Sticky drains torn down because the quota/readyCapacity gate denied the extension\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_drain_sticky_quota_denied_total counter\n")
 	fmt.Fprintf(w, "shadowlink_drain_sticky_quota_denied_total %d\n", Stats.DrainStickyQuotaDeniedTotal.Load())
+	fmt.Fprintf(w, "# HELP shadowlink_drain_phantom_counter_total Drains torn down by streamMap while slot.streams still held phantom entries (leaked decrement)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_drain_phantom_counter_total counter\n")
+	fmt.Fprintf(w, "shadowlink_drain_phantom_counter_total %d\n", Stats.DrainPhantomCounterTotal.Load())
 
 	// Histogram exposition: cumulative bucket counts with le-labels, plus
 	// _sum (seconds) and _count. Matches Prometheus histogram conventions.
