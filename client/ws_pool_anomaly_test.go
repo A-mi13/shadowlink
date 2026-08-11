@@ -112,6 +112,35 @@ func TestClassifyWSReadError_KnownPatterns(t *testing.T) {
 			want: "html",
 		},
 		{
+			// Windows WSAETIMEDOUT. The Go net stack does NOT rewrite this to
+			// "i/o timeout" — the raw winsock text surfaces verbatim, so the
+			// POSIX-shaped pattern above never matches on Windows.
+			//
+			// Полевой замер 2026-08-11 (лог nixavpn-DEBUG-20260811-145918):
+			// 11 таких смертей в одном инциденте падения origin ушли в "other".
+			// filterNoise (slotobs/infer.go) отсеивает io_timeout, но "other"
+			// не отсеивает — шесть из них (возраст 55-79s, выше ageCutMinAge
+			// 45s) попали в чистую выборку, уронили p10 с 84.0s до 59.7s и
+			// сжали порог ротации с 66s до 47s на 2ч48м. Ротация участилась на
+			// ~20% (533 -> 641 соединений/час к origin IP) — ровно тот
+			// counting-сигнал, от которого уходит модель угрозы.
+			name: "windows WSAETIMEDOUT (wsarecv)",
+			err: errors.New("read tcp 192.168.1.137:64907->104.222.177.67:443: wsarecv: " +
+				"A connection attempt failed because the connected party did not properly " +
+				"respond after a period of time, or established connection failed because " +
+				"connected host has failed to respond."),
+			want: "io_timeout",
+		},
+		{
+			// Windows WSAECONNRESET — тот же RST, что POSIX отдаёт как
+			// "connection reset by peer". Без этого паттерна сигнал
+			// RST-инъекции на Windows недостижим в принципе.
+			name: "windows WSAECONNRESET (forcibly closed)",
+			err: errors.New("write tcp 192.168.1.137:54385->104.222.177.67:443: wsasend: " +
+				"An existing connection was forcibly closed by the remote host."),
+			want: "reset_by_peer",
+		},
+		{
 			name: "unknown",
 			err:  errors.New("disk quota exceeded"),
 			want: "other",

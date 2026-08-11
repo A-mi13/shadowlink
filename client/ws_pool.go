@@ -1153,16 +1153,32 @@ func classifyWSReadError(err error) string {
 		// Other WS close codes (1000/1001/1006/1008/...). 1011 is special
 		// above; 1009 (message too big) is special above too.
 		return "close_other"
-	case strings.Contains(msg, "connection reset by peer"):
+	case strings.Contains(msg, "connection reset by peer"),
+		strings.Contains(msg, "forcibly closed by the remote host"):
 		// TCP RST surfaced through the kernel — explicit teardown, distinct
 		// from orderly FIN (EOF). Hoster throttle and CDN RST-injection both
 		// land here.
+		//
+		// Второй паттерн — Windows (WSAECONNRESET, "wsasend: An existing
+		// connection was forcibly closed by the remote host"). Go не
+		// переписывает winsock-текст в POSIX-форму, поэтому без него сигнал
+		// RST-инъекции на Windows недостижим в принципе.
 		return "reset_by_peer"
-	case strings.Contains(msg, "i/o timeout"):
+	case strings.Contains(msg, "i/o timeout"),
+		strings.Contains(msg, "did not properly respond"):
 		// Read or write deadline expired without data — distinct from EOF
 		// (peer never closed) and from `closed_local` (we didn't Close()).
 		// Surface it as its own bucket so dashboards can spot stalled-but-
 		// not-torn-down connections (CF/middlebox black-hole).
+		//
+		// Второй паттерн — Windows (WSAETIMEDOUT, "wsarecv: A connection
+		// attempt failed because the connected party did not properly
+		// respond..."). Это НЕ косметика: filterNoise (slotobs/infer.go)
+		// отсеивает io_timeout из выборки для инференса, а "other" не
+		// отсеивает. Замер 2026-08-11: 11 таких смертей при падении origin
+		// ушли в "other", шесть из них прошли в чистую выборку и сжали порог
+		// ротации с 66s до 47s на 2ч48м — порог стал артефактом сетевого
+		// сбоя, а не выводом о поведении цензора.
 		return "io_timeout"
 	case strings.Contains(msg, "tls:"):
 		return "tls"
