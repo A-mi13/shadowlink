@@ -88,8 +88,13 @@ type drainStreamSnapshot struct {
 //
 // Cost: O(N) where N is the total number of active streams across all
 // slots in the pool (sync.Map.Range cannot pre-filter). Typical N is
-// 50–100; iteration takes <10 µs and runs only at drain teardown — not
-// in any hot path.
+// 50–100; iteration takes <10 µs.
+//
+// Since 2026-08-11 this also runs on every drainWatchdog tick (phantom
+// counter detection, ws_pool_drain.go), not only at teardown. Still not a
+// hot path: drainPollInterval is 500 ms and inflight drains are 0–2 in the
+// field, so ~4 scans/s. At the observed peak (active_streams=274 in log
+// nixavpn-DEBUG-20260811-145918) that is ~1100 entry visits per second.
 func snapshotDrainStreams(p *WSPoolTransport, slotIdx int, now time.Time) drainStreamSnapshot {
 	nowNs := now.UnixNano()
 	const idleThresholdMs = 30_000

@@ -3,6 +3,8 @@ package client
 import (
 	"context"
 	"log/slog"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -107,6 +109,37 @@ func TestSignalNetworkRevival_DoesNotAccumulate(t *testing.T) {
 
 	require.False(t, revived, "старые сигналы не должны будить будущие ожидания")
 	assert.GreaterOrEqual(t, time.Since(start), 100*time.Millisecond)
+}
+
+// Сброс лестницы НЕ должен применяться после ErrRateLimited.
+//
+// Комментарий в reconnectLoopInner (2026-05-18) прямо запрещает `attempt = -1`
+// после рейт-лимита: старое поведение заставляло следующую попытку идти с
+// паузой attempt=0 (5-10s), она под давлением серверного TokenBucket снова
+// упиралась в рейт-лимит, и цикл не заканчивался.
+//
+// Сигнал «сеть вернулась» открывает тот же вход заново: рейт-лимит бывает
+// per-carrier/bucket, поэтому соседний слот может успешно подключиться и
+// разбудить зажатый — а тот обнулит лестницу и пойдёт на новый отказ.
+// Пробуждение само по себе безвредно; вредно именно обнуление.
+func TestReconnectLadder_NotResetAfterRateLimit(t *testing.T) {
+	src, err := os.ReadFile("ws_pool.go")
+	require.NoError(t, err)
+
+	// Проверяем форму кода, а не поведение: воспроизвести серверный
+	// рейт-лимит в юните значит поднять сервер с TokenBucket, а сторожить
+	// надо ровно одну строчку — гейт на сбросе.
+	body := string(src)
+	idx := strings.Index(body, "if p.waitBackoffOrRevival(d)")
+	require.NotEqual(t, -1, idx, "вызов waitBackoffOrRevival не найден — форма кода изменилась")
+
+	// Окно с запасом: гейт стоит сразу за вызовом, но перед ним развёрнутое
+	// обоснование запрета 2026-05-18 — оно длиннее самого кода.
+	gate := body[idx:min(idx+1600, len(body))]
+	if !strings.Contains(gate, "lastWasRateLimited") {
+		t.Errorf("сброс лестницы не гейтится по rate-limit — возвращён регресс 2026-05-18 "+
+			"(бесконечный цикл под серверным TokenBucket). Фрагмент:\n%s", gate)
+	}
 }
 
 // Один успех будит ВСЕ ждущие слоты: восстановление origin — событие

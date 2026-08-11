@@ -2601,6 +2601,10 @@ func (p *WSPoolTransport) reconnectLoopFast(idx int) {
 // post-meltdown handshake spreading). Extracted so the two entry points do NOT
 // duplicate the recycle-guard / ctx-cancel / rate-limit logic (DRY).
 func (p *WSPoolTransport) reconnectLoopInner(idx int, fastFirstAttempt bool) {
+	// lastWasRateLimited — предыдущая попытка упёрлась в серверный
+	// TokenBucket. Гейтит сброс лестницы по сигналу «сеть вернулась»:
+	// см. запрет 2026-05-18 ниже по коду и обоснование там же.
+	lastWasRateLimited := false
 	for attempt := 0; ; attempt++ {
 		select {
 		case <-p.ctx.Done():
@@ -2664,13 +2668,28 @@ func (p *WSPoolTransport) reconnectLoopInner(idx int, fastFirstAttempt bool) {
 			// (attempt=3) уже по здоровой сети — origin вернулся на ~50s
 			// раньше их пробуждения.
 			if p.waitBackoffOrRevival(d) {
-				p.log.Info("WS pool reconnect woken early — another slot connected",
-					"slot", idx, "backoff_skipped", d, "attempt", attempt)
-				// Лестница сбрасывается: держать её после доказанного
-				// успеха соседа значило бы наказывать слот за прошлое
-				// состояние сети. Шторма не будет — сюда попадают только
-				// те, кто реально ждал, и связность уже подтверждена.
-				attempt = -1 // ++ в заголовке цикла вернёт 0
+				// ⚠ Сброс лестницы гейтится по rate-limit. Запрет
+				// 2026-05-18 (ниже по коду) касается не только своей
+				// ветки: рейт-лимит бывает per-carrier/bucket, поэтому
+				// СОСЕДНИЙ слот может успешно подключиться и разбудить
+				// зажатый. Обнулив ему attempt, мы отправили бы его на
+				// повтор с паузой 5-10s прямо в тот же TokenBucket — тот
+				// самый бесконечный цикл, от которого уходили.
+				//
+				// Пробуждение при этом безвредно и полезно: слот просто
+				// пробует раньше, сохраняя накопленную лестницу.
+				if lastWasRateLimited {
+					p.log.Debug("WS pool reconnect woken early — ladder kept (rate-limited)",
+						"slot", idx, "attempt", attempt)
+				} else {
+					p.log.Info("WS pool reconnect woken early — another slot connected",
+						"slot", idx, "backoff_skipped", d, "attempt", attempt)
+					// Держать лестницу после доказанного успеха соседа
+					// значило бы наказывать слот за прошлое состояние
+					// сети. Шторма не будет: сюда попадают только те, кто
+					// реально ждал, и связность уже подтверждена.
+					attempt = -1 // ++ в заголовке цикла вернёт 0
+				}
 			}
 			select {
 			case <-p.ctx.Done():
@@ -2739,6 +2758,7 @@ func (p *WSPoolTransport) reconnectLoopInner(idx int, fastFirstAttempt bool) {
 		// slot-local backoff that grows exp until the slotBackoffDuration
 		// cap (60s, attempt=6 clamp). That gives the server time to refill.
 		if errors.Is(connectErr, ErrRateLimited) {
+			lastWasRateLimited = true
 			Stats.RateLimitedFromServer.Add(1)
 			var cooldown time.Duration
 			var rlErr *RateLimitError
@@ -2762,6 +2782,10 @@ func (p *WSPoolTransport) reconnectLoopInner(idx int, fastFirstAttempt bool) {
 			sleepWithCancel(p.ctx, cooldown)
 			continue
 		}
+
+		// Обычный отказ (не рейт-лимит) снимает флаг: иначе один рейт-лимит
+		// в начале жизни слота навсегда запретил бы ему сброс лестницы.
+		lastWasRateLimited = false
 
 		p.log.Warn("WS pool slot reconnect failed", "slot", idx, "err", connectErr)
 	}

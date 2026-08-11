@@ -659,6 +659,11 @@ func (p *WSPoolTransport) connectReserveSlot(cl *Client, newIdx, oldIdx int) {
 	// Success — reset the failure counter for this cell. Pool-level
 	// storage means this reset persists across cell recycle.
 	p.reserveConnectFailures[newIdx].Store(0)
+	// Резервный слот подключился — это такое же доказательство «origin
+	// отвечает», как и успех в reconnectLoopInner, и в полевом
+	// восстановлении 2026-08-11 путь через резерв был активным. Без
+	// сигнала отсюда половина успехов не будила бы слоты в паузе.
+	p.signalNetworkRevival()
 	go p.slotReader(newIdx)
 }
 
@@ -699,6 +704,13 @@ func (p *WSPoolTransport) drainWatchdog(cl *Client, oldIdx int, oldSlot *poolSlo
 		finishStickyAgeBackstop   // Bug #6: активный стрим, достигнут возрастной предел дренажа
 		finishStickyBytesBackstop // Bug #6: активный стрим, достигнут объёмный предел TCP
 		finishStickyQuotaDenied   // Bug #6: активный стрим, но sticky-квота/ёмкость не позволяют
+		// finishPhantom — счётчик слота разошёлся с streamMap, рвём по карте.
+		// Отдельно от finishStreamsZero намеренно: это НЕ natural finish.
+		// Стримы не завершились сами — мы порвали слот по расхождению, и
+		// смешивать эти события в DrainNaturalFinishTotal значит скачком
+		// «улучшить» долю штатных дренажей (в поле 408 событий из 431) без
+		// изменения реальности.
+		finishPhantom
 	)
 
 	tearDown := func(cause finishCause) {
@@ -715,6 +727,12 @@ func (p *WSPoolTransport) drainWatchdog(cl *Client, oldIdx int, oldSlot *poolSlo
 		case finishStickyQuotaDenied:
 			Stats.DrainStickyQuotaDeniedTotal.Add(1)
 			emitStickyTeardownLog(p, oldIdx, oldSlot, reason, duration, "quota_denied")
+		case finishPhantom:
+			// Только своя метрика: в natural finish это не входит (см.
+			// докстринг finishPhantom). Лог пишется в logPhantom на месте
+			// обнаружения — там доступна величина, по которой принято
+			// решение.
+			Stats.DrainPhantomCounterTotal.Add(1)
 		case finishIdle:
 			Stats.DrainNaturalFinishTotal.Add(1)
 			Stats.DrainIdleFinishTotal.Add(1)
@@ -777,20 +795,59 @@ func (p *WSPoolTransport) drainWatchdog(cl *Client, oldIdx int, oldSlot *poolSlo
 	// streamMap мимо декремента) не найдена и требует -race на сервере:
 	// Windows-dev гонки не ловит (CLAUDE.md hard rule 6). Поэтому расхождение
 	// логируется, а не молча исправляется — иначе причину не найдут никогда.
+	// ⚠ Требуется ДВА наблюдения подряд, а не одно. Одного недостаточно:
+	// AssignStream поднимает счётчик ПЕРЕД публикацией записи в streamMap
+	// («streams.Add MUST precede streamMap.Store», ws_pool.go, spec §2.5), и
+	// в этом окне здоровый новый стрим неотличим от фантома — счётчик>0,
+	// карта пуста. Порвав слот там, мы бы не закрыли канал ещё не
+	// опубликованного стрима (handleSlotDeath обходит streamMap, а записи в
+	// ней нет): соединение повисло бы на мёртвом транспорте до таймаута.
+	//
+	// Отличие во времени, и оно на порядки: утёкший декремент необратим и
+	// держится до конца жизни слота, окно inc→Store живёт наносекунды.
+	// Два тика (>=500ms) гонку не переживают, а фантом переживает.
+	// Цена — полтика задержки против 25s удержания сейчас, то есть выигрыш
+	// сохраняется целиком.
+	//
+	// Тот же race для allStreamsIdle разобран в stream_entry.go и назван
+	// консервативным — и там это верно: found=false → «не рвать». Здесь
+	// знак противоположный, поэтому консервативность надо добавлять руками.
+	var phantomSeenAt time.Time
+	// phantomStreams: величина, по которой принято решение. Отдаётся в лог,
+	// чтобы там стояло измеренное число, а не перечитанное позже другое.
+	var phantomStreams int32
+
+	// isPhantomCounter возвращает true, только когда расхождение подтверждено
+	// вторым наблюдением. Первое лишь запоминает момент.
 	isPhantomCounter := func(now time.Time) bool {
 		counter := oldSlot.streams.Load()
 		if counter <= 0 {
+			phantomSeenAt = time.Time{}
 			return false // обычный пустой слот — им занимается finishStreamsZero
 		}
-		return snapshotDrainStreams(p, oldIdx, now).total == 0
+		if snapshotDrainStreams(p, oldIdx, now).total != 0 {
+			phantomSeenAt = time.Time{} // карта не пуста — расхождения нет
+			return false
+		}
+		if phantomSeenAt.IsZero() {
+			phantomSeenAt = now
+			return false // первое наблюдение — ждём подтверждения
+		}
+		if now.Sub(phantomSeenAt) < drainPollInterval {
+			return false
+		}
+		phantomStreams = counter
+		return true
 	}
 
-	logPhantom := func(counter int32, duration time.Duration) {
-		Stats.DrainPhantomCounterTotal.Add(1)
+	// Счётчик бампает tearDown(finishPhantom) — здесь только лог, иначе
+	// событие посчиталось бы дважды.
+	logPhantom := func(duration time.Duration) {
 		p.log.Warn("WS pool slot drain: phantom stream counter — torn down by map, not counter",
 			"slot", oldIdx, "reason", reason,
-			"counter_streams", counter,
+			"counter_streams", phantomStreams,
 			"map_streams", 0,
+			"confirmed_after", drainPollInterval,
 			"drain_duration", duration.Truncate(time.Second),
 		)
 	}
@@ -819,11 +876,11 @@ func (p *WSPoolTransport) drainWatchdog(cl *Client, oldIdx int, oldSlot *poolSlo
 			drainBytes := oldSlot.downBytes.Load()
 			switch {
 			case isPhantomCounter(now):
-				// Счётчик врёт, привязок нет — рвём как пустой слот, не
-				// оплачивая sticky-предел. Проверка стоит ПЕРВОЙ: ниже
-				// каждая ветка так или иначе доверяет счётчику.
-				logPhantom(oldSlot.streams.Load(), time.Since(drainStart))
-				tearDown(finishStreamsZero)
+				// Счётчик врёт, привязок нет — рвём по карте, не оплачивая
+				// sticky-предел. Проверка стоит ПЕРВОЙ: ниже каждая ветка
+				// так или иначе доверяет счётчику.
+				logPhantom(time.Since(drainStart))
+				tearDown(finishPhantom)
 				return
 			case oldSlot.streams.Load() == 0:
 				// последний стрим закрылся между ticker-тиком и deadline.C —
@@ -865,8 +922,8 @@ func (p *WSPoolTransport) drainWatchdog(cl *Client, oldIdx int, oldSlot *poolSlo
 			// Фантом ловим на тике, а не только на дедлайне: иначе слот всё
 			// равно ждал бы hard_cap впустую, просто рвался бы потом быстрее.
 			if now := time.Now(); isPhantomCounter(now) {
-				logPhantom(streams, time.Since(drainStart))
-				tearDown(finishStreamsZero)
+				logPhantom(time.Since(drainStart))
+				tearDown(finishPhantom)
 				return
 			}
 			if idleEnabled && allStreamsIdle(p, oldIdx, idleThreshold, time.Now()) {
