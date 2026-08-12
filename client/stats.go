@@ -1138,6 +1138,10 @@ func shouldWarnRotationBudget(ageMinCleanMs int64, margin time.Duration) bool {
 // Silent until there are at least minSlotDeathSamplesToLog observations. Below
 // that the CV is noise, and printing it would invite reading a threshold off two
 // data points — exactly the mistake this rework exists to prevent.
+//
+// ⚠ «Silent» относится ТОЛЬКО к распределению и выводу порога. Ниже порога
+// функция всё равно печатает строку о нехватке данных и всё равно скармливает
+// вердикт адаптеру — см. обоснование у раннего return.
 func logSlotDeathSummary() {
 	pool := globalPoolForStatsPtr.Load()
 	if pool == nil || pool.slotDeaths == nil {
@@ -1145,6 +1149,45 @@ func logSlotDeathSummary() {
 	}
 	s := pool.slotDeaths.Summarize()
 	if s.Count < minSlotDeathSamplesToLog {
+		// Нехватка данных — СОСТОЯНИЕ, о котором надо сказать, а не молчать.
+		//
+		// До 2026-08-12 здесь стоял голый `return`, и он глушил не только
+		// печать, но и `ageAdapter.Observe` ниже — единственный вызов адаптера в
+		// кодовой базе. Полевой прогон 20260812-110200 (1ч58м): 8 наблюдений
+		// против порога 12, поэтому за весь прогон не напечатано ни одной строки
+		// `slot death distribution`/`inference`, а адаптация порога per-AS не
+		// исполнялась ни секунды. По логу это выглядело как здоровье.
+		//
+		// Хуже того, обратная связь отрицательная: чем лучше работает плановый
+		// дренаж, тем меньше резов, тем дальше выборка от порога. Фикс фантомного
+		// счётчика (2026-08-11) срезал резы с 10.2/ч до 4.1/ч и тем самым добил
+		// наблюдаемость — контур ослеп именно потому, что транспорт починили.
+		//
+		// Поэтому: распределение и порог по-прежнему молчат (на 8 точках CV — это
+		// шум), но факт нехватки, знаменатель из плановых ротаций и фактически
+		// применённый порог печатаются. Читатель должен видеть «работаю на
+		// конфиге, потому что данных нет», а не пустоту.
+		applied, configured, changes, reason := pool.ageAdapter.Stats()
+		cutShare, shareTotal := pool.slotDeaths.CutShare()
+		slog.Info("slot death observability: insufficient samples — adapter on configured threshold",
+			"samples", s.Count,
+			"required", minSlotDeathSamplesToLog,
+			"total_deaths", pool.slotDeaths.Total(),
+			"planned_rotations", pool.slotDeaths.TotalPlanned(),
+			"cut_share", fmt.Sprintf("%.4f", cutShare),
+			"cut_share_denom", shareTotal,
+			"applied_max_slot_age", applied,
+			"configured_max_slot_age", configured,
+			"adapt_changes", changes,
+			"adapt_reason", reason,
+		)
+
+		// Адаптер зовётся и здесь: на недостаточной выборке Infer вернёт
+		// AxisUnknown, а Observe на AxisUnknown сбрасывает счётчик подтверждений.
+		// Пропуск вызова оставил бы кандидата «подвешенным» между прогонами —
+		// подтверждения копились бы через произвольные промежутки времени, что
+		// ровно противоречит смыслу гистерезиса.
+		pool.ageAdapter.Observe(pool.slotDeaths.InferWithMinAge(pool.ageCutFloor().Milliseconds()))
 		return
 	}
 

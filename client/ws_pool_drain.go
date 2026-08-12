@@ -4,6 +4,8 @@ import (
 	"math/rand/v2"
 	"sync/atomic"
 	"time"
+
+	"github.com/nixavpn/shadowlink/client/slotobs"
 )
 
 const (
@@ -754,6 +756,36 @@ func (p *WSPoolTransport) drainWatchdog(cl *Client, oldIdx int, oldSlot *poolSlo
 				"drain_duration", duration.Truncate(time.Second))
 		}
 		Stats.DrainDurationSeconds.Observe(duration.Seconds())
+
+		// Плановая смена слота — в ОТДЕЛЬНУЮ выборку slotobs (2026-08-12).
+		//
+		// Зачем: до сих пор Record звался только из ветки ошибки чтения, поэтому
+		// выборка была цензурирована — слоты, снятые нашей же ротацией, в неё не
+		// попадали. Полевой прогон 20260812-110200 показал цену: 8 наблюдений за
+		// 1ч58м против порога инференса 12, контур наблюдаемости молчал весь
+		// прогон, адаптация порога не исполнялась. Плюс без знаменателя
+		// перцентили по резам вводят в заблуждение (survivorship bias: p50 по 7
+		// точкам дал 85с против 97.6с по 222 — прочитано как «окно сжалось», хотя
+		// до 100с в том прогоне почти ничего не доезжало).
+		//
+		// Вызов стоит на ОБЩЕМ пути, после switch по причине: sticky-teardown,
+		// hard cap и фантомный разрыв — тоже инициированные нами смены слота, и
+		// они тоже дожили до своего возраста. Ставить вызов внутрь конкретной
+		// ветки значило бы потерять часть выходов молча.
+		//
+		// RecordPlanned, НЕ Record: ринг резов трогать нельзя, иначе порог был бы
+		// выведен из нашего же порога (тавтология). Метку CloseKind проставляет
+		// сам RecordPlanned.
+		if p.slotDeaths != nil {
+			var ageMs int64
+			if started := oldSlot.startedAtNs.Load(); started > 0 {
+				ageMs = time.Since(time.Unix(0, started)).Milliseconds()
+			}
+			p.slotDeaths.RecordPlanned(slotobs.Observation{
+				AgeMs:     ageMs,
+				DownBytes: oldSlot.downBytes.Load(),
+			})
+		}
 
 		// Graceful drain is still a rotation we initiated — surface it in
 		// the rolling 1-minute counter that pool-health logs read. Before

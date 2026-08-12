@@ -1,0 +1,207 @@
+package slotobs
+
+import "testing"
+
+// Плановые ротации живут в ОТДЕЛЬНОМ ринге (2026-08-12).
+//
+// Зачем отдельный, а не метка в общем: полевой замер 20260812-110200 дал 740
+// плановых дренажей против 8 резов за 2 часа — соотношение ~92:1. В общем ринге
+// на 512 записей плановые вытеснили бы все наблюдения о резе за ~20 минут, и
+// Summarize начал бы описывать НАШ СОБСТВЕННЫЙ порог ротации вместо поведения
+// посредника. Это хуже текущего молчания: молчание видно, а подмена — нет.
+
+// Резы и плановые не должны вытеснять друг друга ни в какую сторону.
+func TestPlanned_DoesNotEvictCuts(t *testing.T) {
+	r := NewRecorder(8)
+
+	r.Record(Observation{AgeMs: 90_000, DownBytes: 1234, CloseKind: "close_other"})
+
+	// Плановых кладём вдесятеро больше ёмкости ринга: если бы они шли в общий
+	// буфер, единственное наблюдение о резе было бы затёрто многократно.
+	for i := 0; i < 80; i++ {
+		r.RecordPlanned(Observation{AgeMs: 75_000, CloseKind: ClosePlannedRotation})
+	}
+
+	if got := r.Len(); got != 1 {
+		t.Fatalf("рез вытеснен плановыми: Len()=%d, ожидался 1", got)
+	}
+	s := r.Summarize()
+	if s.Count != 1 {
+		t.Fatalf("Summarize по резам засорён плановыми: Count=%d, ожидался 1", s.Count)
+	}
+	if s.AgeMin != 90_000 {
+		t.Fatalf("AgeMin=%d — в выборку резов попала плановая ротация", s.AgeMin)
+	}
+	if s.ByCloseKind[ClosePlannedRotation] != 0 {
+		t.Fatalf("ByCloseKind содержит плановые: %v", s.ByCloseKind)
+	}
+}
+
+// Обратное направление: поток резов не должен вымывать плановые.
+func TestPlanned_CutsDoNotEvictPlanned(t *testing.T) {
+	r := NewRecorder(4)
+	r.RecordPlanned(Observation{AgeMs: 70_000, CloseKind: ClosePlannedRotation})
+	for i := 0; i < 40; i++ {
+		r.Record(Observation{AgeMs: 90_000, CloseKind: "close_other"})
+	}
+	if got := r.LenPlanned(); got != 1 {
+		t.Fatalf("плановая вытеснена резами: LenPlanned()=%d, ожидался 1", got)
+	}
+}
+
+// Существующий контур (Summarize/Infer) обязан остаться побитово прежним —
+// иначе правка наблюдаемости стала бы правкой поведения ротации.
+func TestPlanned_InferIgnoresPlanned(t *testing.T) {
+	r := NewRecorder(0)
+
+	// Ровно MinSamplesForInference чистых резов по возрасту: узкий разброс по
+	// возрасту, широкий по байтам -> ось age.
+	for i := 0; i < MinSamplesForInference; i++ {
+		r.Record(Observation{
+			AgeMs:     int64(90_000 + i*100),
+			DownBytes: int64(1_000 * (i + 1) * (i + 1)),
+			CloseKind: "close_other",
+		})
+	}
+	want := r.InferWithMinAge(30_000)
+	if want.Axis != AxisAge {
+		t.Fatalf("предусловие не выполнено: Axis=%v, Reason=%q", want.Axis, want.Reason)
+	}
+
+	// Заливаем плановые — вывод не должен шевельнуться.
+	for i := 0; i < 500; i++ {
+		r.RecordPlanned(Observation{AgeMs: 75_000, CloseKind: ClosePlannedRotation})
+	}
+	got := r.InferWithMinAge(30_000)
+
+	if got.Axis != want.Axis || got.Threshold.Age != want.Threshold.Age {
+		t.Fatalf("плановые повлияли на вывод порога: было axis=%v thr=%v, стало axis=%v thr=%v",
+			want.Axis, want.Threshold.Age, got.Axis, got.Threshold.Age)
+	}
+	if got.Samples != want.Samples || got.AgeMinMs != want.AgeMinMs {
+		t.Fatalf("плановые попали в очищенную выборку: samples %d->%d, age_min %d->%d",
+			want.Samples, got.Samples, want.AgeMinMs, got.AgeMinMs)
+	}
+}
+
+// filterNoise обязан отбрасывать плановые, даже если они попадут в ринг резов
+// (защита от будущей ошибки на вызывающей стороне: перепутать Record и
+// RecordPlanned легко, и цена этого — порог, выведенный из своего же порога).
+func TestPlanned_FilterNoiseRejectsPlannedInCutRing(t *testing.T) {
+	r := NewRecorder(0)
+	for i := 0; i < MinSamplesForInference; i++ {
+		r.Record(Observation{
+			AgeMs:     int64(90_000 + i*100),
+			DownBytes: int64(1_000 * (i + 1) * (i + 1)),
+			CloseKind: "close_other",
+		})
+	}
+	// Плановая, ошибочно попавшая в ринг резов.
+	r.Record(Observation{AgeMs: 75_000, CloseKind: ClosePlannedRotation})
+
+	v := r.InferWithMinAge(30_000)
+	if v.Samples != MinSamplesForInference {
+		t.Fatalf("плановая не отсеяна filterNoise: samples=%d, ожидалось %d",
+			v.Samples, MinSamplesForInference)
+	}
+	if v.Rejected.Planned != 1 {
+		t.Fatalf("Rejected.Planned=%d, ожидался 1 (отсев должен быть ВИДЕН, а не молчаливым)",
+			v.Rejected.Planned)
+	}
+}
+
+// Hazard-кривая: доля срезанных среди доживших до полосы. Именно её отсутствие
+// привело к ложному выводу «окно сжалось до 83-87с» — при том, что до 100с
+// почти ничего не доезжало (survivorship bias, разбор 2026-08-12).
+func TestHazard_ComputesRateAmongSurvivors(t *testing.T) {
+	r := NewRecorder(0)
+
+	// 10 плановых по 80с (дошли до полосы 80-90, но срезаны НЕ были).
+	for i := 0; i < 10; i++ {
+		r.RecordPlanned(Observation{AgeMs: 80_000, CloseKind: ClosePlannedRotation})
+	}
+	// 2 реза на 85с — оба внутри полосы 80-90.
+	for i := 0; i < 2; i++ {
+		r.Record(Observation{AgeMs: 85_000, CloseKind: "close_other"})
+	}
+
+	h := r.Hazard(80_000, 90_000)
+	if h.Reached != 12 {
+		t.Fatalf("Reached=%d, ожидалось 12 (все 12 соединений дожили до 80с)", h.Reached)
+	}
+	if h.Cut != 2 {
+		t.Fatalf("Cut=%d, ожидалось 2", h.Cut)
+	}
+	if got := h.Rate(); got < 0.166 || got > 0.167 {
+		t.Fatalf("Rate()=%.4f, ожидалось ~0.1667 (2 из 12)", got)
+	}
+}
+
+// Полоса, до которой не дожил никто, обязана давать Reached=0 и Rate=0, а не
+// делить на ноль и не выдавать «0% риска» как факт.
+func TestHazard_EmptyBandIsNotZeroRisk(t *testing.T) {
+	r := NewRecorder(0)
+	r.RecordPlanned(Observation{AgeMs: 80_000, CloseKind: ClosePlannedRotation})
+
+	h := r.Hazard(100_000, 110_000)
+	if h.Reached != 0 {
+		t.Fatalf("Reached=%d, ожидался 0", h.Reached)
+	}
+	if h.Rate() != 0 {
+		t.Fatalf("Rate()=%v на пустой полосе — деление на ноль", h.Rate())
+	}
+}
+
+// Доля «срезано посредником» — то, что skill прямо называет невыводимым из
+// цензурированной выборки. С отдельным рингом плановых знаменатель появляется.
+func TestCutShare_DenominatorIncludesPlanned(t *testing.T) {
+	r := NewRecorder(0)
+	for i := 0; i < 95; i++ {
+		r.RecordPlanned(Observation{AgeMs: 75_000, CloseKind: ClosePlannedRotation})
+	}
+	for i := 0; i < 5; i++ {
+		r.Record(Observation{AgeMs: 90_000, CloseKind: "close_other"})
+	}
+	share, total := r.CutShare()
+	if total != 100 {
+		t.Fatalf("total=%d, ожидалось 100", total)
+	}
+	if share < 0.049 || share > 0.051 {
+		t.Fatalf("share=%.4f, ожидалось ~0.05", share)
+	}
+}
+
+func TestCutShare_NoDataIsNotZeroShare(t *testing.T) {
+	r := NewRecorder(0)
+	share, total := r.CutShare()
+	if total != 0 || share != 0 {
+		t.Fatalf("share=%v total=%d на пустой выборке", share, total)
+	}
+}
+
+func TestRecorder_ResetClearsPlanned(t *testing.T) {
+	r := NewRecorder(0)
+	r.RecordPlanned(Observation{AgeMs: 75_000, CloseKind: ClosePlannedRotation})
+	r.Reset()
+	if got := r.LenPlanned(); got != 0 {
+		t.Fatalf("LenPlanned()=%d после Reset", got)
+	}
+	if got := r.TotalPlanned(); got != 0 {
+		t.Fatalf("TotalPlanned()=%d после Reset", got)
+	}
+}
+
+// TotalPlanned считает пожизненно, включая затёртые — иначе «сколько ротаций
+// было» не отличить от «сколько влезло в ринг».
+func TestRecorder_TotalPlannedCountsOverwritten(t *testing.T) {
+	r := NewRecorder(4)
+	for i := 0; i < 10; i++ {
+		r.RecordPlanned(Observation{AgeMs: 75_000, CloseKind: ClosePlannedRotation})
+	}
+	if got := r.TotalPlanned(); got != 10 {
+		t.Fatalf("TotalPlanned()=%d, ожидалось 10", got)
+	}
+	if got := r.LenPlanned(); got != 4 {
+		t.Fatalf("LenPlanned()=%d, ожидалось 4 (ёмкость ринга)", got)
+	}
+}

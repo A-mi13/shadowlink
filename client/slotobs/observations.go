@@ -28,18 +28,34 @@
 // volume trigger does not reproduce here. The window is 84-118s (p10 84.1 /
 // p50 97.6 / p90 118.0), NOT the 130-190s this codebase was tuned against.
 //
-// ⚠ KNOWN BIAS — the sample is CENSORED. Record is called from exactly one site
-// (the reader-error path in ws_pool.go), so slots torn down by our OWN planned
-// rotation never enter it. Two consequences, both easy to get wrong:
+// ⚠ KNOWN BIAS — выборка РЕЗОВ по-прежнему цензурирована, и это не лечится:
+// Record зовётся из единственного места (ветка ошибки чтения в ws_pool.go), то
+// есть в неё попадают только слоты, до которых цензор добрался РАНЬШЕ нашей
+// ротации. Правый хвост срезан нашей же политикой, поэтому перцентили смещены
+// ВВЕРХ, а истинное окно может быть плотнее измеренного.
 //
-//	1. ByCloseKind cannot yield "what fraction of slots the censor cut" — planned
-//	   rotations are absent from the denominator by construction.
-//	2. Percentiles are biased UPWARD: we only observe slots the censor reached
-//	   BEFORE our rotation did, so the right tail is truncated by our own policy.
-//	   The true window may be tighter than measured.
+// Именно для этого существует AgeMin: минимум — факт, перцентиль по
+// цензурированной выборке — оценка. Проверки бюджета должны предпочитать первое.
 //
-// This is why AgeMin exists: a minimum is a fact, a percentile over a censored
-// sample is an estimate. Budget checks should prefer the former.
+// ЧАСТИЧНО СНЯТО 2026-08-12 (см. planned.go). Плановые ротации теперь пишутся
+// в ОТДЕЛЬНЫЙ ринг через RecordPlanned, что даёт знаменатель и с ним две
+// величины, прежде невыводимые:
+//
+//	1. CutShare — доля слотов, снятых посредником, от всех смен слота. Прежняя
+//	   формулировка «ByCloseKind cannot yield this» больше не верна.
+//	2. Hazard — риск реза среди ДОЖИВШИХ до полосы возраста. Устойчив к
+//	   survivorship bias по построению, в отличие от гистограммы смертей.
+//
+// Зачем это понадобилось: разбор прогона 20260812-110200 прочитал p50=85.0с по
+// 7 точкам как «окно сжалось» против 97.6с по 222 точкам. Фактически в том
+// прогоне ни одно соединение не жило дольше 104.5с — посредник физически не мог
+// показать рез на 110с. Был измерен собственный порог ротации, а не цензор.
+// Hazard-кривая на тех же данных оказалась монотонно растущей с 80с, без
+// ступеньки на 84с, то есть «окно 84–118с» как интервал — артефакт метода.
+//
+// Summarize и Infer работают ТОЛЬКО по рингу резов и правкой не затронуты:
+// плановых в поле ~92x больше, и в общем буфере они вытеснили бы наблюдения о
+// цензоре за минуты.
 //
 // Privacy: observations never leave the device. No addresses, no hostnames, no
 // payload — only timings, byte counts and a close-shape label. The buffer lives
@@ -98,6 +114,14 @@ type Recorder struct {
 	next  int    // next write index
 	count int    // live entries (< len(buf) until the ring wraps)
 	total uint64 // lifetime deaths, including those overwritten
+
+	// Плановые ротации — ОТДЕЛЬНЫЙ ринг той же ёмкости (см. planned.go).
+	// Общий буфер здесь недопустим: в поле плановых ~92x больше, чем резов,
+	// и они вытеснили бы наблюдения о цензоре за минуты.
+	planned      []Observation
+	plannedNext  int
+	plannedCount int
+	plannedTotal uint64
 }
 
 // NewRecorder creates a recorder holding up to capacity observations.
@@ -161,6 +185,7 @@ func (r *Recorder) Reset() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.next, r.count, r.total = 0, 0, 0
+	r.plannedNext, r.plannedCount, r.plannedTotal = 0, 0, 0
 }
 
 // Summary is a read-only digest of recorded deaths. It reports SPREAD, not just
