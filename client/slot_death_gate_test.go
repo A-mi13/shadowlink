@@ -62,6 +62,52 @@ func TestSlotDeathGate_BelowThresholdStillSpeaks(t *testing.T) {
 	}
 }
 
+// Строка нехватки данных обязана быть РЕДКОЙ.
+//
+// logSlotDeathSummary зовётся из StartStatsLogger каждые 5s
+// (engine_shadowlink.go:216), поэтому безусловная печать дала бы 720 строк в час
+// при нехватке данных. Это ровно тот шум, от которого лечились в b0ad357:
+// «предупреждение, которое срабатывает на три порядка чаще предсказанного
+// отказа, читатель перестаёт читать — а это тот же H-15, только через шум».
+//
+// Дросселирование по ИЗМЕНЕНИЮ состояния, а не по времени: пока samples и
+// применённый порог те же, повторять нечего.
+func TestSlotDeathGate_InsufficientLineIsThrottled(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	p := &WSPoolTransport{
+		slotDeaths:        slotobs.NewRecorder(64),
+		maxSlotAge:        75 * time.Second,
+		stickyMaxDrainAge: DefaultStickyMaxDrainAge,
+		ageAdapter:        slotobs.NewAdapter(75 * time.Second),
+	}
+	SetGlobalPoolForStats(p)
+	t.Cleanup(func() { SetGlobalPoolForStats(nil) })
+
+	for i := 0; i < 8; i++ {
+		p.slotDeaths.Record(slotobs.Observation{AgeMs: 85_000, CloseKind: "close_other"})
+	}
+
+	// Десять тиков подряд без изменения состояния — строка должна быть ОДНА.
+	for i := 0; i < 10; i++ {
+		logSlotDeathSummary()
+	}
+	if got := strings.Count(buf.String(), "slot death observability"); got != 1 {
+		t.Errorf("строка напечатана %d раз за 10 тиков без изменений — шум 720 строк/час", got)
+	}
+
+	// Появилось новое наблюдение — состояние изменилось, сказать надо.
+	buf.Reset()
+	p.slotDeaths.Record(slotobs.Observation{AgeMs: 86_000, CloseKind: "close_other"})
+	logSlotDeathSummary()
+	if got := strings.Count(buf.String(), "slot death observability"); got != 1 {
+		t.Errorf("при изменении samples строка не напечатана (got=%d) — потеря наблюдаемости", got)
+	}
+}
+
 // Пустая выборка — тоже состояние, о котором надо сказать: «резов не было»
 // и «адаптер на конфиге» это разные утверждения, но оба содержательные.
 func TestSlotDeathGate_ZeroSamplesSpeaks(t *testing.T) {

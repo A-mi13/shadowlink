@@ -1169,18 +1169,39 @@ func logSlotDeathSummary() {
 		// конфиге, потому что данных нет», а не пустоту.
 		applied, configured, changes, reason := pool.ageAdapter.Stats()
 		cutShare, shareTotal := pool.slotDeaths.CutShare()
-		slog.Info("slot death observability: insufficient samples — adapter on configured threshold",
-			"samples", s.Count,
-			"required", minSlotDeathSamplesToLog,
-			"total_deaths", pool.slotDeaths.Total(),
-			"planned_rotations", pool.slotDeaths.TotalPlanned(),
-			"cut_share", fmt.Sprintf("%.4f", cutShare),
-			"cut_share_denom", shareTotal,
-			"applied_max_slot_age", applied,
-			"configured_max_slot_age", configured,
-			"adapt_changes", changes,
-			"adapt_reason", reason,
-		)
+
+		// Дросселирование по ИЗМЕНЕНИЮ состояния.
+		//
+		// logSlotDeathSummary зовётся из StartStatsLogger каждые 5s
+		// (engine_shadowlink.go:216). Безусловная печать дала бы 720 строк в час
+		// при нехватке данных — ровно тот шум, от которого лечились в b0ad357:
+		// «предупреждение, которое срабатывает на три порядка чаще
+		// предсказанного отказа, читатель перестаёт читать — а это тот же H-15,
+		// только через шум, а не через молчание». Повторить эту ошибку внутри
+		// правки, которая лечит H-15 через молчание, было бы иронично.
+		//
+		// Ключ по (samples, applied): пока не появилось нового наблюдения и порог
+		// не сдвинулся, повторять нечего. Оба слагаемых нужны — samples растёт
+		// при новых резах, applied меняется при адаптации, и пропуск любого
+		// скрыл бы содержательное событие.
+		//
+		// Порог печатается по ПЕРЕХОДУ, поэтому первый тик после старта всегда
+		// говорит: нулевое состояние отличается от «ещё не печатали».
+		key := insufficientSamplesKey{samples: s.Count, applied: applied}
+		if pool.lastInsufficientLog.Swap(key) != key {
+			slog.Info("slot death observability: insufficient samples — adapter on configured threshold",
+				"samples", s.Count,
+				"required", minSlotDeathSamplesToLog,
+				"total_deaths", pool.slotDeaths.Total(),
+				"planned_rotations", pool.slotDeaths.TotalPlanned(),
+				"cut_share", fmt.Sprintf("%.4f", cutShare),
+				"cut_share_denom", shareTotal,
+				"applied_max_slot_age", applied,
+				"configured_max_slot_age", configured,
+				"adapt_changes", changes,
+				"adapt_reason", reason,
+			)
+		}
 
 		// Адаптер зовётся и здесь: на недостаточной выборке Infer вернёт
 		// AxisUnknown, а Observe на AxisUnknown сбрасывает счётчик подтверждений.
@@ -1371,3 +1392,28 @@ func logSlotDeathSummary() {
 // that a CV comparison is not pure noise; the log line carries `samples` so the
 // reader can judge for themselves.
 const minSlotDeathSamplesToLog = 12
+
+// insufficientSamplesKey — состояние, при неизменности которого строку о
+// нехватке наблюдений повторять не нужно (см. место использования).
+//
+// Comparable-структура, а не строка: сравнение по значению даёт atomic.Pointer
+// семантику «изменилось ли состояние» без форматирования на каждом тике.
+type insufficientSamplesKey struct {
+	samples int
+	applied time.Duration
+}
+
+// Состояние дросселирования живёт НА ПУЛЕ (WSPoolTransport.lastInsufficientLog),
+// а не в пакетной переменной.
+//
+// Сначала было сделано пакетной переменной с рассуждением «при пересоздании пула
+// сброс не нужен, у нового рекордера счётчик нулевой». Рассуждение неверное:
+// нулевое состояние нового пула может СОВПАСТЬ с последним напечатанным для
+// старого, и тогда первая строка после реконнекта пропадёт — то есть ровно в
+// момент, когда наблюдаемость нужнее всего.
+//
+// Обнаружено тестом: TestSlotDeathGate_InsufficientLineIsThrottled проходил в
+// изоляции и падал в наборе, потому что ключ протекал между тестами через
+// пакетную переменную. Тот самый класс, о котором предупреждает skill
+// testing-rules — «зелёный при -count=1, красный в наборе — это почти всегда
+// общее состояние, а не флейк железа». Здесь общее состояние было и в проде.

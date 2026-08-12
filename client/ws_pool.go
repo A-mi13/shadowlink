@@ -1354,12 +1354,25 @@ type WSPoolTransport struct {
 	// (раунд 18 P0, reframed 2026-07-31 — see client/slotobs and
 	// docs/audit/2026-07-25-round18/FIELD-CHECKS.md §2).
 	//
-	// Observation only: nothing reads this to make a decision yet. The
-	// MaxSlotAge / ageCutMinAge constants still drive rotation exactly as
-	// before. Wiring the inference (axis detection → adaptive threshold →
-	// hysteresis) is a separate design step; recording first means the data is
-	// trustworthy before anything acts on it.
+	// ⚠ Больше НЕ observation-only. Комментарий «nothing reads this to make a
+	// decision yet» был верен до шага 3 (2026-07-31): теперь ageAdapter читает
+	// вывод из этих наблюдений и СЖИМАЕТ порог ротации (rotationWatchdog берёт
+	// базу у адаптера, ws_pool.go ~2195). Ротацию по-прежнему ограничивает
+	// сконфигурированный MaxSlotAge как потолок — адаптация только вниз.
+	//
+	// Плановые ротации пишутся в отдельный ринг того же рекордера
+	// (RecordPlanned, см. slotobs/planned.go): они дают знаменатель для
+	// CutShare/Hazard, но в вывод порога не входят.
 	slotDeaths *slotobs.Recorder
+
+	// lastInsufficientLog — последнее напечатанное состояние строки о нехватке
+	// наблюдений, для дросселирования (см. logSlotDeathSummary). Хранит
+	// insufficientSamplesKey.
+	//
+	// На пуле, а не в пакетной переменной: иначе ключ переживает пересоздание
+	// пула, и первая строка после реконнекта может пропасть при совпадении
+	// состояния — то есть ровно тогда, когда наблюдаемость нужнее всего.
+	lastInsufficientLog atomic.Value
 	// byteBudgetMinInterval — wall-clock floor before a byte-budget rotation
 	// may fire on a freshly-(re)connected slot (Bug #4 storm fix). 0 disables
 	// the floor. Defaults to byteBudgetMinRotationInterval when byte budget is
