@@ -1187,15 +1187,43 @@ func logSlotDeathSummary() {
 		//
 		// Порог печатается по ПЕРЕХОДУ, поэтому первый тик после старта всегда
 		// говорит: нулевое состояние отличается от «ещё не печатали».
-		key := insufficientSamplesKey{samples: s.Count, applied: applied}
+		// plannedBucket в ключе: без него строка молчит, пока идут ТОЛЬКО плановые
+		// ротации, — а `planned_rotations` и есть то число, которое объясняет,
+		// почему резов мало. При 740 плановых и неизменных 8 резах читатель иначе
+		// увидел бы одну строку и больше ничего, хотя знаменатель растёт.
+		// Округление до сотен, чтобы не вернуть шум: печатаем на каждую сотню
+		// плановых, а не на каждую.
+		totalPlanned := pool.slotDeaths.TotalPlanned()
+		key := insufficientSamplesKey{
+			samples:       s.Count,
+			applied:       applied,
+			plannedBucket: totalPlanned / 100,
+		}
 		if pool.lastInsufficientLog.Swap(key) != key {
+			totalCuts := pool.slotDeaths.Total()
+			// Две доли, потому что это ДВЕ РАЗНЫЕ величины, и по имени `cut_share`
+			// их не различить (ревью 2026-08-12).
+			//
+			// cut_share_lifetime — по пожизненным счётчикам, несмещённая.
+			// cut_share_ring — по содержимому рингов; смещена при переполнении,
+			// потому что ринги конечны и заполняются с разной скоростью. В поле
+			// это 1.54% против истинных 1.07%, разница в 1.44 раза.
+			//
+			// Раньше печаталась только вторая, под нейтральным именем, рядом с
+			// несмещённым planned_rotations — читатель не понимал, почему 8/748
+			// не сходится с показанным числом.
+			var lifetimeShare float64
+			if totalCuts+totalPlanned > 0 {
+				lifetimeShare = float64(totalCuts) / float64(totalCuts+totalPlanned)
+			}
 			slog.Info("slot death observability: insufficient samples — adapter on configured threshold",
 				"samples", s.Count,
 				"required", minSlotDeathSamplesToLog,
-				"total_deaths", pool.slotDeaths.Total(),
-				"planned_rotations", pool.slotDeaths.TotalPlanned(),
-				"cut_share", fmt.Sprintf("%.4f", cutShare),
-				"cut_share_denom", shareTotal,
+				"total_deaths", totalCuts,
+				"planned_rotations", totalPlanned,
+				"cut_share_lifetime", fmt.Sprintf("%.4f", lifetimeShare),
+				"cut_share_ring", fmt.Sprintf("%.4f", cutShare),
+				"cut_share_ring_denom", shareTotal,
 				"applied_max_slot_age", applied,
 				"configured_max_slot_age", configured,
 				"adapt_changes", changes,
@@ -1288,6 +1316,12 @@ func logSlotDeathSummary() {
 		"rejected_local_close", v.Rejected.LocalClose,
 		"rejected_timeout", v.Rejected.Timeout,
 		"rejected_too_young", v.Rejected.TooYoung,
+		// rejected_planned в норме 0. Ненулевое = плановая ротация попала в ринг
+		// резов (перепутаны Record/RecordPlanned), и это надо ВИДЕТЬ: иначе
+		// наблюдения тихо исчезают из samples_used, а разницу со `samples` в
+		// сводке объяснят чем угодно. Поле заведено ради этого сигнала —
+		// не печатать его значило бы завести молчащий гейт (ревью 2026-08-12).
+		"rejected_planned", v.Rejected.Planned,
 		"applied_max_slot_age", adaptedAge,
 		"configured_max_slot_age", configuredAge,
 		"adapt_changes", adaptChanges,
@@ -1303,6 +1337,8 @@ func logSlotDeathSummary() {
 		"margin_to_age_min", wcMargin,
 		"reason", v.Reason,
 	)
+
+	logSlotDeathHazard(pool)
 
 	// Отрицательный запас — уровень INFO, не WARN (понижено 2026-08-10 по
 	// замеру двух полевых прогонов).
@@ -1391,6 +1427,72 @@ func logSlotDeathSummary() {
 // unlogged. 12 is well short of a statistically comfortable sample but enough
 // that a CV comparison is not pure noise; the log line carries `samples` so the
 // reader can judge for themselves.
+// logSlotDeathHazard печатает hazard-кривую — риск реза среди ДОЖИВШИХ до
+// каждой полосы возраста.
+//
+// Почему это отдельная строка, а не поле в inference: hazard отвечает на другой
+// вопрос. Перцентили смертей говорят «где умирают», и ответ смещён нашей же
+// политикой ротации (survivorship bias). Именно на этом сгорел разбор
+// 2026-08-12: p50 по 7 резам дал 85с против 97.6с по 222, и это прочли как
+// «окно сжалось», хотя в том прогоне ни одно соединение не жило дольше 104.5с —
+// посредник физически не мог показать рез на 110с. Hazard делит на число
+// дошедших и потому от политики зависит слабее.
+//
+// Выводится в лог, а не остаётся вычислимой величиной: до ревью 2026-08-12
+// slotobs.Hazard не вызывалась нигде в проде, при том что SKILL.md уже подал
+// hazard-кривую как «правильную величину» и на этом основании отменил прежнюю
+// оценку окна. Величина, которую никто не читает, — не наблюдаемость.
+//
+// Полосы строятся вокруг ageCutFloor: ниже него рез по нашей же модели не
+// считается age-cut, поэтому смотреть там нечего.
+func logSlotDeathHazard(pool *WSPoolTransport) {
+	if pool == nil || pool.slotDeaths == nil {
+		return
+	}
+	// Молчим, пока нет ни одного наблюдения хоть в одном ринге: пустая кривая
+	// из одних нулей читается как «риска нет», а это не то же, что «нет данных».
+	if pool.slotDeaths.Len() == 0 && pool.slotDeaths.LenPlanned() == 0 {
+		return
+	}
+
+	floorMs := pool.ageCutFloor().Milliseconds()
+	if floorMs <= 0 {
+		floorMs = 30_000
+	}
+
+	attrs := []any{
+		"band_width_ms", hazardBandWidthMs,
+		"floor_ms", floorMs,
+	}
+	for i := 0; i < hazardBandCount; i++ {
+		from := floorMs + int64(i)*hazardBandWidthMs
+		h := pool.slotDeaths.Hazard(from, from+hazardBandWidthMs)
+		// Пустые полосы не печатаем: нули без знаменателя — это шум, который
+		// читается как «риск нулевой».
+		if h.Reached == 0 {
+			continue
+		}
+		// Rate — actuarial: цензурированные внутри полосы входят с весом 1/2.
+		// censored_in обязателен рядом, иначе честный знаменатель не отличить
+		// от раздутого.
+		attrs = append(attrs,
+			fmt.Sprintf("band_%d_%d", from/1000, (from+hazardBandWidthMs)/1000),
+			fmt.Sprintf("reached=%d cut=%d censored_in=%d rate=%.4f",
+				h.Reached, h.Cut, h.CensoredIn, h.Rate()),
+		)
+	}
+	slog.Info("slot death hazard (risk among survivors)", attrs...)
+}
+
+const (
+	// hazardBandWidthMs — ширина полосы hazard-кривой. 5s: в поле риск удваивался
+	// примерно на таком шаге, более узкие полосы дают единичные знаменатели.
+	hazardBandWidthMs = 5_000
+	// hazardBandCount — сколько полос строить от ageCutFloor вверх. 16×5s = 80s
+	// сверху floor'а покрывает наблюдённый диапазон жизни слота с запасом.
+	hazardBandCount = 16
+)
+
 const minSlotDeathSamplesToLog = 12
 
 // insufficientSamplesKey — состояние, при неизменности которого строку о
@@ -1401,6 +1503,10 @@ const minSlotDeathSamplesToLog = 12
 type insufficientSamplesKey struct {
 	samples int
 	applied time.Duration
+	// plannedBucket — TotalPlanned/100. Без него строка молчала бы, пока идут
+	// только плановые ротации, то есть скрывала бы рост знаменателя. Бакет, а не
+	// сырое число, чтобы не печатать на каждую плановую ротацию.
+	plannedBucket uint64
 }
 
 // Состояние дросселирования живёт НА ПУЛЕ (WSPoolTransport.lastInsufficientLog),

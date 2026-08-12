@@ -116,9 +116,10 @@ func TestPlanned_FilterNoiseRejectsPlannedInCutRing(t *testing.T) {
 func TestHazard_ComputesRateAmongSurvivors(t *testing.T) {
 	r := NewRecorder(0)
 
-	// 10 плановых по 80с (дошли до полосы 80-90, но срезаны НЕ были).
+	// 10 плановых на 95с: дожили до полосы 80-90 и ПРОЖИЛИ её целиком
+	// (сняты уже после 90с), поэтому идут в знаменатель с полным весом.
 	for i := 0; i < 10; i++ {
-		r.RecordPlanned(Observation{AgeMs: 80_000, CloseKind: ClosePlannedRotation})
+		r.RecordPlanned(Observation{AgeMs: 95_000, CloseKind: ClosePlannedRotation})
 	}
 	// 2 реза на 85с — оба внутри полосы 80-90.
 	for i := 0; i < 2; i++ {
@@ -132,8 +133,80 @@ func TestHazard_ComputesRateAmongSurvivors(t *testing.T) {
 	if h.Cut != 2 {
 		t.Fatalf("Cut=%d, ожидалось 2", h.Cut)
 	}
+	if h.CensoredIn != 0 {
+		t.Fatalf("CensoredIn=%d, ожидался 0 (все плановые прожили полосу целиком)", h.CensoredIn)
+	}
 	if got := h.Rate(); got < 0.166 || got > 0.167 {
 		t.Fatalf("Rate()=%.4f, ожидалось ~0.1667 (2 из 12)", got)
+	}
+}
+
+// Плановая ротация ВНУТРИ полосы — цензурирование справа: слот дожил до начала
+// полосы, но прожил её лишь частично, потому что сняли его мы сами.
+//
+// Считать такое наблюдение полноценным «дожившим» — значит раздуть знаменатель
+// и ЗАНИЗИТЬ риск. Ревью 2026-08-12 показало цену на данных, повторяющих поле
+// (100 плановых равномерно 80–90с, 5 резов): наивный расчёт даёт Rate=0.0476
+// против actuarial 0.0909, то есть занижение в 1.91 раза — и занижение именно в
+// той полосе, где ищется порог ротации. По памяти проекта «занижение хуже
+// завышения»: читатель решил бы, что риск на 80–90с приемлем.
+//
+// Поправка actuarial (она же Kaplan-Meier для сгруппированных интервалов):
+// цензурированные внутри полосы входят в знаменатель с весом 1/2.
+func TestHazard_CensoredWithinBandGetsHalfWeight(t *testing.T) {
+	r := NewRecorder(0)
+
+	// Полевой профиль: плановые режутся НАМИ внутри полосы интереса.
+	for i := 0; i < 100; i++ {
+		r.RecordPlanned(Observation{AgeMs: int64(80_000 + i*100), CloseKind: ClosePlannedRotation})
+	}
+	for i := 0; i < 5; i++ {
+		r.Record(Observation{AgeMs: 85_000, CloseKind: "close_other"})
+	}
+
+	h := r.Hazard(80_000, 90_000)
+	if h.Reached != 105 {
+		t.Fatalf("Reached=%d, ожидалось 105", h.Reached)
+	}
+	if h.CensoredIn != 100 {
+		t.Fatalf("CensoredIn=%d, ожидалось 100 (все плановые сняты внутри полосы)", h.CensoredIn)
+	}
+	// eff = 105 - 0.5*100 = 55; 5/55 = 0.0909
+	if got := h.Rate(); got < 0.0905 || got > 0.0913 {
+		t.Fatalf("Rate()=%.4f, ожидалось ~0.0909 (actuarial). "+
+			"Наивные 0.0476 занижают риск вдвое", got)
+	}
+}
+
+// Резы внутри полосы в CensoredIn не входят: они не цензурированы, они и есть
+// событие. Иначе поправка съела бы сама себя.
+func TestHazard_CutsAreNotCensored(t *testing.T) {
+	r := NewRecorder(0)
+	for i := 0; i < 4; i++ {
+		r.Record(Observation{AgeMs: 85_000, CloseKind: "close_other"})
+	}
+	h := r.Hazard(80_000, 90_000)
+	if h.CensoredIn != 0 {
+		t.Fatalf("CensoredIn=%d — рез посчитан как цензурированный", h.CensoredIn)
+	}
+	if got := h.Rate(); got != 1.0 {
+		t.Fatalf("Rate()=%.4f, ожидалось 1.0 (все 4 дошедших срезаны)", got)
+	}
+}
+
+// Патологический случай: цензурированных столько, что эффективный знаменатель
+// вырождается. Rate не должен уходить в бесконечность или отрицательное.
+func TestHazard_DegenerateEffectiveDenominator(t *testing.T) {
+	r := NewRecorder(0)
+	r.RecordPlanned(Observation{AgeMs: 85_000, CloseKind: ClosePlannedRotation})
+
+	h := r.Hazard(80_000, 90_000)
+	// Reached=1, CensoredIn=1 -> eff = 1 - 0.5 = 0.5, Cut=0 -> Rate=0
+	if got := h.Rate(); got != 0 {
+		t.Fatalf("Rate()=%v при нулевом Cut", got)
+	}
+	if h.Reached != 1 || h.CensoredIn != 1 {
+		t.Fatalf("Reached=%d CensoredIn=%d, ожидалось 1/1", h.Reached, h.CensoredIn)
 	}
 }
 
@@ -176,6 +249,60 @@ func TestCutShare_NoDataIsNotZeroShare(t *testing.T) {
 	share, total := r.CutShare()
 	if total != 0 || share != 0 {
 		t.Fatalf("share=%v total=%d на пустой выборке", share, total)
+	}
+}
+
+// Нулевой Recorder (`&Recorder{}`) не должен паниковать на записи плановых.
+//
+// Экспортируемого способа получить такой Recorder нет — NewRecorder нормализует
+// capacity<=0 до DefaultCapacity. Но sync.Mutex в структуре делает нулевое
+// значение внешне пригодным к использованию, и ленивая инициализация выглядела
+// защитой от этого случая, не будучи ею: make([]Observation, 0) давал панику
+// index out of range на первой записи (ревью 2026-08-12).
+func TestRecordPlanned_ZeroValueRecorderDoesNotPanic(t *testing.T) {
+	r := &Recorder{}
+	r.RecordPlanned(Observation{AgeMs: 75_000})
+	if got := r.LenPlanned(); got != 1 {
+		t.Fatalf("LenPlanned()=%d после записи в нулевой Recorder", got)
+	}
+}
+
+// Конкурентная запись в ОБА ринга плюс чтение агрегатов.
+//
+// На Windows без -race (hard rule 6) тест докажет лишь отсутствие паники и
+// сохранность счётчиков, но под -race в CI/Linux он поймал бы забытую
+// блокировку. Весь смысл рекордера — конкурентные смерти слотов, каждая в своей
+// горутине, поэтому пробел здесь стоило закрыть (ревью 2026-08-12).
+func TestRecorder_ConcurrentBothRings(t *testing.T) {
+	r := NewRecorder(64)
+	const n = 200
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < n; i++ {
+			r.Record(Observation{AgeMs: 90_000, CloseKind: "close_other"})
+		}
+	}()
+	go func() {
+		for i := 0; i < n; i++ {
+			r.RecordPlanned(Observation{AgeMs: 75_000})
+		}
+	}()
+	// Читатель работает одновременно с писателями.
+	for i := 0; i < 50; i++ {
+		_ = r.Hazard(70_000, 80_000)
+		_, _ = r.CutShare()
+		_ = r.Summarize()
+	}
+	<-done
+
+	if got := r.Total(); got != n {
+		t.Errorf("Total()=%d, ожидалось %d", got, n)
+	}
+	// Плановый писатель мог не закончить — проверяем лишь непротиворечивость.
+	if lp, tp := r.LenPlanned(), r.TotalPlanned(); uint64(lp) > tp {
+		t.Errorf("LenPlanned()=%d больше TotalPlanned()=%d", lp, tp)
 	}
 }
 

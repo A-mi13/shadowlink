@@ -270,6 +270,10 @@ func (p *WSPoolTransport) tryForceEvictIdleSlot(cl *Client, skipIdx int) bool {
 		// via shouldExitReader when transport.Close in handleSlotDeath
 		// surfaces as a read error.
 		s.generation.Add(1)
+		// Наша смена слота — в выборку плановых, как и дренаж (см.
+		// recordPlannedRotation). Пропуск занижал бы знаменатель hazard и
+		// завышал Rate.
+		p.recordPlannedRotation(s)
 		// handleSlotDeath takes reserveMu internally to nil the cell.
 		p.handleSlotDeath(cl, i, deathCauseDrainTeardown)
 		return true
@@ -375,6 +379,8 @@ func (p *WSPoolTransport) tryEmergencyEvictMinStreamsSlot(cl *Client, skipIdx in
 		"remaining", remaining)
 
 	victim.generation.Add(1)
+	// Наша смена слота — в выборку плановых (см. recordPlannedRotation).
+	p.recordPlannedRotation(victim)
 	p.handleSlotDeath(cl, bestIdx, deathCauseDrainTeardown)
 	return true
 }
@@ -669,6 +675,44 @@ func (p *WSPoolTransport) connectReserveSlot(cl *Client, newIdx, oldIdx int) {
 	go p.slotReader(newIdx)
 }
 
+// recordPlannedRotation пишет НАШУ смену слота в отдельный ринг slotobs.
+//
+// Единственная точка записи плановых наблюдений: три копии этого кода (дренаж +
+// два evict-пути) разъехались бы при первой правке полей Observation, а
+// расхождение здесь означает расхождение знаменателя в CutShare/Hazard.
+//
+// Зовётся из ВСЕХ путей, где смену слота инициируем мы:
+//   - drainWatchdog.tearDown — плановый дренаж, sticky, hard cap, фантом;
+//   - tryForceEvictIdleSlot — вытеснение простаивающей ячейки;
+//   - tryEmergencyEvictMinStreamsSlot — аварийное вытеснение.
+//
+// Почему полнота важна именно здесь (ревью 2026-08-12): пропуск выживших
+// ЗАНИЖАЕТ знаменатель hazard и ЗАВЫШАЕТ Rate — смещение, противоположное по
+// знаку цензурированию внутри полосы (HazardBand.CensoredIn). Два смещения
+// разных знаков дают суммарную ошибку, непредсказуемую по направлению, и это
+// хуже одного известного смещения. Вытеснения происходят, когда пул забит и
+// ротация застряла, то есть в самых интересных для анализа условиях.
+//
+// НЕ покрывает: ctx.Done() в drainWatchdog (остановка клиента — по одному
+// наблюдению на слот за прогон) и legacy fireRotation при
+// SHADOWLINK_GRACEFUL_DRAIN=0. Второе осознанно: при бисекции по этому флагу
+// ринг плановых останется пустым, и CutShare вернёт 1.0 — что честно означает
+// «наблюдений о плановых ротациях нет», а не «всё срезал цензор». Читать
+// CutShare без graceful drain нельзя, и это сказано в его докстринге.
+func (p *WSPoolTransport) recordPlannedRotation(slot *poolSlot) {
+	if p.slotDeaths == nil || slot == nil {
+		return
+	}
+	var ageMs int64
+	if started := slot.startedAtNs.Load(); started > 0 {
+		ageMs = time.Since(time.Unix(0, started)).Milliseconds()
+	}
+	p.slotDeaths.RecordPlanned(slotobs.Observation{
+		AgeMs:     ageMs,
+		DownBytes: slot.downBytes.Load(),
+	})
+}
+
 // drainWatchdog polls oldSlot.streams every drainPollInterval until
 // either count reaches 0 (natural finish) or drainHardCap elapses
 // (hard cap). In both cases:
@@ -774,18 +818,8 @@ func (p *WSPoolTransport) drainWatchdog(cl *Client, oldIdx int, oldSlot *poolSlo
 		// ветки значило бы потерять часть выходов молча.
 		//
 		// RecordPlanned, НЕ Record: ринг резов трогать нельзя, иначе порог был бы
-		// выведен из нашего же порога (тавтология). Метку CloseKind проставляет
-		// сам RecordPlanned.
-		if p.slotDeaths != nil {
-			var ageMs int64
-			if started := oldSlot.startedAtNs.Load(); started > 0 {
-				ageMs = time.Since(time.Unix(0, started)).Milliseconds()
-			}
-			p.slotDeaths.RecordPlanned(slotobs.Observation{
-				AgeMs:     ageMs,
-				DownBytes: oldSlot.downBytes.Load(),
-			})
-		}
+		// выведен из нашего же порога (тавтология).
+		p.recordPlannedRotation(oldSlot)
 
 		// Graceful drain is still a rotation we initiated — surface it in
 		// the rolling 1-minute counter that pool-health logs read. Before

@@ -108,6 +108,58 @@ func TestSlotDeathGate_InsufficientLineIsThrottled(t *testing.T) {
 	}
 }
 
+// Hazard обязан попадать в ЛОГ, а не оставаться мёртвым кодом.
+//
+// Ревью 2026-08-12: функция не вызывалась нигде в проде (только в тестах), при
+// том что SKILL.md уже подал hazard-кривую как «правильную величину» и на этом
+// основании отменил прежнюю оценку окна 84–118с. Величина, которую никто не
+// читает, — не наблюдаемость; это тот же дефект, что и лечит вся правка.
+func TestSlotDeathGate_HazardCurveIsLogged(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	p := &WSPoolTransport{
+		slotDeaths:        slotobs.NewRecorder(512),
+		maxSlotAge:        75 * time.Second,
+		ageCutMinAge:      30 * time.Second,
+		stickyMaxDrainAge: DefaultStickyMaxDrainAge,
+		ageAdapter:        slotobs.NewAdapter(75 * time.Second),
+	}
+	SetGlobalPoolForStats(p)
+	t.Cleanup(func() { SetGlobalPoolForStats(nil) })
+
+	// Достаточная выборка резов, чтобы дойти до полного вывода, плюс плановые
+	// как знаменатель.
+	ages := []int64{85275, 88073, 88844, 92333, 99664, 100281, 104410, 106583,
+		106675, 110838, 112992, 114056}
+	vols := []int64{0, 162, 13365, 12880, 1710253, 9896, 5230692, 10333620,
+		10946, 11583, 79708, 339834}
+	for i := range ages {
+		p.slotDeaths.Record(slotobs.Observation{
+			AgeMs: ages[i], DownBytes: vols[i], CloseKind: "close_other",
+		})
+	}
+	for i := 0; i < 300; i++ {
+		p.slotDeaths.RecordPlanned(slotobs.Observation{AgeMs: int64(78_000 + i*20)})
+	}
+
+	logSlotDeathSummary()
+	out := buf.String()
+
+	if !strings.Contains(out, "slot death hazard") {
+		t.Fatalf("hazard-кривая не попала в лог — величина остаётся мёртвым кодом:\n%s", out)
+	}
+	// Полосы и поправка на цензурирование обязаны быть видны: без CensoredIn
+	// читатель не отличит честный знаменатель от раздутого.
+	for _, want := range []string{"band_", "reached", "cut", "censored_in", "rate"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("в hazard-строке нет %q:\n%s", want, out)
+		}
+	}
+}
+
 // Пустая выборка — тоже состояние, о котором надо сказать: «резов не было»
 // и «адаптер на конфиге» это разные утверждения, но оба содержательные.
 func TestSlotDeathGate_ZeroSamplesSpeaks(t *testing.T) {
@@ -159,10 +211,59 @@ func TestSlotDeathGate_ReportsPlannedDenominator(t *testing.T) {
 	logSlotDeathSummary()
 	out := buf.String()
 
-	for _, want := range []string{"planned_rotations=740", "cut_share="} {
+	// Две доли раздельно: несмещённая по пожизненным счётчикам и смещённая по
+	// содержимому рингов. Под одним именем `cut_share` их путали (ревью
+	// 2026-08-12): 8/748=0.0107 не сходилось с показанным 0.0154.
+	for _, want := range []string{
+		"planned_rotations=740",
+		"cut_share_lifetime=0.0107",
+		"cut_share_ring=0.0154",
+		"cut_share_ring_denom=520",
+	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("в строке нехватки данных нет %q:\n%s", want, out)
 		}
+	}
+}
+
+// Рост числа плановых ротаций обязан пробивать дроссель: именно это число
+// объясняет, почему резов мало. Иначе знаменатель растёт молча.
+func TestSlotDeathGate_PlannedGrowthBreaksThrottle(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	p := &WSPoolTransport{
+		slotDeaths:        slotobs.NewRecorder(512),
+		maxSlotAge:        75 * time.Second,
+		stickyMaxDrainAge: DefaultStickyMaxDrainAge,
+		ageAdapter:        slotobs.NewAdapter(75 * time.Second),
+	}
+	SetGlobalPoolForStats(p)
+	t.Cleanup(func() { SetGlobalPoolForStats(nil) })
+
+	for i := 0; i < 8; i++ {
+		p.slotDeaths.Record(slotobs.Observation{AgeMs: 85_000, CloseKind: "close_other"})
+	}
+	logSlotDeathSummary()
+
+	// Ещё сотня плановых при тех же 8 резах — состояние изменилось.
+	buf.Reset()
+	for i := 0; i < 100; i++ {
+		p.slotDeaths.RecordPlanned(slotobs.Observation{AgeMs: 75_000})
+	}
+	logSlotDeathSummary()
+	if !strings.Contains(buf.String(), "slot death observability") {
+		t.Error("рост плановых не пробил дроссель — знаменатель растёт молча")
+	}
+
+	// Но единичная плановая внутри той же сотни — не повод печатать снова.
+	buf.Reset()
+	p.slotDeaths.RecordPlanned(slotobs.Observation{AgeMs: 75_000})
+	logSlotDeathSummary()
+	if strings.Contains(buf.String(), "slot death observability") {
+		t.Error("печать на каждую плановую ротацию — вернулся шум")
 	}
 }
 
@@ -205,6 +306,35 @@ func TestSlotDeathGate_AboveThresholdStillAdapts(t *testing.T) {
 	if strings.Contains(out, "slot death observability") {
 		t.Errorf("строка нехватки данных напечатана при достаточной выборке:\n%s", out)
 	}
+}
+
+// Пул без адаптера не должен ронять stats-логгер.
+//
+// Adapter.Observe/Stats/Threshold nil-safe по коду (adapt.go), но защита не была
+// засторожена, а &WSPoolTransport{} с ageAdapter==nil в тестах уже живёт
+// (slot_death_metrics_test.go). Ревью 2026-08-12: nil-safety держалась только на
+// чтении adapt.go.
+func TestSlotDeathGate_NilAdapterDoesNotPanic(t *testing.T) {
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&bytes.Buffer{}, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	p := &WSPoolTransport{slotDeaths: slotobs.NewRecorder(64)} // ageAdapter == nil
+	SetGlobalPoolForStats(p)
+	t.Cleanup(func() { SetGlobalPoolForStats(nil) })
+
+	// Ниже порога — путь через строку нехватки данных.
+	p.slotDeaths.Record(slotobs.Observation{AgeMs: 85_000, CloseKind: "close_other"})
+	logSlotDeathSummary()
+
+	// И выше порога — полный путь с Observe/Stats.
+	for i := 0; i < minSlotDeathSamplesToLog; i++ {
+		p.slotDeaths.Record(slotobs.Observation{
+			AgeMs: int64(90_000 + i*100), DownBytes: int64(1000 * (i + 1) * (i + 1)),
+			CloseKind: "close_other",
+		})
+	}
+	logSlotDeathSummary()
 }
 
 // Адаптер должен получать Observe даже когда инференс вернул AxisUnknown:

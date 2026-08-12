@@ -39,7 +39,7 @@ func TestDrainPlanned_RecordedInTearDown(t *testing.T) {
 	}
 	body := code[idx : idx+end]
 
-	if !strings.Contains(body, "RecordPlanned(") {
+	if !strings.Contains(body, "recordPlannedRotation(") {
 		t.Error("tearDown не пишет плановую ротацию в slotobs: выборка останется " +
 			"цензурированной, а cut_share — невыводимым")
 	}
@@ -49,9 +49,17 @@ func TestDrainPlanned_RecordedInTearDown(t *testing.T) {
 		t.Error("tearDown пишет в РИНГ РЕЗОВ (Record вместо RecordPlanned) — " +
 			"порог был бы выведен из нашего же порога")
 	}
-	// Возраст обязателен: без него наблюдение не даёт ни знаменателя для
-	// hazard-полосы, ни вклада в cut_share по возрастной оси.
-	if !strings.Contains(body, "startedAtNs") {
+
+	// Возраст берётся из startedAtNs — проверяем в хелпере, куда вызов вынесен.
+	h := strings.Index(code, "func (p *WSPoolTransport) recordPlannedRotation(")
+	if h < 0 {
+		t.Fatal("нет хелпера recordPlannedRotation")
+	}
+	hRest := code[h:]
+	if hEnd := strings.Index(hRest[10:], "\nfunc "); hEnd > 0 {
+		hRest = hRest[:hEnd+10]
+	}
+	if !strings.Contains(hRest, "startedAtNs") {
 		t.Error("в плановом наблюдении нет возраста слота (startedAtNs) — " +
 			"hazard-кривую посчитать нельзя")
 	}
@@ -80,9 +88,9 @@ func TestDrainPlanned_RecordOnCommonPath(t *testing.T) {
 	}
 	body := code[idx : idx+end]
 
-	rec := strings.Index(body, "RecordPlanned(")
+	rec := strings.Index(body, "recordPlannedRotation(")
 	if rec < 0 {
-		t.Fatal("RecordPlanned отсутствует (покрыто соседним тестом)")
+		t.Fatal("recordPlannedRotation отсутствует (покрыто соседним тестом)")
 	}
 	// switch по cause заканчивается на закрывающей скобке перед
 	// DrainDurationSeconds — вызов должен быть ПОСЛЕ него, на общем пути.
@@ -93,6 +101,65 @@ func TestDrainPlanned_RecordOnCommonPath(t *testing.T) {
 	if rec < common {
 		t.Error("RecordPlanned вызывается внутри switch по причине — часть путей " +
 			"выхода (sticky/phantom/hard cap) не попадёт в выборку")
+	}
+}
+
+// Принудительные вытеснения ячеек — тоже НАШИ смены слота, и они минуют
+// tearDown (ревью 2026-08-12).
+//
+// tryForceEvictIdleSlot и tryEmergencyEvictMinStreamsSlot зовут handleSlotDeath
+// напрямую, поэтому первая версия правки их не записывала. Заявление «все
+// инициированные нами смены слота» было неверным, а последствие хуже простого
+// недосчёта: пропуск выживших ЗАНИЖАЕТ знаменатель hazard и ЗАВЫШАЕТ Rate, то
+// есть смещает в сторону, противоположную цензурированию внутри полосы. Два
+// смещения разного знака дают суммарную ошибку, непредсказуемую по направлению.
+//
+// Вытеснения происходят, когда пул забит и ротация застряла — то есть в самых
+// интересных для анализа условиях.
+func TestDrainPlanned_EvictPathsAlsoRecord(t *testing.T) {
+	src, err := os.ReadFile("ws_pool_drain.go")
+	if err != nil {
+		t.Fatalf("не прочитан ws_pool_drain.go: %v", err)
+	}
+	code := string(src)
+
+	for _, fn := range []string{
+		"func (p *WSPoolTransport) tryForceEvictIdleSlot(",
+		"func (p *WSPoolTransport) tryEmergencyEvictMinStreamsSlot(",
+	} {
+		idx := strings.Index(code, fn)
+		if idx < 0 {
+			t.Fatalf("не найдена %s — тест устарел, обновить якорь", fn)
+		}
+		// Границей берём начало следующей функции верхнего уровня.
+		rest := code[idx+len(fn):]
+		end := strings.Index(rest, "\nfunc ")
+		if end < 0 {
+			end = len(rest)
+		}
+		body := rest[:end]
+
+		if !strings.Contains(body, "recordPlannedRotation(") {
+			t.Errorf("%s не пишет плановую ротацию: выжившие потеряны, hazard завышен", fn)
+		}
+	}
+}
+
+// Общий хелпер, а не копия вызова в каждом месте: три копии разъехались бы при
+// первой правке полей Observation.
+func TestDrainPlanned_RecordViaSharedHelper(t *testing.T) {
+	src, err := os.ReadFile("ws_pool_drain.go")
+	if err != nil {
+		t.Fatalf("не прочитан ws_pool_drain.go: %v", err)
+	}
+	code := string(src)
+
+	if !strings.Contains(code, "func (p *WSPoolTransport) recordPlannedRotation(") {
+		t.Fatal("нет хелпера recordPlannedRotation — запись размазана по местам вызова")
+	}
+	// Ровно один вызов RecordPlanned на весь клиент: внутри хелпера.
+	if got := strings.Count(code, "slotDeaths.RecordPlanned("); got != 1 {
+		t.Errorf("вызовов slotDeaths.RecordPlanned = %d, ожидался 1 (только в хелпере)", got)
 	}
 }
 
