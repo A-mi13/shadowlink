@@ -3,6 +3,7 @@ package client
 import (
 	"sync"
 	"testing"
+	"time"
 )
 
 // stream_counter_leak_test.go — spec 2026-06-01 stream-counter-leak-fix.
@@ -290,26 +291,154 @@ func TestHandleStreamClose_CounterMatchesMapAfterCloses(t *testing.T) {
 	}
 }
 
-// Сторож двойного учёта: handleSlotDeath обнуляет счётчик через Store(0) ПОСЛЕ
-// закрытия стримов, поэтому декремент в handleStreamClose на этом пути не должен
-// давать отрицательных значений.
+// Сторож двойного учёта на пути handleSlotDeath.
+//
+// Зовёт РЕАЛЬНЫЙ handleSlotDeath, а не эмулирует его (ревью 2026-08-12: первая
+// версия теста делала streams.Store(0) руками ПО ИНДЕКСУ, тогда как
+// handleSlotDeath делает это по захваченному в начале функции УКАЗАТЕЛЮ —
+// различие невидимо, пока ячейку не подменяют, но именно в нём весь риск).
+//
+// Счётчик проверяется на захваченном ДО вызова указателе: если handleSlotDeath
+// обнулит другой объект, тест это увидит.
 func TestHandleStreamClose_SlotDeathPathNoDoubleCount(t *testing.T) {
 	p, cl := newResumeTestPool(t, 2)
 	p.slots[0].state.Store(int32(slotReady))
+	p.slots[1].state.Store(int32(slotReady))
+	// Миграция выключена: с ней handleSlotDeath уводит стримы через
+	// resumeStreamOnDeath и до closeStream не доходит, то есть проверяемый путь
+	// не исполняется.
+	p.migrateEnabled.Store(false)
 
-	// Три стрима на слоте 0.
+	victim := p.slots[0]
 	for i := 0; i < 3; i++ {
-		p.slots[0].streams.Add(1)
+		victim.streams.Add(1)
 		p.streamMap.Store(uint16(300+i), newStreamEntry(0))
 	}
-	// Эмулируем то, что делает handleSlotDeath: закрыть стримы, затем Store(0).
-	for i := 0; i < 3; i++ {
-		p.handleStreamClose(cl, uint16(300+i))
-	}
-	p.slots[0].streams.Store(0)
 
-	if got := p.slots[0].streams.Load(); got != 0 {
-		t.Errorf("счётчик = %d, ожидался 0 (двойной учёт или остаток)", got)
+	p.handleSlotDeath(cl, 0, deathCauseDrainTeardown)
+
+	if got := victim.streams.Load(); got != 0 {
+		t.Errorf("счётчик захваченного слота = %d, ожидался 0 — либо остаток, "+
+			"либо Store(0) лёг на другой объект", got)
+	}
+	var left int
+	p.streamMap.Range(func(_, _ any) bool { left++; return true })
+	if left != 0 {
+		t.Errorf("в карте осталось %d записей после смерти слота", left)
+	}
+}
+
+// ============================================================================
+// Гонка декремента: Load+Delete неатомарен (ревью 2026-08-12)
+// ============================================================================
+//
+// Первая версия фикса (22a4504) декрементировала так:
+//
+//	if v, ok := streamMap.Load(id); ok { ...dec... }
+//	streamMap.Delete(id)
+//
+// Между Load и Delete нет атомарности: две горутины проходят Load с ok=true,
+// обе декрементируют — счётчик занижается на единицу ЖИВОГО стрима.
+//
+// Это опаснее исходной утечки: знак ошибки перевернулся. Завышение лишь
+// удерживало ячейку, занижение до нуля роняет слот с живыми стримами
+// (ws_pool_drain.go: ветки `streams.Load() == 0` → tearDown), клиент закрывает
+// каналы, SOCKS получает EOF посреди передачи — потеря данных. Плюс
+// isPhantomCounter от занижения слеп по конструкции: он требует counter > 0.
+//
+// Окно расширяется ШТАТНЫМ средством кода: reserveMu, на котором обе горутины
+// блокируются внутри slotAt — уже ПОСЛЕ своего Load. В проде этот мьютекс
+// удерживают connectSlot, handleSlotDeath, claimFreeSlot и каждый slotAt, так
+// что расширитель не искусственный. Поэтому сторож детерминирован и НЕ требует
+// -race (недоступного на Windows-dev, hard rule 6).
+//
+// Кто зовёт параллельно в проде:
+//   - handleStreamClose ‖ ReleaseStream: сервер прислал FlagStreamClose
+//     (ws_pool.go, ридер слота) → канал закрыт → SOCKS-хендлер в СВОЕЙ горутине
+//     идёт в CloseStream → defer ReleaseStream (client.go:894). Закрытие канала
+//     будит вторую горутину, но не ждёт её;
+//   - handleStreamClose ‖ handleStreamClose: два ридера разных слотов —
+//     RESUME-fallback доставляет FlagStreamClose на слоте B, пока streamMap
+//     ещё указывает на A (комментарий у FlagStreamClose это описывает);
+//   - handleStreamClose ‖ цикл handleSlotDeath.
+func TestStreamCounterRace_CloseVersusRelease(t *testing.T) {
+	p, cl := newResumeTestPool(t, 2)
+	p.slots[0].state.Store(int32(slotReady))
+
+	// 4 живых стрима, закрываем ровно один.
+	p.slots[0].streams.Store(4)
+	for id := 10; id < 14; id++ {
+		p.streamMap.Store(uint16(id), newStreamEntry(0))
+	}
+
+	p.reserveMu.Lock() // окно открыто: slotAt в обоих путях встанет здесь
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); p.handleStreamClose(cl, 10) }()
+	go func() { defer wg.Done(); p.ReleaseStream(10) }()
+	time.Sleep(50 * time.Millisecond) // обе прошли Load, стоят на slotAt
+	p.reserveMu.Unlock()
+	wg.Wait()
+
+	if got := p.slots[0].streams.Load(); got != 3 {
+		t.Errorf("двойной декремент: streams=%d вместо 3 — съеден живой стрим; "+
+			"такой слот порвут как «без стримов», а стримы на нём живы", got)
+	}
+}
+
+func TestStreamCounterRace_TwoHandleStreamClose(t *testing.T) {
+	p, cl := newResumeTestPool(t, 2)
+	p.slots[0].state.Store(int32(slotReady))
+
+	p.slots[0].streams.Store(4)
+	for id := 10; id < 14; id++ {
+		p.streamMap.Store(uint16(id), newStreamEntry(0))
+	}
+
+	p.reserveMu.Lock()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); p.handleStreamClose(cl, 10) }()
+	go func() { defer wg.Done(); p.handleStreamClose(cl, 10) }()
+	time.Sleep(50 * time.Millisecond)
+	p.reserveMu.Unlock()
+	wg.Wait()
+
+	if got := p.slots[0].streams.Load(); got != 3 {
+		t.Errorf("двойной декремент: streams=%d вместо 3", got)
+	}
+}
+
+// Последовательный двойной путь: сервер закрыл стрим, затем SOCKS освободил тот
+// же id. Безопасен и до правки (второй Load промахивается), но фиксируем как
+// инвариант — именно его наличие маскировало конкурентный случай.
+func TestStreamCounterRace_SequentialBothPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		order func(p *WSPoolTransport, cl *Client)
+	}{
+		{"close_then_release", func(p *WSPoolTransport, cl *Client) {
+			p.handleStreamClose(cl, 10)
+			p.ReleaseStream(10)
+		}},
+		{"release_then_close", func(p *WSPoolTransport, cl *Client) {
+			p.ReleaseStream(10)
+			p.handleStreamClose(cl, 10)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, cl := newResumeTestPool(t, 2)
+			p.slots[0].state.Store(int32(slotReady))
+			p.slots[0].streams.Store(2)
+			p.streamMap.Store(uint16(10), newStreamEntry(0))
+			p.streamMap.Store(uint16(11), newStreamEntry(0))
+
+			tc.order(p, cl)
+
+			if got := p.slots[0].streams.Load(); got != 1 {
+				t.Errorf("streams=%d вместо 1 (стрим 11 остаётся живым)", got)
+			}
+		})
 	}
 }
 

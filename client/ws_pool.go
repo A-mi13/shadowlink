@@ -653,13 +653,24 @@ func (p *WSPoolTransport) staggerSpan() time.Duration {
 // лишь, что редкая ячейка в окно наблюдения не попала. max=127.6s на 08-11
 // границу max()=111.5s пробивает, что подтверждает: занижать нельзя.
 //
-// ⚠ Слагаемое deferred в поле НЕ НАБЛЮДАЛОСЬ ни разу: no-free-cell = 0 и
-// storm-brake = 0 в обоих прогонах 08-12 (grep по логам). Единственная реально
-// наблюдаемая отсрочка — `drain deferred (inflight cap)`, 3 и 1 событие, и её в
-// бюджете нет вовсе. При этом она доказанно опасна: 20260812-110200, slot=10 —
-// отсрочка на возрасте 85.7s, рез через 7.8s. То есть бюджет моделирует ветку,
-// которая молчит, и не моделирует ту, что стреляет. Это отдельная работа
-// (приоритет: очередь дренажа для слота, перешагнувшего порог).
+// ⚠ Про наблюдаемость слагаемого deferred, уточнено ревью 2026-08-12.
+//
+// Ветка, дающая в бюджет 30s (no-free-cell), в поле НЕ наблюдалась: 0 событий в
+// обоих прогонах 08-12. Ветка на 5s наблюдалась — это `drain deferred (inflight
+// cap)`, и `drainStormBrakeBackoff` применяется ИМЕННО В НЕЙ
+// (ws_pool_drain.go:514), отдельной storm-brake-ветки в коде нет. Прежняя
+// формулировка «storm-brake = 0» противопоставляла их как разные и была ложной.
+//
+// Счёт по строкам лога занижает: они дросселируются на 30s
+// (drainDeferredLogInterval), и в прогоне 110200 три напечатанные строки несут
+// total_count = 1, 4, 5 — то есть событий было минимум 5, не 3.
+//
+// Слагаемое 30s остаётся в бюджете как ХУДШАЯ из двух ветвей (обоснование ниже),
+// но эмпирической опоры под самой веткой нет — она ни разу не сработала.
+// Отдельно: наблюдаемая 5-секундная отсрочка доказанно опасна (20260812-110200,
+// slot=10 — отсрочка на возрасте 85.7s, рез через 7.8s), а в бюджет она не
+// входит вовсе. Это отдельная работа: очередь дренажа для слота, перешагнувшего
+// порог возраста.
 //
 // # Почему deferred = 30s, а не 5s
 //
@@ -672,11 +683,14 @@ func (p *WSPoolTransport) staggerSpan() time.Duration {
 // счётчик говорит «событие было», бюджет — «ячейка не доживёт»; это разные
 // утверждения.
 //
-// ⚠ Прежняя оценка частоты («12 событий storm-brake за час, 4 no-free-cell»)
-// на прогонах 08-12 не подтвердилась: обе ветки дали НОЛЬ событий. Выбор 30s
-// остаётся как консервативный (худшая из двух ветвей), но эмпирической опоры
-// под ним сейчас нет — при следующем разборе стоит проверить, не мертвы ли обе
-// ветки вовсе, и не заменить ли слагаемое на наблюдаемую отсрочку inflight-cap.
+// ⚠ Прежняя оценка частоты («12 событий storm-brake за час, 4 no-free-cell») на
+// прогонах 08-12 не подтвердилась. Уточнено ревью 2026-08-12: no-free-cell дала
+// НОЛЬ событий в обоих прогонах, а 5-секундная ветка (inflight cap, в ней и
+// применяется drainStormBrakeBackoff) — минимум 5 и 1 соответственно по
+// total_count. Выбор 30s остаётся консервативным (худшая ветвь), но опирается на
+// свойство ветки, а не на замер: сама она не срабатывала. При следующем разборе
+// стоит проверить, достижима ли no-free-cell вообще, и не добавить ли в бюджет
+// наблюдаемую отсрочку inflight-cap — сейчас её там нет.
 //
 // ⚠ Не учтён drainCatastrophicBackoff (150s, ws_pool_drain.go:519-522) — ветка
 // capacity floor при ready < poolSize/2. Бюджет её не моделирует ни до, ни
@@ -3315,14 +3329,28 @@ func (p *WSPoolTransport) ReleaseStream(streamID uint16) {
 	// gone stream was the only active one → tearDown fires while Release
 	// hasn't completed counter decrement → silent drop or decrypt_fails.
 	//
-	// Read entry via Load first (need slotIdx), then decrement counter,
-	// then Delete from map. Trade: not atomic vs old LoadAndDelete, but
-	// SOCKS layer guarantees one owner per streamID so double-Release
-	// requires a future bug (defense-in-depth via inner type checks).
-	if v, ok := p.streamMap.Load(streamID); ok {
+	// LoadAndDelete, а НЕ Load+Delete (возврат к атомарности, 2026-08-12).
+	//
+	// Здесь стоял Load+Delete с доводом: «not atomic vs old LoadAndDelete, but
+	// SOCKS layer guarantees one owner per streamID». Довод перестал держать,
+	// когда декремент появился и в handleStreamClose: тот зовётся НЕ из SOCKS
+	// (ридеры слотов по FlagStreamClose от сервера + цикл handleSlotDeath), то
+	// есть гарантия одного владельца на него не распространяется. Два пути
+	// декремента на одном ключе + неатомарный Load+Delete = обе горутины видят
+	// ok=true и декрементируют дважды.
+	//
+	// Цена ошибки перевёрнута по знаку и потому серьёзнее исходной утечки:
+	// завышение лишь удерживало ячейку, занижение до нуля роняет слот с ЖИВЫМИ
+	// стримами (drainWatchdog: ветки `streams.Load() == 0` → tearDown), клиент
+	// закрывает их каналы, SOCKS получает EOF посреди передачи. isPhantomCounter
+	// от этого не защищает: он требует counter > 0.
+	//
+	// LoadAndDelete атомарен — ровно один вызывающий получает loaded=true.
+	// Инвариант R2-H2 («dec не позже удаления записи») соблюдён СИЛЬНЕЕ ручного
+	// порядка: окна «запись удалена, а счётчик ещё высок» не существует вовсе.
+	if v, loaded := p.streamMap.LoadAndDelete(streamID); loaded {
 		e, ok := v.(*streamEntry)
 		if !ok {
-			p.streamMap.Delete(streamID)
 			return
 		}
 		// Spec 2026-06-01 (counter-leak fix, F3): capture the slot pointer under
@@ -3334,7 +3362,6 @@ func (p *WSPoolTransport) ReleaseStream(streamID uint16) {
 		if slot := p.slotAt(e.slotIdx); slot != nil {
 			decStreamsFloor(slot)
 		}
-		p.streamMap.Delete(streamID)
 	}
 }
 
@@ -4181,25 +4208,46 @@ func (p *WSPoolTransport) handleStreamClose(cl *Client, streamID uint16) {
 	// Фикс 2026-08-11 (a223cb9) лечил последствие: слот перестал висеть весь
 	// teardown_cap и рвётся за ~1s. Причина оставалась здесь.
 	//
-	// Порядок (dec до Delete) — тот же инвариант, что в ReleaseStream (R2-H2):
-	// иначе drainWatchdog может увидеть streams.Load()>0 при уже удалённой из
-	// карты записи и решить, что стримы не простаивают.
+	// LoadAndDelete, а НЕ Load+Delete. Первая версия правки (22a4504) сделала
+	// именно Load+Delete и тем внесла ГОНКУ хуже исходной утечки: два пути
+	// декремента на одном ключе (этот и ReleaseStream) при неатомарном
+	// Load+Delete позволяют обеим горутинам получить ok=true и декрементировать
+	// дважды — то есть съесть единицу ЖИВОГО стрима.
+	//
+	// Знак ошибки при этом переворачивается с безопасного на опасный: завышение
+	// счётчика лишь удерживало ячейку, а занижение до нуля роняет слот с живыми
+	// стримами (drainWatchdog: ветки `streams.Load() == 0` → tearDown) → каналы
+	// закрываются → SOCKS получает EOF посреди передачи. isPhantomCounter здесь
+	// не спасает: он требует counter > 0 и против занижения слеп по конструкции.
+	//
+	// Кто зовёт параллельно: (1) ридер слота по FlagStreamClose от сервера ‖
+	// SOCKS-хендлер, идущий в CloseStream → defer ReleaseStream (client.go) —
+	// закрытие канала будит вторую горутину, но не ждёт её; (2) два ридера
+	// разных слотов, когда RESUME-fallback доставляет FlagStreamClose на слоте B,
+	// пока streamMap ещё указывает на A; (3) этот вызов ‖ цикл handleSlotDeath.
+	// Ни один из них не из SOCKS-слоя, поэтому гарантия «один владелец на
+	// streamID», которой обосновывался Load+Delete в ReleaseStream, здесь
+	// неприменима.
 	//
 	// Захват указателя через slotAt (под reserveMu), а не dec по индексу: если
 	// ячейку подменили (death+reconnect) между Assign и закрытием, dec по индексу
-	// увёл бы свежий обнулённый объект в минус. decStreamsFloor дополнительно
-	// клампит по нулю (F3, 2026-06-01).
+	// увёл бы свежий обнулённый объект в минус. decStreamsFloor клампит по нулю
+	// (F3, 2026-06-01).
 	//
-	// На пути handleSlotDeath (:4196) этот декремент безвреден: там после
-	// закрытия всех стримов идёт streams.Store(0), то есть двойного учёта нет.
-	if v, ok := p.streamMap.Load(streamID); ok {
+	// ⚠ На пути handleSlotDeath двойного учёта нет, но не потому, что «там же
+	// Store(0)»: тот применяется к указателю, захваченному в начале
+	// handleSlotDeath, а каждый вызов отсюда делает свой свежий slotAt и при
+	// подмене ячейки мог бы адресовать другой объект. Спасает tryMarkDead,
+	// закрывающий окно подмены на время teardown. Сторож —
+	// TestHandleStreamClose_SlotDeathPathNoDoubleCount (зовёт РЕАЛЬНЫЙ
+	// handleSlotDeath и проверяет счётчик на захваченном заранее указателе).
+	if v, loaded := p.streamMap.LoadAndDelete(streamID); loaded {
 		if e, isEntry := v.(*streamEntry); isEntry {
 			if slot := p.slotAt(e.slotIdx); slot != nil {
 				decStreamsFloor(slot)
 			}
 		}
 	}
-	p.streamMap.Delete(streamID)
 	cl.streamMu.Lock()
 	if ch, ok := cl.streamChans[streamID]; ok {
 		close(ch)
