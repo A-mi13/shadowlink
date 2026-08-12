@@ -161,6 +161,158 @@ func TestReleaseStream_AfterSlotReplaced_NoNegative(t *testing.T) {
 	}
 }
 
+// ============================================================================
+// Вторая утечка декремента: handleStreamClose (найдена 2026-08-12)
+// ============================================================================
+//
+// Правка 2026-06-01 выше закрыла утечку на пути rebindStreamToSlot. Но осталась
+// вторая, по другому пути, и именно она давала фантомный счётчик в поле.
+//
+// AssignStream делает streams.Add(1) + streamMap.Store. Освобождение идёт двумя
+// путями, и декремент был только в одном:
+//
+//	ReleaseStream     — Load, decStreamsFloor, Delete   ← декремент ЕСТЬ
+//	handleStreamClose — Delete                          ← декремента НЕ БЫЛО
+//
+// Второй путь не редкость: сервер присылает FlagStreamClose при смерти origin
+// TCP (ws_pool.go:3719) — это штатное завершение стрима. Плюс ветка
+// неразбираемого migration-кадра (:4139).
+//
+// Полевая цена: counter_streams>0 при map_streams=0 в 28.1% дренажей прогона
+// 110200 и 34.4% прогона 140930 (z=2.48, доля РОСЛА). Фикс 2026-08-11 лечил
+// последствие — слот перестал висеть весь teardown_cap, — но расхождение
+// оставалось. Это его причина.
+//
+// Исключение: handleSlotDeath (:4196) зовёт closeStream в цикле, но затем делает
+// streams.Store(0). Там декремент был бы двойным учётом — сторожевой тест ниже.
+func TestHandleStreamClose_DecrementsCounter(t *testing.T) {
+	p, cl := newResumeTestPool(t, 2)
+	p.slots[0].state.Store(int32(slotReady))
+
+	const sid = uint16(4242)
+	p.slots[0].streams.Store(1)
+	p.streamMap.Store(sid, newStreamEntry(0))
+
+	p.handleStreamClose(cl, sid)
+
+	if _, ok := p.streamMap.Load(sid); ok {
+		t.Error("запись осталась в streamMap после handleStreamClose")
+	}
+	if got := p.slots[0].streams.Load(); got != 0 {
+		t.Errorf("счётчик слота = %d после handleStreamClose, ожидался 0 — "+
+			"это и есть утечка, дающая фантомный счётчик", got)
+	}
+}
+
+// Двойное закрытие не должно уводить счётчик ниже нуля.
+func TestHandleStreamClose_DoubleCloseNoNegative(t *testing.T) {
+	p, cl := newResumeTestPool(t, 2)
+	p.slots[0].state.Store(int32(slotReady))
+
+	const sid = uint16(777)
+	p.slots[0].streams.Store(1)
+	p.streamMap.Store(sid, newStreamEntry(0))
+
+	p.handleStreamClose(cl, sid)
+	p.handleStreamClose(cl, sid) // записи в карте уже нет
+
+	if got := p.slots[0].streams.Load(); got != 0 {
+		t.Errorf("счётчик = %d после двойного закрытия, ожидался 0", got)
+	}
+}
+
+// Закрытие неизвестного стрима не трогает чужие счётчики.
+func TestHandleStreamClose_UnknownStreamLeavesCountersAlone(t *testing.T) {
+	p, cl := newResumeTestPool(t, 2)
+	p.slots[0].streams.Store(3)
+	p.slots[1].streams.Store(2)
+
+	p.handleStreamClose(cl, 9999)
+
+	if got := p.slots[0].streams.Load(); got != 3 {
+		t.Errorf("slot0 streams=%d, ожидалось 3", got)
+	}
+	if got := p.slots[1].streams.Load(); got != 2 {
+		t.Errorf("slot1 streams=%d, ожидалось 2", got)
+	}
+}
+
+// Декремент по ЗАХВАЧЕННОМУ указателю, не по индексу: если ячейку подменили
+// между Assign и закрытием, свежий обнулённый объект не должен уйти в минус.
+// Тот же довод, что в ReleaseStream (F3, 2026-06-01).
+func TestHandleStreamClose_SurvivesCellReplacement(t *testing.T) {
+	p, cl := newResumeTestPool(t, 2)
+	p.slots[0].state.Store(int32(slotReady))
+
+	const sid = uint16(555)
+	p.slots[0].streams.Store(1)
+	p.streamMap.Store(sid, newStreamEntry(0))
+
+	// death+reconnect: свежий объект с нулевым счётчиком.
+	p.reserveMu.Lock()
+	fresh := &poolSlot{index: 0}
+	fresh.setState(slotReady)
+	p.slots[0] = fresh
+	p.reserveMu.Unlock()
+
+	p.handleStreamClose(cl, sid)
+
+	if got := fresh.streams.Load(); got < 0 {
+		t.Errorf("свежая ячейка ушла в минус: streams=%d", got)
+	}
+}
+
+// Инвариант, который ломался в поле: после серии штатных FlagStreamClose сумма
+// счётчиков обязана совпасть с числом записей в карте (обе нули).
+func TestHandleStreamClose_CounterMatchesMapAfterCloses(t *testing.T) {
+	p, cl := newResumeTestPool(t, 2)
+	p.slots[0].state.Store(int32(slotReady))
+	p.slots[1].state.Store(int32(slotReady))
+
+	const n = 50
+	for i := 0; i < n; i++ {
+		idx := i % 2
+		p.slots[idx].streams.Add(1)
+		p.streamMap.Store(uint16(1000+i), newStreamEntry(idx))
+	}
+	for i := 0; i < n; i++ {
+		p.handleStreamClose(cl, uint16(1000+i))
+	}
+
+	var mapCount int
+	p.streamMap.Range(func(_, _ any) bool { mapCount++; return true })
+
+	if mapCount != 0 {
+		t.Errorf("в карте осталось %d записей", mapCount)
+	}
+	if sum := poolLiveStreamSum(p); sum != 0 {
+		t.Errorf("сумма счётчиков = %d при пустой карте — фантом (%d стримов закрыто)", sum, n)
+	}
+}
+
+// Сторож двойного учёта: handleSlotDeath обнуляет счётчик через Store(0) ПОСЛЕ
+// закрытия стримов, поэтому декремент в handleStreamClose на этом пути не должен
+// давать отрицательных значений.
+func TestHandleStreamClose_SlotDeathPathNoDoubleCount(t *testing.T) {
+	p, cl := newResumeTestPool(t, 2)
+	p.slots[0].state.Store(int32(slotReady))
+
+	// Три стрима на слоте 0.
+	for i := 0; i < 3; i++ {
+		p.slots[0].streams.Add(1)
+		p.streamMap.Store(uint16(300+i), newStreamEntry(0))
+	}
+	// Эмулируем то, что делает handleSlotDeath: закрыть стримы, затем Store(0).
+	for i := 0; i < 3; i++ {
+		p.handleStreamClose(cl, uint16(300+i))
+	}
+	p.slots[0].streams.Store(0)
+
+	if got := p.slots[0].streams.Load(); got != 0 {
+		t.Errorf("счётчик = %d, ожидался 0 (двойной учёт или остаток)", got)
+	}
+}
+
 // TestNextStreamID_SkipsIDInFramesChans — F4: NextStreamID must not hand out an
 // ID already live in streamFramesChans (migration-mode streams register there,
 // not in streamChans). A collision makes AssignStream's dup-guard skip the inc.

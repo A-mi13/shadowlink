@@ -151,6 +151,72 @@ func TestSlotDeathGate_HazardCurveIsLogged(t *testing.T) {
 	if !strings.Contains(out, "slot death hazard") {
 		t.Fatalf("hazard-кривая не попала в лог — величина остаётся мёртвым кодом:\n%s", out)
 	}
+}
+
+// Hazard обязан печататься и НИЖЕ порога инференса.
+//
+// Полевой прогон 20260812-140930 (1ч43м): 6 резов против порога 12, и строка
+// `slot death hazard` не появилась ни разу — вызов стоял ПОСЛЕ раннего return
+// гейта. То есть я повторил ровно тот дефект, который этой серией правок и
+// лечил: величину заперли за порогом, который в поле не достигается.
+//
+// Hazard от порога инференса не зависит по смыслу: он считается по знаменателю
+// из ПЛАНОВЫХ ротаций (их 601 за прогон), а не по резам. Порог 12 существует
+// для CV и перцентилей смертей, к hazard он отношения не имеет.
+func TestSlotDeathGate_HazardLoggedBelowInferenceThreshold(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	p := &WSPoolTransport{
+		slotDeaths:        slotobs.NewRecorder(512),
+		maxSlotAge:        75 * time.Second,
+		ageCutMinAge:      30 * time.Second,
+		stickyMaxDrainAge: DefaultStickyMaxDrainAge,
+		ageAdapter:        slotobs.NewAdapter(75 * time.Second),
+	}
+	SetGlobalPoolForStats(p)
+	t.Cleanup(func() { SetGlobalPoolForStats(nil) })
+
+	// Полевая ситуация: резов МЕНЬШЕ порога, плановых много.
+	for i := 0; i < 6; i++ {
+		p.slotDeaths.Record(slotobs.Observation{AgeMs: int64(85_000 + i*500), CloseKind: "close_other"})
+	}
+	for i := 0; i < 601; i++ {
+		p.slotDeaths.RecordPlanned(slotobs.Observation{AgeMs: int64(76_000 + i*10)})
+	}
+
+	logSlotDeathSummary()
+	out := buf.String()
+
+	// Сводка и вывод порога молчат — данных правда мало.
+	if strings.Contains(out, "slot death distribution") {
+		t.Errorf("сводка напечатана при 6 резах (порог %d):\n%s", minSlotDeathSamplesToLog, out)
+	}
+	// А hazard — нет: его знаменатель есть.
+	if !strings.Contains(out, "slot death hazard") {
+		t.Fatalf("hazard заперт за порогом инференса — повтор того же дефекта:\n%s", out)
+	}
+
+	// И он тоже обязан дросселироваться: вызов идёт каждые 5s, а кривая меняется
+	// только при новых наблюдениях. Иначе перенос выше гейта вернул бы 720
+	// строк/час — тот же шум, что лечили в 9563dad.
+	buf.Reset()
+	for i := 0; i < 10; i++ {
+		logSlotDeathSummary()
+	}
+	if got := strings.Count(buf.String(), "slot death hazard"); got != 0 {
+		t.Errorf("hazard напечатан %d раз за 10 тиков без новых наблюдений — шум", got)
+	}
+
+	// Новое наблюдение — кривая изменилась, печатаем.
+	buf.Reset()
+	p.slotDeaths.Record(slotobs.Observation{AgeMs: 88_000, CloseKind: "close_other"})
+	logSlotDeathSummary()
+	if got := strings.Count(buf.String(), "slot death hazard"); got != 1 {
+		t.Errorf("при новом резе hazard не напечатан (got=%d) — потеря наблюдаемости", got)
+	}
 	// Полосы и поправка на цензурирование обязаны быть видны: без CensoredIn
 	// читатель не отличит честный знаменатель от раздутого.
 	for _, want := range []string{"band_", "reached", "cut", "censored_in", "rate"} {

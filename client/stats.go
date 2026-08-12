@@ -1148,6 +1148,19 @@ func logSlotDeathSummary() {
 		return
 	}
 	s := pool.slotDeaths.Summarize()
+
+	// Hazard — ДО гейта: его знаменатель составляют ПЛАНОВЫЕ ротации, а не резы,
+	// поэтому к порогу minSlotDeathSamplesToLog он отношения не имеет. Порог
+	// существует для CV и перцентилей смертей.
+	//
+	// Первая версия (e1f8c3c) ставила этот вызов ниже раннего return, и полевой
+	// прогон 20260812-140930 это поймал: 6 резов против порога 12, 601 плановая
+	// ротация — и ни одной строки `slot death hazard` за 1ч43м. То есть правка,
+	// лечившая «величину заперли за недостижимым порогом», сама повторила этот
+	// дефект. Гейт наблюдаемости обязан быть узким: он про доверие к перцентилям,
+	// а не про право что-либо печатать.
+	logSlotDeathHazard(pool)
+
 	if s.Count < minSlotDeathSamplesToLog {
 		// Нехватка данных — СОСТОЯНИЕ, о котором надо сказать, а не молчать.
 		//
@@ -1338,8 +1351,6 @@ func logSlotDeathSummary() {
 		"reason", v.Reason,
 	)
 
-	logSlotDeathHazard(pool)
-
 	// Отрицательный запас — уровень INFO, не WARN (понижено 2026-08-10 по
 	// замеру двух полевых прогонов).
 	//
@@ -1455,6 +1466,21 @@ func logSlotDeathHazard(pool *WSPoolTransport) {
 		return
 	}
 
+	// Дроссель: кривая меняется только при новых наблюдениях, а зовут нас каждые
+	// 5s. Без этого перенос вызова выше гейта дал бы 720 строк/час — тот шум,
+	// который лечили в 9563dad. Ключ — пара пожизненных счётчиков: любое новое
+	// наблюдение в любом ринге меняет кривую, отсутствие новых не меняет ничего.
+	// Резы — по сырому счётчику: их единицы за прогон, и каждый меняет кривую
+	// содержательно. Плановые — бакетом по 100: их сотни, и печатать на каждую
+	// значило бы вернуть шум с другой стороны.
+	hkey := hazardLogKey{
+		cuts:          pool.slotDeaths.Total(),
+		plannedBucket: pool.slotDeaths.TotalPlanned() / 100,
+	}
+	if pool.lastHazardLog.Swap(hkey) == hkey {
+		return
+	}
+
 	floorMs := pool.ageCutFloor().Milliseconds()
 	if floorMs <= 0 {
 		floorMs = 30_000
@@ -1482,6 +1508,13 @@ func logSlotDeathHazard(pool *WSPoolTransport) {
 		)
 	}
 	slog.Info("slot death hazard (risk among survivors)", attrs...)
+}
+
+// hazardLogKey — состояние, при неизменности которого hazard-кривую повторять не
+// нужно. Резы по сырому счётчику (их единицы), плановые бакетом по 100 (их сотни).
+type hazardLogKey struct {
+	cuts          uint64
+	plannedBucket uint64
 }
 
 const (
