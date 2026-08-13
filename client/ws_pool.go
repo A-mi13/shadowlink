@@ -832,12 +832,24 @@ const maxConcurrentDrainsFraction = 0.5
 // catch up.
 //
 // Decoupled 2026-05-24 from maxConcurrentDrainsFraction (previously both
-// derived from a single rotationStormBrakeFraction=0.25 constant). The
-// canary 2026-05-24-evening proved this gate never triggers in steady
-// state (0 defers over 4h), so it's set independently of the inflight
-// cap. Value 0.75 preserves the prior floor at most poolSizes (the
-// floor stays unchanged for poolSize ∈ {2, 4, 6, 8, 16}) — purely
-// decoupling, no behavior change for the capacity-floor branch.
+// derived from a single rotationStormBrakeFraction=0.25 constant). Value
+// 0.75 preserves the prior floor at most poolSizes (the floor stays
+// unchanged for poolSize ∈ {2, 4, 6, 8, 16}) — purely decoupling, no
+// behavior change for the capacity-floor branch.
+//
+// ⚠ УСТАРЕЛО (2026-08-13): здесь стояло «canary 2026-05-24-evening proved
+// this gate never triggers in steady state (0 defers over 4h)». Замер при
+// SHADOWLINK_MAX_SLOT_AGE=70s опроверг: 25 срабатываний за 2ч02м
+// (лог nixavpn-DEBUG-20260813-153638, поле capacity_floor_deferred_total),
+// все с одинаковым профилем `ready_capacity=5 floor=6 backoff=5s` при
+// poolSize=8. Канарейка 2026-05-24 гоняла порог 75s+ — при более коротком
+// пороге ротация чаще, и «steady state» другой: пул штатно балансирует НА
+// полу, а не выше него.
+//
+// Это не деградация: 25 отложек по 5s за 2ч, потерь нет (балансы
+// socks_connects=uplink=downlink=694, decrypt_fails=0). Гейт делает ровно
+// то, для чего написан. Но утверждение «никогда не срабатывает» больше
+// НЕ основание считать ветку мёртвой — она живая и на горячем пути.
 //
 // Spec 2026-05-24 (concurrency-lift-and-backoff).
 const readyCapacityFloorFraction = 0.75
