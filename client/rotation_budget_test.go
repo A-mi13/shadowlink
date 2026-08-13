@@ -407,3 +407,94 @@ func TestStaggerSpan_ShrinksWithCap(t *testing.T) {
 	}
 	t.Logf("span: %v → %v (бюджет освобождает %v)", old, nw, old-nw)
 }
+
+// Дросселирование строк о бюджете (2026-08-13).
+//
+// Замер age-wall probe (2ч40м, порог 150s): 1782 строки «rotation budget below
+// observed cut window» и 176 строк «upper bound is no longer an upper bound».
+// Обе горели на каждом тике StartStatsLogger (5s) при НЕИЗМЕННОМ структурном
+// дефиците: worstCaseTeardown()=142.5s против age_min_clean=82.59s, дефицит
+// 59.91s. Гейты сработали корректно — дефект в том, что WARN, горящий всегда,
+// не значит ничего (H-15 наоборот: там молчание приняли за здоровье, здесь
+// непрерывный крик перестают читать).
+//
+// Инвариант: гейт НЕ ослаблен (условие срабатывания то же), но повтор
+// неизменного состояния не печатается.
+func TestBudgetLogThrottle_SilentWhileStateUnchanged(t *testing.T) {
+	var th budgetLogThrottle
+	const deficit = 59910 * time.Millisecond
+
+	if !th.shouldLog(true, deficit, rotationBudgetLogEpsilon) {
+		t.Fatal("первое срабатывание обязано печататься — иначе дефицит не увидят вовсе")
+	}
+
+	// Полевой сценарий: 1781 повтор того же состояния. Дефицит дрожит на
+	// сотни миллисекунд от переоценки перцентилей — это не изменение.
+	printed := 0
+	for i := range 1781 {
+		jitter := time.Duration(i%7) * 100 * time.Millisecond
+		if th.shouldLog(true, deficit+jitter, rotationBudgetLogEpsilon) {
+			printed++
+		}
+	}
+	if printed != 0 {
+		t.Errorf("напечатано %d повторов неизменного состояния — троттлинг не работает, "+
+			"строка снова выродится в 1782 строки за прогон", printed)
+	}
+}
+
+// Сдвиг дефицита больше epsilon — это НОВОСТЬ, её печатать обязательно.
+// Иначе троттлинг превратится в глушилку и повторит H-15 уже по-настоящему.
+func TestBudgetLogThrottle_LogsMaterialChange(t *testing.T) {
+	var th budgetLogThrottle
+	const deficit = 59910 * time.Millisecond
+
+	th.shouldLog(true, deficit, rotationBudgetLogEpsilon)
+
+	if th.shouldLog(true, deficit+4*time.Second, rotationBudgetLogEpsilon) {
+		t.Error("сдвиг меньше epsilon напечатан — порог значимости не работает")
+	}
+	if !th.shouldLog(true, deficit+9*time.Second, rotationBudgetLogEpsilon) {
+		t.Error("сдвиг больше epsilon НЕ напечатан — реальное изменение бюджета проглочено")
+	}
+	// Сдвиг в другую сторону (адаптер сжал порог) — тоже новость.
+	if !th.shouldLog(true, deficit, rotationBudgetLogEpsilon) {
+		t.Error("сокращение дефицита не напечатано — улучшение так же значимо, как ухудшение")
+	}
+}
+
+// Возврат в норму обязан печататься: без него последняя строка в логе
+// навсегда останется тревожной, и читатель не узнает, что дефицит исчез.
+func TestBudgetLogThrottle_LogsReturnToNormal(t *testing.T) {
+	var th budgetLogThrottle
+
+	th.shouldLog(true, 59910*time.Millisecond, rotationBudgetLogEpsilon)
+
+	if !th.shouldLog(false, 5*time.Second, rotationBudgetLogEpsilon) {
+		t.Fatal("возврат в норму не напечатан — исчезновение дефицита осталось невидимым")
+	}
+	// В норме молчим, сколько бы тиков ни прошло.
+	for range 100 {
+		if th.shouldLog(false, 5*time.Second, rotationBudgetLogEpsilon) {
+			t.Fatal("печать в нормальном состоянии — шум вернулся с другой стороны")
+		}
+	}
+	// А новое ухудшение снова печатается.
+	if !th.shouldLog(true, 30*time.Second, rotationBudgetLogEpsilon) {
+		t.Error("повторное появление дефицита не напечатано — троттлинг залип")
+	}
+}
+
+// Гейт не должен быть ослаблен троттлингом: shouldWarnRotationBudget отвечает
+// за то, ЕСТЬ ли дефицит, троттлинг — только за частоту печати. Разъезд этих
+// двух ответственностей и был бы починкой симптома вместо причины.
+func TestBudgetLogThrottle_DoesNotWeakenGate(t *testing.T) {
+	const margin = -59910 * time.Millisecond
+	if !shouldWarnRotationBudget(82590, margin) {
+		t.Error("гейт перестал видеть полевой дефицит 2026-08-13 " +
+			"(worst_case 142.5s против age_min_clean 82.59s)")
+	}
+	if shouldWarnRotationBudget(82590, 5*time.Second) {
+		t.Error("гейт сработал при положительном запасе")
+	}
+}

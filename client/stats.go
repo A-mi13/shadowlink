@@ -1123,6 +1123,80 @@ func shouldWarnRotationBudget(ageMinCleanMs int64, margin time.Duration) bool {
 	return ageMinCleanMs > 0 && margin <= 0
 }
 
+// Дросселирование строк о бюджете ротации по ИЗМЕНЕНИЮ СОСТОЯНИЯ (2026-08-13).
+//
+// Замер 2026-08-13 (2ч40м): 1782 строки «rotation budget below observed cut
+// window» и 176 строк «upper bound is no longer an upper bound» — обе горели
+// на каждом тике StartStatsLogger (5s). Оба гейта СРАБОТАЛИ КОРРЕКТНО:
+// worstCaseTeardown()=142.5s против age_min_clean=82.59s, дефицит 59.91s —
+// он структурный и в этой конфигурации неустранимый.
+//
+// Дефект не в гейте, а в том, что предупреждение, горящее ВСЕГДА, не несёт
+// информации. Это H-15 наоборот: там контур молчал и это приняли за здоровье,
+// здесь контур кричит непрерывно и это перестают читать. Ровно та же логика,
+// по которой 2026-08-10 понижали прогноз до INFO (237 WARN за час на 0.07%
+// реальных пробоев) и по которой дросселировали строку нехватки наблюдений
+// (9563dad, 720 строк/час).
+//
+// Выбран троттлинг ПО ИЗМЕНЕНИЮ, а не по времени и не дедупликация:
+//
+//   - Дефицит меняется только когда меняется одно из слагаемых бюджета
+//     (адаптер сжал порог, сменился stagger) или приехали новые наблюдения.
+//     Это редкие события — в замере адаптер дал 11 изменений за 2ч40м.
+//     Значит «логировать при изменении» даёт ~10-20 строк вместо 1782,
+//     не теряя ни одного перехода.
+//   - Троттлинг по времени (раз в N минут) сохранил бы шум пропорционально
+//     длительности сессии и всё равно размывал бы момент перехода.
+//   - Чистая дедупликация по тексту не сработала бы: в строке есть поля,
+//     которые дрожат на каждом тике (age_min_raw, samples), — она бы
+//     печаталась почти каждый раз.
+//
+// Порог значимости 5s: дефицит дрожит на сотни миллисекунд от переоценки
+// перцентилей, и без него троттлинг выродился бы обратно в поток. 5s заметно
+// меньше самого дефицита (59.91s в замере), то есть реальный сдвиг бюджета
+// не будет проглочен.
+//
+// ⚠ Гейты НЕ удалены и НЕ ослаблены: условие срабатывания то же, меняется
+// только частота печати. Первое срабатывание печатается всегда, возврат в
+// норму — тоже (иначе исчезновение дефицита осталось бы незамеченным).
+const rotationBudgetLogEpsilon = 5 * time.Second
+
+// budgetLogThrottle хранит последнее НАПЕЧАТАННОЕ состояние одной строки.
+// Не atomic: единственный вызывающий — goroutine StartStatsLogger, она одна.
+type budgetLogThrottle struct {
+	active bool          // печаталось ли, что состояние «плохое»
+	value  time.Duration // величина, при которой печатали в последний раз
+}
+
+// shouldLog решает, печатать ли строку в этом тике.
+//
+// Печатаем, когда: (а) состояние сменилось (норма↔дефицит) либо (б) величина
+// сдвинулась заметнее epsilon. Во всех остальных случаях состояние то же,
+// что уже в логе, и повтор ничего не добавляет.
+func (t *budgetLogThrottle) shouldLog(active bool, value, epsilon time.Duration) bool {
+	if active != t.active {
+		t.active = active
+		t.value = value
+		return true
+	}
+	if !active {
+		return false
+	}
+	if d := value - t.value; d >= epsilon || d <= -epsilon {
+		t.value = value
+		return true
+	}
+	return false
+}
+
+// Состояние троттлинга живёт на уровне пакета, потому что logSlotDeathSummary
+// вызывается из одной goroutine StartStatsLogger и не имеет своего объекта.
+// Обнуление между сессиями не требуется: клиент — один процесс на сессию.
+var (
+	budgetDeficitThrottle budgetLogThrottle
+	budgetReachedThrottle budgetLogThrottle
+)
+
 // logSlotDeathSummary emits the slot-death distribution to the log (раунд 18 P0).
 //
 // The Prometheus exporter (WritePromMetrics) is NOT reachable on the client — no
@@ -1373,18 +1447,38 @@ func logSlotDeathSummary() {
 	// видно, что накладные (stagger+sweep+defer+tear = 75.5s) сами по себе
 	// сопоставимы с окном реза 84–118s, то есть дефицит структурный, а не
 	// следствие плохой настройки.
-	if shouldWarnRotationBudget(v.AgeMinMs, wcMargin) {
-		slog.Info("rotation budget below observed cut window (upper-bound estimate, not an observed failure)",
-			"worst_case_teardown", wcTotal,
-			"age_min_clean", time.Duration(v.AgeMinMs)*time.Millisecond,
-			"age_min_raw", time.Duration(s.AgeMin)*time.Millisecond,
-			"deficit", -wcMargin,
-			"base", wcBase,
-			"stagger_span", wcStagger,
-			"sweep_tick", wcSweep,
-			"defer_backoff", wcDeferred,
-			"teardown_cap", wcTear,
-		)
+	// ⚠ Дросселирование 2026-08-13: гейт тот же, печать — только при СМЕНЕ
+	// состояния или сдвиге дефицита больше epsilon. В замере 2026-08-13 эта
+	// строка дала 1782 повтора за 2ч40м при неизменном структурном дефиците
+	// 59.91s — предупреждение, горящее всегда, читатель перестаёт читать.
+	// Подробное обоснование выбора именно троттлинга — у budgetLogThrottle.
+	deficitActive := shouldWarnRotationBudget(v.AgeMinMs, wcMargin)
+	if budgetDeficitThrottle.shouldLog(deficitActive, -wcMargin, rotationBudgetLogEpsilon) {
+		if deficitActive {
+			slog.Info("rotation budget below observed cut window (upper-bound estimate, not an observed failure)",
+				"worst_case_teardown", wcTotal,
+				"age_min_clean", time.Duration(v.AgeMinMs)*time.Millisecond,
+				"age_min_raw", time.Duration(s.AgeMin)*time.Millisecond,
+				"deficit", -wcMargin,
+				"base", wcBase,
+				"stagger_span", wcStagger,
+				"sweep_tick", wcSweep,
+				"defer_backoff", wcDeferred,
+				"teardown_cap", wcTear,
+				// Явный маркер, что строка дросселирована: иначе читатель,
+				// увидев ОДНУ строку вместо потока, решит, что событие было
+				// однократным. Молчание должно быть объяснимым.
+				"throttled", "logged on change only",
+			)
+		} else {
+			// Возврат в норму печатаем обязательно: без этого исчезновение
+			// дефицита осталось бы невидимым, и последняя строка в логе
+			// навсегда осталась бы тревожной.
+			slog.Info("rotation budget deficit cleared",
+				"worst_case_teardown", wcTotal,
+				"margin_to_age_min", wcMargin,
+			)
+		}
 	}
 
 	// А вот ФАКТ — уровень WARN: наблюдённая жизнь слота дошла до бюджета,
@@ -1403,13 +1497,46 @@ func logSlotDeathSummary() {
 	// слотам; это смещает оценку вниз, то есть в сторону молчания. Строка
 	// сознательно консервативна: ложная тревога здесь дороже пропуска, ради
 	// этого и понижали соседний прогноз до INFO.
+	// ⚠ Дросселирование 2026-08-13: 176 повторов за 2ч40м. См. budgetLogThrottle.
+	//
+	// ⚠ И ОГОВОРКА О САМОЙ ВЕЛИЧИНЕ (замер 2026-08-13). observed_age_p90
+	// приколот к нашему же MAX_SLOT_AGE: при пороге 150s он дал 150.8s, то
+	// есть повторил кап, а не описал цензора. Сравнивать worst_case с
+	// величиной, ограниченной сверху нашим собственным капом, — сомнительно:
+	// при достаточно высоком пороге p90 подойдёт к бюджету механически, без
+	// какого-либо изменения поведения сети.
+	//
+	// Почему гейт всё же ОСТАВЛЕН как есть, а не «починен» подстановкой другой
+	// величины: он ловит ровно то, что заявляет — «верхняя оценка перестала
+	// быть верхней». Если наблюдённые времена жизни дошли до расчётного
+	// worst-case, сумма слагаемых требует пересмотра НЕЗАВИСИМО от того, кто
+	// поставил потолок — цензор или мы сами. Подмена p90 на величину «из
+	// резов» сузила бы гейт до цензурированной выборки (Record зовётся только
+	// на ошибке чтения) и вернула бы тот же survivorship bias, из-за которого
+	// уже дважды неверно оценили окно.
+	//
+	// Правка тут была бы правкой ТАЙМИНГОВОЙ СЕМАНТИКИ по рассуждению, без
+	// замера, — ровно то, что запрещает CLAUDE.md rule 8. Вместо этого
+	// ограничение сделано ВИДИМЫМ в самой строке (поле observed_p90_capped_by),
+	// чтобы читатель не принял совпадение p90 с капом за сигнал о сети.
+	// Развязать по-честному можно только сравнением с временами жизни ПЛАНОВЫХ
+	// ротаций (slotobs.RecordPlanned), у которых знаменатель не цензурирован, —
+	// это отдельная работа со своим замером.
 	if s.AgeP90 > 0 && wcTotal > 0 {
-		if observed := time.Duration(s.AgeP90) * time.Millisecond; observed >= wcTotal {
+		observed := time.Duration(s.AgeP90) * time.Millisecond
+		reached := observed >= wcTotal
+		if budgetReachedThrottle.shouldLog(reached, observed-wcTotal, rotationBudgetLogEpsilon) && reached {
 			slog.Warn("rotation budget reached by observed slot lifetimes — upper bound is no longer an upper bound",
 				"observed_age_p90", observed,
 				"worst_case_teardown", wcTotal,
 				"excess", observed-wcTotal,
 				"samples", s.Count,
+				// Потолок наблюдаемого p90 — наш собственный порог ротации.
+				// Если observed_age_p90 примерно равен ему, строка говорит о
+				// НАШЕЙ политике, а не о поведении сети (замер 2026-08-13:
+				// при пороге 150s p90=150.8s).
+				"observed_p90_capped_by", adaptedAge,
+				"throttled", "logged on change only",
 			)
 		}
 	}
