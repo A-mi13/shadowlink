@@ -22,8 +22,15 @@ tun2socks*
 config.yaml
 
 # Connection scripts (contain server IPs and passwords)
+# ⚠ Шаблон по префиксу `connect*` НЕ ловит launcher'ы с другими именами.
+# 2026-08-13: bin/probe-age-wall.bat (диагностический запуск) нёс тот же
+# `sl://<ключ>@...`, что и connect-*.bat, и под ignore не попадал — один
+# `git add .` отправил бы учётные данные в историю. Поэтому ниже правила
+# по КАТАЛОГУ и по расширению, а не только по префиксу имени.
 connect*.bat
 connect*.sh
+bin/*.bat
+bin/*.sh
 
 # OS files
 .DS_Store
