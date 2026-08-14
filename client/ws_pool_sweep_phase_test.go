@@ -2,6 +2,7 @@ package client
 
 import (
 	"math"
+	"math/rand/v2"
 	"testing"
 	"time"
 
@@ -51,12 +52,17 @@ func TestRotationWatchdogTick_SubSecondForPhaseSpreading(t *testing.T) {
 		"тик watchdog'а определяет фазу новых TLS-соединений на wire: при 5s все "+
 			"588 ротаций легли в одну фазу (σ 0.0001s, 92.2%% в одном 1s-окне)")
 
-	// Прод-конфигурация: staggerStep=1s → амплитуда джиттера ±0.5s.
+	// Прод-конфигурация: staggerStep=1s → амплитуда джиттера порога ±0.5s.
+	// Требование «квант не больше амплитуды» осталось со времён, когда фазу
+	// пытались размазать джиттером ПОРОГА. Замер 2026-08-14 показал, что так не
+	// работает вовсе (R на периоде тика не изменился: 0.598 → 0.553), и фаза
+	// теперь развязана джиттером на самом ПРОБУЖДЕНИИ — см.
+	// TestRotationWatchdogLoop_WakeupsAreNotOnAGrid. Условие оставлено как
+	// дополнительная страховка: пока оно держится, джиттер порога тоже вносит
+	// вклад, а не только выбирает тик.
 	const prodStaggerStep = time.Second
-	jitterAmplitude := prodStaggerStep / 2
-	require.LessOrEqual(t, rotationWatchdogTick, jitterAmplitude,
-		"квант сетки должен быть не больше амплитуды stagger-джиттера (±step/2), "+
-			"иначе джиттер не способен размазать фазу — он лишь выбирает тик")
+	require.LessOrEqual(t, rotationWatchdogTick, prodStaggerStep/2,
+		"квант сетки должен быть не больше амплитуды stagger-джиттера (±step/2)")
 }
 
 // TestWorstCaseTeardown_SweepCountsTickTwice — тик расходуется ДВАЖДЫ.
@@ -70,6 +76,55 @@ func TestRotationWatchdogTick_SubSecondForPhaseSpreading(t *testing.T) {
 // другой стороны: слагаемое `deferred` в бюджете есть, но БЕЗ тика, через который
 // отсрочка физически не может рассосаться. Занижение бюджета в этом проекте
 // считается хуже завышения — бюджет обязан быть верхней границей.
+func TestSweepWorstCase_CoversJitteredWakeups(t *testing.T) {
+	// 2 пробуждения × (tick + максимум джиттера = tick) = 4 × tick.
+	require.Equal(t, 4*rotationWatchdogTick, sweepWorstCase(),
+		"бюджет обязан брать ВЕРХНЮЮ границу интервала пробуждения (tick+jitter), "+
+			"а не средний 1.5×tick: занижение бюджета хуже завышения")
+	require.Equal(t, 2*time.Second, sweepWorstCase(),
+		"при tick=500ms вклад свипа = 2s; если упало — перечитать обоснование "+
+			"у rotationWatchdogTick, а не подгонять число")
+}
+
+// TestRotationWatchdogLoop_WakeupsAreNotOnAGrid — джиттер на пробуждении реально
+// применяется и берётся заново.
+//
+// Прямо измерить моменты пробуждения из юнит-теста нельзя (цикл бесконечный и
+// живёт на своём тайминге), поэтому проверяется само распределение сна той же
+// формулой, что в цикле. Тест ловит два конкретных отказа:
+//
+//  1. джиттер убрали/занулили → все интервалы равны tick, решётка вернулась;
+//  2. джиттер сэмплируется ОДИН раз и переиспользуется → интервалы равны между
+//     собой, то есть решётка с другим шагом. Это «single-sample reused»
+//     антипаттерн, разобранный у slotStaggerOffset.
+func TestRotationWatchdogLoop_WakeupsAreNotOnAGrid(t *testing.T) {
+	const n = 200
+	seen := make(map[time.Duration]int, n)
+	var min, max time.Duration = 1 << 62, 0
+	for i := 0; i < n; i++ {
+		// Ровно та формула, что в rotationWatchdogLoop.
+		d := rotationWatchdogTick + time.Duration(rand.Float64()*float64(rotationWatchdogTick))
+		seen[d]++
+		if d < min {
+			min = d
+		}
+		if d > max {
+			max = d
+		}
+	}
+	require.Greater(t, len(seen), n/2,
+		"интервалы пробуждения повторяются — джиттер либо снят, либо сэмплирован "+
+			"один раз и переиспользован; решётка на wire вернётся")
+	require.GreaterOrEqual(t, min, rotationWatchdogTick,
+		"интервал не может быть короче базового тика")
+	require.Less(t, max, 2*rotationWatchdogTick,
+		"интервал не может достигать 2×tick — иначе sweepWorstCase занижен")
+	// Разброс должен покрывать существенную часть периода, иначе размазывание
+	// номинально: при джиттере в 1% фаза остаётся приколоченной.
+	require.Greater(t, max-min, rotationWatchdogTick/2,
+		"разброс интервалов мал — фаза останется различимой")
+}
+
 func TestWorstCaseTeardown_SweepCountsTickTwice(t *testing.T) {
 	p := &WSPoolTransport{
 		poolSize:          8,
@@ -84,18 +139,17 @@ func TestWorstCaseTeardown_SweepCountsTickTwice(t *testing.T) {
 
 	base, stagger, sweep, deferred, tear, total := p.worstCaseTeardown()
 
-	require.Equal(t, 2*rotationWatchdogTick, sweep,
-		"sweep обязан считать тик дважды: обнаружение + повторная попытка после "+
-			"отсрочки гейта")
+	require.Equal(t, sweepWorstCase(), sweep,
+		"слагаемое обязано приходить из sweepWorstCase() — единственного источника")
 	require.Equal(t, base+stagger+sweep+deferred+tear, total,
 		"итог обязан быть суммой напечатанных слагаемых — иначе лог врёт о механизме")
 
-	// Регрессия на конкретную арифметику прода: 70 + 15.5 + 1 + 30 + 25.
-	// Если тик снова станет 5s, эта строка упадёт и заставит перечитать
-	// обоснование у rotationWatchdogTick, а не молча принять +9s накладных.
+	// Регрессия на конкретную арифметику прода: 70 + 15.5 + 2 + 30 + 25.
+	// Если тик или джиттер изменятся, строка упадёт и заставит перечитать
+	// обоснование, а не молча принять другие накладные.
 	require.Equal(t, 15500*time.Millisecond, stagger, "cap 15s + step/2")
-	require.Equal(t, time.Second, sweep, "2 × 500ms")
-	require.Equal(t, 141500*time.Millisecond, total)
+	require.Equal(t, 2*time.Second, sweep, "2 пробуждения × (500ms + 500ms джиттера)")
+	require.Equal(t, 142500*time.Millisecond, total)
 }
 
 // TestNormalizeFloorFraction — кламп доли пола storm-brake.

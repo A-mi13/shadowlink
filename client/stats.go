@@ -318,11 +318,43 @@ type statsRegistry struct {
 	// экспозиции 0.2s, единицы разные. Ровно на этой подмене единиц уже
 	// строился неверный вывод (разбор 2026-08-14).
 	//
+	// ⚠ Уточнено 2026-08-14: причина отложек — НЕ порог 70s, как считалось выше, а
+	// утечка ячеек в reconnect/recycle. До первой потери ячейки (15:42:12) гейт не
+	// срабатывал ни разу, первая отложка — 15:44:32, все 22 при ready=5 floor=6, а
+	// ready=5 достижимо только после потери двух ячеек. Полная цепочка: утечка →
+	// alive до пола → отложка → +возраст → рез. Утечка исправлена, и в следующем
+	// прогоне отложек стало 0 при неизменной доле 0.75.
+	//
 	// Читать так: ненулевой rate = слоты платят возрастом за исправность пула.
 	// Смотреть вместе с ready_capacity / ready_capacity_floor и возрастами резов,
 	// а не как индикатор «каскад/не каскад»: ready_capacity == floor означает,
 	// что пул балансирует НА полу и любая плановая ротация будет отклонена.
 	CapacityFloorDeferredTotal atomic.Uint64
+
+	// HealingRetargetTotal — сколько раз цепочка reconnectLoop переприцелилась на
+	// другую ячейку, потому что её собственную забрал дренаж.
+	//
+	// Заведён 2026-08-14 вместе с исправлением утечки ячеек (D1). До правки
+	// такой обрыв означал ПОТЕРЮ ячейки навсегда: периодического healer'а в пуле
+	// нет, каждая цепочка reconnectLoop одноразова. В поле это давало
+	// empty 8 → 9 → 10 → 11 и mean alive 7.21 → 5.80 за 2 часа, а на конце
+	// цепочки — пул на полу storm-brake, отклонённые ротации и резы посредника.
+	//
+	// Ненулевое значение = утечка ПРОИЗОШЛА БЫ, но была вылечена. Это не тревога,
+	// а доказательство работы правки: сравнивать с ReserveConnectFailuresTotal
+	// (поводов войти в ветку) и с alive в health snapshot.
+	HealingRetargetTotal atomic.Uint64
+
+	// HealingRetargetGaveUpTotal — лечение исчерпало maxHealingRetargets и
+	// отказалось. Пул идёт на одну ячейку меньше до следующей естественной смерти
+	// слота.
+	//
+	// Отдельный счётчик, а не общий с HealingRetargetTotal: «вылечили» и «сдались»
+	// — противоположные исходы, и складывать их значило бы завести поле, чьё имя
+	// врёт о механизме (в этом проекте — повторяющийся класс дефектов). В поле
+	// ожидается ноль; ненулевое означает, что дренажи забирают ячейки быстрее,
+	// чем лечение успевает их занимать, и предел надо пересмотреть замером.
+	HealingRetargetGaveUpTotal atomic.Uint64
 
 	// ⚠ Здесь был SweepPhaseJitterAppliedTotal — счётчик подтиковых отсрочек
 	// дренажа. Удалён 2026-08-14 вместе с самой ручкой: она не размазывала фазу
@@ -876,6 +908,14 @@ func WritePromMetrics(w io.Writer) {
 	fmt.Fprintf(w, "# TYPE shadowlink_slot_drain_capacity_floor_deferred_total counter\n")
 	fmt.Fprintf(w, "shadowlink_slot_drain_capacity_floor_deferred_total %d\n", Stats.CapacityFloorDeferredTotal.Load())
 
+	fmt.Fprintf(w, "# HELP shadowlink_pool_healing_retargets_total Reconnect chains re-targeted to another cell after a drain claimed theirs (prevents permanent cell loss)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_pool_healing_retargets_total counter\n")
+	fmt.Fprintf(w, "shadowlink_pool_healing_retargets_total %d\n", Stats.HealingRetargetTotal.Load())
+
+	fmt.Fprintf(w, "# HELP shadowlink_pool_healing_gave_up_total Healing attempts abandoned after maxHealingRetargets — pool runs one cell short until next slot death\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_pool_healing_gave_up_total counter\n")
+	fmt.Fprintf(w, "shadowlink_pool_healing_gave_up_total %d\n", Stats.HealingRetargetGaveUpTotal.Load())
+
 	fmt.Fprintf(w, "# HELP shadowlink_slot_drain_force_evicted_total Force-evictions of idle slotReady cells when claimFreeSlot would have returned -1 (slice full)\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_slot_drain_force_evicted_total counter\n")
 	fmt.Fprintf(w, "shadowlink_slot_drain_force_evicted_total %d\n", Stats.DrainForceEvictedTotal.Load())
@@ -1336,6 +1376,19 @@ func logSlotDeathSummary() {
 			if totalCuts+totalPlanned > 0 {
 				lifetimeShare = float64(totalCuts) / float64(totalCuts+totalPlanned)
 			}
+			// Бюджет печатается ЗДЕСЬ ТОЖЕ, а не только в полной сводке ниже
+			// (ревью 2026-08-14, D2).
+			//
+			// Дефект, который это лечит: worst_case_teardown и его слагаемые жили
+			// исключительно в строке «slot death inference», а та выходит лишь при
+			// samples >= 12. Резов в прогоне 2026-08-14 не было вовсе → samples=0 →
+			// строка молчала 3 часа, и правка бюджета (sweep = 2×tick) оказалась
+			// НЕПРОВЕРЯЕМОЙ замером. Тот же контур, что уже описан для адаптера:
+			// чем лучше работает порог, тем меньше видно и порог, и бюджет.
+			//
+			// Бюджет не зависит от выборки — он считается из конфигурации, — поэтому
+			// прятать его за гейтом наблюдений было ошибкой категории.
+			bBase, bStagger, bSweep, bDeferred, bTear, bTotal := pool.worstCaseTeardown()
 			slog.Info("slot death observability: insufficient samples — adapter on configured threshold",
 				"samples", s.Count,
 				"required", minSlotDeathSamplesToLog,
@@ -1348,6 +1401,19 @@ func logSlotDeathSummary() {
 				"configured_max_slot_age", configured,
 				"adapt_changes", changes,
 				"adapt_reason", reason,
+				// Слагаемые порознь: суммой одна ошибка в слагаемом неотличима от
+				// другой, а именно так и родился H-15.
+				"budget_base", bBase,
+				"stagger_span", bStagger,
+				"sweep_budget", bSweep,
+				"sweep_tick", rotationWatchdogTick,
+				"defer_backoff", bDeferred,
+				"teardown_cap", bTear,
+				"worst_case_teardown", bTotal,
+				// ⚠ Запаса до окна реза здесь НЕТ намеренно: он требует
+				// age_min_clean из выборки, которой в этой ветке недостаточно.
+				// Печатать его с нулём значило бы показать «дефицит 141.5s».
+				"margin_to_age_min", "n/a (insufficient samples)",
 			)
 		}
 

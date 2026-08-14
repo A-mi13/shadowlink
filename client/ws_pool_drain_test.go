@@ -1340,8 +1340,17 @@ func TestClaimFreeSlot_AllOccupiedReturnsNegOne(t *testing.T) {
 
 // TestReconnectLoop_RecycleGuard asserts that if the cell at idx has
 // been recycled (e.g. by a drain that claimed this freed primary slot),
-// reconnectLoop short-circuits instead of overwriting the new cell.
-// Spec §2.2.2 (W7 review fix).
+// reconnectLoop does NOT overwrite the new cell. Spec §2.2.2 (W7 review fix).
+//
+// ⚠ Ожидание уточнено 2026-08-14 (утечка D1). Раньше тест требовал, чтобы
+// connectSlot НЕ вызывался вовсе, и это закрепляло дефект: голый return терял
+// ячейку навсегда, потому что периодического healer'а в пуле нет. Теперь
+// правильное поведение — «от ЯЧЕЙКИ отказаться, ЁМКОСТЬ восстановить»: цепочка
+// переприцеливается на свободную ячейку.
+//
+// Здесь проверяется инвариант, ради которого guard и заводился: чужая ячейка не
+// перезаписана. Поведение лечения — в TestReconnectLoop_RecycleHealsCapacity и
+// TestReconnectLoop_RecycleNoHealWhenPoolFull.
 func TestReconnectLoop_RecycleGuard(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1364,13 +1373,8 @@ func TestReconnectLoop_RecycleGuard(t *testing.T) {
 	p.slots[3] = recycledSlot
 	p.reserveMu.Unlock()
 
-	// Stub connectSlot — must NOT be called when guard fires.
-	called := false
 	prev := getConnectSlotForTest()
-	setConnectSlotForTest(func() error {
-		called = true
-		return nil
-	})
+	setConnectSlotForTest(func() error { return nil })
 	defer func() { setConnectSlotForTest(prev) }()
 
 	// Stub backoff to zero so the timer fires immediately — without this,
@@ -1378,20 +1382,189 @@ func TestReconnectLoop_RecycleGuard(t *testing.T) {
 	setSlotBackoffDurationForTest(func(int) time.Duration { return 0 })
 	defer setSlotBackoffDurationForTest(nil)
 
-	// Let reconnectLoop run normally (don't cancel ctx upfront). If the
-	// guard fires (cell recycled, not slotDead) it returns without calling
-	// connectSlot. If the guard is missing, connectSlot stub fires, returns
-	// nil, reconnectLoop returns — called=true.
 	p.reconnectLoop(3)
 
-	if called {
-		t.Errorf("connectSlot called despite recycled cell — guard failed")
-	}
 	p.reserveMu.Lock()
 	cell3 := p.slots[3]
 	p.reserveMu.Unlock()
 	if cell3 != recycledSlot {
-		t.Errorf("recycled cell was overwritten")
+		t.Errorf("recycled cell was overwritten — guard failed")
+	}
+}
+
+// TestReconnectLoop_RecycleHealsCapacity — регрессия на УТЕЧКУ ЯЧЕЕК (D1,
+// замер 2026-08-14). Главный тест этой правки.
+//
+// Механизм дефекта, который он ловит: connectReserveSlot не смог поднять
+// резервную ячейку → освободил placeholder и запланировал reconnectLoop →
+// пока тот ждал backoff, дренаж забрал ту же ячейку → recycle guard делал голый
+// return → ячейка терялась НАВСЕГДА, потому что периодического healer'а в пуле
+// нет (единственный вызов reconnectLoop на старте — начальный connect).
+//
+// Полевая цена: empty 8 → 9 → 10 → 11, mean alive 7.21 → 5.80 за 2 часа, дальше
+// пул садится на пол storm-brake (ready=5 при floor=6), гейт отклоняет плановые
+// ротации, слот доживает до полосы ненулевого hazard и его режет посредник.
+// Три реза из четырёх в том прогоне — на конце этой цепочки.
+func TestReconnectLoop_RecycleHealsCapacity(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	p := &WSPoolTransport{
+		poolSize: 8,
+		ctx:      ctx,
+		log:      newDiscardLogger(),
+	}
+	p.slots = make([]*poolSlot, 16)
+
+	// Пул НЕДОУКОМПЛЕКТОВАН: 7 живых при poolSize=8 — ровно та недостача,
+	// которую оставляет за собой потерянная ячейка.
+	for i := 0; i < 7; i++ {
+		s := &poolSlot{index: i}
+		s.setState(slotReady)
+		p.slots[i] = s
+	}
+	// Ячейку 7 «забрал дренаж», пока наш reconnect ждал backoff.
+	recycled := &poolSlot{index: 7}
+	recycled.setState(slotDraining)
+	p.reserveMu.Lock()
+	p.slots[7] = recycled
+	p.reserveMu.Unlock()
+
+	var mu sync.Mutex
+	connectCalls := 0
+	prev := getConnectSlotForTest()
+	setConnectSlotForTest(func() error {
+		mu.Lock()
+		connectCalls++
+		mu.Unlock()
+		return nil
+	})
+	defer func() { setConnectSlotForTest(prev) }()
+	setSlotBackoffDurationForTest(func(int) time.Duration { return 0 })
+	defer setSlotBackoffDurationForTest(nil)
+
+	before := Stats.HealingRetargetTotal.Load()
+	p.reconnectLoop(7)
+
+	mu.Lock()
+	got := connectCalls
+	mu.Unlock()
+	if got != 1 {
+		t.Fatalf("connectSlot вызван %d раз, ожидался 1: ёмкость обязана "+
+			"восполняться на СВОБОДНОЙ ячейке, а не теряться", got)
+	}
+	if delta := Stats.HealingRetargetTotal.Load() - before; delta != 1 {
+		t.Errorf("HealingRetargetTotal += %d, ожидалось 1 — без счётчика лечение "+
+			"неотличимо от исходной утечки", delta)
+	}
+	// Чужую ячейку не тронули.
+	p.reserveMu.Lock()
+	cell7 := p.slots[7]
+	p.reserveMu.Unlock()
+	if cell7 != recycled {
+		t.Errorf("ячейка дренажа перезаписана")
+	}
+}
+
+// TestReconnectLoop_RecycleNoHealWhenPoolFull — обратная сторона: лечение НЕ
+// должно поднимать лишнее соединение, когда недостачи нет.
+//
+// Темп новых TLS-соединений к origin — это P0-угроза (policing по числу
+// соединений). Замер 2026-08-14: 388 conn/ч против 305 в базе, причём на живую
+// ячейку темп не изменился — весь рост от того, что пул держал штатные 8 вместо
+// деградировавших 6. То есть ёмкость не бесплатна, и лечить «на всякий случай»
+// нельзя.
+func TestReconnectLoop_RecycleNoHealWhenPoolFull(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	p := &WSPoolTransport{
+		poolSize: 8,
+		ctx:      ctx,
+		log:      newDiscardLogger(),
+	}
+	p.slots = make([]*poolSlot, 16)
+
+	// Полный комплект: 8 живых. Плюс ячейка, которую забрал дренаж.
+	for i := 0; i < 8; i++ {
+		s := &poolSlot{index: i}
+		s.setState(slotReady)
+		p.slots[i] = s
+	}
+	recycled := &poolSlot{index: 8}
+	recycled.setState(slotDraining)
+	p.reserveMu.Lock()
+	p.slots[8] = recycled
+	p.reserveMu.Unlock()
+
+	called := false
+	prev := getConnectSlotForTest()
+	setConnectSlotForTest(func() error { called = true; return nil })
+	defer func() { setConnectSlotForTest(prev) }()
+	setSlotBackoffDurationForTest(func(int) time.Duration { return 0 })
+	defer setSlotBackoffDurationForTest(nil)
+
+	p.reconnectLoop(8)
+
+	if called {
+		t.Errorf("connectSlot вызван при полном пуле — лишнее TLS-соединение " +
+			"к origin, это P0 (policing по числу соединений)")
+	}
+}
+
+// TestClaimFreeCellForHealing_CountsOnlyLiveStates — что считается недостачей.
+//
+// Дренирующиеся НЕ живые: у них уже есть replacement, и учёт их как живых занизил
+// бы недостачу ровно на число параллельных дренажей — то есть лечение молчало бы
+// именно тогда, когда дренаж и забрал ячейку. Мёртвые тоже не живые: за ними своя
+// цепочка reconnectLoop.
+func TestClaimFreeCellForHealing_CountsOnlyLiveStates(t *testing.T) {
+	newPool := func(states ...slotState) *WSPoolTransport {
+		p := &WSPoolTransport{poolSize: 4}
+		p.slots = make([]*poolSlot, 8)
+		for i, st := range states {
+			s := &poolSlot{index: i}
+			s.setState(st)
+			p.slots[i] = s
+		}
+		return p
+	}
+
+	// 4 живых при poolSize=4 → недостачи нет.
+	full := newPool(slotReady, slotReady, slotReady, slotReady)
+	if got := full.claimFreeCellForHealing(); got != -1 {
+		t.Errorf("полный пул: got %d, want -1", got)
+	}
+
+	// slotConnecting считается живым — иначе лечение сработало бы дважды на
+	// одну недостачу, пока первое соединение поднимается.
+	rising := newPool(slotReady, slotReady, slotReady, slotConnecting)
+	if got := rising.claimFreeCellForHealing(); got != -1 {
+		t.Errorf("slotConnecting должен считаться живым: got %d, want -1", got)
+	}
+
+	// Дренирующийся НЕ живой: 3 живых + 1 draining при poolSize=4 → недостача.
+	draining := newPool(slotReady, slotReady, slotReady, slotDraining)
+	if got := draining.claimFreeCellForHealing(); got < 0 {
+		t.Errorf("draining не должен считаться живым — недостача не увидена")
+	}
+
+	// Мёртвый НЕ живой.
+	dead := newPool(slotReady, slotReady, slotReady, slotDead)
+	if got := dead.claimFreeCellForHealing(); got < 0 {
+		t.Errorf("slotDead не должен считаться живым — недостача не увидена")
+	}
+
+	// Недостача есть, но свободных ячеек нет → лечить негде, -1.
+	p := &WSPoolTransport{poolSize: 4}
+	p.slots = make([]*poolSlot, 4)
+	for i := range p.slots {
+		s := &poolSlot{index: i}
+		s.setState(slotDraining) // все заняты, ни одна не живая
+		p.slots[i] = s
+	}
+	if got := p.claimFreeCellForHealing(); got != -1 {
+		t.Errorf("нет свободных ячеек: got %d, want -1", got)
 	}
 }
 

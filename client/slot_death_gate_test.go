@@ -253,8 +253,33 @@ func TestSlotDeathGate_ZeroSamplesSpeaks(t *testing.T) {
 	t.Cleanup(func() { SetGlobalPoolForStats(nil) })
 
 	logSlotDeathSummary()
-	if out := buf.String(); !strings.Contains(out, "slot death observability") {
+	out := buf.String()
+	if !strings.Contains(out, "slot death observability") {
 		t.Fatalf("при нулевой выборке контур молчит:\n%s", out)
+	}
+
+	// БЮДЖЕТ обязан быть видён и здесь (ревью 2026-08-14, D2).
+	//
+	// Дефект, который тест закрывает: worst_case_teardown и слагаемые жили только
+	// в строке «slot death inference», а та выходит при samples >= 12. В прогоне
+	// 2026-08-14 резов не было вовсе → samples=0 → строка молчала 3 часа, и правка
+	// бюджета (sweep = 2×tick) оказалась непроверяемой замером. Бюджет считается
+	// из КОНФИГУРАЦИИ и от выборки не зависит — прятать его за гейтом наблюдений
+	// было ошибкой категории.
+	for _, want := range []string{
+		"worst_case_teardown=", "sweep_budget=", "sweep_tick=",
+		"stagger_span=", "budget_base=", "teardown_cap=",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("в строке нехватки выборки нет %q — бюджет снова непроверяем "+
+				"замером, пока порог работает:\n%s", want, out)
+		}
+	}
+	// Запас до окна реза, наоборот, показывать НЕЛЬЗЯ: он требует age_min_clean из
+	// выборки, которой здесь нет. Нулём он читался бы как «дефицит 141.5s».
+	if !strings.Contains(out, "margin_to_age_min=\"n/a (insufficient samples)\"") {
+		t.Errorf("margin_to_age_min должен быть явно помечен как недоступный, "+
+			"иначе ноль прочитается как дефицит:\n%s", out)
 	}
 }
 

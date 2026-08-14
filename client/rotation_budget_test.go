@@ -52,11 +52,11 @@ func TestWorstCaseTeardown_IncludesStaggerAndSweep(t *testing.T) {
 	if want := 48 * time.Second; stagger != want {
 		t.Errorf("stagger = %v, want %v (cap 45s + step/2 3s)", stagger, want)
 	}
-	// Тик расходуется ДВАЖДЫ (уточнено 2026-08-14): обнаружение перезревания +
-	// повторная попытка после отсрочки гейта, которую читает только свип.
-	// Подробнее — TestWorstCaseTeardown_SweepCountsTickTwice.
-	if want := 2 * rotationWatchdogTick; sweep != want {
-		t.Errorf("sweep = %v, want %v (тик считается дважды)", sweep, want)
+	// Слагаемое берётся у sweepWorstCase() — единственного источника. Формула
+	// менялась дважды за 2026-08-14 (1×tick → 2×tick → 2×(tick+jitter)), и
+	// зашивать её здесь числом значило бы держать вторую копию правды.
+	if want := sweepWorstCase(); sweep != want {
+		t.Errorf("sweep = %v, want %v", sweep, want)
 	}
 	if tear != 15*time.Second {
 		t.Errorf("teardown cap = %v, want 15s", tear)
@@ -79,7 +79,7 @@ func TestWorstCaseTeardown_IncludesStaggerAndSweep(t *testing.T) {
 	// (5s → 500ms, 2026-08-14, ради фазы ротаций на wire) и будет меняться снова.
 	// Зашитое число превратило бы тест из проверки ФОРМУЛЫ в проверку значения
 	// константы — а формулу здесь и защищаем.
-	if want := 75*time.Second + 48*time.Second + 2*rotationWatchdogTick +
+	if want := 75*time.Second + 48*time.Second + sweepWorstCase() +
 		drainRevertBackoff + 15*time.Second; total != want {
 		t.Errorf("worst-case = %v, want %v", total, want)
 	}
