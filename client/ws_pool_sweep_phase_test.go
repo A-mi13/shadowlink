@@ -2,6 +2,9 @@ package client
 
 import (
 	"math"
+	"os"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -128,6 +131,82 @@ func TestRotationWatchdogLoop_WakeupsAreNotOnAGrid(t *testing.T) {
 	// номинально: при джиттере в 1% фаза остаётся приколоченной.
 	require.Greater(t, max-min, rotationWatchdogTick/2,
 		"разброс интервалов мал — фаза останется различимой")
+}
+
+// Свип обязан просыпаться по перевзводимому time.Timer, а НЕ по time.Ticker.
+//
+// # Почему это сторож на уровне ИСХОДНИКА, а не на поведении
+//
+// Замер прогона 161915 показал, что джиттер этого цикла — ЯКОРЬ ФАЗЫ ВСЕГО ПУЛА,
+// а не только моментов connect. Ticker дренажа (drainPollInterval) создаётся
+// ВНУТРИ каждого drainWatchdog, поэтому его фаза наследуется от startDrain, а
+// startDrain зовётся из свипа. Проверено на логе: сетка дренажа относительно
+// старта жива на 100% (R((close−drain_start) mod 500ms) = 1.0000, 1575/1575 в
+// бине 0-50ms, и на подвыборке многотиковых дренажей n=208 тоже R=1.0000), а
+// абсолютная фаза close на wire — шум (R=0.0447 при 1/√n=0.0256). Фаза старта
+// дренажа распределена равномерно: гистограмма по 50ms-бинам 185/144/187/165/
+// 146/159/154/131/141/163.
+//
+// Следствие: возврат ЭТОГО цикла к time.NewTicker немедленно проявит решётку
+// 500 мс в моментах close, хотя код дренажа не изменится (наблюдалось в прогоне
+// 115514: R=0.8933 по close при жёстком свипе и том же drainPollInterval).
+// Взаимные ссылки в комментариях эту связь описывают, но не защищают: рефакторинг
+// «упростим цикл до тикера» пройдёт и build, и vet, и все поведенческие тесты —
+// TestRotationWatchdogLoop_WakeupsAreNotOnAGrid проверяет nextWatchdogWakeup()
+// изолированно и останется зелёным, даже если ЦИКЛ перестанет её вызывать.
+//
+// Поэтому сторож читает исходник. Это грубо, но дешевле, чем 4-часовой полевой
+// прогон, которым эта регрессия обнаруживается иначе.
+func TestRotationWatchdogLoop_UsesJitteredTimerNotTicker(t *testing.T) {
+	src, err := os.ReadFile("ws_pool.go")
+	require.NoError(t, err, "не читается ws_pool.go — сторож фазы свипа бесполезен")
+
+	body := funcBodySource(t, string(src), "func (p *WSPoolTransport) rotationWatchdogLoop()")
+
+	require.NotContains(t, body, "time.NewTicker",
+		"rotationWatchdogLoop вернулся к time.NewTicker — фаза пула снова "+
+			"приколочена к сетке, и решётка 500мс проявится в моментах close БЕЗ "+
+			"единой правки в дренаже (прогон 115514: R=0.8933). Джиттер этого "+
+			"цикла — якорь фазы для drainPollInterval, см. его комментарий")
+	require.Contains(t, body, "nextWatchdogWakeup()",
+		"rotationWatchdogLoop больше не зовёт nextWatchdogWakeup() — джиттер фазы "+
+			"снят; тест на саму функцию этого не поймает, она останется корректной")
+	require.Contains(t, body, "time.NewTimer",
+		"ожидался перевзводимый time.NewTimer: джиттер обязан сэмплироваться "+
+			"ЗАНОВО на каждый взвод, иначе это решётка с другим шагом")
+}
+
+// funcBodySource возвращает КОД тела функции по её сигнатуре: от строки с
+// сигнатурой до закрывающей `}` в нулевой колонке, с вырезанными комментариями.
+//
+// ⚠ Комментарии вырезаются обязательно, и это не косметика. Первая версия
+// сторожа падала на здоровом коде: комментарий у rotationWatchdogLoop разбирает
+// антипаттерн и потому СОДЕРЖИТ строку «time.NewTicker». Сторож, читающий
+// исходник вместе с комментариями, запрещал бы документировать то, от чего он
+// защищает, — и был бы снят как флейкующий при первой же правке комментария.
+//
+// Строковые литералы не вырезаются: в телах проверяемых функций их нет, а
+// полноценный лексер здесь не нужен (go/ast — оверкилл на одну проверку).
+func funcBodySource(t *testing.T, src, signature string) string {
+	t.Helper()
+	i := strings.Index(src, signature)
+	require.GreaterOrEqual(t, i, 0,
+		"не найдена сигнатура %q — тест устарел и молча ничего не проверяет "+
+			"(это опаснее его отсутствия): обновить сторож", signature)
+	rest := src[i:]
+	end := regexp.MustCompile(`(?m)^\}`).FindStringIndex(rest[len(signature):])
+	require.NotNil(t, end, "не найден конец функции %q", signature)
+	body := rest[:len(signature)+end[1]]
+
+	// Убрать //-комментарии (построчно) и /* */-блоки.
+	body = regexp.MustCompile(`(?s)/\*.*?\*/`).ReplaceAllString(body, "")
+	lines := strings.Split(body, "\n")
+	for i, ln := range lines {
+		if c := strings.Index(ln, "//"); c >= 0 {
+			lines[i] = ln[:c]
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func TestWorstCaseTeardown_SweepCountsTickTwice(t *testing.T) {

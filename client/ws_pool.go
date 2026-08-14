@@ -2464,7 +2464,10 @@ func (p *WSPoolTransport) rotationWatchdogLoop() {
 	// механизм:
 	//
 	//	R((close − drain_start) mod 500ms) = 1.0000  ← сетка дренажа жива на 100%
-	//	   гистограмма: 1525/1525 событий в бине 0-50ms
+	//	   гистограмма: 1575/1575 событий в бине 0-50ms (ВСЕ терминации)
+	//	   на подвыборке многотиковых дренажей (delta>0.75s, n=208) тоже 1.0000,
+	//	   delta кратна 500ms с остатком <=4ms — доказательство именно тикера,
+	//	   а не того, что 87% дренажей закрываются на первом тике (delta=0.500s)
 	//	R(close mod 500ms) на wire        = 0.0447  ← шум (1/√n = 0.025)
 	//	R(reader started mod 500ms)       = 0.0330
 	//	слепой скан 0.05–6.0s шагом 5ms: max R = 0.063 — линий нет вовсе
@@ -2686,11 +2689,17 @@ func (p *WSPoolTransport) emitHealthSummary() {
 		// монотонный рост empty, теперь он должен отсутствовать.
 		"healing_retargets_total", Stats.HealingRetargetTotal.Load(),
 		"healing_gave_up_total", Stats.HealingRetargetGaveUpTotal.Load(),
-		// Экспозиция за 82s, накопленная sticky-дренажами. После исправления
-		// утечки ячеек это ЕДИНСТВЕННЫЙ значимый источник хвоста возрастов: 77%
-		// опасной экспозиции прогона 161915 (196.8s из 254s). Делить на часы
-		// uptime и сравнивать с hazard: при 49.2s/ч ожидается ~1 рез за 4ч.
-		"sticky_exposure_over_82s_ms", Stats.StickyExposureOver82sMs.Load(),
+		// Перебег возраста за ageExposureThreshold по ВСЕМ путям терминации.
+		// Sticky — главный вклад (77% в прогоне 161915, 196.8s из 254.0s), но не
+		// единственный: natural finish дал остальные 23%, поэтому накопление
+		// стоит на общем пути tearDown, а не в sticky-ветке.
+		//
+		// ⚠ Читать как ТРЕНД (рост = риск растёт), а не как оценку числа резов:
+		// умножение на rate_exp даёт 3-4 ожидаемых реза при наблюдённых 0, то
+		// есть модель замером отвергается. Подробно — в докстринге счётчика.
+		// Порог печатается рядом, иначе величина несравнима между прогонами.
+		"age_exposure_threshold", ageExposureThreshold,
+		"age_exposure_over_threshold_ms", Stats.AgeExposureOverThresholdMs.Load(),
 		"reserve_connect_failures_total", Stats.ReserveConnectFailuresTotal.Load(),
 		"uptime", uptime,
 	)

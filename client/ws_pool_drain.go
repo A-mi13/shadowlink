@@ -20,7 +20,11 @@ const (
 	// причина — в ЯКОРЕ фазы:
 	//
 	//	R((close − drain_start) mod 500ms) = 1.0000   ← сетка жива на 100%
-	//	   гистограмма: 1525/1525 в бин 0-50ms
+	//	   гистограмма: 1575/1575 в бин 0-50ms (ВСЕ терминации)
+	//	   подвыборка многотиковых (delta>0.75s, n=208): тоже R=1.0000, delta
+	//	   кратна 500ms (остаток <=4ms). Без этой подвыборки вывод не держался бы:
+	//	   87% дренажей закрываются на ПЕРВОМ тике, delta=0.500s — константа,
+	//	   а по константе R=1.0 получается тривиально
 	//	R(close mod 500ms) на wire        = 0.0447   ← на уровне шума (0.025)
 	//
 	// Ticker создаётся ВНУТРИ каждого drainWatchdog, то есть его фаза наследуется
@@ -117,8 +121,8 @@ const (
 	// load). Spec 2026-05-24.
 	reserveConnectBackoffJitterFraction = 0.2
 
-	// stickyExposureThreshold — возраст, выше которого время соединения на wire
-	// считается ОПАСНОЙ экспозицией (Stats.StickyExposureOver82sMs).
+	// ageExposureThreshold — возраст, выше которого время соединения на wire
+	// считается ОПАСНОЙ экспозицией (Stats.AgeExposureOverThresholdMs).
 	//
 	// 82s, а не 80s: 80s — нижняя граница полосы, где hazard впервые перестаёт
 	// быть нулём (замер 08-13: 0 резов ниже 80s на 52 808s экспозиции), но
@@ -129,7 +133,21 @@ const (
 	// не влияет, кроме счётчика. Менять можно без замера — но тогда исторические
 	// значения счётчика становятся несравнимыми, поэтому величина зафиксирована
 	// здесь одним местом, а не вписана в вызов.
-	stickyExposureThreshold = 82 * time.Second
+	//
+	// ⚠ Имя БЕЗ величины намеренно (переименовано 2026-08-14 из
+	// stickyExposureThreshold, счётчик — из StickyExposureOver82sMs). Два дефекта
+	// в прежних именах, оба — известный в этом проекте класс «имя врёт о
+	// механизме»:
+	//   1. «82s» в имени: порог настраиваемый, при первой же его смене имя стало
+	//      бы ложью, а Prom-серия — молча несравнимой со своим названием;
+	//   2. «sticky»: экспозицию за порогом дают ВСЕ пути терминации, а не только
+	//      sticky. Замер прогона 161915 по восстановленным временам жизни
+	//      (n=1575): при пороге 82s всего 254.0s перебега, из них sticky 196.8s
+	//      (77%), а natural finish 57.3s (23%) — и эти 23% счётчик, накапливаясь
+	//      лишь в emitStickyTeardownLog, не видел вовсе. Доля не константа: при
+	//      пороге 80s sticky даёт уже 66% (222.8 из 339.7s), то есть слепая зона
+	//      растёт вниз по порогу.
+	ageExposureThreshold = 82 * time.Second
 )
 
 // shouldLogDeferred returns true if at least drainDeferredLogInterval has
@@ -866,6 +884,52 @@ func (p *WSPoolTransport) recordPlannedRotation(slot *poolSlot) {
 	})
 }
 
+// accrueAgeExposure накапливает время, проведённое слотом ЗА
+// ageExposureThreshold, в Stats.AgeExposureOverThresholdMs.
+//
+// # Почему на общем пути, а не в emitStickyTeardownLog (правка 2026-08-14)
+//
+// Изначально накопление стояло внутри emitStickyTeardownLog, потому что замер
+// прогона 161915 показал: sticky даёт 77% перебега за 82s. Но 77% — это НЕ 100%,
+// и остаток не шум: natural finish дал 57.3s из 254.0s. Счётчик, названный
+// «экспозиция за порогом», систематически недосчитывал бы её на четверть, причём
+// в безопасную сторону — то есть ровно тот дефект, который в этом проекте уже
+// ловили под именем «лог врёт о механизме».
+//
+// Доля sticky к тому же зависит от порога и потому не может быть «списана как
+// малая»: при 82s это 77%, при 80s — уже 66% (222.8 из 339.7s). Понижение порога
+// расширяет слепую зону.
+//
+// Зовётся отсюда — из tearDown, после switch по причине, — по той же причине, по
+// которой там стоит recordPlannedRotation: это единственная точка, через которую
+// проходят ВСЕ наши терминации (natural finish, idle, hard cap, sticky, фантом).
+// Ставить в конкретную ветку значит терять пути молча.
+//
+// Отдельная функция, а не строка в recordPlannedRotation: у того ранний выход по
+// `p.slotDeaths == nil`, и экспозиция переставала бы считаться в конфигурации без
+// ринга наблюдений — связь, которой здесь быть не должно.
+//
+// Возвращает возраст слота для лога (0, если слот ни разу не подключался).
+func accrueAgeExposure(slot *poolSlot) time.Duration {
+	if slot == nil {
+		return 0
+	}
+	// startedAtNs == 0 означает «ни разу не подключался» (см. его докстринг), и
+	// тогда возраст неизвестен — молча трактовать это как «возраст 0» нельзя,
+	// иначе счётчик тихо не считает.
+	started := slot.startedAtNs.Load()
+	if started <= 0 {
+		return 0
+	}
+	age := time.Since(time.Unix(0, started))
+	// Накапливаем ПЕРЕБЕГ за порогом, а не число заходов: два соединения по 1s и
+	// одно по 20s — разный риск, а событий во всех случаях мало.
+	if over := age - ageExposureThreshold; over > 0 {
+		Stats.AgeExposureOverThresholdMs.Add(uint64(over.Milliseconds()))
+	}
+	return age
+}
+
 // drainWatchdog polls oldSlot.streams every drainPollInterval until
 // either count reaches 0 (natural finish) or drainHardCap elapses
 // (hard cap). In both cases:
@@ -914,18 +978,26 @@ func (p *WSPoolTransport) drainWatchdog(cl *Client, oldIdx int, oldSlot *poolSlo
 
 	tearDown := func(cause finishCause) {
 		duration := time.Since(drainStart)
+
+		// Экспозиция за порогом считается ЗДЕСЬ, на общем пути, а не в
+		// emitStickyTeardownLog: перебег дают все пути терминации, и в прогоне
+		// 161915 natural finish дал 23% его (57.3s из 254.0s) — см.
+		// accrueAgeExposure. Один вызов на одну терминацию: слот после этого
+		// уходит в handleSlotDeath, повторного прохода по нему нет.
+		slotAge := accrueAgeExposure(oldSlot)
+
 		switch cause {
 		case finishHardCap:
-			emitHardCapLog(p, oldIdx, oldSlot, reason, duration)
+			emitHardCapLog(p, oldIdx, oldSlot, reason, duration, slotAge)
 		case finishStickyAgeBackstop:
 			Stats.DrainStickyBackstopAgeTotal.Add(1)
-			emitStickyTeardownLog(p, oldIdx, oldSlot, reason, duration, "age_backstop")
+			emitStickyTeardownLog(p, oldIdx, oldSlot, reason, duration, "age_backstop", slotAge)
 		case finishStickyBytesBackstop:
 			Stats.DrainStickyBackstopBytesTotal.Add(1)
-			emitStickyTeardownLog(p, oldIdx, oldSlot, reason, duration, "bytes_backstop")
+			emitStickyTeardownLog(p, oldIdx, oldSlot, reason, duration, "bytes_backstop", slotAge)
 		case finishStickyQuotaDenied:
 			Stats.DrainStickyQuotaDeniedTotal.Add(1)
-			emitStickyTeardownLog(p, oldIdx, oldSlot, reason, duration, "quota_denied")
+			emitStickyTeardownLog(p, oldIdx, oldSlot, reason, duration, "quota_denied", slotAge)
 		case finishPhantom:
 			// Только своя метрика: в natural finish это не входит (см.
 			// докстринг finishPhantom). Лог пишется в logPhantom на месте
@@ -940,6 +1012,11 @@ func (p *WSPoolTransport) drainWatchdog(cl *Client, oldIdx int, oldSlot *poolSlo
 				"slot", oldIdx, "reason", reason,
 				"remaining_streams", oldSlot.streams.Load(),
 				"drain_duration", duration.Truncate(time.Second),
+				// slot_age и здесь: natural finish — не «безопасный» путь. В
+				// прогоне 161915 он дал 23% перебега за 82s (57.3s из 254.0s) и
+				// 5 из 17 соединений старше 85s, max 95.0s. Без поля этот вклад
+				// в логе не виден, а по drain_duration не вычисляется.
+				"slot_age", slotAge.Truncate(time.Millisecond),
 				"diag_total", snap.total,
 				"diag_idle_30s_count", snap.idleAge30sCount,
 				"diag_active_count", snap.activeCount,
@@ -950,7 +1027,10 @@ func (p *WSPoolTransport) drainWatchdog(cl *Client, oldIdx int, oldSlot *poolSlo
 			Stats.DrainNaturalFinishTotal.Add(1)
 			p.log.Info("WS pool slot drain natural finish",
 				"slot", oldIdx, "reason", reason,
-				"drain_duration", duration.Truncate(time.Second))
+				"drain_duration", duration.Truncate(time.Second),
+				// См. ветку idle выше: 23% перебега прогона 161915 пришло
+				// именно на natural finish.
+				"slot_age", slotAge.Truncate(time.Millisecond))
 		}
 		Stats.DrainDurationSeconds.Observe(duration.Seconds())
 
@@ -1163,7 +1243,11 @@ func (p *WSPoolTransport) drainWatchdog(cl *Client, oldIdx int, oldSlot *poolSlo
 // drive this directly without orchestrating a full drain.
 //
 // Spec 2026-05-24 (drain-diagnostics-counter-split) §4.
-func emitHardCapLog(p *WSPoolTransport, oldIdx int, slot *poolSlot, reason string, duration time.Duration) {
+// slotAge — полный возраст соединения, посчитанный ОДИН раз в tearDown
+// (accrueAgeExposure); передаётся, а не вычисляется здесь заново, чтобы лог и
+// счётчик экспозиции не разъезжались на величину исполнения самой функции.
+func emitHardCapLog(p *WSPoolTransport, oldIdx int, slot *poolSlot, reason string,
+	duration time.Duration, slotAge time.Duration) {
 	Stats.DrainHardCapTotal.Add(1)
 	remaining := slot.streams.Load()
 	snap := snapshotDrainStreams(p, oldIdx, time.Now())
@@ -1176,6 +1260,10 @@ func emitHardCapLog(p *WSPoolTransport, oldIdx int, slot *poolSlot, reason strin
 		"slot", oldIdx, "reason", reason,
 		"remaining_streams", remaining,
 		"drain_duration", duration.Truncate(time.Second),
+		// slot_age и здесь: hard cap в прогоне 161915 не сработал ни разу (0 из
+		// 1575), но при hard_cap=30s и старте дренажа на max 77.6s этот путь
+		// способен дать перебег не хуже sticky. Без поля он был бы слепым.
+		"slot_age", slotAge.Truncate(time.Millisecond),
 		"diag_total", snap.total,
 		"diag_idle_30s_count", snap.idleAge30sCount,
 		"diag_active_count", snap.activeCount,
@@ -1188,40 +1276,24 @@ func emitHardCapLog(p *WSPoolTransport, oldIdx int, slot *poolSlot, reason strin
 // stream was finally torn down because a backstop (age/bytes) or quota gate
 // fired. outcome ∈ {age_backstop, bytes_backstop, quota_denied}. Mirrors
 // emitHardCapLog's diag fields so operators see WHY an active download was cut.
+// slotAge — ПОЛНЫЙ возраст соединения на момент разрыва, а не длительность
+// дренажа. Считается один раз в tearDown (accrueAgeExposure) и передаётся сюда.
+//
+// Почему drain_duration недостаточно и вводит в заблуждение: в ветке
+// age_backstop он РАВЕН stickyMaxDrainAge всегда — все 50 teardown'ов прогона
+// 161915 дали ровно `drain_duration=25s`. То есть поле не несёт информации о
+// том, чем эти 25s оплачены, а оплачены они возрастом соединения на wire.
+//
+// Замер того же прогона (восстановление времён жизни, n=1575): старт дренажа
+// приходится на p50 34.2s / p90 74.2s / max 77.6s возраста, полная жизнь
+// sticky-слотов — p50 59.7 / p90 99.2 / max 102.6s. Sticky даёт 77% перебега за
+// 82s (196.8s из 254.0s) и 12 из 17 соединений старше 85s, то есть после
+// исправления утечки ячеек это главный источник хвоста возрастов — но НЕ
+// единственный: остальные 23% дал natural finish, и он теперь тоже пишет
+// slot_age (см. tearDown).
 func emitStickyTeardownLog(p *WSPoolTransport, oldIdx int, slot *poolSlot,
-	reason string, duration time.Duration, outcome string) {
+	reason string, duration time.Duration, outcome string, slotAge time.Duration) {
 	snap := snapshotDrainStreams(p, oldIdx, time.Now())
-
-	// slot_age — ПОЛНЫЙ возраст TCP на момент разрыва, а не длительность дренажа
-	// (добавлено 2026-08-14 по замеру прогона 161915).
-	//
-	// Почему drain_duration недостаточно и вводит в заблуждение: в ветке
-	// age_backstop он РАВЕН stickyMaxDrainAge всегда — все 50 teardown'ов
-	// прогона дали ровно `drain_duration=25s`. То есть поле не несёт информации
-	// о том, чем эти 25s оплачены, а оплачены они возрастом соединения на wire.
-	//
-	// Замер того же прогона: старт дренажа приходится на p50 34.2s / p90 74.2s /
-	// max 77.6s возраста, поэтому полная жизнь получается p50 59.2 / p90 99.2 /
-	// max 102.6s. Sticky даёт 77% всей экспозиции в опасной полосе >82s
-	// (196.8s из 254s) и 12 из 17 соединений старше 85s — то есть после
-	// исправления утечки ячеек это ГЛАВНЫЙ и почти единственный источник хвоста
-	// возрастов, а по drain_duration его не увидеть.
-	//
-	// Величина сравнивается с окном реза напрямую: 0 резов ниже 80s на 52 808s
-	// экспозиции (замер 08-13), hazard 80-85s ≈ 14.4e-3 1/с. При наблюдённых
-	// 49.2s/ч экспозиции >82s ожидается ~1 рез за 4-часовой прогон; наблюдалось
-	// 0. Порог не пробит, но запас исчерпывается именно здесь, поэтому величина
-	// обязана быть в логе ДО того, как станет вредной.
-	slotAge := time.Duration(0)
-	if started := slot.startedAtNs.Load(); started > 0 {
-		slotAge = time.Since(time.Unix(0, started))
-		// Накапливаем экспозицию ЗА порогом, а не число заходов: два соединения
-		// по 1s и одно по 20s — разный риск, а событий во всех случаях мало.
-		// Порог см. Stats.StickyExposureOver82sMs.
-		if over := slotAge - stickyExposureThreshold; over > 0 {
-			Stats.StickyExposureOver82sMs.Add(uint64(over.Milliseconds()))
-		}
-	}
 
 	p.log.Info("WS pool slot drain sticky backstop teardown",
 		"slot", oldIdx, "reason", reason,

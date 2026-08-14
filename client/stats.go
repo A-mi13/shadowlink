@@ -331,13 +331,17 @@ type statsRegistry struct {
 	// что пул балансирует НА полу и любая плановая ротация будет отклонена.
 	CapacityFloorDeferredTotal atomic.Uint64
 
-	// StickyExposureOver82sMs — суммарное время, проведённое соединениями ЗА
-	// порогом 82s, накопленное по sticky-teardown'ам.
+	// AgeExposureOverThresholdMs — суммарное время, проведённое соединениями ЗА
+	// ageExposureThreshold, накопленное по ВСЕМ нашим путям терминации.
 	//
-	// Заведён 2026-08-14 после того, как замер показал: sticky даёт 77% всей
-	// экспозиции в опасной полосе (196.8s из 254s за 4ч) и 12 из 17 соединений
-	// старше 85s. До этого утечка ячеек и отложки гейта маскировали вклад sticky;
-	// после их исправления он остался единственным значимым источником хвоста.
+	// Заведён 2026-08-14 после того, как замер показал: sticky даёт 77% перебега
+	// за 82s (196.8s из 254.0s за 4ч) и 12 из 17 соединений старше 85s. До этого
+	// утечка ячеек и отложки гейта маскировали его вклад; после их исправления
+	// sticky остался ГЛАВНЫМ источником хвоста возрастов.
+	//
+	// ⚠ Имя без «sticky» и без «82s» — намеренно (см. ageExposureThreshold):
+	// накопление идёт на общем пути tearDown, потому что остальные 23% перебега
+	// (57.3s) дал natural finish, а порог настраиваемый и в имени быть не должен.
 	//
 	// Почему 82s, а не 80s: 80s — нижняя граница, где hazard впервые перестаёт
 	// быть нулём, но плановые ротации массово проходят через 80.2s и раздули бы
@@ -345,10 +349,24 @@ type statsRegistry struct {
 	// перебег. Величина в миллисекундах, а не в числе событий: два соединения по
 	// 1s и одно по 20s — разный риск, а событий во всех случаях мало.
 	//
-	// Как читать: делить на часы прогона и сравнивать с hazard-кривой.
-	// При 49.2s/ч и hazard 80-85s ≈ 14.4e-3 1/с ожидается ~1 рез за 4ч. Рост
-	// этой величины — единственный оставшийся канал, по которому вернутся резы.
-	StickyExposureOver82sMs atomic.Uint64
+	// Как читать: делить на часы прогона и сравнивать с hazard-кривой. В прогоне
+	// 161915 перебег за 82s составил 254.0s на 4.01ч = 63.4 с/ч.
+	//
+	// ⚠ Ожидаемое число резов из этой величины НЕ выводится умножением на
+	// rate_exp. Прикидка «63.4 с/ч × 14.4e-3 1/с × 4ч ≈ 3.7 реза» дала бы 3-4
+	// ожидаемых реза при наблюдённых 0 — то есть модель отвергается замером, а не
+	// подтверждает запас. Причины, по которым перемножать нельзя:
+	//   - 14.4e-3 1/с — rate полосы 80-85s, а перебег за 82s набран в основном
+	//     ВЫШЕ неё (при 85s остаётся 196.0s из 254.0s), где rate не измерен;
+	//   - сам rate_exp получен по 3 резам на 208s экспозиции другого прогона,
+	//     то есть его собственный интервал доверия перекрывает порядок величины;
+	//   - подмена единиц «доля на вход / вероятность прохода / 1/с» — известный в
+	//     этом проекте класс ошибок, разобранный в
+	//     docs/plans/2026-08-14-post-fable-fixes.md §2.
+	// Поэтому величина — ИНДИКАТОР ТРЕНДА (рост = риск растёт), а не оценка числа
+	// резов. Абсолютный прогноз требует hazard со знаменателем из плановых
+	// ротаций в тех же полосах, и эта работа не сделана.
+	AgeExposureOverThresholdMs atomic.Uint64
 
 	// HealingRetargetTotal — сколько раз цепочка reconnectLoop переприцелилась на
 	// другую ячейку, потому что её собственную забрал дренаж.
@@ -927,9 +945,18 @@ func WritePromMetrics(w io.Writer) {
 	fmt.Fprintf(w, "# TYPE shadowlink_slot_drain_capacity_floor_deferred_total counter\n")
 	fmt.Fprintf(w, "shadowlink_slot_drain_capacity_floor_deferred_total %d\n", Stats.CapacityFloorDeferredTotal.Load())
 
-	fmt.Fprintf(w, "# HELP shadowlink_sticky_exposure_over_82s_ms Cumulative wire time spent by connections past the 82s hazard threshold, accumulated at sticky-drain teardown\n")
-	fmt.Fprintf(w, "# TYPE shadowlink_sticky_exposure_over_82s_ms counter\n")
-	fmt.Fprintf(w, "shadowlink_sticky_exposure_over_82s_ms %d\n", Stats.StickyExposureOver82sMs.Load())
+	// Порог НЕ вписан в имя серии: он настраиваемый (ageExposureThreshold), и
+	// «over_82s» в названии стало бы ложью при первой же его смене, причём молча.
+	// Актуальную величину порога печатает отдельная gauge ниже.
+	fmt.Fprintf(w, "# HELP shadowlink_age_exposure_over_threshold_ms Cumulative wire time spent by connections past shadowlink_age_exposure_threshold_seconds, accumulated across ALL drain teardown paths\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_age_exposure_over_threshold_ms counter\n")
+	fmt.Fprintf(w, "shadowlink_age_exposure_over_threshold_ms %d\n", Stats.AgeExposureOverThresholdMs.Load())
+
+	// Порог рядом со счётчиком: без него исторические значения счётчика
+	// несравнимы между прогонами, а по имени серии порог уже не восстановить.
+	fmt.Fprintf(w, "# HELP shadowlink_age_exposure_threshold_seconds Age above which wire time is counted as dangerous exposure (denominator context for shadowlink_age_exposure_over_threshold_ms)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_age_exposure_threshold_seconds gauge\n")
+	fmt.Fprintf(w, "shadowlink_age_exposure_threshold_seconds %.0f\n", ageExposureThreshold.Seconds())
 
 	fmt.Fprintf(w, "# HELP shadowlink_pool_healing_retargets_total Reconnect chains re-targeted to another cell after a drain claimed theirs (prevents permanent cell loss)\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_pool_healing_retargets_total counter\n")

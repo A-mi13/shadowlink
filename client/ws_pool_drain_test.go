@@ -3004,7 +3004,7 @@ func TestEmitHardCapLog_IncludesDiagSnapshot(t *testing.T) {
 	storeStreamForTestWithAge(p, 1, 0, 1*time.Second)
 	storeStreamForTestWithAge(p, 2, 0, 60*time.Second)
 
-	emitHardCapLog(p, 0, p.slots[0], "age", 90*time.Second)
+	emitHardCapLog(p, 0, p.slots[0], "age", 90*time.Second, 90*time.Second)
 
 	out := buf.String()
 	required := []string{

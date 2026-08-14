@@ -451,7 +451,7 @@ func TestHardCap_LogLevelInfo_BelowThreshold(t *testing.T) {
 	p.log = logger
 	slot.streams.Store(2)
 
-	emitHardCapLog(p, 0, slot, "age", 90*time.Second)
+	emitHardCapLog(p, 0, slot, "age", 90*time.Second, 90*time.Second)
 
 	out := buf.String()
 	if !strings.Contains(out, "hard cap reached") {
@@ -469,7 +469,7 @@ func TestHardCap_LogLevelWarn_AtThreshold(t *testing.T) {
 	p.log = logger
 	slot.streams.Store(5)
 
-	emitHardCapLog(p, 0, slot, "age", 90*time.Second)
+	emitHardCapLog(p, 0, slot, "age", 90*time.Second, 90*time.Second)
 
 	out := buf.String()
 	if !strings.Contains(out, "level=WARN") {
@@ -484,7 +484,7 @@ func TestHardCap_LogLevelWarn_AboveThreshold(t *testing.T) {
 	p.log = logger
 	slot.streams.Store(9)
 
-	emitHardCapLog(p, 0, slot, "age", 90*time.Second)
+	emitHardCapLog(p, 0, slot, "age", 90*time.Second, 90*time.Second)
 
 	out := buf.String()
 	if !strings.Contains(out, "level=WARN") {
@@ -499,7 +499,7 @@ func TestHardCap_CounterIncrementsRegardlessOfLevel(t *testing.T) {
 		before := Stats.DrainHardCapTotal.Load()
 		p, slot := makeHardCapTestPool(t)
 		slot.streams.Store(streams)
-		emitHardCapLog(p, 0, slot, "age", 90*time.Second)
+		emitHardCapLog(p, 0, slot, "age", 90*time.Second, 90*time.Second)
 		if got := Stats.DrainHardCapTotal.Load(); got != before+1 {
 			t.Errorf("DrainHardCapTotal didn't advance for streams=%d: %d → %d",
 				streams, before, got)

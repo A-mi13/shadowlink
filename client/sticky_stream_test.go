@@ -515,58 +515,78 @@ func TestSticky_HealthyCapacity_Granted(t *testing.T) {
 //
 // # Зачем счётчик (замер прогона 20260814-161915)
 //
-// После исправления утечки ячеек и обнуления отложек capacity-floor sticky остался
-// ЕДИНСТВЕННЫМ значимым источником хвоста возрастов: 77% всей экспозиции за 82s
-// (196.8s из 254s за 4 часа), 12 из 17 соединений старше 85s, max 102.6s.
+// После исправления утечки ячеек и обнуления отложек capacity-floor sticky стал
+// ГЛАВНЫМ источником хвоста возрастов: 77% перебега за 82s (196.8s из 254.0s за
+// 4 часа), 12 из 17 соединений старше 85s, max 102.6s. Но НЕ единственным —
+// остальные 23% дал natural finish, поэтому накопление стоит на общем пути
+// (см. TestAgeExposure_AccruedOnAllTeardownPaths).
 //
 // Из логов это было не видно: в ветке age_backstop `drain_duration` РАВЕН
 // stickyMaxDrainAge всегда — все 50 teardown'ов дали ровно 25s. Поле не несёт
 // информации о том, чем эти 25s оплачены, а оплачены они возрастом на wire.
 //
-// Тест закрепляет три свойства, каждое из которых легко потерять при правке:
+// Тест закрепляет четыре свойства, каждое из которых легко потерять при правке:
 //  1. считается ПЕРЕБЕГ (age - threshold), а не полный возраст — иначе величина
 //     раздувается штатной работой и перестаёт сравниваться с hazard-кривой;
 //  2. соединение НИЖЕ порога не добавляет ничего — иначе плановые ротации,
 //     массово проходящие через 80.2s, забьют счётчик;
 //  3. накопление аддитивно: два прохода складываются. Величина — время, а не
-//     число событий, потому что 1s и 20s перебега это разный риск.
-func TestStickyExposure_CountsOnlyOverThreshold(t *testing.T) {
-	p := &WSPoolTransport{poolSize: 4, log: newDiscardLogger()}
-	p.slots = make([]*poolSlot, 8)
-
-	newDrainingSlot := func(age time.Duration) *poolSlot {
+//     число событий, потому что 1s и 20s перебега это разный риск;
+//  4. слот без startedAtNs НЕ считается возрастом 0 молча — иначе счётчик
+//     тихо перестаёт считать при регрессии в порядке инициализации.
+func TestAgeExposure_CountsOnlyOverThreshold(t *testing.T) {
+	newSlot := func(age time.Duration) *poolSlot {
 		s := &poolSlot{index: 0}
 		s.setState(slotDraining)
 		s.startedAtNs.Store(time.Now().Add(-age).UnixNano())
-		p.slots[0] = s
 		return s
 	}
 
 	// 1. Ниже порога — вклада нет.
-	before := Stats.StickyExposureOver82sMs.Load()
-	emitStickyTeardownLog(p, 0, newDrainingSlot(70*time.Second), "age", 25*time.Second, "age_backstop")
-	if got := Stats.StickyExposureOver82sMs.Load(); got != before {
+	before := Stats.AgeExposureOverThresholdMs.Load()
+	accrueAgeExposure(newSlot(70 * time.Second))
+	if got := Stats.AgeExposureOverThresholdMs.Load(); got != before {
 		t.Errorf("возраст 70s (ниже порога %v) добавил %d мс — счётчик забьётся "+
 			"штатными ротациями и перестанет сравниваться с hazard",
-			stickyExposureThreshold, got-before)
+			ageExposureThreshold, got-before)
 	}
 
 	// 2. Выше порога — вклад равен ПЕРЕБЕГУ, не всему возрасту.
-	before = Stats.StickyExposureOver82sMs.Load()
-	emitStickyTeardownLog(p, 0, newDrainingSlot(92*time.Second), "byte_budget", 25*time.Second, "age_backstop")
-	delta := Stats.StickyExposureOver82sMs.Load() - before
-	// Ожидаем ~10s перебега (92 - 82). Допуск на время исполнения теста.
+	before = Stats.AgeExposureOverThresholdMs.Load()
+	age := ageExposureThreshold + 10*time.Second
+	if got := accrueAgeExposure(newSlot(age)); got < age || got > age+time.Second {
+		t.Errorf("возвращённый возраст %v не равен фактическому %v — в лог уедет "+
+			"не тот slot_age, по которому посчитан счётчик", got, age)
+	}
+	delta := Stats.AgeExposureOverThresholdMs.Load() - before
+	// Ожидаем ~10s перебега. Допуск на время исполнения теста.
 	if delta < 9_500 || delta > 10_500 {
-		t.Errorf("перебег для возраста 92s = %d мс, ожидалось ~10000 "+
-			"(92s - порог %v). Если ~92000 — считается весь возраст вместо перебега",
-			delta, stickyExposureThreshold)
+		t.Errorf("перебег для возраста %v = %d мс, ожидалось ~10000 (age - порог %v). "+
+			"Если ~%d — считается весь возраст вместо перебега",
+			age, delta, ageExposureThreshold, age.Milliseconds())
 	}
 
 	// 3. Аддитивность: второй проход складывается с первым.
-	before = Stats.StickyExposureOver82sMs.Load()
-	emitStickyTeardownLog(p, 0, newDrainingSlot(87*time.Second), "age", 25*time.Second, "age_backstop")
-	if d := Stats.StickyExposureOver82sMs.Load() - before; d < 4_500 || d > 5_500 {
+	before = Stats.AgeExposureOverThresholdMs.Load()
+	accrueAgeExposure(newSlot(ageExposureThreshold + 5*time.Second))
+	if d := Stats.AgeExposureOverThresholdMs.Load() - before; d < 4_500 || d > 5_500 {
 		t.Errorf("второй проход добавил %d мс, ожидалось ~5000 — накопление сломано", d)
+	}
+
+	// 4. Слот, который ни разу не подключался (startedAtNs=0), не даёт ни вклада,
+	// ни ложного возраста. Иначе time.Unix(0,0) дал бы возраст «с 1970 года» и
+	// счётчик разом получил бы полвека перебега.
+	before = Stats.AgeExposureOverThresholdMs.Load()
+	fresh := &poolSlot{index: 0}
+	if got := accrueAgeExposure(fresh); got != 0 {
+		t.Errorf("слот без startedAtNs дал возраст %v, ожидался 0", got)
+	}
+	if got := Stats.AgeExposureOverThresholdMs.Load(); got != before {
+		t.Errorf("слот без startedAtNs добавил %d мс — startedAtNs=0 трактуется "+
+			"как эпоха Unix, счётчик испорчен навсегда", got-before)
+	}
+	if got := accrueAgeExposure(nil); got != 0 {
+		t.Errorf("nil-слот дал возраст %v, ожидался 0", got)
 	}
 }
 
@@ -576,16 +596,58 @@ func TestStickyExposure_CountsOnlyOverThreshold(t *testing.T) {
 // Замер 08-13: p75 = p90 = 80.2s по 622 плановым ротациям — то есть порог 80s
 // собрал бы почти весь пул. 82s отсекает их. Ниже 80s резов не наблюдалось вовсе
 // (0 на 52 808s экспозиции), так что смысла опускать порог нет.
-func TestStickyExposureThreshold_AbovePlannedRotationBand(t *testing.T) {
-	if stickyExposureThreshold <= 80*time.Second {
+func TestAgeExposureThreshold_AbovePlannedRotationBand(t *testing.T) {
+	if ageExposureThreshold <= 80*time.Second {
 		t.Errorf("порог %v не выше 80s: плановые ротации проходят через 80.2s "+
 			"(p75=p90 по 622 наблюдениям) и забьют счётчик штатной работой",
-			stickyExposureThreshold)
+			ageExposureThreshold)
 	}
 	// И не слишком высоко: hazard в полосе 80-85s уже 14.4e-3 1/с, поэтому
 	// перебег в этой зоне обязан быть виден.
-	if stickyExposureThreshold >= 85*time.Second {
+	if ageExposureThreshold >= 85*time.Second {
 		t.Errorf("порог %v слишком высок: полоса 80-85s несёт hazard 14.4e-3 1/с "+
-			"и перебег в ней должен попадать в счётчик", stickyExposureThreshold)
+			"и перебег в ней должен попадать в счётчик", ageExposureThreshold)
+	}
+}
+
+// Перебег обязан накапливаться на ВСЕХ путях терминации, а не только в
+// sticky-ветке.
+//
+// Замер прогона 161915 по восстановленным временам жизни (n=1575): при пороге 82s
+// всего 254.0s перебега, из них sticky 196.8s (77%), natural finish 57.3s (23%).
+// Первая версия счётчика накапливала только в emitStickyTeardownLog и эти 23% не
+// видела. Доля не константа: при пороге 80s sticky даёт уже 66% (222.8 из
+// 339.7s), то есть слепая зона растёт при понижении порога.
+//
+// Тест — сторож против возврата накопления в конкретную ветку switch: он
+// проверяет, что накопление живёт в accrueAgeExposure, который tearDown зовёт ДО
+// switch по причине, и что sticky-лог сам ничего не накапливает (иначе перебег
+// на sticky-пути посчитался бы дважды).
+func TestAgeExposure_AccruedOnAllTeardownPaths(t *testing.T) {
+	p := &WSPoolTransport{poolSize: 4, log: newDiscardLogger()}
+	p.slots = make([]*poolSlot, 8)
+	slot := &poolSlot{index: 0}
+	slot.setState(slotDraining)
+	slot.startedAtNs.Store(time.Now().Add(-(ageExposureThreshold + 8*time.Second)).UnixNano())
+	p.slots[0] = slot
+
+	// Эмиттеры логов ПОЛУЧАЮТ возраст, а не считают его и не накапливают:
+	// двойной учёт на sticky-пути был бы тем же дефектом с другим знаком.
+	before := Stats.AgeExposureOverThresholdMs.Load()
+	emitStickyTeardownLog(p, 0, slot, "age", 25*time.Second, "age_backstop", 90*time.Second)
+	emitHardCapLog(p, 0, slot, "age", 30*time.Second, 90*time.Second)
+	if got := Stats.AgeExposureOverThresholdMs.Load(); got != before {
+		t.Errorf("эмиттеры логов накопили %d мс — накопление обязано быть только в "+
+			"accrueAgeExposure на общем пути, иначе sticky считается дважды, "+
+			"а natural finish не считается вовсе", got-before)
+	}
+
+	// А сам accrueAgeExposure считает независимо от того, каким путём слот умер:
+	// он вообще не смотрит на причину.
+	if d := accrueAgeExposure(slot); d < ageExposureThreshold {
+		t.Errorf("accrueAgeExposure вернул %v — не видит возраст слота", d)
+	}
+	if got := Stats.AgeExposureOverThresholdMs.Load() - before; got < 7_500 || got > 8_500 {
+		t.Errorf("накоплено %d мс, ожидалось ~8000: накопление не на общем пути", got)
 	}
 }
