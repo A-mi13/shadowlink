@@ -310,22 +310,26 @@ type statsRegistry struct {
 	// относительный риск ×21 (гипергеометрический p ≈ 1.5e-4, n=3, поэтому
 	// указание, а не доказательство). Механизм статистики не требует: отсрочка
 	// на 79.7s гарантирует ≥3s экспозиции в полосе 80-85s, где hazard впервые
-	// перестаёт быть нулём (2.1% на проход против 0 на 52 808s ниже 80s).
+	// перестаёт быть нулём.
+	//
+	// Величина этой полосы (прогон 153638, по экспозиции): rate_exp
+	// 14.4e-3 1/с, то есть p_pass ≈ 6.94% при проходе полосы целиком.
+	// ⚠ Не путать с 2.1% = Cut/Reached — это доля на ВХОД в полосу при
+	// экспозиции 0.2s, единицы разные. Ровно на этой подмене единиц уже
+	// строился неверный вывод (разбор 2026-08-14).
 	//
 	// Читать так: ненулевой rate = слоты платят возрастом за исправность пула.
-	// Смотреть вместе с sweep_phase_jitter_applied_total и возрастами резов, а
-	// не как индикатор «каскад/не каскад».
+	// Смотреть вместе с ready_capacity / ready_capacity_floor и возрастами резов,
+	// а не как индикатор «каскад/не каскад»: ready_capacity == floor означает,
+	// что пул балансирует НА полу и любая плановая ротация будет отклонена.
 	CapacityFloorDeferredTotal atomic.Uint64
 
-	// SweepPhaseJitterAppliedTotal — сколько раз rotationWatchdogSweep выдал
-	// слоту подтиковую отсрочку дренажа (sweepPhaseJitterDefault, ws_pool.go).
-	//
-	// Ожидание: примерно одна на каждую age-ротацию, потому что флаг
-	// phaseJitterApplied однократен на жизнь слота. Существенный недобор
-	// означает, что слоты уходят не через age-ветку свипа (byte budget, резы,
-	// meltdown) — то есть размазывание фазы покрывает меньшую долю новых
-	// TLS-соединений, чем кажется, и замер фазы надо читать с этой поправкой.
-	SweepPhaseJitterAppliedTotal atomic.Uint64
+	// ⚠ Здесь был SweepPhaseJitterAppliedTotal — счётчик подтиковых отсрочек
+	// дренажа. Удалён 2026-08-14 вместе с самой ручкой: она не размазывала фазу
+	// (единственный читатель nextDrainAttemptNs — свип, а свип просыпается по
+	// тому же тикеру, поэтому отсрочка меньше тика всегда переносила дренаж
+	// ровно на следующий тик, в ту же фазу). Причина лечится срезкой
+	// rotationWatchdogTick — см. обоснование у этой константы.
 
 	// StreamBufferOverflowsTotal — cumulative count of frames dropped at
 	// client.RouteToStream when the per-stream buffered channel (cap 512)
@@ -871,10 +875,6 @@ func WritePromMetrics(w io.Writer) {
 	fmt.Fprintf(w, "# HELP shadowlink_slot_drain_capacity_floor_deferred_total Drains deferred by storm-brake capacity-floor gate (readyCapacity < poolSize * readyCapacityFloorFraction)\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_slot_drain_capacity_floor_deferred_total counter\n")
 	fmt.Fprintf(w, "shadowlink_slot_drain_capacity_floor_deferred_total %d\n", Stats.CapacityFloorDeferredTotal.Load())
-
-	fmt.Fprintf(w, "# HELP shadowlink_sweep_phase_jitter_applied_total Sub-tick drain delays issued by rotationWatchdogSweep to de-phase new TLS connects from the watchdog grid\n")
-	fmt.Fprintf(w, "# TYPE shadowlink_sweep_phase_jitter_applied_total counter\n")
-	fmt.Fprintf(w, "shadowlink_sweep_phase_jitter_applied_total %d\n", Stats.SweepPhaseJitterAppliedTotal.Load())
 
 	fmt.Fprintf(w, "# HELP shadowlink_slot_drain_force_evicted_total Force-evictions of idle slotReady cells when claimFreeSlot would have returned -1 (slice full)\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_slot_drain_force_evicted_total counter\n")
@@ -1449,15 +1449,14 @@ func logSlotDeathSummary() {
 		"drain_hard_cap", pool.drainHardCap,
 		"stagger_span", wcStagger,
 		"effective_max_age_max", wcBase+wcStagger,
-		// ⚠ Имя переименовано 2026-08-14 из `sweep_tick`. Слагаемое перестало
-		// быть чистым тиком: в него вошло подтиковое размазывание фазы
-		// (sweepPhaseJitter, до +4s). Оставить прежнее имя значило бы завести
-		// ровно тот дефект, который проект собирает пачками — поле, чьё имя
-		// врёт о механизме. Составляющие печатаются рядом порознь, чтобы
+		// ⚠ Имя переименовано 2026-08-14 из `sweep_tick`. Слагаемое не равно
+		// одному тику: тик расходуется ДВАЖДЫ (обнаружение + повторная попытка
+		// после отсрочки гейта, см. worstCaseTeardown). Оставить прежнее имя
+		// значило бы завести ровно тот дефект, который проект собирает пачками —
+		// поле, чьё имя врёт о механизме. Сам тик печатается рядом, чтобы
 		// величину можно было разложить, не читая код.
 		"sweep_budget", wcSweep,
 		"sweep_tick", rotationWatchdogTick,
-		"sweep_phase_jitter", pool.sweepPhaseJitter,
 		"defer_backoff", wcDeferred,
 		"teardown_cap", wcTear,
 		"worst_case_teardown", wcTotal,
@@ -1671,21 +1670,28 @@ func logSlotDeathHazard(pool *WSPoolTransport) {
 		}
 		// Печатаем ОБЕ величины и экспозицию.
 		//
-		// rate_exp (1/с) — несмещённая: резы делятся на фактически прожитое в
-		// полосе время. rate_act — прежняя actuarial-форма, оставлена только для
-		// сравнимости со старыми логами; в нашей конфигурации она ЗАНИЖАЕТ вдвое,
-		// потому что цензурирование сидит у нижней кромки полосы (порог ротации
-		// 70s+stagger → плановые умирают на 74-80s). Замер 2026-08-14: 3.37%
-		// против 6.94% по экспозиции в полосе 80-85s.
+		// rate_exp (1/с) — не смещена ЦЕНЗУРИРОВАНИЕМ: резы делятся на фактически
+		// прожитое в полосе время. rate_act — прежняя actuarial-форма, оставлена
+		// только для сравнимости со старыми логами; в нашей конфигурации она
+		// ЗАНИЖАЕТ вдвое, потому что цензурирование сидит у нижней кромки полосы
+		// (порог ротации 70s+stagger → плановые умирают на 74-80s). Замер
+		// 2026-08-14 для полосы 80-85s: rate_act 3.37% против p_pass 6.94%.
 		//
-		// p_pass — вероятность реза при проходе полосы целиком, чтобы читателю не
-		// приходилось умножать интенсивность на ширину в голове. Именно эту
-		// величину сравнивают с «hazard 2-6%» из разборов.
+		// p_pass — вероятность реза при проходе полосы ЦЕЛИКОМ (1-exp(-rate*width)).
+		// Именно её сравнивают с «hazard N%» из разборов. ⚠ Не путать с Cut/Reached:
+		// та величина — доля на ВХОД в полосу, и при экспозиции 0.2s даёт 2.1%
+		// там, где p_pass даёт 6.94%. Подмена этих единиц уже приводила к неверному
+		// выводу (разбор 2026-08-14).
 		//
 		// ⚠ Поле reached читать буквально нельзя: это «записей осталось в ринге»,
-		// а не «соединений дошло». При ring_saturated=true оба ринга набирались
-		// окнами разной длины и любая доля смещена — в PROBE 2026-08-13 это дало
-		// завышение ×2.06.
+		// а не «соединений дошло». При ring_saturated=true ринги набирались окнами
+		// разной длины, и смещена ЛЮБАЯ доля, включая rate_exp — у него обрезается
+		// знаменатель. В PROBE 2026-08-13 это дало завышение ×2.06. С 2026-08-14
+		// ринг плановых вмещает PlannedCapacity=4096 (~13ч), поэтому в обычном
+		// прогоне флаг должен быть false; true = прогон длиннее ринга.
+		//
+		// exposure_s == 0 при cut > 0 означает рез ровно на входе в полосу:
+		// rate_exp тогда 0, и это «нет данных», а не «нет риска» (см. Hazard).
 		bandWidthSec := float64(hazardBandWidthMs) / 1000
 		rateExp := h.RateByExposure()
 		attrs = append(attrs,

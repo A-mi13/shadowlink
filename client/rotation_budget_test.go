@@ -52,10 +52,11 @@ func TestWorstCaseTeardown_IncludesStaggerAndSweep(t *testing.T) {
 	if want := 48 * time.Second; stagger != want {
 		t.Errorf("stagger = %v, want %v (cap 45s + step/2 3s)", stagger, want)
 	}
-	// sweepPhaseJitter здесь 0 (литерал, не NewWSPoolTransport) → слагаемое
-	// размазывания фазы не участвует, sweep равен чистому тику.
-	if sweep != rotationWatchdogTick {
-		t.Errorf("sweep = %v, want %v", sweep, rotationWatchdogTick)
+	// Тик расходуется ДВАЖДЫ (уточнено 2026-08-14): обнаружение перезревания +
+	// повторная попытка после отсрочки гейта, которую читает только свип.
+	// Подробнее — TestWorstCaseTeardown_SweepCountsTickTwice.
+	if want := 2 * rotationWatchdogTick; sweep != want {
+		t.Errorf("sweep = %v, want %v (тик считается дважды)", sweep, want)
 	}
 	if tear != 15*time.Second {
 		t.Errorf("teardown cap = %v, want 15s", tear)
@@ -74,7 +75,11 @@ func TestWorstCaseTeardown_IncludesStaggerAndSweep(t *testing.T) {
 		t.Fatalf("worst-case %v совпал с наивным base+sticky %v — "+
 			"stagger и sweep снова выпали из расчёта", total, naive)
 	}
-	if want := 75*time.Second + 48*time.Second + 5*time.Second +
+	// Слагаемое sweep берётся из константы, а не зашито числом: тик менялся
+	// (5s → 500ms, 2026-08-14, ради фазы ротаций на wire) и будет меняться снова.
+	// Зашитое число превратило бы тест из проверки ФОРМУЛЫ в проверку значения
+	// константы — а формулу здесь и защищаем.
+	if want := 75*time.Second + 48*time.Second + 2*rotationWatchdogTick +
 		drainRevertBackoff + 15*time.Second; total != want {
 		t.Errorf("worst-case = %v, want %v", total, want)
 	}

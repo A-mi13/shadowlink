@@ -268,27 +268,54 @@ func TestHazard_RateByExposureEmptyIsNotZeroRisk(t *testing.T) {
 // rate=0.0367 против 0.0178 по экспозиции, завышение ×2.06, и это было прочитано
 // как реальный риск. CutShare про ловушку предупреждает, Hazard не предупреждал.
 func TestHazard_RingSaturationIsVisible(t *testing.T) {
-	r := NewRecorder(8) // маленькая ёмкость, чтобы переполнить дёшево
+	r := NewRecorder(8) // маленькая ёмкость РЕЗОВ, чтобы переполнить дёшево
 
-	// Ринг резов не насыщен, плановых — тоже.
+	// Ни один ринг не насыщен.
 	r.Record(Observation{AgeMs: 85_000, CloseKind: "close_other"})
+	r.RecordPlanned(Observation{AgeMs: 95_000, CloseKind: ClosePlannedRotation})
 	if h := r.Hazard(80_000, 90_000); h.RingSaturated {
 		t.Fatalf("RingSaturated=true при ненасыщенных рингах")
 	}
 
-	// Переполняем ринг плановых: 12 записей при ёмкости 8.
+	// Переполняем ринг резов: 12 записей при ёмкости 8. Флаг обязан подняться —
+	// смещение возникает от насыщения ЛЮБОГО из двух рингов, потому что окна
+	// наблюдения числителя и знаменателя расходятся по длине.
 	for i := 0; i < 12; i++ {
-		r.RecordPlanned(Observation{AgeMs: 95_000, CloseKind: ClosePlannedRotation})
+		r.Record(Observation{AgeMs: 85_000, CloseKind: "close_other"})
 	}
 	h := r.Hazard(80_000, 90_000)
 	if !h.RingSaturated {
-		t.Fatalf("RingSaturated=false при переполненном ринге плановых — " +
+		t.Fatalf("RingSaturated=false при переполненном ринге резов — " +
 			"смещение доли останется невидимым в логе")
 	}
 	// Пожизненные счётчики обязаны помнить то, что ринг забыл: без них
 	// восстановить масштаб искажения нечем.
-	if got := r.TotalPlanned(); got != 12 {
-		t.Fatalf("TotalPlanned()=%d, ожидалось 12 (ринг забыл, счётчик — нет)", got)
+	if got := r.Total(); got != 13 {
+		t.Fatalf("Total()=%d, ожидалось 13 (ринг забыл, счётчик — нет)", got)
+	}
+	if got := r.Len(); got != 8 {
+		t.Fatalf("Len()=%d, ожидалось 8 (ёмкость)", got)
+	}
+}
+
+// Ёмкости рингов РАЗВЕДЕНЫ: плановых кратно больше, и общая ёмкость смещала
+// hazard (см. PlannedCapacity). Тест фиксирует само разделение — без него правка
+// молча вернётся при первом «упрощении».
+func TestRecorder_PlannedRingHasOwnCapacity(t *testing.T) {
+	if PlannedCapacity <= DefaultCapacity {
+		t.Fatalf("PlannedCapacity=%d не больше DefaultCapacity=%d: плановых в поле "+
+			"на два порядка больше резов, общая ёмкость переполняется за ~1.7ч "+
+			"и смещает hazard", PlannedCapacity, DefaultCapacity)
+	}
+
+	// Ёмкость, переданная в NewRecorder, к плановым не применяется.
+	r := NewRecorder(2)
+	for i := 0; i < 100; i++ {
+		r.RecordPlanned(Observation{AgeMs: 75_000, CloseKind: ClosePlannedRotation})
+	}
+	if got := r.LenPlanned(); got != 100 {
+		t.Fatalf("LenPlanned()=%d, ожидалось 100: ринг плановых не должен "+
+			"наследовать ёмкость ринга резов", got)
 	}
 }
 
@@ -434,15 +461,33 @@ func TestRecorder_ResetClearsPlanned(t *testing.T) {
 
 // TotalPlanned считает пожизненно, включая затёртые — иначе «сколько ротаций
 // было» не отличить от «сколько влезло в ринг».
+//
+// Ёмкость плановых — PlannedCapacity, НЕ та, что передана в NewRecorder: та
+// задаёт ринг резов. Развязано 2026-08-14, потому что темпы различаются на два
+// порядка (300+ плановых в час против 2-4 резов) и общая ёмткость 512
+// переполнялась за ~1.7ч, смещая hazard ×2.06. См. PlannedCapacity.
 func TestRecorder_TotalPlannedCountsOverwritten(t *testing.T) {
-	r := NewRecorder(4)
+	r := NewRecorder(4) // 4 — ёмкость ринга РЕЗОВ, плановых это не касается
 	for i := 0; i < 10; i++ {
 		r.RecordPlanned(Observation{AgeMs: 75_000, CloseKind: ClosePlannedRotation})
 	}
 	if got := r.TotalPlanned(); got != 10 {
 		t.Fatalf("TotalPlanned()=%d, ожидалось 10", got)
 	}
-	if got := r.LenPlanned(); got != 4 {
-		t.Fatalf("LenPlanned()=%d, ожидалось 4 (ёмкость ринга)", got)
+	if got := r.LenPlanned(); got != 10 {
+		t.Fatalf("LenPlanned()=%d, ожидалось 10: ёмкость плановых %d, "+
+			"переполнения быть не должно", got, PlannedCapacity)
+	}
+
+	// Ринг резов ёмкостью 4 переполняется независимо — ровно та асимметрия,
+	// из-за которой ёмкости и разведены.
+	for i := 0; i < 10; i++ {
+		r.Record(Observation{AgeMs: 85_000, CloseKind: "close_other"})
+	}
+	if got := r.Len(); got != 4 {
+		t.Fatalf("Len()=%d, ожидалось 4 (ёмкость ринга резов)", got)
+	}
+	if got := r.Total(); got != 10 {
+		t.Fatalf("Total()=%d, ожидалось 10", got)
 	}
 }

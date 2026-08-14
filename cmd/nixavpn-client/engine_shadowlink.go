@@ -506,18 +506,6 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 				staggerOffsetCap := envDurationDefault("SHADOWLINK_STAGGER_OFFSET_CAP", 45*time.Second)
 				ageCutMinAge := envDurationDefault("SHADOWLINK_AGE_CUT_MIN_AGE", 45*time.Second)
 
-				// Подтиковое размазывание момента дренажа (2026-08-14). Замер по
-				// логу nixavpn-DEBUG-20260813-153638: все 588 age-ротаций легли в
-				// ОДНУ фазу 5-секундной сетки watchdog'а (σ 0.0001s, дрейфа за 2ч
-				// нет), 92.2% TCP-connect'ов — в одном 1-секундном окне. Stagger
-				// это не лечит: он прибавляется к ПОРОГУ, а порог проверяется
-				// только на тике.
-				//
-				// 0/не задано → дефолт 4s. Отрицательное (напр. `-1s`) выключает
-				// ровно, для A/B: ручка платит возрастом до +4s, а полоса 80-85s
-				// несёт hazard 2.1% на проход против нуля ниже 80s.
-				sweepPhaseJitter := envDurationDefault("SHADOWLINK_SWEEP_PHASE_JITTER", 0)
-
 				// Доля пола storm-brake. 0 → константа 0.75. Выведена ради A/B:
 				// при MaxSlotAge=70s пул штатно балансирует НА полу (alive=6 при
 				// floor=6), и отложки гейта удлиняют жизнь слота в полосу
@@ -528,32 +516,30 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 				readyCapacityFloorFraction := envFloatDefault("SHADOWLINK_READY_CAPACITY_FLOOR_FRACTION", 0)
 
 				pool := client.NewWSPoolTransport(e.cl, client.WSPoolConfig{
-					Size:                poolSize,
-					ServerAddr:          wsTarget,
-					UseTLS:              slCfg.TLS,
-					SkipVerify:          false,
-					SNIHost:             sniHost,
-					CFIP:                slCfg.CFIP,
-					MaxStreamsPerSlot:   maxStreamsPerSlot,
-					MaxPendingPerSlot:   maxPendingPerSlot,
-					MaxBytesPerSlot:     maxBytesPerSlot,
-					MaxSlotAge:          maxSlotAge,
-					WriteTimeout:        writeTimeout,
-					StaggerDelay:        staggerDelay,
-					KeepaliveInterval:   keepaliveInterval,
-					StaggerStep:         staggerStep,
-					StaggerOffsetCap:    staggerOffsetCap,
-					AgeCutMinAge:        ageCutMinAge,
-					SweepPhaseJitter:    sweepPhaseJitter,
-
+					Size:                       poolSize,
+					ServerAddr:                 wsTarget,
+					UseTLS:                     slCfg.TLS,
+					SkipVerify:                 false,
+					SNIHost:                    sniHost,
+					CFIP:                       slCfg.CFIP,
+					MaxStreamsPerSlot:          maxStreamsPerSlot,
+					MaxPendingPerSlot:          maxPendingPerSlot,
+					MaxBytesPerSlot:            maxBytesPerSlot,
+					MaxSlotAge:                 maxSlotAge,
+					WriteTimeout:               writeTimeout,
+					StaggerDelay:               staggerDelay,
+					KeepaliveInterval:          keepaliveInterval,
+					StaggerStep:                staggerStep,
+					StaggerOffsetCap:           staggerOffsetCap,
+					AgeCutMinAge:               ageCutMinAge,
 					ReadyCapacityFloorFraction: readyCapacityFloorFraction,
-					GracefulDrain:       gracefulDrain,
-					DrainHardCap:        drainHardCap,
-					DrainIdleThreshold:  drainIdleThreshold,
-					DrainIdleStreamsMax: drainIdleStreamsMax,
-					StickyMaxDrainAge:   stickyMaxDrainAge,
-					StickyMaxTotalBytes: stickyMaxTotalBytes,
-					StickyMaxSlots:      stickyMaxSlots,
+					GracefulDrain:              gracefulDrain,
+					DrainHardCap:               drainHardCap,
+					DrainIdleThreshold:         drainIdleThreshold,
+					DrainIdleStreamsMax:        drainIdleStreamsMax,
+					StickyMaxDrainAge:          stickyMaxDrainAge,
+					StickyMaxTotalBytes:        stickyMaxTotalBytes,
+					StickyMaxSlots:             stickyMaxSlots,
 				})
 				if err := pool.Connect(ctx2); err != nil {
 					slog.Warn("WS Pool не удался, fallback на SplitHTTP", "err", err)

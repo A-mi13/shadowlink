@@ -8,146 +8,94 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Подтиковое размазывание фазы дренажа (sweepPhaseJitter, ws_pool.go).
+// Фаза ротаций на wire и бюджет свипа.
 //
-// Что защищаем и почему это не «ещё один джиттер». Замер 2026-08-14 по логу
-// nixavpn-DEBUG-20260813-153638 (2.04ч): все 588 age-ротаций легли в ОДНУ фазу
-// 5-секундной сетки rotationWatchdogTick, σ фазы = 0.0001s, дрейфа за 2 часа
-// нет; 92.2% TCP-connect'ов — в одном односекундном окне этой фазы. То есть
-// комментарий к slotStaggerOffset про размазанный FFT-пик описывал механизм,
-// который НЕ исполняется: stagger прибавляется к порогу, а порог проверяется
-// только на тике, поэтому подтиковая фаза не размазывается вообще.
+// # История, без которой эти тесты выглядят произвольными
 //
-// Три свойства, каждое из которых ломает фичу целиком, если не выполнено:
+// Замер 2026-08-14 (лог nixavpn-DEBUG-20260813-153638, 2.04ч): все 588
+// age-ротаций легли в ОДНУ фазу 5-секундной сетки rotationWatchdogTick,
+// σ фазы 0.0001s, дрейфа за 2 часа нет; 92.2% TCP-connect'ов — в одном
+// односекундном окне. Комментарий к slotStaggerOffset утверждал, что additive
+// grid jitter разрушает спектральный пик; замер показал, что пик лишь переехал
+// на 1/tick и стал предельно узким.
 //
-//  1. отсрочка выдаётся ОДИН раз за жизнь слота. Иначе свип перевзводил бы её
-//     каждый тик и слот не ротировался бы НИКОГДА — ручка размазывания стала бы
-//     выключателем ротации;
-//  2. после истечения отсрочки ротация ДОЛЖНА состояться;
-//  3. отсрочка не превышает тик, иначе она накапливается и слагаемое в
-//     worstCaseTeardown перестаёт быть верхней границей (урок H-15).
+// Первая попытка починки была ОТКАЧЕНА в тот же день: слоту выдавалась разовая
+// отсрочка uniform[0, 4s) через nextDrainAttemptNs. Она не работала, и это
+// свойство КОДА, а не выборки — единственный читатель nextDrainAttemptNs это сам
+// свип, а свип просыпается только по тикеру. Отсрочка короче тика не «истекает»,
+// её сравнивают со следующим тиком, поэтому дренаж происходил ровно на следующем
+// тике, в той же фазе, с вероятностью 1.
+//
+// ⚠ Урок для тестов, а не только для кода. Тесты той попытки были ЗЕЛЁНЫМИ: они
+// вручную ставили nextDrainAttemptNs в прошлое и звали rotationWatchdogSweep(),
+// то есть эмулировали подтиковое пробуждение, которого в проде не существует.
+// Они прошли бы и при полностью сломанной фиче. Поэтому здесь НЕ проверяется
+// «свип отложил и потом сработал» — такая проверка ничего не значит, пока свип
+// вызывается вручную. Проверяется то, что действительно определяет фазу: период
+// тикера и его вклад в бюджет.
 
-// newPhaseJitterPool — пул с одним перезревшим ready-слотом и включённым
-// размазыванием. Возраст задаётся заведомо больше порога, чтобы тест проверял
-// именно ветку отсрочки, а не арифметику порога (её держат
-// TestRotationWatchdogSweep_*).
-func newPhaseJitterPool(t *testing.T, jitter time.Duration) (*WSPoolTransport, *poolSlot) {
-	t.Helper()
-	slot := &poolSlot{index: 0}
-	slot.setState(slotReady)
-	slot.streams.Store(0) // idle → ротация не отложится по активным стримам
-	slot.startedAtNs.Store(time.Now().Add(-3 * time.Minute).UnixNano())
+// TestRotationWatchdogTick_SubSecondForPhaseSpreading — период тикера обязан быть
+// заметно меньше секунды, иначе фаза ротаций видна на wire.
+//
+// Почему тест на константу, а не на поведение: фазу определяет ИМЕННО период
+// тикера (см. историю выше), а проверить фазу в юнит-тесте нельзя — для этого
+// нужен прогон с часами. Тест фиксирует решение и ловит откат константы к 5s,
+// который вернул бы 92.2% connect'ов в одно окно.
+//
+// Второе утверждение — про соотношение с stagger-джиттером. Срезка тика работает
+// потому, что амплитуда уже существующего джиттера (±step/2 = ±0.5s при step=1s)
+// стала СРАВНИМА с квантом сетки; при тике 5s джиттер был в 10 раз меньше кванта
+// и размазать фазу не мог физически.
+func TestRotationWatchdogTick_SubSecondForPhaseSpreading(t *testing.T) {
+	require.Less(t, rotationWatchdogTick, time.Second,
+		"тик watchdog'а определяет фазу новых TLS-соединений на wire: при 5s все "+
+			"588 ротаций легли в одну фазу (σ 0.0001s, 92.2%% в одном 1s-окне)")
 
-	pool, _ := newRotationTestPool(t, slot)
-	pool.client = &Client{}
-	pool.maxSlotAge = 2 * time.Minute
-	pool.sweepPhaseJitter = jitter
-	return pool, slot
+	// Прод-конфигурация: staggerStep=1s → амплитуда джиттера ±0.5s.
+	const prodStaggerStep = time.Second
+	jitterAmplitude := prodStaggerStep / 2
+	require.LessOrEqual(t, rotationWatchdogTick, jitterAmplitude,
+		"квант сетки должен быть не больше амплитуды stagger-джиттера (±step/2), "+
+			"иначе джиттер не способен размазать фазу — он лишь выбирает тик")
 }
 
-// TestSweepPhaseJitter_DefersFirstSweepThenRotates — свойства 1 и 2 вместе:
-// первый свип не рвёт слот, а ставит отсрочку; после её истечения рвёт.
-func TestSweepPhaseJitter_DefersFirstSweepThenRotates(t *testing.T) {
-	pool, slot := newPhaseJitterPool(t, 4*time.Second)
-
-	before := time.Now().UnixNano()
-	pool.rotationWatchdogSweep()
-
-	require.Equal(t, slotReady, slot.getState(),
-		"первый свип обязан ОТЛОЖИТЬ дренаж, а не выполнить его — иначе фаза "+
-			"остаётся приколоченной к тику")
-	require.True(t, slot.phaseJitterApplied.Load(),
-		"флаг однократности должен быть выставлен на первом же заходе")
-
-	deadline := slot.nextDrainAttemptNs.Load()
-	require.Greater(t, deadline, before,
-		"отсрочка должна быть в будущем")
-	require.LessOrEqual(t, deadline, before+int64(4*time.Second)+int64(time.Second),
-		"отсрочка не может превышать sweepPhaseJitter (+запас на медленный CI)")
-
-	// Отсрочка истекла — тот же слот, тот же свип.
-	slot.nextDrainAttemptNs.Store(time.Now().Add(-time.Millisecond).UnixNano())
-	pool.rotationWatchdogSweep()
-
-	require.Equal(t, slotDead, slot.getState(),
-		"после истечения отсрочки ротация обязана состояться")
-}
-
-// TestSweepPhaseJitter_AppliedOncePerSlot — свойство 1 в чистом виде, и это
-// главный регресс-тест файла.
+// TestWorstCaseTeardown_SweepCountsTickTwice — тик расходуется ДВАЖДЫ.
 //
-// Сценарий отказа, который он ловит: отсрочка ставится без проверки
-// phaseJitterApplied. Тогда каждый тик сдвигает дедлайн вперёд, слот стареет
-// неограниченно и умирает от посредника вместо плановой ротации — то есть
-// правка против периодического сигнала оборачивается ростом резов.
-func TestSweepPhaseJitter_AppliedOncePerSlot(t *testing.T) {
-	pool, slot := newPhaseJitterPool(t, 4*time.Second)
-
-	pool.rotationWatchdogSweep()
-	require.Equal(t, slotReady, slot.getState(), "первый свип откладывает")
-	first := slot.nextDrainAttemptNs.Load()
-
-	// Второй свип ПРИ ЖИВОЙ отсрочке: должен пройти мимо (continue по
-	// nextDrainAttemptNs) и не сдвинуть дедлайн.
-	pool.rotationWatchdogSweep()
-	require.Equal(t, first, slot.nextDrainAttemptNs.Load(),
-		"свип внутри окна отсрочки не имеет права её перевзводить")
-
-	// Отсрочка истекла — второй раз джиттер не выдаётся, слот рвётся.
-	slot.nextDrainAttemptNs.Store(time.Now().Add(-time.Millisecond).UnixNano())
-	pool.rotationWatchdogSweep()
-	require.Equal(t, slotDead, slot.getState(),
-		"второй отсрочки быть не должно: иначе слот не ротируется никогда")
-}
-
-// TestSweepPhaseJitter_DisabledPreservesLegacyBehavior — отрицательное значение
-// возвращает поведение до 2026-08-14 РОВНО, без «почти».
+// Путь ячейки проходит через свип два раза: обнаружение (перешагнул порог сразу
+// после тика → ждёт до целого периода) и повторная попытка, если startDrain
+// отложил ротацию через nextDrainAttemptNs — прочитать эту отсрочку может только
+// свип, то есть только на очередном тике.
 //
-// Зачем отдельный выключатель, когда есть 0: ручка не бесплатна — она платит
-// возрастом (до +jitter), а возраст в полосе 80-85s несёт hazard 2.1% на проход
-// против нуля ниже 80s. Оператор должен иметь способ вернуть прежнее поведение
-// для A/B, а 0 занят дефолтом.
-func TestSweepPhaseJitter_DisabledPreservesLegacyBehavior(t *testing.T) {
-	pool, slot := newPhaseJitterPool(t, -1)
-
-	pool.rotationWatchdogSweep()
-
-	require.Equal(t, slotDead, slot.getState(),
-		"при выключенном размазывании перезревший слот рвётся на первом свипе")
-	require.False(t, slot.phaseJitterApplied.Load(),
-		"выключенная ручка не должна трогать флаг")
-	require.Zero(t, slot.nextDrainAttemptNs.Load(),
-		"выключенная ручка не должна ставить отсрочку")
-}
-
-// TestNewWSPoolTransport_SweepPhaseJitterNormalization — нормализация ручки:
-// 0 → дефолт, отрицательное → выключено, больше тика → кламп тиком.
-//
-// Кламп сверху существен: отсрочка длиннее rotationWatchdogTick не рассасывается
-// на следующем тике, начинает накапливаться, и слагаемое sweep в
-// worstCaseTeardown перестаёт быть верхней границей.
-func TestNewWSPoolTransport_SweepPhaseJitterNormalization(t *testing.T) {
-	cases := []struct {
-		name string
-		in   time.Duration
-		want time.Duration
-	}{
-		{"ноль → дефолт", 0, sweepPhaseJitterDefault},
-		{"отрицательное → выключено (сохраняется как есть)", -1, -1},
-		{"в пределах тика → как задано", 2 * time.Second, 2 * time.Second},
-		{"больше тика → кламп тиком", 30 * time.Second, rotationWatchdogTick},
+// Прежняя формула считала один тик и была занижена ровно на период. Это H-15 с
+// другой стороны: слагаемое `deferred` в бюджете есть, но БЕЗ тика, через который
+// отсрочка физически не может рассосаться. Занижение бюджета в этом проекте
+// считается хуже завышения — бюджет обязан быть верхней границей.
+func TestWorstCaseTeardown_SweepCountsTickTwice(t *testing.T) {
+	p := &WSPoolTransport{
+		poolSize:          8,
+		maxSlotAge:        70 * time.Second,
+		staggerStep:       time.Second,
+		staggerOffsetCap:  15 * time.Second,
+		gracefulDrain:     true,
+		drainHardCap:      15 * time.Second,
+		stickyMaxDrainAge: 25 * time.Second,
 	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			p := NewWSPoolTransport(&Client{}, WSPoolConfig{
-				Size:             2,
-				ServerAddr:       "127.0.0.1:0",
-				SweepPhaseJitter: c.in,
-			})
-			defer p.Close()
-			require.Equal(t, c.want, p.sweepPhaseJitter)
-		})
-	}
+	p.slots = make([]*poolSlot, p.poolSize*2)
+
+	base, stagger, sweep, deferred, tear, total := p.worstCaseTeardown()
+
+	require.Equal(t, 2*rotationWatchdogTick, sweep,
+		"sweep обязан считать тик дважды: обнаружение + повторная попытка после "+
+			"отсрочки гейта")
+	require.Equal(t, base+stagger+sweep+deferred+tear, total,
+		"итог обязан быть суммой напечатанных слагаемых — иначе лог врёт о механизме")
+
+	// Регрессия на конкретную арифметику прода: 70 + 15.5 + 1 + 30 + 25.
+	// Если тик снова станет 5s, эта строка упадёт и заставит перечитать
+	// обоснование у rotationWatchdogTick, а не молча принять +9s накладных.
+	require.Equal(t, 15500*time.Millisecond, stagger, "cap 15s + step/2")
+	require.Equal(t, time.Second, sweep, "2 × 500ms")
+	require.Equal(t, 141500*time.Millisecond, total)
 }
 
 // TestNormalizeFloorFraction — кламп доли пола storm-brake.
@@ -180,8 +128,8 @@ func TestNormalizeFloorFraction(t *testing.T) {
 // TestReadyCapacityFloor_HonoursConfiguredFraction — доля обязана доходить до
 // самого пола, а не оставаться декоративным полем конфига.
 //
-// Второе утверждение теста не менее важно: при нулевом поле (транспорт, собранный
-// литералом — так делают многие тесты в пакете) поведение обязано остаться
+// Второе утверждение не менее важно: при нулевом поле (транспорт, собранный
+// литералом — так делает часть тестов пакета) поведение обязано остаться
 // прежним, иначе правка молча сдвинула бы storm-brake во всём наборе.
 func TestReadyCapacityFloor_HonoursConfiguredFraction(t *testing.T) {
 	// poolSize=8: floor(8*0.5)=4 против дефолтного floor(8*0.75)=6.
@@ -199,37 +147,27 @@ func TestReadyCapacityFloor_HonoursConfiguredFraction(t *testing.T) {
 		"пол обязан оставлять пулу хотя бы один слот запаса")
 }
 
-// TestWorstCaseTeardown_IncludesSweepPhaseJitter — бюджет обязан знать о новом
-// слагаемом.
+// TestEffectiveFloorFraction_IsLoggable — применённая доля обязана быть
+// наблюдаемой, иначе A/B по ней неподтверждаем.
 //
-// Это прямая регрессия на H-15: механизм, о котором лог рассказывает неправду,
-// хуже отсутствующего. Если размазывание добавляет до 4s возраста, а
-// worstCaseTeardown их не считает, проверка «бюджет против p10 смертей» снова
-// начнёт врать — на этот раз в сторону занижения, которое по памяти проекта
-// хуже завышения.
-func TestWorstCaseTeardown_IncludesSweepPhaseJitter(t *testing.T) {
-	newPool := func(jitter time.Duration) *WSPoolTransport {
-		p := &WSPoolTransport{
-			poolSize:          8,
-			maxSlotAge:        70 * time.Second,
-			staggerStep:       time.Second,
-			staggerOffsetCap:  15 * time.Second,
-			gracefulDrain:     true,
-			drainHardCap:      15 * time.Second,
-			stickyMaxDrainAge: 25 * time.Second,
-			sweepPhaseJitter:  jitter,
-		}
-		p.slots = make([]*poolSlot, p.poolSize*2)
-		return p
-	}
+// Ревью S8: до 2026-08-14 применённая доля не логировалась нигде, а сам floor был
+// виден ТОЛЬКО внутри строки отказа гейта — то есть исчезал ровно в том
+// сценарии, который A/B считает успехом (capacity_floor_deferred_total → 0).
+// А envFloatDefault молча возвращает дефолт на любой мусор (`0,5`, `50%`),
+// поэтому «успешный» прогон был неотличим от «настройка не применилась».
+func TestEffectiveFloorFraction_IsLoggable(t *testing.T) {
+	configured := &WSPoolTransport{poolSize: 8, readyCapacityFloorFraction: 0.5}
+	require.Equal(t, 0.5, configured.effectiveFloorFraction(),
+		"логируемая доля обязана совпадать с той, из которой посчитан пол")
 
-	_, _, sweepOff, _, _, totalOff := newPool(-1).worstCaseTeardown()
-	require.Equal(t, rotationWatchdogTick, sweepOff,
-		"при выключенной ручке sweep = чистый тик")
+	legacy := &WSPoolTransport{poolSize: 8}
+	require.Equal(t, readyCapacityFloorFraction, legacy.effectiveFloorFraction(),
+		"при нулевом поле логировать надо константу, а не ноль — иначе читатель "+
+			"решит, что пол выключен")
 
-	_, _, sweepOn, _, _, totalOn := newPool(4 * time.Second).worstCaseTeardown()
-	require.Equal(t, rotationWatchdogTick+4*time.Second, sweepOn,
-		"включённая ручка обязана попасть в слагаемое sweep")
-	require.Equal(t, totalOff+4*time.Second, totalOn,
-		"вклад ручки обязан дойти до итога, а не потеряться по пути")
+	// Согласованность с самим полом: доля и floor не должны расходиться.
+	require.Equal(t,
+		int(math.Floor(float64(configured.poolSize)*configured.effectiveFloorFraction())),
+		configured.readyCapacityFloor(),
+		"напечатанная доля и напечатанный пол обязаны быть об одном и том же")
 }

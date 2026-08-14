@@ -53,10 +53,10 @@
 // в ОТДЕЛЬНЫЙ ринг через RecordPlanned, что даёт знаменатель и с ним две
 // величины, прежде невыводимые:
 //
-//	1. CutShare — доля слотов, снятых посредником, от всех смен слота. Прежняя
-//	   формулировка «ByCloseKind cannot yield this» больше не верна.
-//	2. Hazard — риск реза среди ДОЖИВШИХ до полосы возраста. Устойчив к
-//	   survivorship bias по построению, в отличие от гистограммы смертей.
+//  1. CutShare — доля слотов, снятых посредником, от всех смен слота. Прежняя
+//     формулировка «ByCloseKind cannot yield this» больше не верна.
+//  2. Hazard — риск реза среди ДОЖИВШИХ до полосы возраста. Устойчив к
+//     survivorship bias по построению, в отличие от гистограммы смертей.
 //
 // Зачем это понадобилось: разбор прогона 20260812-110200 прочитал p50=85.0с по
 // 7 точкам как «окно сжалось» против 97.6с по 222 точкам. Фактически в том
@@ -80,11 +80,32 @@ import (
 	"sync"
 )
 
-// DefaultCapacity is the ring size. ~512 deaths is several hours of direct-mode
-// operation at the observed age-cut cadence — enough for percentile estimates
-// while bounded (this is a client process, and H-14 in the same audit round was
-// exactly an unbounded per-key map).
+// DefaultCapacity is the ring size for CUTS. ~512 deaths is several hours of
+// direct-mode operation at the observed age-cut cadence — enough for percentile
+// estimates while bounded (this is a client process, and H-14 in the same audit
+// round was exactly an unbounded per-key map).
 const DefaultCapacity = 512
+
+// PlannedCapacity — ёмкость ринга ПЛАНОВЫХ ротаций. Отдельная от DefaultCapacity,
+// потому что темпы событий различаются на два порядка.
+//
+// Замер 2026-08-14 показал цену общей ёмкости. Обоснование «~512 = several hours»
+// верно для резов: их 2-4 в час. Плановых — 300+ в час, то есть 512 записей
+// набираются за ~1.7 часа, и в прогоне PROBE (2.68 ч, 1256 плановых) ринг
+// переполнился, а ринг резов нет (126 из 512). Следствие: Hazard набирал
+// числитель за весь прогон, а знаменатель — за последние 512 плановых, и доля
+// завышалась ×2.06 (логировалось 0.0367 против 0.0178 по экспозиции). Это было
+// прочитано как реальный рост риска.
+//
+// 4096 покрывает ~13 часов при 300 ротациях/час — то есть переживает любой
+// разумный прогон целиком. Цена памяти: Observation ~64 байта → ~256 КиБ на пул,
+// один пул на процесс. Приемлемо для клиента; неограниченным ринг всё равно не
+// делаем (H-14).
+//
+// ⚠ Ёмкость НЕ отменяет флаг HazardBand.RingSaturated: при достаточно долгом
+// прогоне переполнение всё равно наступит, и тогда доли снова смещаются. Флаг —
+// единственная защита от чтения смещённой величины как наблюдения.
+const PlannedCapacity = 4096
 
 // Observation is one slot death. Fields mirror what ws_pool already logs at the
 // reader-error site, because those three together are what distinguishes the
