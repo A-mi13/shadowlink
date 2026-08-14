@@ -2,7 +2,6 @@ package client
 
 import (
 	"math"
-	"math/rand/v2"
 	"testing"
 	"time"
 
@@ -90,8 +89,15 @@ func TestSweepWorstCase_CoversJitteredWakeups(t *testing.T) {
 // применяется и берётся заново.
 //
 // Прямо измерить моменты пробуждения из юнит-теста нельзя (цикл бесконечный и
-// живёт на своём тайминге), поэтому проверяется само распределение сна той же
-// формулой, что в цикле. Тест ловит два конкретных отказа:
+// живёт на своём тайминге), поэтому проверяется распределение интервала сна.
+//
+// ⚠ Исправлено ревью 2026-08-14: тест держал СВОЮ КОПИЮ формулы
+// (`tick + rand.Float64()*tick` прямо здесь) и проверял её, а не цикл. Снятие
+// джиттера в самом rotationWatchdogLoop тест бы не заметил — он остался бы
+// зелёным на собственном выражении. Теперь зовётся nextWatchdogWakeup() —
+// ровно та функция, которую вызывает цикл, — поэтому вторая правда исключена.
+//
+// Тест ловит два конкретных отказа:
 //
 //  1. джиттер убрали/занулили → все интервалы равны tick, решётка вернулась;
 //  2. джиттер сэмплируется ОДИН раз и переиспользуется → интервалы равны между
@@ -102,8 +108,7 @@ func TestRotationWatchdogLoop_WakeupsAreNotOnAGrid(t *testing.T) {
 	seen := make(map[time.Duration]int, n)
 	var min, max time.Duration = 1 << 62, 0
 	for i := 0; i < n; i++ {
-		// Ровно та формула, что в rotationWatchdogLoop.
-		d := rotationWatchdogTick + time.Duration(rand.Float64()*float64(rotationWatchdogTick))
+		d := nextWatchdogWakeup()
 		seen[d]++
 		if d < min {
 			min = d

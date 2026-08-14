@@ -1,6 +1,7 @@
 package client
 
 import (
+	"errors"
 	"math/rand/v2"
 	"sync/atomic"
 	"time"
@@ -214,10 +215,31 @@ func (p *WSPoolTransport) claimFreeSlot() int {
 // вида. Возврат «просто индекса» безопасен: connectSlot сам installs слот под
 // reserveMu, а до тех пор ячейка остаётся nil и видна другим как свободная.
 //
-// Цена — окно, в которое два обрыва могут выбрать одну ячейку. Оно безвредно:
-// connectSlot пишет под reserveMu, второй перезапишет первого, лишним будет
-// одно соединение, а не потерянная ячейка. Обратная ошибка (заглушить лечение)
-// стоит дороже — именно она и была исходным дефектом.
+// # Окно между этой функцией и установкой — и почему оно теперь закрыто
+//
+// ⚠ Здесь стояло: «оно безвредно: connectSlot пишет под reserveMu, второй
+// перезапишет первого, лишним будет одно соединение, а не потерянная ячейка».
+// Это было НЕВЕРНО (ревью 2026-08-14). Перезапись ячейки, в которой сидит ЖИВОЙ
+// слот, стоит куда дороже одного соединения:
+//
+//   - старый transport не закрывает никто (все Close идут через slotAt(idx), то
+//     есть уже по новому указателю) — TLS к origin живёт до серверного
+//     idle-timeout вне учёта пула;
+//   - старый slotReader не выходит: shouldExitReader сравнивает generation его
+//     СОБСТВЕННОГО объекта, а connectSlot бампает generation нового;
+//   - этот ридер при своей ошибке чтения зовёт handleSlotDeath ПО ИНДЕКСУ и
+//     убивает свежий слот;
+//   - slot.streams старого объекта навсегда выпадает из readyCapacity.
+//
+// Правильное место защиты — сам писатель, а не оценка вероятности. connectSlot
+// теперь проверяет прежнее содержимое ячейки под тем же reserveMu и возвращает
+// ErrCellOccupied, если там slotReady/slotDraining (см. обоснование там же).
+// Поэтому возврат «просто индекса» отсюда остаётся безопасным: проигравший в
+// гонке получит типизированную ошибку и уйдёт искать другую ячейку, а не
+// осиротит чужое соединение.
+//
+// Обратная ошибка (заглушить лечение placeholder'ом) по-прежнему стоит дороже —
+// именно она и была исходным дефектом.
 func (p *WSPoolTransport) claimFreeCellForHealing() int {
 	p.reserveMu.Lock()
 	defer p.reserveMu.Unlock()
@@ -697,6 +719,23 @@ func (p *WSPoolTransport) connectReserveSlot(cl *Client, newIdx, oldIdx int) {
 		err = hook()
 	} else {
 		err = p.connectSlot(p.ctx, newIdx)
+	}
+
+	// ErrCellOccupied — ячейку заняли живым слотом, пока мы шли к установке
+	// (ревью 2026-08-14, см. connectSlot). Это НЕ отказ origin, и вести его по
+	// общей ветке было бы двумя ошибками сразу: reserveConnectFailures[newIdx]
+	// и ReserveConnectFailuresTotal стали бы говорить о доступности origin то,
+	// чего не было (счётчик, врущий о механизме), а computeReserveBackoff
+	// наказал бы следующую попытку за чужую занятость.
+	//
+	// Замена дренажу при этом НЕ нужна: занять ячейку живым слотом мог только
+	// тот, кто поднял соединение, — ёмкость на месте. Плейсхолдер тоже не наш,
+	// обнулять его нельзя.
+	if errors.Is(err, ErrCellOccupied) {
+		p.log.Info("WS pool reserve slot install skipped — cell taken by a live slot",
+			"slot", newIdx, "for_drain_of", oldIdx,
+			"consequence", "no replacement needed, capacity already restored")
+		return
 	}
 
 	if err != nil {

@@ -699,7 +699,11 @@ func (p *WSPoolTransport) staggerSpan() time.Duration {
 // Слагаемые:
 //   - base    — действующий порог ротации (адаптированный, если адаптер сжал)
 //   - stagger — максимальный вклад сетки размазывания, см. staggerSpan
-//   - sweep   — задержка обнаружения: rotationWatchdogSweep тикает раз в 5s
+//   - sweep   — задержка обнаружения и повторной попытки, sweepWorstCase().
+//     ⚠ «раз в 5s» здесь стояло до 2026-08-14 и врало дважды: тик срезан до
+//     500ms, а сам свип просыпается через tick + uniform[0, tick), поэтому
+//     слагаемое равно 4×tick, а не одному периоду. Не складывать по месту —
+//     спрашивать sweepWorstCase()
 //   - defer_  — отложенная ротация: если гейт startDrain не пропустил слот, тот
 //     возвращается в slotReady и ждёт backoff, ПРОДОЛЖАЯ стареть и принимать
 //     новые стримы. Берётся drainRevertBackoff (30s) — худшая из ветвей.
@@ -2407,7 +2411,7 @@ func (p *WSPoolTransport) Connect(ctx context.Context) error {
 	return nil
 }
 
-// rotationWatchdogLoop ticks at a fixed cadence (independent of downlink
+// rotationWatchdogLoop wakes up at a JITTERED cadence (independent of downlink
 // data arrival) and checks every ready slot's age against its effective
 // max-age (MaxSlotAge + slot.staggerOffsetNs, sampled per-session via
 // slotStaggerOffset(idx) — see A1 fix 2026-05-18 for the additive-grid
@@ -2421,8 +2425,11 @@ func (p *WSPoolTransport) Connect(ctx context.Context) error {
 // blocks until either data arrives OR the 60s read deadline fires. If
 // MaxSlotAge passes during that idle blockage, the in-reader check would
 // never run before the middlebox kills the TCP — defeating the purpose
-// of preemptive rotation. The watchdog ticks every 5s regardless of
-// reader activity.
+// of preemptive rotation. The watchdog wakes regardless of reader activity.
+//
+// ⚠ «ticks every 5s» здесь стояло до 2026-08-14 и врало: период — не 5s, и он
+// вообще не фиксирован (nextWatchdogWakeup(): tick + uniform[0, tick),
+// tick=500ms). Фиксированная формулировка и была тем, что уходило на wire.
 //
 // Concurrency: the watchdog reads slot.startedAtNs atomically, then calls
 // maybeRotateSlot. maybeRotateSlot writes rotationDeferredNs atomically.
@@ -2444,16 +2451,24 @@ func (p *WSPoolTransport) rotationWatchdogLoop() {
 	// результат на следующем масштабе — потому что причина не в величине периода,
 	// а в его ПОСТОЯНСТВЕ.
 	//
-	// Timer со сном period + uniform[0, period) решает это на корню: моменты
-	// пробуждения образуют процесс без выделенной частоты, к сетке привязки нет.
-	// Средний период вырастает в 1.5 раза (750ms при базе 500ms) — это учтено в
+	// Timer со сном period + uniform[0, period) убирает решётку У ЭТОГО ЦИКЛА:
+	// моменты пробуждения образуют процесс без выделенной частоты. Средний период
+	// вырастает в 1.5 раза (750ms при базе 500ms) — это учтено в
 	// worstCaseTeardown через sweepWorstCase(), см. там.
+	//
+	// ⚠ ГРАНИЦА ПРАВКИ (ревью 2026-08-14): развязан момент НОВОГО СОЕДИНЕНИЯ, но
+	// не момент ЗАКРЫТИЯ. startDrain вызывается отсюда и сразу спавнит
+	// connectReserveSlot, поэтому `reader started` едет на этом (уже
+	// джиттерованном) расписании. А фактический teardown делает drainWatchdog по
+	// СВОЕМУ тикеру — time.NewTicker(drainPollInterval=500ms),
+	// ws_pool_drain.go:805, — и он остался жёстким. Утверждение «решётки не
+	// остаётся» было бы сильнее данных: на wire живёт вторая, независимая сетка
+	// 2 Гц по моментам close. Замер R=0.8657 брался «по моменту дренажа», то есть
+	// как раз по ней, и одной этой правкой он НЕ обязан упасть.
+	// → Критерий замера здесь — R по `reader started`; для close нужен отдельный
+	//   замер и отдельная правка drainPollInterval.
 	for {
-		// Джиттер берётся ЗАНОВО на каждом взводе. Один сэмпл, переиспользованный
-		// на весь сеанс, дал бы ту же решётку с другим шагом — ровно
-		// «single-sample reused» антипаттерн, разобранный у slotStaggerOffset.
-		d := rotationWatchdogTick + time.Duration(rand.Float64()*float64(rotationWatchdogTick))
-		timer := time.NewTimer(d)
+		timer := time.NewTimer(nextWatchdogWakeup())
 		select {
 		case <-p.ctx.Done():
 			timer.Stop()
@@ -2763,6 +2778,43 @@ func (p *WSPoolTransport) sendSlotSessionFIN(slot *poolSlot) {
 	}
 }
 
+// ErrCellOccupied — ячейка занята ЖИВЫМ слотом, установка новой отменена.
+//
+// Заведена ревью 2026-08-14 вместе с проверкой в connectSlot (см. там). Отдельный
+// типизированный sentinel, а не generic error: вызывающий обязан отличать «origin
+// не ответил» (повод для backoff-лестницы) от «ячейку заняли, пока мы спали»
+// (повод искать другую ячейку или просто уйти). Смешение этих двух наказывало бы
+// слот лестницей за чужую занятость.
+var ErrCellOccupied = errors.New("pool cell occupied by a live slot")
+
+// cellIsOverwritable — можно ли поставить новый *poolSlot в эту ячейку.
+//
+// ЕДИНСТВЕННЫЙ источник этого правила: и connectSlot, и тест обязаны спрашивать
+// здесь. Держать копию условия в тесте значило бы проверять копию, а не код —
+// повторяющийся класс дефектов в этом проекте.
+//
+// Вызывать ТОЛЬКО под reserveMu: читает состояние ячейки, которую конкурентно
+// пишут claimFreeSlot / handleSlotDeath / connectSlot.
+//
+//   - nil — ячейка свободна;
+//   - slotDead — слот разобран, соединения за ним нет;
+//   - slotConnecting — placeholder claimFreeSlot'а, он ровно для перезаписи и
+//     ставится (ws_pool_drain.go:161-164).
+//
+// slotReady / slotDraining перезаписывать НЕЛЬЗЯ: за ними живое соединение,
+// которое после перезаписи никто не закроет, и ридер, который никогда не выйдет.
+// Разбор — в connectSlot.
+func cellIsOverwritable(prev *poolSlot) bool {
+	if prev == nil {
+		return true
+	}
+	switch prev.getState() {
+	case slotReady, slotDraining:
+		return false
+	}
+	return true
+}
+
 // connectSlot creates a new WS connection for the given slot index.
 func (p *WSPoolTransport) connectSlot(ctx context.Context, idx int) error {
 	slot := &poolSlot{index: idx}
@@ -2771,7 +2823,50 @@ func (p *WSPoolTransport) connectSlot(ctx context.Context, idx int) error {
 	// in handleSlotDeath and the placeholder write in claimFreeReserveSlot.
 	// Without it, a concurrent drain teardown could nil this cell after
 	// connectSlot installed the new *poolSlot — slot leak. See spec §C3.
+	//
+	// ⚠ УСТАНОВКА УСЛОВНА (ревью 2026-08-14). Раньше здесь стояла безусловная
+	// запись `p.slots[idx] = slot`, и connectSlot был ЕДИНСТВЕННЫМ писателем
+	// ячейки, который не смотрел на её прежнее содержимое (сравните с
+	// ws_pool_drain.go:711, где условие есть). Пока каждый вызывающий гарантировал
+	// «ячейка nil или slotDead», это не стреляло.
+	//
+	// Лечение ёмкости (D1, тот же день) такую гарантию сняло:
+	// claimFreeCellForHealing НАМЕРЕННО не ставит placeholder (обоснование там —
+	// placeholder висел бы «здоровым» через весь backoff и глушил бы повторное
+	// лечение), поэтому между её Unlock и этим Lock ячейку успевает занять
+	// claimFreeSlot из startDrain. Комментарий у claimFreeCellForHealing оценивал
+	// цену этого окна как «лишнее одно соединение» — это НЕВЕРНО, и вот почему
+	// перезапись живой ячейки дороже:
+	//
+	//   - старый transport не закроет НИКТО: все Close() идут через slotAt(idx),
+	//     то есть уже по новому указателю. TCP/TLS к origin остаётся жить до
+	//     серверного idle-timeout, и пул его больше не учитывает — ровно
+	//     P0-угроза (лишнее долгоживущее TLS), а не «лишнее соединение»;
+	//   - старый slotReader не выйдет: он сравнивает generation СВОЕГО объекта
+	//     (shouldExitReader), а connectSlot делает generation.Add(1) на НОВОМ.
+	//     Счётчики независимы, mismatch не наступит никогда. Механизм выхода
+	//     стального ридера описан на slotReaderWithClient как «old conn is
+	//     Close'd by handleSlotDeath / rotation» — а её здесь не будет;
+	//   - хуже всего: этот ридер при своей ошибке чтения позовёт
+	//     handleSlotDeath(idx) ПО ИНДЕКСУ и убьёт СВЕЖИЙ слот. Перезапись
+	//     превращается в отложенное убийство только что поднятого соединения;
+	//   - счётчик slot.streams старого объекта навсегда уходит из readyCapacity
+	//     (известный класс, stream_counter_leak_test.go).
+	//
+	// Поэтому: живую ячейку не трогаем и возвращаем ErrCellOccupied. Проверка
+	// стоит ЗДЕСЬ, а не у вызывающих, потому что писатель один, а вызывающих
+	// четыре, и двум из них (Connect fan-out, legacyRotateOneSlot) гарантии не
+	// давал никто.
+	//
+	// nil / slotDead / slotConnecting-placeholder перезаписывать МОЖНО и нужно:
+	// placeholder claimFreeSlot'а именно для этого и ставится
+	// (ws_pool_drain.go:161-164), а slotDead — это ячейка, чей слот уже разобран.
 	p.reserveMu.Lock()
+	if prev := p.slots[idx]; !cellIsOverwritable(prev) {
+		st := prev.getState()
+		p.reserveMu.Unlock()
+		return fmt.Errorf("slot %d: %w (state %v)", idx, ErrCellOccupied, st)
+	}
 	p.slots[idx] = slot
 	p.reserveMu.Unlock()
 
@@ -2963,6 +3058,26 @@ func (p *WSPoolTransport) connectSlot(ctx context.Context, idx int) error {
 func sweepWorstCase() time.Duration {
 	// 2 пробуждения × (tick + максимум джиттера, который равен tick).
 	return 2 * (rotationWatchdogTick + rotationWatchdogTick)
+}
+
+// nextWatchdogWakeup — интервал до следующего пробуждения свипа:
+// tick + uniform[0, tick).
+//
+// Вынесено из rotationWatchdogLoop отдельной функцией (ревью 2026-08-14), чтобы
+// у формулы был ЕДИНСТВЕННЫЙ экземпляр. До этого тест
+// TestRotationWatchdogLoop_WakeupsAreNotOnAGrid держал СВОЮ копию выражения и
+// проверял её, а не цикл: снятие джиттера в самом цикле тест бы не заметил —
+// он остался бы зелёным на собственной копии. Ровно тот класс дефекта, что уже
+// собран в проекте пачками («вторая копия правды»), только в тестовом контуре.
+//
+// Джиттер сэмплируется ЗАНОВО на каждом вызове. Один сэмпл, переиспользованный
+// на весь сеанс, дал бы ту же решётку с другим шагом — антипаттерн
+// «single-sample reused», разобранный у slotStaggerOffset.
+//
+// Верхняя граница интервала (2×tick) — это то, что закладывает sweepWorstCase();
+// менять здесь распределение, не поправив там, значит занизить бюджет.
+func nextWatchdogWakeup() time.Duration {
+	return rotationWatchdogTick + time.Duration(rand.Float64()*float64(rotationWatchdogTick))
 }
 
 // maxHealingRetargets — сколько раз одна цепочка reconnectLoop может
@@ -3177,6 +3292,21 @@ func (p *WSPoolTransport) reconnectLoopInner(idx int, fastFirstAttempt bool) {
 				// Лестницу backoff НЕ сбрасываем: причина, по которой мы сюда
 				// попали, — отказ connect, а не занятость ячейки. Сброс отправил
 				// бы нас на повторную попытку с паузой 5-10s в тот же отказ.
+				//
+				// Переприцеливание переменной цикла проверено (ревью 2026-08-14) на
+				// весь idx-зависимый контур ниже:
+				//   - reserveConnectFailures[idx] здесь НЕ трогается вовсе — он
+				//     per-cell и живёт только в connectReserveSlot. Счётчик старой
+				//     ячейки остаётся при ней, что и правильно: он про НЕЁ;
+				//   - fastFirstAttempt от idx не зависит (гейт только по attempt),
+				//     поэтому fast-путь не «оживает» после переприцеливания;
+				//   - meltdown-гейт (meltdownWaitDuration) пуловый, не per-slot;
+				//   - reconnectJitterOffset(idx) и гейт `idx > 0` дадут другое
+				//     смещение post-meltdown разброса. Это косметика: смысл
+				//     смещения — развести одновременные хендшейки, а не закрепить
+				//     ячейку за фазой;
+				//   - логи и Stats ниже печатают уже НОВЫЙ idx — так и надо, они
+				//     описывают ячейку, на которой поднимается соединение.
 				continue
 			}
 			// Свободных ячеек нет — значит недостачи тоже нет: все 2*poolSize
@@ -3206,6 +3336,40 @@ func (p *WSPoolTransport) reconnectLoopInner(idx int, fastFirstAttempt bool) {
 			// того же отказа origin.
 			p.signalNetworkRevival()
 			go p.slotReader(idx)
+			return
+		}
+
+		// ErrCellOccupied — НЕ отказ origin (ревью 2026-08-14).
+		//
+		// Ячейку заняли живым слотом в микроокне между recycle guard'ом и
+		// установкой в connectSlot. Смешивать это с сетевым отказом нельзя по двум
+		// причинам: (1) лестница backoff и AgeCutReconnectFail описывали бы
+		// доступность origin, которая тут ни при чём — ровно тот класс дефектов
+		// «счётчик врёт о механизме», что проект собирает пачками; (2) ёмкость
+		// восполнена не нами, а тем, кто ячейку занял, поэтому повторять попытку
+		// на этом же idx бессмысленно.
+		//
+		// Отправляем на общую ветку лечения: она сама решит, есть ли недостача.
+		// Счётчик тот же (HealingRetargetTotal) — событие по смыслу то же
+		// «нашу ячейку забрали», просто обнаруженное на шаг позже.
+		if errors.Is(connectErr, ErrCellOccupied) {
+			if retargets >= maxHealingRetargets {
+				p.log.Warn("WS pool reconnect abandoned — cell taken at install time",
+					"slot", idx, "retargets", retargets,
+					"consequence", "pool runs one cell short until next slot death")
+				Stats.HealingRetargetGaveUpTotal.Add(1)
+				return
+			}
+			if free := p.claimFreeCellForHealing(); free >= 0 {
+				retargets++
+				p.log.Info("WS pool reconnect re-targeted — cell taken at install time",
+					"slot", idx, "healing_on", free, "retargets", retargets)
+				Stats.HealingRetargetTotal.Add(1)
+				idx = free
+				continue
+			}
+			p.log.Info("WS pool reconnect short-circuited — cell taken at install time",
+				"slot", idx, "healing", "not needed (no free cell)")
 			return
 		}
 

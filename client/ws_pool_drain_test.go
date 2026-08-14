@@ -1568,6 +1568,86 @@ func TestClaimFreeCellForHealing_CountsOnlyLiveStates(t *testing.T) {
 	}
 }
 
+// TestConnectSlot_RefusesToOverwriteLiveCell — connectSlot не имеет права
+// перезаписать ячейку, в которой сидит живой или дренирующийся слот
+// (ревью 2026-08-14).
+//
+// Дефект, который тест закрывает: connectSlot был ЕДИНСТВЕННЫМ писателем ячейки
+// без проверки прежнего содержимого. Пока каждый вызывающий гарантировал «nil или
+// slotDead», это не стреляло. Лечение ёмкости (D1) гарантию сняло:
+// claimFreeCellForHealing намеренно не ставит placeholder, поэтому между её
+// Unlock и установкой в connectSlot ячейку успевает занять claimFreeSlot из
+// startDrain.
+//
+// Цену той перезаписи комментарий оценивал как «лишнее одно соединение» — неверно:
+// старый transport не закрыл бы НИКТО (все Close идут через slotAt(idx), то есть
+// уже по новому указателю), старый slotReader не вышел бы (shouldExitReader
+// смотрит generation своего объекта, а бампается generation нового), и этот ридер
+// при своей ошибке чтения позвал бы handleSlotDeath ПО ИНДЕКСУ, убив свежий слот.
+//
+// Отказ проверяется через РЕАЛЬНЫЙ connectSlot: он возвращает ErrCellOccupied до
+// всякого сетевого ввода-вывода, поэтому пустой пул в фикстуре достаточен.
+// Разрешённые состояния — через cellIsOverwritable (тот же предикат, что зовёт
+// connectSlot): дальше по коду connectSlot уходит в реальный хендшейк и упёрся бы
+// в p.client, что к правилу перезаписи отношения не имеет.
+func TestConnectSlot_RefusesToOverwriteLiveCell(t *testing.T) {
+	// slotState не имеет String(), поэтому имя подтеста задаём явно — иначе в
+	// выводе окажутся числа, и читателю придётся сверять их с iota.
+	refuse := []struct {
+		name  string
+		state slotState
+	}{
+		{"slotReady — живой, перезапись осиротила бы ридер и transport", slotReady},
+		{"slotDraining — ячейкой владеет дренаж", slotDraining},
+	}
+	for _, tc := range refuse {
+		st := tc.state
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			p := &WSPoolTransport{poolSize: 4, ctx: ctx, log: newDiscardLogger()}
+			p.slots = make([]*poolSlot, 8)
+			occupant := &poolSlot{index: 2}
+			occupant.setState(st)
+			p.slots[2] = occupant
+
+			err := p.connectSlot(ctx, 2)
+			if !errors.Is(err, ErrCellOccupied) {
+				t.Fatalf("connectSlot вернул %v, ожидался ErrCellOccupied: "+
+					"перезапись живой ячейки осиротит transport и ридер", err)
+			}
+			p.reserveMu.Lock()
+			got := p.slots[2]
+			p.reserveMu.Unlock()
+			if got != occupant {
+				t.Errorf("ячейка перезаписана, несмотря на состояние %v", st)
+			}
+		})
+	}
+
+	// Разрешённые: nil, slotDead и placeholder slotConnecting. Запретить их
+	// значило бы сломать штатный путь замены при дренаже — claimFreeSlot ставит
+	// placeholder ровно для того, чтобы connectSlot его перезаписал.
+	if !cellIsOverwritable(nil) {
+		t.Error("nil-ячейка обязана быть перезаписываемой")
+	}
+	for _, tc := range []struct {
+		name  string
+		state slotState
+	}{
+		{"slotDead", slotDead},
+		{"slotConnecting (placeholder claimFreeSlot)", slotConnecting},
+	} {
+		s := &poolSlot{}
+		s.setState(tc.state)
+		if !cellIsOverwritable(s) {
+			t.Errorf("%s обязано быть перезаписываемым — иначе штатная замена "+
+				"при дренаже (claimFreeSlot → connectSlot) сломана", tc.name)
+		}
+	}
+}
+
 // TestStartDrain_InflightCounterCaps asserts that with
 // maxConcurrentDrains=2 (default for poolSize=8), at most 2 of N
 // concurrent startDrain calls actually transition slots to slotDraining

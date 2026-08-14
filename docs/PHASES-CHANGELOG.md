@@ -775,6 +775,20 @@ reserve-слотах, с нагрузкой не коррелирует.
   `maxHealingRetargets=3`, счётчики `healing_retargets_total` /
   `healing_gave_up_total`). Лечение УСЛОВНО — только при недостаче живых слотов:
   лишнее TLS к origin это P0.
+  ⚠ **Гонка «два обрыва выберут одну ячейку» оценивалась неверно** (ревью 08-14).
+  Комментарий у `claimFreeCellForHealing` утверждал: «безвредно, connectSlot пишет
+  под reserveMu, второй перезапишет первого, лишним будет одно соединение».
+  Перезапись ЖИВОЙ ячейки стоит дороже: старый transport не закроет никто (все
+  `Close()` идут через `slotAt(idx)`, т.е. уже по новому указателю), старый
+  `slotReader` не выйдет (`shouldExitReader` сравнивает `generation` своего
+  объекта, а бампается `generation` нового), и этот ридер на своей ошибке чтения
+  позовёт `handleSlotDeath` **по индексу**, убив свежий слот; `slot.streams`
+  старого объекта навсегда уйдёт из `readyCapacity`. Закрыто у писателя:
+  `connectSlot` проверяет ячейку через `cellIsOverwritable` под тем же
+  `reserveMu` и возвращает `ErrCellOccupied` для `slotReady`/`slotDraining`.
+  Заодно закрыты два пути, где гарантии не давал никто изначально —
+  повторный `Connect` fan-out и `legacyRotateOneSlot`. `ErrCellOccupied` не
+  считается отказом origin ни в `reconnectLoopInner`, ни в `connectReserveSlot`.
 - **Диагноз capacity floor ОПРОВЕРГНУТ хронологией.** Утверждение «порог 75→70s
   посадил пул на пол» неверно: до первой потери ячейки (15:42:12) гейт не
   срабатывал ни разу, первая отложка 15:44:32, все 22 при `ready=5`, а `ready=5`
@@ -786,7 +800,16 @@ reserve-слотах, с нагрузкой не коррелирует.
   периода 5s→500ms убила линию 0.2Гц (vector strength 1.0000 → 0.0096), но пик
   ПЕРЕЕХАЛ на 2Гц (R=0.8657 на периоде 500ms; по `reader started` 0.598 → 0.553,
   то есть не изменился). Причина не в величине периода, а в его ПОСТОЯНСТВЕ.
-  Джиттер сэмплируется заново каждый взвод.
+  Джиттер сэмплируется заново каждый взвод (`nextWatchdogWakeup()` — вынесен
+  функцией ревью 08-14, потому что тест держал СВОЮ копию формулы и на снятие
+  джиттера в цикле не отреагировал бы).
+  ⚠ **Развязан момент нового СОЕДИНЕНИЯ, но не момент ЗАКРЫТИЯ** (ревью 08-14).
+  `startDrain` зовётся из свипа и сразу спавнит `connectReserveSlot`, поэтому
+  `reader started` едет на джиттерованном расписании. Фактический teardown делает
+  `drainWatchdog` по своему `time.NewTicker(drainPollInterval=500ms)`
+  (`ws_pool_drain.go:805`) — он остался жёстким, и на wire живёт вторая сетка 2Гц
+  по close. Замер R=0.8657 брался «по моменту дренажа», т.е. по ней, и от этой
+  правки упасть не обязан. «Решётки не остаётся» было сильнее данных.
   ⚠ Мой критерий «доля в модальном 1s-окне сетки 5s» (100% → 21.4%) был
   ТАВТОЛОГИЧЕН: падает автоматически при любом тике <1s, то есть измеряет ручку,
   а не наблюдаемость. Правильный критерий — **R < 0.2 по `reader started`**.
@@ -804,8 +827,12 @@ reserve-слотах, с нагрузкой не коррелирует.
 
 1. Лечение ёмкости: убрать ветку `claimFreeCellForHealing` в `reconnectLoopInner`
    — вернётся утечка ячеек, диагностируемая по монотонному росту `empty`.
-2. Фаза: `Timer` → `time.NewTicker(rotationWatchdogTick)` — вернётся решётка на
-   2Гц. Величину периода при этом менять не нужно.
+2. Фаза: `Timer` → `time.NewTicker(rotationWatchdogTick)` (и удалить
+   `nextWatchdogWakeup`) — вернётся решётка на 2Гц по новым соединениям.
+   Величину периода при этом менять не нужно.
+4. Условная установка ячейки: убрать проверку `cellIsOverwritable` в
+   `connectSlot` и ветки `ErrCellOccupied` у двух вызывающих — вернётся риск
+   осиротить живой transport/ридер в микроокне лечения.
 3. Бюджет в ветке нехватки выборки: удалить блок `budget_*` — вернётся
    непроверяемость.
 
@@ -829,6 +856,7 @@ reserve-слотах, с нагрузкой не коррелирует.
 - `CLAUDE.md` правила 9 (фаза, бюджет), 10 (cap), **11 (утечка ячеек)**
 - `client/ws_pool_drain_test.go`: `TestReconnectLoop_RecycleHealsCapacity`,
   `TestReconnectLoop_RecycleNoHealWhenPoolFull`,
-  `TestClaimFreeCellForHealing_CountsOnlyLiveStates`
+  `TestClaimFreeCellForHealing_CountsOnlyLiveStates`,
+  `TestConnectSlot_RefusesToOverwriteLiveCell`
 - `client/ws_pool_sweep_phase_test.go`: `TestRotationWatchdogLoop_WakeupsAreNotOnAGrid`,
   `TestSweepWorstCase_CoversJitteredWakeups`
