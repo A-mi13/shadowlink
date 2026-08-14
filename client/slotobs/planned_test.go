@@ -178,6 +178,120 @@ func TestHazard_CensoredWithinBandGetsHalfWeight(t *testing.T) {
 	}
 }
 
+// Actuarial-поправка СМЕЩЕНА, когда цензурирование сидит у нижней кромки полосы,
+// и именно так устроена наша прод-конфигурация.
+//
+// Тест выше (CensoredWithinBandGetsHalfWeight) строит цензуру РАВНОМЕРНО по
+// полосе — там вес 1/2 корректен. Здесь воспроизводится поле: порог ротации
+// 70s+stagger, плановые массово снимаются на 80.2s, то есть проживают в полосе
+// 80-90s всего 0.2s, а не 5s. Замер 2026-08-14 по 622 восстановленным ротациям
+// (nixavpn-DEBUG-20260813-153638): p75 = p90 = 80.2s.
+//
+// Что защищаем: RateByExposure обязан быть СУЩЕСТВЕННО выше Rate(). Если кто-то
+// «упростит» экспозицию обратно к весам, тест это поймает.
+func TestHazard_ExposureBeatsActuarialAtBandEdge(t *testing.T) {
+	r := NewRecorder(0)
+
+	// 100 плановых на 80.2с — прожили в полосе по 0.2с каждый.
+	for i := 0; i < 100; i++ {
+		r.RecordPlanned(Observation{AgeMs: 80_200, CloseKind: ClosePlannedRotation})
+	}
+	// 2 реза на 85с — прожили в полосе по 5с.
+	for i := 0; i < 2; i++ {
+		r.Record(Observation{AgeMs: 85_000, CloseKind: "close_other"})
+	}
+
+	h := r.Hazard(80_000, 90_000)
+
+	// Экспозиция: 100*0.2с + 2*5с = 20 + 10 = 30с.
+	if h.ExposureMs != 30_000 {
+		t.Fatalf("ExposureMs=%d, ожидалось 30000 (100*200мс + 2*5000мс)", h.ExposureMs)
+	}
+	// 2 реза / 30с = 0.0667 1/с.
+	got := h.RateByExposure()
+	if got < 0.066 || got > 0.067 {
+		t.Fatalf("RateByExposure()=%.5f, ожидалось ~0.0667 (2 реза на 30с)", got)
+	}
+	// Actuarial: eff = 102 - 50 = 52; 2/52 = 0.0385 — и это НЕ интенсивность,
+	// а доля, то есть сравнивать напрямую нельзя. Сравниваем с вероятностью
+	// прохода полосы: 1-exp(-0.0667*10) = 0.487 против 0.0385, разрыв ~12x.
+	if h.Rate() >= got {
+		t.Fatalf("Rate()=%.4f не ниже RateByExposure()=%.5f — смещение у кромки "+
+			"перестало воспроизводиться, проверьте расчёт экспозиции", h.Rate(), got)
+	}
+}
+
+// Дожившие до конца полосы дают полную ширину экспозиции, умершие внутри — от
+// кромки до смерти. Прямая проверка арифметики, без полевых профилей.
+func TestHazard_ExposureAccountsPartialAndFullPasses(t *testing.T) {
+	r := NewRecorder(0)
+	// Прожил полосу целиком (умер за её пределами): вклад = вся ширина 10с.
+	r.RecordPlanned(Observation{AgeMs: 150_000, CloseKind: ClosePlannedRotation})
+	// Умер ровно на середине: вклад 5с.
+	r.Record(Observation{AgeMs: 85_000, CloseKind: "close_other"})
+	// Не дожил до полосы: вклад 0, в Reached не входит.
+	r.RecordPlanned(Observation{AgeMs: 70_000, CloseKind: ClosePlannedRotation})
+
+	h := r.Hazard(80_000, 90_000)
+	if h.Reached != 2 {
+		t.Fatalf("Reached=%d, ожидалось 2 (не доживший не считается)", h.Reached)
+	}
+	if h.ExposureMs != 15_000 {
+		t.Fatalf("ExposureMs=%d, ожидалось 15000 (10с полный проход + 5с частичный)",
+			h.ExposureMs)
+	}
+}
+
+// Пустая экспозиция — «нет данных», а не «нулевой риск». Деления на ноль быть
+// не должно.
+func TestHazard_RateByExposureEmptyIsNotZeroRisk(t *testing.T) {
+	r := NewRecorder(0)
+	// Ровно на нижней кромке: дожил, но экспозиция 0.
+	r.RecordPlanned(Observation{AgeMs: 80_000, CloseKind: ClosePlannedRotation})
+
+	h := r.Hazard(80_000, 90_000)
+	if h.Reached != 1 {
+		t.Fatalf("Reached=%d, ожидалось 1", h.Reached)
+	}
+	if h.ExposureMs != 0 {
+		t.Fatalf("ExposureMs=%d, ожидался 0", h.ExposureMs)
+	}
+	if got := h.RateByExposure(); got != 0 {
+		t.Fatalf("RateByExposure()=%v при нулевой экспозиции — деление на ноль", got)
+	}
+}
+
+// Насыщение ринга обязано быть ВИДНО, а не выводиться читателем из третьих чисел.
+//
+// Замер PROBE 2026-08-13: плановых 1256 при ёмкости 512 (переполнен), резов 126
+// (нет). Числитель полный, знаменатель обрезан последними 512 → логировалось
+// rate=0.0367 против 0.0178 по экспозиции, завышение ×2.06, и это было прочитано
+// как реальный риск. CutShare про ловушку предупреждает, Hazard не предупреждал.
+func TestHazard_RingSaturationIsVisible(t *testing.T) {
+	r := NewRecorder(8) // маленькая ёмкость, чтобы переполнить дёшево
+
+	// Ринг резов не насыщен, плановых — тоже.
+	r.Record(Observation{AgeMs: 85_000, CloseKind: "close_other"})
+	if h := r.Hazard(80_000, 90_000); h.RingSaturated {
+		t.Fatalf("RingSaturated=true при ненасыщенных рингах")
+	}
+
+	// Переполняем ринг плановых: 12 записей при ёмкости 8.
+	for i := 0; i < 12; i++ {
+		r.RecordPlanned(Observation{AgeMs: 95_000, CloseKind: ClosePlannedRotation})
+	}
+	h := r.Hazard(80_000, 90_000)
+	if !h.RingSaturated {
+		t.Fatalf("RingSaturated=false при переполненном ринге плановых — " +
+			"смещение доли останется невидимым в логе")
+	}
+	// Пожизненные счётчики обязаны помнить то, что ринг забыл: без них
+	// восстановить масштаб искажения нечем.
+	if got := r.TotalPlanned(); got != 12 {
+		t.Fatalf("TotalPlanned()=%d, ожидалось 12 (ринг забыл, счётчик — нет)", got)
+	}
+}
+
 // Резы внутри полосы в CensoredIn не входят: они не цензурированы, они и есть
 // событие. Иначе поправка съела бы сама себя.
 func TestHazard_CutsAreNotCensored(t *testing.T) {
