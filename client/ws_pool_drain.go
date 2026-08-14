@@ -12,6 +12,39 @@ import (
 const (
 	// drainPollInterval — drainWatchdog tick rate when checking if active
 	// streams have drained naturally.
+	//
+	// # Почему джиттер здесь НЕ нужен (замер 2026-08-14, прогон 161915)
+	//
+	// Ревью предсказывало, что этот Ticker оставит решётку 500 мс на wire, и
+	// требовало его джиттеровать. Замер показал, что предсказание неверно, а
+	// причина — в ЯКОРЕ фазы:
+	//
+	//	R((close − drain_start) mod 500ms) = 1.0000   ← сетка жива на 100%
+	//	   гистограмма: 1525/1525 в бин 0-50ms
+	//	R(close mod 500ms) на wire        = 0.0447   ← на уровне шума (0.025)
+	//
+	// Ticker создаётся ВНУТРИ каждого drainWatchdog, то есть его фаза наследуется
+	// от момента startDrain. А startDrain зовётся из rotationWatchdogSweep, который
+	// с 2026-08-14 просыпается по `tick + uniform[0, tick)` (см.
+	// nextWatchdogWakeup). Якорь джиттерован → абсолютная фаза размазана, хотя
+	// относительная сетка сохранена идеально.
+	//
+	// Слепой скан 0.05–6.0 с шагом 5 мс по моментам close: максимум R = 0.063,
+	// то есть ни одной линии выше шума во всём диапазоне.
+	//
+	// ⚠ Отсюда следует ЗАВИСИМОСТЬ, а не свобода: маскировка этого тикера держится
+	// на джиттере свипа. Если rotationWatchdogLoop когда-нибудь вернут к
+	// time.NewTicker, решётка 500 мс проступит на wire НЕМЕДЛЕННО и без правок
+	// здесь — именно это и наблюдалось в прогоне 115514 (R=0.8933 по close при
+	// жёстком свипе с тем же drainPollInterval).
+	//
+	// ⚠ Величину менять по-прежнему нельзя без разбора: она гейтит
+	// stickyRecheckInterval (спец L3 требует stickyRecheckInterval >=
+	// drainPollInterval), см. ниже.
+	//
+	// Остаточный признак, который замером НЕ снят: медиана (close − start) = 0.500 с
+	// ровно, то есть пара «новое TLS → close через полсекунды» жёстко
+	// коррелирована по ИНТЕРВАЛУ. Это не периодичность, а шаблон; отдельная работа.
 	drainPollInterval = 500 * time.Millisecond
 
 	// stickyRecheckInterval is how often the deadline branch re-evaluates an
@@ -83,6 +116,20 @@ const (
 	// simultaneously (e.g. cascade TIME_WAIT exhaustion under upload
 	// load). Spec 2026-05-24.
 	reserveConnectBackoffJitterFraction = 0.2
+
+	// stickyExposureThreshold — возраст, выше которого время соединения на wire
+	// считается ОПАСНОЙ экспозицией (Stats.StickyExposureOver82sMs).
+	//
+	// 82s, а не 80s: 80s — нижняя граница полосы, где hazard впервые перестаёт
+	// быть нулём (замер 08-13: 0 резов ниже 80s на 52 808s экспозиции), но
+	// плановые ротации массово проходят через 80.2s и раздували бы счётчик
+	// штатной работой. 82s отсекает их и оставляет только реальный перебег.
+	//
+	// ⚠ Это порог НАБЛЮДЕНИЯ, а не поведения: он ничего не запрещает и ни на что
+	// не влияет, кроме счётчика. Менять можно без замера — но тогда исторические
+	// значения счётчика становятся несравнимыми, поэтому величина зафиксирована
+	// здесь одним местом, а не вписана в вызов.
+	stickyExposureThreshold = 82 * time.Second
 )
 
 // shouldLogDeferred returns true if at least drainDeferredLogInterval has
@@ -1144,12 +1191,47 @@ func emitHardCapLog(p *WSPoolTransport, oldIdx int, slot *poolSlot, reason strin
 func emitStickyTeardownLog(p *WSPoolTransport, oldIdx int, slot *poolSlot,
 	reason string, duration time.Duration, outcome string) {
 	snap := snapshotDrainStreams(p, oldIdx, time.Now())
+
+	// slot_age — ПОЛНЫЙ возраст TCP на момент разрыва, а не длительность дренажа
+	// (добавлено 2026-08-14 по замеру прогона 161915).
+	//
+	// Почему drain_duration недостаточно и вводит в заблуждение: в ветке
+	// age_backstop он РАВЕН stickyMaxDrainAge всегда — все 50 teardown'ов
+	// прогона дали ровно `drain_duration=25s`. То есть поле не несёт информации
+	// о том, чем эти 25s оплачены, а оплачены они возрастом соединения на wire.
+	//
+	// Замер того же прогона: старт дренажа приходится на p50 34.2s / p90 74.2s /
+	// max 77.6s возраста, поэтому полная жизнь получается p50 59.2 / p90 99.2 /
+	// max 102.6s. Sticky даёт 77% всей экспозиции в опасной полосе >82s
+	// (196.8s из 254s) и 12 из 17 соединений старше 85s — то есть после
+	// исправления утечки ячеек это ГЛАВНЫЙ и почти единственный источник хвоста
+	// возрастов, а по drain_duration его не увидеть.
+	//
+	// Величина сравнивается с окном реза напрямую: 0 резов ниже 80s на 52 808s
+	// экспозиции (замер 08-13), hazard 80-85s ≈ 14.4e-3 1/с. При наблюдённых
+	// 49.2s/ч экспозиции >82s ожидается ~1 рез за 4-часовой прогон; наблюдалось
+	// 0. Порог не пробит, но запас исчерпывается именно здесь, поэтому величина
+	// обязана быть в логе ДО того, как станет вредной.
+	slotAge := time.Duration(0)
+	if started := slot.startedAtNs.Load(); started > 0 {
+		slotAge = time.Since(time.Unix(0, started))
+		// Накапливаем экспозицию ЗА порогом, а не число заходов: два соединения
+		// по 1s и одно по 20s — разный риск, а событий во всех случаях мало.
+		// Порог см. Stats.StickyExposureOver82sMs.
+		if over := slotAge - stickyExposureThreshold; over > 0 {
+			Stats.StickyExposureOver82sMs.Add(uint64(over.Milliseconds()))
+		}
+	}
+
 	p.log.Info("WS pool slot drain sticky backstop teardown",
 		"slot", oldIdx, "reason", reason,
 		"sticky_outcome", outcome,
 		"remaining_streams", slot.streams.Load(),
 		"down_bytes", slot.downBytes.Load(),
 		"drain_duration", duration.Truncate(time.Second),
+		// ⚠ Читать ИМЕННО это поле при оценке риска реза, а не drain_duration:
+		// второе в ветке age_backstop константа и о возрасте на wire молчит.
+		"slot_age", slotAge.Truncate(time.Millisecond),
 		"diag_total", snap.total,
 		"diag_active_count", snap.activeCount,
 		"diag_max_stream_age_ms", snap.maxStreamAgeMs,

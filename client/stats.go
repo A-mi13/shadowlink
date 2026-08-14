@@ -331,6 +331,25 @@ type statsRegistry struct {
 	// что пул балансирует НА полу и любая плановая ротация будет отклонена.
 	CapacityFloorDeferredTotal atomic.Uint64
 
+	// StickyExposureOver82sMs — суммарное время, проведённое соединениями ЗА
+	// порогом 82s, накопленное по sticky-teardown'ам.
+	//
+	// Заведён 2026-08-14 после того, как замер показал: sticky даёт 77% всей
+	// экспозиции в опасной полосе (196.8s из 254s за 4ч) и 12 из 17 соединений
+	// старше 85s. До этого утечка ячеек и отложки гейта маскировали вклад sticky;
+	// после их исправления он остался единственным значимым источником хвоста.
+	//
+	// Почему 82s, а не 80s: 80s — нижняя граница, где hazard впервые перестаёт
+	// быть нулём, но плановые ротации массово проходят через 80.2s и раздули бы
+	// счётчик штатной работой. 82s отсекает их и оставляет только реальный
+	// перебег. Величина в миллисекундах, а не в числе событий: два соединения по
+	// 1s и одно по 20s — разный риск, а событий во всех случаях мало.
+	//
+	// Как читать: делить на часы прогона и сравнивать с hazard-кривой.
+	// При 49.2s/ч и hazard 80-85s ≈ 14.4e-3 1/с ожидается ~1 рез за 4ч. Рост
+	// этой величины — единственный оставшийся канал, по которому вернутся резы.
+	StickyExposureOver82sMs atomic.Uint64
+
 	// HealingRetargetTotal — сколько раз цепочка reconnectLoop переприцелилась на
 	// другую ячейку, потому что её собственную забрал дренаж.
 	//
@@ -907,6 +926,10 @@ func WritePromMetrics(w io.Writer) {
 	fmt.Fprintf(w, "# HELP shadowlink_slot_drain_capacity_floor_deferred_total Drains deferred by storm-brake capacity-floor gate (readyCapacity < poolSize * readyCapacityFloorFraction)\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_slot_drain_capacity_floor_deferred_total counter\n")
 	fmt.Fprintf(w, "shadowlink_slot_drain_capacity_floor_deferred_total %d\n", Stats.CapacityFloorDeferredTotal.Load())
+
+	fmt.Fprintf(w, "# HELP shadowlink_sticky_exposure_over_82s_ms Cumulative wire time spent by connections past the 82s hazard threshold, accumulated at sticky-drain teardown\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_sticky_exposure_over_82s_ms counter\n")
+	fmt.Fprintf(w, "shadowlink_sticky_exposure_over_82s_ms %d\n", Stats.StickyExposureOver82sMs.Load())
 
 	fmt.Fprintf(w, "# HELP shadowlink_pool_healing_retargets_total Reconnect chains re-targeted to another cell after a drain claimed theirs (prevents permanent cell loss)\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_pool_healing_retargets_total counter\n")

@@ -509,3 +509,83 @@ func TestSticky_HealthyCapacity_Granted(t *testing.T) {
 		t.Fatal("healthy capacity under cap: sticky must be granted")
 	}
 }
+
+// Экспозиция за порогом hazard обязана считаться в МИЛЛИСЕКУНДАХ и только за
+// перебег, а не за весь возраст соединения.
+//
+// # Зачем счётчик (замер прогона 20260814-161915)
+//
+// После исправления утечки ячеек и обнуления отложек capacity-floor sticky остался
+// ЕДИНСТВЕННЫМ значимым источником хвоста возрастов: 77% всей экспозиции за 82s
+// (196.8s из 254s за 4 часа), 12 из 17 соединений старше 85s, max 102.6s.
+//
+// Из логов это было не видно: в ветке age_backstop `drain_duration` РАВЕН
+// stickyMaxDrainAge всегда — все 50 teardown'ов дали ровно 25s. Поле не несёт
+// информации о том, чем эти 25s оплачены, а оплачены они возрастом на wire.
+//
+// Тест закрепляет три свойства, каждое из которых легко потерять при правке:
+//  1. считается ПЕРЕБЕГ (age - threshold), а не полный возраст — иначе величина
+//     раздувается штатной работой и перестаёт сравниваться с hazard-кривой;
+//  2. соединение НИЖЕ порога не добавляет ничего — иначе плановые ротации,
+//     массово проходящие через 80.2s, забьют счётчик;
+//  3. накопление аддитивно: два прохода складываются. Величина — время, а не
+//     число событий, потому что 1s и 20s перебега это разный риск.
+func TestStickyExposure_CountsOnlyOverThreshold(t *testing.T) {
+	p := &WSPoolTransport{poolSize: 4, log: newDiscardLogger()}
+	p.slots = make([]*poolSlot, 8)
+
+	newDrainingSlot := func(age time.Duration) *poolSlot {
+		s := &poolSlot{index: 0}
+		s.setState(slotDraining)
+		s.startedAtNs.Store(time.Now().Add(-age).UnixNano())
+		p.slots[0] = s
+		return s
+	}
+
+	// 1. Ниже порога — вклада нет.
+	before := Stats.StickyExposureOver82sMs.Load()
+	emitStickyTeardownLog(p, 0, newDrainingSlot(70*time.Second), "age", 25*time.Second, "age_backstop")
+	if got := Stats.StickyExposureOver82sMs.Load(); got != before {
+		t.Errorf("возраст 70s (ниже порога %v) добавил %d мс — счётчик забьётся "+
+			"штатными ротациями и перестанет сравниваться с hazard",
+			stickyExposureThreshold, got-before)
+	}
+
+	// 2. Выше порога — вклад равен ПЕРЕБЕГУ, не всему возрасту.
+	before = Stats.StickyExposureOver82sMs.Load()
+	emitStickyTeardownLog(p, 0, newDrainingSlot(92*time.Second), "byte_budget", 25*time.Second, "age_backstop")
+	delta := Stats.StickyExposureOver82sMs.Load() - before
+	// Ожидаем ~10s перебега (92 - 82). Допуск на время исполнения теста.
+	if delta < 9_500 || delta > 10_500 {
+		t.Errorf("перебег для возраста 92s = %d мс, ожидалось ~10000 "+
+			"(92s - порог %v). Если ~92000 — считается весь возраст вместо перебега",
+			delta, stickyExposureThreshold)
+	}
+
+	// 3. Аддитивность: второй проход складывается с первым.
+	before = Stats.StickyExposureOver82sMs.Load()
+	emitStickyTeardownLog(p, 0, newDrainingSlot(87*time.Second), "age", 25*time.Second, "age_backstop")
+	if d := Stats.StickyExposureOver82sMs.Load() - before; d < 4_500 || d > 5_500 {
+		t.Errorf("второй проход добавил %d мс, ожидалось ~5000 — накопление сломано", d)
+	}
+}
+
+// Порог наблюдения обязан быть ВЫШЕ полосы, через которую массово проходят
+// плановые ротации, иначе счётчик измеряет штатную работу.
+//
+// Замер 08-13: p75 = p90 = 80.2s по 622 плановым ротациям — то есть порог 80s
+// собрал бы почти весь пул. 82s отсекает их. Ниже 80s резов не наблюдалось вовсе
+// (0 на 52 808s экспозиции), так что смысла опускать порог нет.
+func TestStickyExposureThreshold_AbovePlannedRotationBand(t *testing.T) {
+	if stickyExposureThreshold <= 80*time.Second {
+		t.Errorf("порог %v не выше 80s: плановые ротации проходят через 80.2s "+
+			"(p75=p90 по 622 наблюдениям) и забьют счётчик штатной работой",
+			stickyExposureThreshold)
+	}
+	// И не слишком высоко: hazard в полосе 80-85s уже 14.4e-3 1/с, поэтому
+	// перебег в этой зоне обязан быть виден.
+	if stickyExposureThreshold >= 85*time.Second {
+		t.Errorf("порог %v слишком высок: полоса 80-85s несёт hazard 14.4e-3 1/с "+
+			"и перебег в ней должен попадать в счётчик", stickyExposureThreshold)
+	}
+}
