@@ -416,6 +416,18 @@ type poolSlot struct {
 	// on next tick).
 	nextDrainAttemptNs atomic.Int64
 
+	// phaseJitterApplied — подтиковая отсрочка дренажа уже выдана этому слоту.
+	//
+	// Флаг обязателен, а не «просто ещё раз посчитать джиттер»: свип заходит каждые
+	// rotationWatchdogTick, и без однократности отсрочка перевзводилась бы на
+	// каждом тике. Слот, перешагнувший порог, не ротировался бы НИКОГДА при любом
+	// jitter>0 — то есть ручка размазывания превратилась бы в отключение ротации.
+	//
+	// Живёт на *poolSlot, а не в мапе по индексу, по той же причине, что isSticky:
+	// переподключение отдаёт ячейке НОВЫЙ *poolSlot, и флаг обнуляется нулевым
+	// значением сам, без явного сброса на пути реконнекта.
+	phaseJitterApplied atomic.Bool
+
 	// isSticky marks that THIS slot's drainWatchdog currently holds a sticky
 	// extension slot in the pool-wide stickyDrainCount (Bug #6). Set via
 	// markSticky (CAS false→true, increments count once), cleared via
@@ -511,8 +523,33 @@ const slotRotationStaggerStep = 15 * time.Second
 //     full reversal is statistically negligible.
 //   - FFT effect: the additive grid noise spreads the ladder's spectral
 //     peak (was a delta at 1/step) into a band centered at 1/step with
-//     width ~1/step. A passive observer collecting ≥100 inter-arrival
-//     samples can no longer reject the "irregular" null hypothesis.
+//     width ~1/step.
+//
+// ⚠ ПОСЛЕДНЕЕ СВОЙСТВО ОПРОВЕРГНУТО ЗАМЕРОМ 2026-08-14. Здесь стояло
+// продолжение: «A passive observer collecting ≥100 inter-arrival samples can no
+// longer reject the "irregular" null hypothesis». Замер по логу
+// nixavpn-DEBUG-20260813-153638 (2.04ч, 588 age-ротаций):
+//
+//	все 588 ротаций — в ОДНОЙ фазе сетки 5.000s (rotationWatchdogTick)
+//	   σ фазы 0.0001s, дрейфа за 2 часа нет
+//	92.2% TCP-connect'ов — в одном односекундном окне этой фазы
+//
+// Пик не размазан — он ПЕРЕЕХАЛ с 1/step на 1/rotationWatchdogTick и стал
+// предельно узким. Причина: этот джиттер прибавляется к ПОРОГУ, а порог
+// сравнивается с возрастом только на тике watchdog'а. Поэтому джиттер решает,
+// ЧЕРЕЗ КАКОЙ ТИК слот уйдёт, и не влияет на подтиковую фазу — а наблюдателю на
+// краю ISP видна именно фаза.
+//
+// Побочное следствие того же квантования: при staggerStep=1s соседние offsets
+// неразличимы. В поле видны ровно ДВА режима возраста ротации с разницей 5.0s
+// (cell 0-4 → p50 73.8-74.7s, cell 5-8 → 79.6-79.7s), а не лестница из 16
+// ступеней. Модель подтверждена на втором прогоне (083912, base 75s):
+// cell 0-4 → 79.7s, cell 5-9 → 84.7s, cell 10-11 → 89.6/90.5s.
+//
+// Спектральное свойство теперь обеспечивает ОТДЕЛЬНАЯ ручка, действующая на
+// момент дренажа, а не на порог: см. sweepPhaseJitterDefault. Этот джиттер
+// остаётся полезным (он размазывает ПОРЯДОК ячеек), но заявлять за него
+// разрушение FFT-пика больше нельзя.
 //
 // Why additive (not multiplicative / not cumulative independent):
 //   - Multiplicative `idx × JitteredInterval(step, 0.5)` draws ONE sample
@@ -555,12 +592,75 @@ const slotRotationStaggerStep = 15 * time.Second
 // what staggering is for. Visible in the field log as bursts of same-second
 // teardowns.
 //
+// ⚠ Оба абзаца выше описывают КОНФИГУРАЦИЮ step=6s / cap=45s и к текущему
+// проду (step=1s, cap=15s) неприменимы. Разбор 2026-08-14: при step=1s и 16
+// ячейках максимум idx=15 даёт base=15s, а кламп требует `base > cap`, то есть
+// при cap=15s он НЕ СРАБАТЫВАЕТ НИ НА ОДНОЙ ячейке. Склейки высоких idx в одно
+// значение в проде нет, и cap не является причиной заходов в опасную полосу
+// возраста — причина в offsets 5…9s у ячеек 5-9 плюс квантование тиком.
+//
+// Практическое следствие, чтобы вопрос не поднимался снова: правка cap
+// 15s → 10s связала бы только idx 11…15, а их занятость в поле — 0.16%
+// (по ячейкам: 0:87 1:84 2:83 3:84 4:82 5:80 6:75 7:31 8:16 9:2 10:3 11:1,
+// 12-15 пусты). После квантования тиком корзину меняет только idx=15 → ноль
+// соединений за прогон. То есть правка — no-op, а по hard rule 8 каждая
+// тайминговая правка оплачивается замером.
+//
 // Always size this through WSPoolTransport.worstCaseTeardown(), never by
 // eyeballing MaxSlotAge. cap=0 preserves the legacy unbounded ladder.
 // rotationWatchdogTick — период обхода слотов на предмет перезревания.
 // Слагаемое worst-case: слот, перешедший порог сразу после тика, ждёт до целого
 // периода, прежде чем ротация вообще будет замечена.
 const rotationWatchdogTick = 5 * time.Second
+
+// sweepPhaseJitterDefault — размазывание момента дренажа ВНУТРИ тика watchdog'а.
+//
+// # Что измерено (2026-08-14, лог nixavpn-DEBUG-20260813-153638, 2.04ч)
+//
+// Комментарий к slotStaggerOffset утверждал: «additive grid noise spreads the
+// ladder's spectral peak (was a delta at 1/step) into a band … a passive
+// observer collecting ≥100 inter-arrival samples can no longer reject the
+// "irregular" null hypothesis». Замер это ОПРОВЕРГ:
+//
+//	все 588 age-ротаций попали в ОДНУ фазу сетки 5.000s
+//	   разброс фазы: min 0.000 · max 0.001s · σ = 0.0001s
+//	   дрейфа за 2 часа нет: mean(первые 100) == mean(последние 100) == 0.000
+//	92.2% TCP-connect'ов — в одном односекундном окне этой фазы
+//	   (фазовая гистограмма стартов: бин 0.5s → 500 из 628)
+//
+// Пик не размазан — он ПЕРЕЕХАЛ с 1/step на 1/rotationWatchdogTick и стал
+// предельно узким. Наши новые TLS-соединения к голому origin IP рождаются на
+// жёсткой 5-секундной решётке с фазой, стабильной на всём сеансе.
+//
+// # Почему stagger-джиттер это не лечит
+//
+// slotStaggerOffset прибавляет uniform[-step/2, step/2) к ПОРОГУ, а не к моменту
+// действия. rotationWatchdogSweep сравнивает возраст с порогом только на своём
+// тике, поэтому джиттер влияет на то, ЧЕРЕЗ КАКОЙ ТИК слот уйдёт, и НИКОГДА на
+// подтиковую фазу. Наблюдателю на краю ISP видна именно фаза (ACM IMC 2022: ТСПУ
+// стоит inline на первом хопе от абонента). Побочное следствие того же
+// квантования: при staggerStep=1s соседние offsets неразличимы — в поле видны
+// ровно два режима возраста ротации с разницей 5.0s, а не лестница из 16 ступеней.
+//
+// # Почему задержка, а не сдвиг порога
+//
+// Сдвинуть порог нельзя: он и так уже несёт stagger, а квантование живёт в
+// момент ПРОВЕРКИ. Поэтому слот, перешагнувший порог, получает разовую отсрочку
+// uniform[0, jitter) через уже существующий механизм nextDrainAttemptNs — тот,
+// которым пользуется storm-brake, и который свип уже уважает (ws_pool.go ~2257).
+// Никакой новой ветки поведения не появляется.
+//
+// # Величина: 4s
+//
+// Меньше тика (5s), чтобы отсрочка гарантированно рассасывалась на следующем
+// тике и не накапливалась. Плата — до 4s дополнительного возраста в худшем
+// случае, что учтено в worstCaseTeardown отдельным слагаемым (см. там).
+// При базе 70s это уводит худшую ячейку с 74…79s в 74…83s — внутри полосы, где
+// hazard по замеру 2026-08-14 равен 2.1% на проход, тогда как ниже 80s он ноль
+// на 52 808s экспозиции. То есть ручка НЕ бесплатна и сознательно выведена в env:
+// снижение периодического сигнала оплачивается экспозицией в первой ненулевой
+// полосе, и что дороже — решается замером, а не здесь.
+const sweepPhaseJitterDefault = 4 * time.Second
 
 // staggerSpan — МАКСИМАЛЬНЫЙ вклад stagger-джиттера в возраст слота, по всем
 // ячейкам слайса. Ровно та величина, которой не хватало в расчёте worst-case.
@@ -701,7 +801,19 @@ func (p *WSPoolTransport) worstCaseTeardown() (base, stagger, sweep, deferred, t
 		base = adapted
 	}
 	stagger = p.staggerSpan()
+	// sweep несёт ДВА слагаемых, потому что оба живут в одном тике:
+	// обнаружение (слот перешагнул порог сразу после тика — ждёт до целого
+	// периода) и подтиковая отсрочка размазывания фазы (uniform[0, jitter),
+	// один раз за жизнь слота — см. sweepPhaseJitterDefault).
+	//
+	// Складываются, а не max(): отсрочка ставится ПОСЛЕ того, как обнаружение
+	// уже состоялось, и рассасывается на следующем тике. Занижение здесь
+	// повторило бы H-15 — бюджет обязан быть верхней границей, поэтому берём
+	// полный jitter, а не его среднее.
 	sweep = rotationWatchdogTick
+	if p.sweepPhaseJitter > 0 {
+		sweep += p.sweepPhaseJitter
+	}
 	if p.gracefulDrain {
 		deferred = drainRevertBackoff
 
@@ -846,10 +958,44 @@ const maxConcurrentDrainsFraction = 0.5
 // пороге ротация чаще, и «steady state» другой: пул штатно балансирует НА
 // полу, а не выше него.
 //
-// Это не деградация: 25 отложек по 5s за 2ч, потерь нет (балансы
-// socks_connects=uplink=downlink=694, decrypt_fails=0). Гейт делает ровно
-// то, для чего написан. Но утверждение «никогда не срабатывает» больше
-// НЕ основание считать ветку мёртвой — она живая и на горячем пути.
+// ⚠ ВЫВОД ВЫШЕ ПЕРЕСМОТРЕН 2026-08-14. Здесь стояло: «Это не деградация: 25
+// отложек по 5s за 2ч, потерь нет (балансы socks_connects=uplink=downlink=694,
+// decrypt_fails=0). Гейт делает ровно то, для чего написан». Первая половина
+// верна — потерь по балансам действительно нет. Вторая неверна.
+//
+// Разбор всех четырёх резов того же прогона по контексту (окно `reader started`
+// → `reader error` для той же ячейки):
+//
+//	slot 8 · жизнь 86.6s · +79.6s `drain deferred (capacity floor)` → рез +7.0s
+//	slot 6 · жизнь 84.4s · +79.8s то же                            → рез +4.6s
+//	slot 5 · жизнь 82.7s · +79.7s то же                            → рез +3.0s
+//	slot 10 · жизнь 83.7s · отложек нет, ячейка idx=10 доросла до порога
+//
+// ТРИ РЕЗА ИЗ ЧЕТЫРЁХ — на конце цепочки отложки. Ротация срабатывала вовремя,
+// на своём тике 79.7s; её отказывал этот гейт с backoff 5s, и слот доживал до
+// полосы, где hazard впервые перестаёт быть нулём. Резов среди отложенных
+// 3/22 = 13.6% против базового 4/622 = 0.64%, относительный риск ×21
+// (гипергеометрический p ≈ 1.5e-4). n=3, поэтому это сильное указание, а не
+// доказательство, — но механизм статистики не требует: отложка на 79.7s
+// ГАРАНТИРУЕТ ≥3-7s лишней экспозиции ровно в первой ненулевой полосе
+// (2.1% на проход против 0 на 52 808s экспозиции ниже 80s).
+//
+// Почему отложки вообще появились: floor = floor(8 × 0.75) = 6, а сокращение
+// порога 75s → 70s сдвинуло рабочую точку пула РОВНО НА этот пол:
+//
+//	порог 70s: alive=5:15  alive=6:146  alive=7:75  alive=8:8  ← мода = пол
+//	порог 75s: alive=6:26  alive=7:203  alive=8:95             ← пол с запасом 1
+//
+// То есть гейт, написанный для катастрофы («пул теряет слоты быстрее, чем лечит
+// reconnectLoop»), оказался взведён в штатном режиме и стреляет по обычной
+// ротации. Формулировка «делает ровно то, для чего написан» это скрывала.
+//
+// Значение НЕ меняется здесь: правка требует A/B-замера (hard rule 8), а
+// занижение пола — это уже риск clinch'а, ради которого гейт и заводился.
+// Вместо правки доля выведена в env (SHADOWLINK_READY_CAPACITY_FLOOR_FRACTION),
+// чтобы замер стало возможно провести без пересборки. Критерий успеха A/B:
+// capacity_floor_deferred_total → 0 И число резов, следующих за отложкой той же
+// ячейки в пределах 10s. Нужно ≥3 прогона по 2ч, чтобы n вышел из области n=3.
 //
 // Spec 2026-05-24 (concurrency-lift-and-backoff).
 const readyCapacityFloorFraction = 0.75
@@ -987,8 +1133,35 @@ func (p *WSPoolTransport) readyCapacity() int {
 //   - floor >= 1 (always require at least one ready slot)
 //   - floor <= poolSize-1 (never block all drains by setting floor at
 //     pool size — at minimum poolSize-1 ready slots is "acceptable")
+// normalizeFloorFraction приводит долю пола к допустимому диапазону.
+//
+// 0 (не задано) и мусор → константа readyCapacityFloorFraction. Значения >= 1
+// клампятся: доля 1.0 означала бы «все слоты обязаны быть ready», то есть при
+// любой ротации (слот выходит из slotReady) гейт запрещал бы следующую — пул
+// перестал бы ротировать вовсе. Такое поведение из env получить нельзя.
+//
+// Верхняя граница 0.95, а не 1.0-epsilon: readyCapacityFloor всё равно режет
+// результат до poolSize-1, и жёсткая граница здесь нужна лишь чтобы значение в
+// логе было честным, а не выглядело применённым буквально.
+func normalizeFloorFraction(f float64) float64 {
+	if f <= 0 || math.IsNaN(f) {
+		return readyCapacityFloorFraction
+	}
+	if f > 0.95 {
+		return 0.95
+	}
+	return f
+}
+
 func (p *WSPoolTransport) readyCapacityFloor() int {
-	floor := int(math.Floor(float64(p.poolSize) * readyCapacityFloorFraction))
+	// Доля настраиваема с 2026-08-14 (env SHADOWLINK_READY_CAPACITY_FLOOR_FRACTION).
+	// 0 → константа readyCapacityFloorFraction, чтобы нулевое значение поля у
+	// тестов, собирающих транспорт литералом, сохраняло прежнее поведение.
+	fraction := p.readyCapacityFloorFraction
+	if fraction <= 0 {
+		fraction = readyCapacityFloorFraction
+	}
+	floor := int(math.Floor(float64(p.poolSize) * fraction))
 	if floor < 1 {
 		floor = 1
 	}
@@ -1390,6 +1563,14 @@ type WSPoolTransport struct {
 	staggerStep       time.Duration // per-slot grid interval (0 → slotRotationStaggerStep)
 	staggerOffsetCap  time.Duration // max staggerOffset regardless of idx (0 → no cap)
 	ageCutMinAge      time.Duration // age-cut classification floor (0 → ageCutMinAgeMs default)
+	sweepPhaseJitter  time.Duration // подтиковое размазывание дренажа (<0 → выключено)
+
+	// readyCapacityFloorFraction — доля poolSize, обязанная быть в slotReady,
+	// чтобы storm-brake пропустил новый дренаж. 0 → константа
+	// readyCapacityFloorFraction. Выведена в конфиг 2026-08-14: замер показал,
+	// что при пороге 70s пул штатно балансирует НА полу, и отложки гейта
+	// удлиняют жизнь слота в полосу ненулевого hazard (см. константу).
+	readyCapacityFloorFraction float64
 
 	// ageAdapter сжимает порог ротации по наблюдаемому поведению сети
 	// пользователя (P0 шаг 3). Только сжимает, никогда не поднимает выше
@@ -1828,6 +2009,31 @@ type WSPoolConfig struct {
 	// rotation threshold. 0 → 60s default. env SHADOWLINK_AGE_CUT_MIN_AGE.
 	AgeCutMinAge time.Duration
 
+	// SweepPhaseJitter размазывает момент дренажа ВНУТРИ тика watchdog'а.
+	// 0 → sweepPhaseJitterDefault; отрицательное значение выключает.
+	// env SHADOWLINK_SWEEP_PHASE_JITTER.
+	//
+	// Зачем отдельная ручка, когда stagger-джиттер уже есть: тот прибавляется к
+	// ПОРОГУ, а порог проверяется только на тике rotationWatchdogTick. Замер
+	// 2026-08-14 (лог nixavpn-DEBUG-20260813-153638): все 588 age-ротаций легли
+	// в ОДНУ фазу 5-секундной сетки, σ = 0.0001s, дрейфа за 2ч нет; 92.2%
+	// TCP-connect'ов — в одном односекундном окне этой фазы. Подробнее см.
+	// sweepPhaseJitterDefault.
+	SweepPhaseJitter time.Duration
+
+	// ReadyCapacityFloorFraction — доля Size, обязанная быть в slotReady, чтобы
+	// storm-brake пропустил новый дренаж. 0 → константа
+	// readyCapacityFloorFraction (0.75). env
+	// SHADOWLINK_READY_CAPACITY_FLOOR_FRACTION.
+	//
+	// Выведена в конфиг 2026-08-14 ради A/B, а не для повседневного тюнинга:
+	// разбор показал, что при MaxSlotAge=70s пул штатно балансирует НА полу и
+	// отложки гейта удлиняют жизнь слота в полосу ненулевого hazard (3 реза из 4
+	// в прогоне — на конце такой цепочки). Занижение пола — это риск clinch'а,
+	// ради которого гейт и заводился, поэтому дефолт НЕ изменён. Обоснование и
+	// критерий успеха замера — у константы readyCapacityFloorFraction.
+	ReadyCapacityFloorFraction float64
+
 	// ByteBudgetMinInterval is the wall-clock floor before a byte-budget
 	// rotation may fire on a freshly-(re)connected slot (Bug #4 storm fix).
 	// 0 → use the default (byteBudgetMinRotationInterval) when byte budget is
@@ -2020,6 +2226,18 @@ func NewWSPoolTransport(cl *Client, cfg WSPoolConfig) *WSPoolTransport {
 	if keepaliveBase <= 0 {
 		keepaliveBase = keepaliveDefaultBase
 	}
+	// Подтиковый джиттер дренажа: 0 → дефолт, отрицательное → выключено.
+	// Различать 0 и «выключено» обязательно: ручка не бесплатна (плата — возраст),
+	// поэтому у оператора должен быть способ вернуть прежнее поведение ровно, а не
+	// «почти». Клампим сверху тиком: отсрочка длиннее тика накапливалась бы, и
+	// слагаемое в worstCaseTeardown перестало бы быть верхней границей.
+	sweepPhaseJitter := cfg.SweepPhaseJitter
+	if sweepPhaseJitter == 0 {
+		sweepPhaseJitter = sweepPhaseJitterDefault
+	}
+	if sweepPhaseJitter > rotationWatchdogTick {
+		sweepPhaseJitter = rotationWatchdogTick
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &WSPoolTransport{
 		poolSize:              cfg.Size,
@@ -2030,6 +2248,12 @@ func NewWSPoolTransport(cl *Client, cfg WSPoolConfig) *WSPoolTransport {
 		staggerStep:           cfg.StaggerStep,
 		staggerOffsetCap:      cfg.StaggerOffsetCap,
 		ageCutMinAge:          cfg.AgeCutMinAge,
+		sweepPhaseJitter:      sweepPhaseJitter,
+		// Кламп в (0, 1): при >= 1 пол становится >= poolSize и дренаж запрещён
+		// НАВСЕГДА (readyCapacityFloor режет до poolSize-1, но 0.99*8=7 уже
+		// оставляет пулу один слот запаса — это не отказ, а деградация). При <= 0
+		// берётся константа. Мусор из env не должен глушить ротацию молча.
+		readyCapacityFloorFraction: normalizeFloorFraction(cfg.ReadyCapacityFloorFraction),
 		slotDeaths:            slotobs.NewRecorder(0), // 0 → DefaultCapacity
 		ageAdapter:            slotobs.NewAdapter(cfg.MaxSlotAge),
 		byteBudgetMinInterval: byteBudgetMinInterval,
@@ -2296,6 +2520,23 @@ func (p *WSPoolTransport) rotationWatchdogSweep() {
 		if nowNs-started < effectiveMaxAge {
 			continue
 		}
+		// Подтиковое размазывание: слот перешагнул порог, но рвать его ИМЕННО
+		// сейчас — значит родить новое TLS-соединение в фазе тика, одной и той же
+		// на весь сеанс (замер 2026-08-14: σ фазы 0.0001s на 588 ротаций, 92.2%
+		// connect'ов в одном 1-секундном окне). Даём разовую отсрочку
+		// uniform[0, sweepPhaseJitter) — тем же механизмом, что storm-brake, и
+		// ровно один раз за жизнь слота (см. phaseJitterApplied).
+		//
+		// Отсрочка ставится ПОСЛЕ проверки порога, а не прибавляется к нему:
+		// порог уже несёт stagger, а квантование живёт в момент проверки. И
+		// ПОСЛЕ проверки nextDrainAttemptNs выше — иначе первый же тик после
+		// отсрочки сравнил бы её с собой и получил вечный defer.
+		if p.sweepPhaseJitter > 0 && slot.phaseJitterApplied.CompareAndSwap(false, true) {
+			delay := time.Duration(rand.Float64() * float64(p.sweepPhaseJitter))
+			slot.nextDrainAttemptNs.Store(nowNs + delay.Nanoseconds())
+			Stats.SweepPhaseJitterAppliedTotal.Add(1)
+			continue
+		}
 		if p.gracefulDrain {
 			p.startDrain(p.client, idx, "age")
 		} else {
@@ -2401,6 +2642,11 @@ func (p *WSPoolTransport) emitHealthSummary() {
 		"inflight_drains", p.inflightDrains.Load(),
 		"inflight_cap_deferred_total", Stats.InflightCapDeferredTotal.Load(),
 		"capacity_floor_deferred_total", Stats.CapacityFloorDeferredTotal.Load(),
+		// Ожидается ≈ одна на age-ротацию (флаг phaseJitterApplied однократен на
+		// жизнь слота). Существенный недобор против slot_teardowns_1m означает,
+		// что слоты уходят не через age-ветку свипа, и замер фазы покрывает
+		// меньшую долю новых TLS-соединений, чем кажется.
+		"sweep_phase_jitter_applied_total", Stats.SweepPhaseJitterAppliedTotal.Load(),
 		"deferred_drains_1m", p.drainDeferrals1m.Load(),
 		"uptime", uptime,
 	)

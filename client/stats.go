@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -289,14 +290,42 @@ type statsRegistry struct {
 
 	// CapacityFloorDeferredTotal — drain attempts deferred because
 	// readyCapacity fell below readyCapacityFloor (poolSize *
-	// readyCapacityFloorFraction, see ws_pool.go). Catastrophic path —
-	// pool losing slots faster than reconnectLoop heals. Non-zero rate
-	// is a warning sign; persistent non-zero rate is cascading-slot-deaths
-	// failure mode. Counter increments on EVERY defer; log emission
-	// rate-limited. Spec 2026-05-24 (drain-diagnostics-counter-split,
-	// updated by concurrency-lift-and-backoff to use the decoupled
-	// fraction constant).
+	// readyCapacityFloorFraction, see ws_pool.go). Counter increments on
+	// EVERY defer; log emission rate-limited. Spec 2026-05-24
+	// (drain-diagnostics-counter-split, updated by concurrency-lift-and-backoff
+	// to use the decoupled fraction constant).
+	//
+	// ⚠ ПЕРЕЧИТАНО 2026-08-14. Здесь стояло «Catastrophic path — pool losing
+	// slots faster than reconnectLoop heals», и это описание сделало счётчик
+	// нечитаемым: при пороге 70s гейт срабатывает 25 раз за 2ч в ОТСУТСТВИЕ
+	// катастрофы (пул штатно балансирует НА полу: alive=6 при floor=6,
+	// poolSize=8), поэтому оператор, следуя этому тексту, прочёл бы штатный
+	// режим как каскадную смерть слотов.
+	//
+	// Что счётчик значит на самом деле: ротация уже признана нужной, но
+	// отложена — слот вернулся в slotReady и ПРОДОЛЖАЕТ стареть. Разбор
+	// лога nixavpn-DEBUG-20260813-153638: 3 реза из 4 за прогон следуют за
+	// отложкой той же ячейки в пределах 7s (79.6s → рез на 86.6s; 79.8s →
+	// 84.4s; 79.7s → 82.7s). Резов среди отложенных 3/22, среди всех 4/622 —
+	// относительный риск ×21 (гипергеометрический p ≈ 1.5e-4, n=3, поэтому
+	// указание, а не доказательство). Механизм статистики не требует: отсрочка
+	// на 79.7s гарантирует ≥3s экспозиции в полосе 80-85s, где hazard впервые
+	// перестаёт быть нулём (2.1% на проход против 0 на 52 808s ниже 80s).
+	//
+	// Читать так: ненулевой rate = слоты платят возрастом за исправность пула.
+	// Смотреть вместе с sweep_phase_jitter_applied_total и возрастами резов, а
+	// не как индикатор «каскад/не каскад».
 	CapacityFloorDeferredTotal atomic.Uint64
+
+	// SweepPhaseJitterAppliedTotal — сколько раз rotationWatchdogSweep выдал
+	// слоту подтиковую отсрочку дренажа (sweepPhaseJitterDefault, ws_pool.go).
+	//
+	// Ожидание: примерно одна на каждую age-ротацию, потому что флаг
+	// phaseJitterApplied однократен на жизнь слота. Существенный недобор
+	// означает, что слоты уходят не через age-ветку свипа (byte budget, резы,
+	// meltdown) — то есть размазывание фазы покрывает меньшую долю новых
+	// TLS-соединений, чем кажется, и замер фазы надо читать с этой поправкой.
+	SweepPhaseJitterAppliedTotal atomic.Uint64
 
 	// StreamBufferOverflowsTotal — cumulative count of frames dropped at
 	// client.RouteToStream when the per-stream buffered channel (cap 512)
@@ -842,6 +871,10 @@ func WritePromMetrics(w io.Writer) {
 	fmt.Fprintf(w, "# HELP shadowlink_slot_drain_capacity_floor_deferred_total Drains deferred by storm-brake capacity-floor gate (readyCapacity < poolSize * readyCapacityFloorFraction)\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_slot_drain_capacity_floor_deferred_total counter\n")
 	fmt.Fprintf(w, "shadowlink_slot_drain_capacity_floor_deferred_total %d\n", Stats.CapacityFloorDeferredTotal.Load())
+
+	fmt.Fprintf(w, "# HELP shadowlink_sweep_phase_jitter_applied_total Sub-tick drain delays issued by rotationWatchdogSweep to de-phase new TLS connects from the watchdog grid\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_sweep_phase_jitter_applied_total counter\n")
+	fmt.Fprintf(w, "shadowlink_sweep_phase_jitter_applied_total %d\n", Stats.SweepPhaseJitterAppliedTotal.Load())
 
 	fmt.Fprintf(w, "# HELP shadowlink_slot_drain_force_evicted_total Force-evictions of idle slotReady cells when claimFreeSlot would have returned -1 (slice full)\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_slot_drain_force_evicted_total counter\n")
@@ -1416,7 +1449,15 @@ func logSlotDeathSummary() {
 		"drain_hard_cap", pool.drainHardCap,
 		"stagger_span", wcStagger,
 		"effective_max_age_max", wcBase+wcStagger,
-		"sweep_tick", wcSweep,
+		// ⚠ Имя переименовано 2026-08-14 из `sweep_tick`. Слагаемое перестало
+		// быть чистым тиком: в него вошло подтиковое размазывание фазы
+		// (sweepPhaseJitter, до +4s). Оставить прежнее имя значило бы завести
+		// ровно тот дефект, который проект собирает пачками — поле, чьё имя
+		// врёт о механизме. Составляющие печатаются рядом порознь, чтобы
+		// величину можно было разложить, не читая код.
+		"sweep_budget", wcSweep,
+		"sweep_tick", rotationWatchdogTick,
+		"sweep_phase_jitter", pool.sweepPhaseJitter,
 		"defer_backoff", wcDeferred,
 		"teardown_cap", wcTear,
 		"worst_case_teardown", wcTotal,
@@ -1462,7 +1503,9 @@ func logSlotDeathSummary() {
 				"deficit", -wcMargin,
 				"base", wcBase,
 				"stagger_span", wcStagger,
-				"sweep_tick", wcSweep,
+				// Как и в сводке выше: величина = тик + подтиковое
+				// размазывание фазы, поэтому имя не `sweep_tick`.
+				"sweep_budget", wcSweep,
 				"defer_backoff", wcDeferred,
 				"teardown_cap", wcTear,
 				// Явный маркер, что строка дросселирована: иначе читатель,
@@ -1617,6 +1660,7 @@ func logSlotDeathHazard(pool *WSPoolTransport) {
 		"band_width_ms", hazardBandWidthMs,
 		"floor_ms", floorMs,
 	}
+	ringSaturated := false
 	for i := 0; i < hazardBandCount; i++ {
 		from := floorMs + int64(i)*hazardBandWidthMs
 		h := pool.slotDeaths.Hazard(from, from+hazardBandWidthMs)
@@ -1625,13 +1669,46 @@ func logSlotDeathHazard(pool *WSPoolTransport) {
 		if h.Reached == 0 {
 			continue
 		}
-		// Rate — actuarial: цензурированные внутри полосы входят с весом 1/2.
-		// censored_in обязателен рядом, иначе честный знаменатель не отличить
-		// от раздутого.
+		// Печатаем ОБЕ величины и экспозицию.
+		//
+		// rate_exp (1/с) — несмещённая: резы делятся на фактически прожитое в
+		// полосе время. rate_act — прежняя actuarial-форма, оставлена только для
+		// сравнимости со старыми логами; в нашей конфигурации она ЗАНИЖАЕТ вдвое,
+		// потому что цензурирование сидит у нижней кромки полосы (порог ротации
+		// 70s+stagger → плановые умирают на 74-80s). Замер 2026-08-14: 3.37%
+		// против 6.94% по экспозиции в полосе 80-85s.
+		//
+		// p_pass — вероятность реза при проходе полосы целиком, чтобы читателю не
+		// приходилось умножать интенсивность на ширину в голове. Именно эту
+		// величину сравнивают с «hazard 2-6%» из разборов.
+		//
+		// ⚠ Поле reached читать буквально нельзя: это «записей осталось в ринге»,
+		// а не «соединений дошло». При ring_saturated=true оба ринга набирались
+		// окнами разной длины и любая доля смещена — в PROBE 2026-08-13 это дало
+		// завышение ×2.06.
+		bandWidthSec := float64(hazardBandWidthMs) / 1000
+		rateExp := h.RateByExposure()
 		attrs = append(attrs,
 			fmt.Sprintf("band_%d_%d", from/1000, (from+hazardBandWidthMs)/1000),
-			fmt.Sprintf("reached=%d cut=%d censored_in=%d rate=%.4f",
-				h.Reached, h.Cut, h.CensoredIn, h.Rate()),
+			fmt.Sprintf("reached=%d cut=%d censored_in=%d exposure_s=%.1f "+
+				"rate_exp=%.5f p_pass=%.4f rate_act=%.4f",
+				h.Reached, h.Cut, h.CensoredIn,
+				float64(h.ExposureMs)/1000, rateExp,
+				1-math.Exp(-rateExp*bandWidthSec), h.Rate()),
+		)
+		if h.RingSaturated {
+			ringSaturated = true
+		}
+	}
+	// Насыщение печатаем ОДИН раз на строку, а не полем в каждой полосе: оно
+	// свойство рингов, а не полосы. Молча пропустить нельзя — читатель принял бы
+	// смещённые доли за наблюдение (урок PROBE 2026-08-13).
+	attrs = append(attrs, "ring_saturated", ringSaturated)
+	if ringSaturated {
+		attrs = append(attrs,
+			"ring_warning", "ring full: numerator and denominator span different windows, ratios biased",
+			"cuts_lifetime", pool.slotDeaths.Total(),
+			"planned_lifetime", pool.slotDeaths.TotalPlanned(),
 		)
 	}
 	slog.Info("slot death hazard (risk among survivors)", attrs...)

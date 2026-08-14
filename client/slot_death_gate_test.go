@@ -219,7 +219,16 @@ func TestSlotDeathGate_HazardLoggedBelowInferenceThreshold(t *testing.T) {
 	}
 	// Полосы и поправка на цензурирование обязаны быть видны: без CensoredIn
 	// читатель не отличит честный знаменатель от раздутого.
-	for _, want := range []string{"band_", "reached", "cut", "censored_in", "rate"} {
+	//
+	// exposure_s / rate_exp / p_pass добавлены 2026-08-14: actuarial-форма
+	// (rate_act) в нашей конфигурации ЗАНИЖАЕТ вдвое, потому что цензурирование
+	// сидит у нижней кромки полосы. ring_saturated обязателен рядом — без него
+	// смещение от переполнения ринга (в PROBE 2026-08-13 завышение ×2.06)
+	// остаётся невидимым.
+	for _, want := range []string{
+		"band_", "reached", "cut", "censored_in",
+		"exposure_s", "rate_exp", "p_pass", "rate_act", "ring_saturated",
+	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("в hazard-строке нет %q:\n%s", want, out)
 		}

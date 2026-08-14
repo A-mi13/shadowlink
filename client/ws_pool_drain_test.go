@@ -763,6 +763,13 @@ func TestUnifiedRotation_AgeTriggerUsesStartDrain(t *testing.T) {
 		MaxSlotAge:    time.Minute,
 		GracefulDrain: true,
 		DrainHardCap:  5 * time.Second,
+		// Размазывание фазы выключено: этот тест про то, КАКОЙ путь ротации
+		// выбирает свип (startDrain против legacy maybeRotateSlot), а не про то,
+		// на каком тике он это делает. С дефолтным джиттером (4s) первый свип
+		// штатно откладывает дренаж, и тест падал бы по причине, к своей цели не
+		// относящейся. Поведение самой ручки закрыто отдельно —
+		// ws_pool_sweep_phase_test.go.
+		SweepPhaseJitter: -1,
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -814,6 +821,10 @@ func TestRotationWatchdogSweep_RespectsNextDrainAttemptNs(t *testing.T) {
 		MaxSlotAge:    time.Minute,
 		GracefulDrain: true,
 		DrainHardCap:  5 * time.Second,
+		// Выключено намеренно, хотя тест проходит и с ручкой: с ней он проходил
+		// бы ПО ДРУГОЙ ПРИЧИНЕ (джиттер тоже ставит nextDrainAttemptNs), то есть
+		// перестал бы проверять уважение к УЖЕ выставленному backoff'у.
+		SweepPhaseJitter: -1,
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -52,6 +52,8 @@ func TestWorstCaseTeardown_IncludesStaggerAndSweep(t *testing.T) {
 	if want := 48 * time.Second; stagger != want {
 		t.Errorf("stagger = %v, want %v (cap 45s + step/2 3s)", stagger, want)
 	}
+	// sweepPhaseJitter здесь 0 (литерал, не NewWSPoolTransport) → слагаемое
+	// размазывания фазы не участвует, sweep равен чистому тику.
 	if sweep != rotationWatchdogTick {
 		t.Errorf("sweep = %v, want %v", sweep, rotationWatchdogTick)
 	}

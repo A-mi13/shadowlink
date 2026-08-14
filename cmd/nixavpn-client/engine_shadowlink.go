@@ -506,6 +506,27 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 				staggerOffsetCap := envDurationDefault("SHADOWLINK_STAGGER_OFFSET_CAP", 45*time.Second)
 				ageCutMinAge := envDurationDefault("SHADOWLINK_AGE_CUT_MIN_AGE", 45*time.Second)
 
+				// Подтиковое размазывание момента дренажа (2026-08-14). Замер по
+				// логу nixavpn-DEBUG-20260813-153638: все 588 age-ротаций легли в
+				// ОДНУ фазу 5-секундной сетки watchdog'а (σ 0.0001s, дрейфа за 2ч
+				// нет), 92.2% TCP-connect'ов — в одном 1-секундном окне. Stagger
+				// это не лечит: он прибавляется к ПОРОГУ, а порог проверяется
+				// только на тике.
+				//
+				// 0/не задано → дефолт 4s. Отрицательное (напр. `-1s`) выключает
+				// ровно, для A/B: ручка платит возрастом до +4s, а полоса 80-85s
+				// несёт hazard 2.1% на проход против нуля ниже 80s.
+				sweepPhaseJitter := envDurationDefault("SHADOWLINK_SWEEP_PHASE_JITTER", 0)
+
+				// Доля пола storm-brake. 0 → константа 0.75. Выведена ради A/B:
+				// при MaxSlotAge=70s пул штатно балансирует НА полу (alive=6 при
+				// floor=6), и отложки гейта удлиняют жизнь слота в полосу
+				// ненулевого hazard — 3 реза из 4 в прогоне 20260813-153638
+				// следуют за отложкой той же ячейки в пределах 7s. Дефолт НЕ
+				// изменён: занижение пола — это риск clinch'а, ради которого гейт
+				// и заводился. Обоснование у client.readyCapacityFloorFraction.
+				readyCapacityFloorFraction := envFloatDefault("SHADOWLINK_READY_CAPACITY_FLOOR_FRACTION", 0)
+
 				pool := client.NewWSPoolTransport(e.cl, client.WSPoolConfig{
 					Size:                poolSize,
 					ServerAddr:          wsTarget,
@@ -523,6 +544,9 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 					StaggerStep:         staggerStep,
 					StaggerOffsetCap:    staggerOffsetCap,
 					AgeCutMinAge:        ageCutMinAge,
+					SweepPhaseJitter:    sweepPhaseJitter,
+
+					ReadyCapacityFloorFraction: readyCapacityFloorFraction,
 					GracefulDrain:       gracefulDrain,
 					DrainHardCap:        drainHardCap,
 					DrainIdleThreshold:  drainIdleThreshold,
@@ -872,6 +896,21 @@ func envDurationDefault(name string, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+// envFloatDefault reads a float64 env var. Unset, empty, or unparseable values
+// return def. Диапазон НЕ проверяется — валидация на вызывающем (для доли пола
+// это client.normalizeFloorFraction, которая клампит и мусор, и >= 1).
+func envFloatDefault(name string, def float64) float64 {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return def
+	}
+	return f
 }
 
 // envIntDefault reads a base-10 int env var. Unset, empty, or
