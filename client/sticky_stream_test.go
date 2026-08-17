@@ -684,36 +684,54 @@ func TestAgeExposure_AccruedOnCutPath(t *testing.T) {
 		return s
 	}
 
-	// Резы и наши преждевременные снятия НЕ проходят через дренаж, поэтому
-	// экспозиция обязана накапливаться здесь.
+	// Экспозиция обязана считаться на ЛЮБОЙ причине, включая обе эвикции:
+	// deathCauseDrainTeardown приходит в handleSlotDeath из трёх мест, и лишь
+	// одно из них (tearDown) считает экспозицию само. Фильтр по причине, стоявший
+	// здесь до ревью 2026-08-17, терял tryForceEvictIdleSlot и
+	// tryEmergencyEvictMinStreamsSlot — то есть снятия старых слотов при нехватке
+	// ячеек, где перебег за порогом как раз максимален.
 	for _, cause := range []slotDeathCause{
 		deathCauseAgeCut,
 		deathCauseNatural,
 		deathCausePreemptiveRotation,
+		deathCauseDrainTeardown,
 	} {
 		p := &WSPoolTransport{poolSize: 4, log: newDiscardLogger()}
 		p.slots = make([]*poolSlot, 8)
 		p.slots[0] = newAgedSlot()
 
 		before := Stats.AgeExposureOverThresholdMs.Load()
-		p.accrueAgeExposureOnDeath(p.slots[0], cause)
+		p.accrueAgeExposureOnDeath(p.slots[0])
 		got := Stats.AgeExposureOverThresholdMs.Load() - before
 
 		if got < 8_500 || got > 9_500 {
-			t.Errorf("cause=%v: накоплено %d мс, ожидалось ~9000 — экспозиция на пути "+
-				"реза не считается (счётчик видит только дренажные терминации)", cause, got)
+			t.Errorf("cause=%v: накоплено %d мс, ожидалось ~9000 — экспозиция на этом "+
+				"пути терминации не считается", cause, got)
 		}
 	}
 
-	// А дренажный путь здесь молчит: tearDown уже посчитал его сам.
+	// Двойного счёта нет, и защита структурная: CAS на самом слоте, а не
+	// перечисление причин в вызывающем. Эмулируем последовательность
+	// tearDown → handleSlotDeath на ОДНОМ слоте: второй проход обязан молчать.
 	p := &WSPoolTransport{poolSize: 4, log: newDiscardLogger()}
 	p.slots = make([]*poolSlot, 8)
 	p.slots[0] = newAgedSlot()
 
 	before := Stats.AgeExposureOverThresholdMs.Load()
-	p.accrueAgeExposureOnDeath(p.slots[0], deathCauseDrainTeardown)
-	if got := Stats.AgeExposureOverThresholdMs.Load() - before; got != 0 {
-		t.Errorf("deathCauseDrainTeardown накопил %d мс — двойной счёт: tearDown "+
-			"уже вызвал accrueAgeExposure до handleSlotDeath", got)
+	if age := accrueAgeExposure(p.slots[0]); age < ageExposureThreshold {
+		t.Fatalf("первый проход вернул возраст %v — фикстура сломана", age)
+	}
+	first := Stats.AgeExposureOverThresholdMs.Load() - before
+
+	p.accrueAgeExposureOnDeath(p.slots[0]) // так делает handleSlotDeath после tearDown
+	if got := Stats.AgeExposureOverThresholdMs.Load() - before; got != first {
+		t.Errorf("второй проход добавил %d мс — двойной счёт: CAS ageExposureAccrued "+
+			"не удержал повторный учёт того же слота", got-first)
+	}
+
+	// И возраст для лога второй проход всё равно возвращает: его печатают все
+	// ветки teardown, поэтому CAS стоит после вычисления, а не до.
+	if age := accrueAgeExposure(p.slots[0]); age < ageExposureThreshold {
+		t.Errorf("после CAS возраст вернулся как %v — лог потеряет slot_age", age)
 	}
 }

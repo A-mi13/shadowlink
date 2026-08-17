@@ -347,6 +347,25 @@ type poolSlot struct {
 	// where readerActive is already true.
 	readerActive atomic.Bool
 
+	// ageExposureAccrued — экспозиция возраста этого слота УЖЕ учтена
+	// (accrueAgeExposure отработал). CAS(false→true) там же, где учёт.
+	//
+	// Флаг на слоте, а НЕ фильтр по slotDeathCause в вызывающем (ревью
+	// 2026-08-17): причина отвечает на вопрос «кто снял слот», а нужен ответ на
+	// «посчитано ли уже», и это разные вопросы. Первая версия фильтровала
+	// deathCauseDrainTeardown, считая его синонимом «tearDown уже посчитал», —
+	// но эта причина приходит в handleSlotDeath из ТРЁХ мест
+	// (ws_pool_drain.go: tearDown :1093, tryForceEvictIdleSlot :432,
+	// tryEmergencyEvictMinStreamsSlot :538), а accrueAgeExposure стоит только в
+	// первом. Оба эвикта теряли учёт — причём именно там, где перебег
+	// максимален: их зовут при нехватке свободных ячеек, то есть по старым
+	// слотам под давлением.
+	//
+	// Сравнение с соседом делает недосмотр очевидным: recordPlannedRotation
+	// стоит во всех трёх местах, его докстринг их перечисляет. Учёт экспозиции
+	// обязан идти тем же контуром.
+	ageExposureAccrued atomic.Bool
+
 	// rotationDeferredNs holds the first time maybeRotateSlot wanted to
 	// rotate this slot but found active streams on it. 0 means "rotation
 	// not currently deferred". When the slot finally drains its streams
@@ -4974,12 +4993,13 @@ func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int, cause slotDeathCa
 	}
 	slot.lastDeathNs.Store(time.Now().UnixNano())
 
-	// Экспозиция возраста за порогом — ДО любой другой работы и сразу за CAS'ом
-	// tryMarkDead, который гарантирует один проход на одну смерть. Резы и наши
-	// преждевременные снятия дренаж не проходят, поэтому в tearDown их не видно;
-	// drainTeardown отфильтрован внутри, иначе дренажные пути посчитались бы
-	// дважды. Замер 2026-08-17: недосчёт составлял 27%. См. accrueAgeExposureOnDeath.
-	p.accrueAgeExposureOnDeath(slot, cause)
+	// Экспозиция возраста за порогом — ДО любой другой работы. Точка общая для
+	// ВСЕХ причин: резы и оба пути эвикции дренаж не проходят, поэтому в tearDown
+	// их не видно. От двойного счёта с tearDown защищает CAS
+	// slot.ageExposureAccrued внутри, а не фильтр по причине — та говорит, кто снял
+	// слот, но не говорит, посчитан ли он. Замер 2026-08-17: недосчёт 27% (резы),
+	// ревью того же дня: ещё два пути эвикции. См. accrueAgeExposureOnDeath.
+	p.accrueAgeExposureOnDeath(slot)
 
 	// Uniform stream cleanup (spec 2026-05-20 §3): close(streamChans[id])
 	// for every cause (natural, preemptive, drainTeardown). The earlier
