@@ -35,12 +35,34 @@ type statsRegistry struct {
 	CoverPosts atomic.Int64
 	// UDP ASSOCIATE poll ticker fires (20ms each) sending a poll POST.
 	UdpPolls atomic.Int64
-	// Per-stream WebSocket connections opened (fresh WS per SOCKS5 CONNECT).
+	// WsCreated — WS-соединения к origin, ПОДНЯТЫЕ этим клиентом: слот пула
+	// (connectSlot после успешного UpgradeToWS) и per-stream WS в
+	// экспериментальном режиме (proxy/socks5/tcp.go). Режимы взаимно
+	// исключающие (engine_shadowlink.go выбирает ветку), поэтому двойного
+	// счёта нет.
+	//
+	// ⚠ Перевешен на путь пула 2026-08-17. До этого инкремент жил ТОЛЬКО в
+	// proxy/socks5/tcp.go, и в прод-архитектуре (WS-пул) поле печатало вечный
+	// 0: прогон 20260817 — ws_created=0 в каждом из 6847 тиков при 3848
+	// `WS pool slot reader started`.
+	//
+	// Считает только СОСТОЯВШИЕСЯ соединения: отказ handshake/upgrade и
+	// ErrCellOccupied сюда не идут. Прочие TLS к origin (cover POST, warmup)
+	// это не WS и здесь не видны — не читать как «все TCP к origin».
 	WsCreated atomic.Int64
-	// Per-stream WebSocket connections died (reader/writer exit).
+	// WsDied — WS-соединения, которых больше нет: каждая смерть слота пула
+	// (handleSlotDeath, любая причина — транспорт закрывается во всех) и
+	// завершение per-stream WS.
+	//
+	// Инкремент идёт ПОСЛЕ CAS tryMarkDead, поэтому один отказ считается один
+	// раз, даже когда его одновременно видят ридер и писатель.
+	//
+	// ⚠ Два закрытия транспорта в пуле сюда НЕ попадают: legacy-ротация
+	// (ws_pool.go, ветка `reconnect:` в legacyRotateOneSlot) и штатный
+	// Close() всего пула на выходе клиента. Первое в проде не исполняется,
+	// второе однократно на завершении процесса. Значит в steady state
+	// ws_created ≈ ws_died, и устойчивый разрыв — сигнал, а не норма.
 	WsDied atomic.Int64
-	// Per-stream WS upgrades via the ready pool (Acquire returned a warmed WS).
-	WsFromPool atomic.Int64
 	// Session.EncryptChunk calls (every outgoing data/control frame).
 	Encrypts atomic.Int64
 	// Session.DecryptChunkSafe calls (every incoming frame).
@@ -412,6 +434,22 @@ type statsRegistry struct {
 	FlowWindowUpdatesSent   atomic.Uint64
 	FlowWindowUpdateDropped atomic.Uint64 // TryEnqueueControl full → delta kept
 	FlowNegotiationTimeout  atomic.Uint64 // ack not received within negotiationAckTimeout
+	// FlowAckUndecryptable — ack ПРИШЁЛ, но не расшифровался ключами только что
+	// согласованной сессии. Практически это один случай: сервер отверг
+	// first-frame auth и замаскировал отказ под штатное закрытие
+	// (server/websocket.go:601 → fakeAckAndClose).
+	//
+	// ⚠ Отдельно от FlowNegotiationTimeout намеренно. До 2026-08-17 оба события
+	// тикали ОДИН счётчик с именем про таймаут, поэтому отказ auth был
+	// неотличим от «сервер не поддерживает flow control» — ровно дефект «имя
+	// счётчика врёт о механизме». В прогоне 20260817 таких отказов было 13 на
+	// девяти слотах (~раз в 25 минут), и по логу они выглядели как смерти слотов
+	// с slot_age_ms=0, а не как отказ авторизации.
+	//
+	// Ненулевое значение читать как «сервер нас отверг N раз», а НЕ как проблему
+	// сети. Устойчивый рост — расхождение сессий (сервер потерял тоннель,
+	// ghost-sweep забрал сессию, конкурирующий WS-attach выиграл CAS).
+	FlowAckUndecryptable atomic.Uint64
 
 	// Bug #9 §5.4 downlink-reassembler client-side counters.
 	// StreamReassemblyOverflow: per-stream reassembler buffered past its byte cap
@@ -982,6 +1020,9 @@ func WritePromMetrics(w io.Writer) {
 	fmt.Fprintf(w, "# HELP shadowlink_flow_negotiation_timeout_total Flow-control negotiation acks not received within the timeout (old server / off) (Bug #8)\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_flow_negotiation_timeout_total counter\n")
 	fmt.Fprintf(w, "shadowlink_flow_negotiation_timeout_total %d\n", Stats.FlowNegotiationTimeout.Load())
+	fmt.Fprintf(w, "# HELP shadowlink_flow_ack_undecryptable_total FLOWCTL acks that arrived but did not decrypt — the server rejected our first-frame auth and masked it as a normal close (server fakeAckAndClose). Distinct from the timeout counter: this is a rejection, not an old server.\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_flow_ack_undecryptable_total counter\n")
+	fmt.Fprintf(w, "shadowlink_flow_ack_undecryptable_total %d\n", Stats.FlowAckUndecryptable.Load())
 
 	fmt.Fprintf(w, "# HELP shadowlink_stream_reassembly_overflow_total Migration downlink reassembler exceeded its per-stream byte cap; stream broken (Bug #9)\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_stream_reassembly_overflow_total counter\n")
@@ -1160,7 +1201,7 @@ func StartStatsLogger(ctx context.Context, interval time.Duration) {
 	}
 	go func() {
 		var (
-			lastCover, lastUDP, lastWSNew, lastWSDie, lastPool int64
+			lastCover, lastUDP, lastWSNew, lastWSDie          int64
 			lastEnc, lastDec, lastDecFail                      int64
 			lastSocks, lastUp, lastDown                        int64
 			lastWriterExits, lastReaderExits                   int64
@@ -1179,7 +1220,6 @@ func StartStatsLogger(ctx context.Context, interval time.Duration) {
 			udp := Stats.UdpPolls.Load()
 			wsNew := Stats.WsCreated.Load()
 			wsDie := Stats.WsDied.Load()
-			pool := Stats.WsFromPool.Load()
 			enc := Stats.Encrypts.Load()
 			dec := Stats.Decrypts.Load()
 			decFail := Stats.DecryptFails.Load()
@@ -1197,7 +1237,6 @@ func StartStatsLogger(ctx context.Context, interval time.Duration) {
 				"udp_polls", udp-lastUDP,
 				"ws_created", wsNew-lastWSNew,
 				"ws_died", wsDie-lastWSDie,
-				"ws_from_pool", pool-lastPool,
 				"encrypts", enc-lastEnc,
 				"decrypts", dec-lastDec,
 				"decrypt_fails", decFail-lastDecFail,
@@ -1210,7 +1249,7 @@ func StartStatsLogger(ctx context.Context, interval time.Duration) {
 				"bypass_miss", bypassMiss-lastBypassMiss,
 			)
 
-			lastCover, lastUDP, lastWSNew, lastWSDie, lastPool = cover, udp, wsNew, wsDie, pool
+			lastCover, lastUDP, lastWSNew, lastWSDie = cover, udp, wsNew, wsDie
 			lastEnc, lastDec, lastDecFail = enc, dec, decFail
 			lastSocks, lastUp, lastDown = socks, up, down
 			lastWriterExits, lastReaderExits = writerExits, readerExits
@@ -1473,7 +1512,8 @@ func logSlotDeathSummary() {
 		// Пропуск вызова оставил бы кандидата «подвешенным» между прогонами —
 		// подтверждения копились бы через произвольные промежутки времени, что
 		// ровно противоречит смыслу гистерезиса.
-		pool.ageAdapter.Observe(pool.slotDeaths.InferWithMinAge(pool.ageCutFloor().Milliseconds()))
+		pool.ageAdapter.Observe(pool.slotDeaths.InferWithMinAgeAndTeardown(
+			pool.ageCutFloor().Milliseconds(), pool.inferTeardownBoundMs()))
 		return
 	}
 
@@ -1516,7 +1556,11 @@ func logSlotDeathSummary() {
 	// Порог «слишком молодой слот» — тот же ageCutMinAge, по которому клиент
 	// классифицирует age-cut. Передаём его, а не заводим копию в slotobs: две
 	// правды об одном пороге разъедутся при первой же правке.
-	v := pool.slotDeaths.InferWithMinAge(pool.ageCutFloor().Milliseconds())
+	// Верхняя граница правдоподобия наблюдения — worstCaseTeardown (2026-08-17).
+	// Передаётся так же, как minAge: единственный источник истины про бюджет живёт
+	// на пуле, а slotobs от client не зависит. См. inferTeardownBoundMs.
+	v := pool.slotDeaths.InferWithMinAgeAndTeardown(
+		pool.ageCutFloor().Milliseconds(), pool.inferTeardownBoundMs())
 
 	// P0 шаг 3: скармливаем вердикт адаптеру. Он сам решает, менять ли порог —
 	// требует подтверждений, только сжимает, держит пол и гистерезис.
@@ -1559,6 +1603,22 @@ func logSlotDeathSummary() {
 		// сводке объяснят чем угодно. Поле заведено ради этого сигнала —
 		// не печатать его значило бы завести молчащий гейт (ревью 2026-08-12).
 		"rejected_planned", v.Rejected.Planned,
+		// rejected_above_teardown — наблюдения СТАРШЕ полного бюджета ротации
+		// (worstCaseTeardown). Такое наблюдение не про посредника: слот, который мы
+		// обязаны были снять сами, не мог быть срезан на нашем пороге.
+		//
+		// Заведено по прогону 2026-08-17, где пять наблюдений 177–505 с из окна
+		// заморозки вывода в консоль (QuickEdit, 428 с) влетели в ринг за две
+		// секунды и подняли CV возраста с 0.081 до 0.741 — впятеро. Порог
+		// удержался случайно, а CV — та величина, по которой выбирается ОСЬ.
+		//
+		// Печатается рядом с остальными rejected_* именно потому, что отбраковка
+		// без счётчика — это молчаливое исчезновение данных из samples_used, то
+		// есть ровно дефект «лог врёт о механизме», собранный в проекте пачками.
+		// Ненулевое значение читать как «наша ротация не сработала N раз», а НЕ
+		// как активность цензора.
+		"rejected_above_teardown", v.Rejected.AboveTeardown,
+		"teardown_bound", time.Duration(pool.inferTeardownBoundMs())*time.Millisecond,
 		"applied_max_slot_age", adaptedAge,
 		"configured_max_slot_age", configuredAge,
 		"adapt_changes", adaptChanges,

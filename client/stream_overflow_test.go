@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // captureSlogOverflow redirects the default slog logger to an in-memory buffer
@@ -70,6 +71,63 @@ func TestStreamBufferOverflow_SingleStreamMultipleDrops(t *testing.T) {
 	delta := Stats.StreamBufferOverflowsTotal.Load() - startBaseline
 	if delta != 200 {
 		t.Errorf("StreamBufferOverflowsTotal delta = %d, want 200", delta)
+	}
+}
+
+// TestStreamBufferOverflow_SingleDropReportsRealWindow — сторож против поля
+// `duration`, которое считало не то, чем называлось (полевой прогон
+// 2026-08-17, лог nixavpn-DEBUG-20260817-092533).
+//
+// Что было: flushBufferOverflow печатал "duration", st.lastAt.Sub(st.firstAt) —
+// интервал между ПЕРВЫМ и ПОСЛЕДНИМ дропом. При одном дропе (а это и был
+// единственный случай в том прогоне) он тождественно равен 0s, и лог утверждал
+// «переполнение длилось 0s», хотя между строками `started` (17:51:16.192) и
+// `ended` (17:54:17.248) прошло три минуты:
+//
+//	msg="stream buffer overflow ended" stream_id=5950 drops=1 dropped_bytes=5600 duration=0s
+//
+// Ноль-по-построению — тот же класс, что мёртвые счётчики: он читается как
+// наблюдение «переполнение мгновенное», хотя не измеряет ничего.
+//
+// Стало: два поля с честными именами вместо одного лживого —
+// `since_first_drop` (от первого дропа до конца стрима, момент доступен, потому
+// что flush зовётся из UnregisterStream) и `drop_span` (первый→последний дроп,
+// прежняя величина под своим именем). Тест требует, чтобы поля `duration`
+// не было вовсе: переименование при сохранении обоих смыслов в одном поле
+// оставило бы читателя без возможности отличить одно от другого.
+func TestStreamBufferOverflow_SingleDropReportsRealWindow(t *testing.T) {
+	buf := captureSlogOverflow(t, slog.LevelInfo)
+	c := newTestClient(t)
+
+	const sid uint16 = 5950
+	if _, err := c.RegisterStream(sid); err != nil {
+		t.Fatalf("RegisterStream: %v", err)
+	}
+	// Заполняем буфер, затем РОВНО один дроп — конфигурация из полевого лога.
+	for i := 0; i < 512; i++ {
+		c.RouteToStream(sid, []byte{0x01})
+	}
+	c.RouteToStream(sid, []byte{0x02})
+
+	// Стрим живёт после дропа: именно этот интервал прежнее поле теряло.
+	time.Sleep(30 * time.Millisecond)
+	c.UnregisterStream(sid)
+
+	line := buf.String()
+	if !strings.Contains(line, `msg="stream buffer overflow ended"`) {
+		t.Fatalf("нет строки 'ended':\n%s", line)
+	}
+	if strings.Contains(line, "duration=") {
+		t.Errorf("поле duration осталось: при одном дропе оно тождественно 0s и "+
+			"о длительности переполнения не говорит.\n%s", line)
+	}
+	if strings.Contains(line, "since_first_drop=0s") || !strings.Contains(line, "since_first_drop=") {
+		t.Errorf("since_first_drop отсутствует или равен 0s — интервал от первого "+
+			"дропа до конца стрима не измеряется.\n%s", line)
+	}
+	if !strings.Contains(line, "drop_span=") {
+		t.Errorf("drop_span отсутствует — прежняя величина (первый→последний дроп) "+
+			"должна остаться, но под своим именем.\n%s", line)
 	}
 }
 

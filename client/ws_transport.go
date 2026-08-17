@@ -5,6 +5,7 @@ import (
 	stdtls "crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -56,9 +57,11 @@ type WebSocketTransport struct {
 	conn        *websocket.Conn
 	asyncWriter *core.WSAsyncWriter // async egress queue, used by WriteMessage (ws_pool hot path)
 
-	// Per-frame write deadline. Zero → WSAsyncWriter default (30s). For viaCF
+	// Per-frame write deadline, as CONFIGURED by the caller. Zero → the writer
+	// applies core.DefaultWSWriteTimeout; zero does NOT mean "no deadline", and
+	// logs must print the effective value (see logAsyncWriterExit). For viaCF
 	// mode this should be 5-8s: CF-side stalls propagate to us as TCP
-	// backpressure and the default 30s means the slot freezes for 30s before
+	// backpressure and the default means the slot freezes that long before
 	// the pool can route around the bad edge. Cross-check 2026-04-15 H6.
 	writeTimeout time.Duration
 
@@ -163,8 +166,9 @@ func (t *WebSocketTransport) SetCFIP(ip string) { t.cfIP = ip }
 
 // SetWriteTimeout overrides the per-frame write deadline used by the async
 // writer. Must be called before UpgradeToWS. Zero keeps the WSAsyncWriter
-// default (30s). For viaCF mode pass 5-8s to surface CF-side backpressure
-// quickly instead of letting a stalled slot block traffic for 30s.
+// default (core.DefaultWSWriteTimeout) — NOT "no deadline". For viaCF mode pass
+// 5-8s to surface CF-side backpressure quickly instead of letting a stalled slot
+// block traffic for the full default.
 func (t *WebSocketTransport) SetWriteTimeout(d time.Duration) { t.writeTimeout = d }
 
 // SendHandshake performs initial HTTP handshake (same as DirectTransport).
@@ -554,8 +558,17 @@ func (t *WebSocketTransport) UpgradeToWS(token []byte, session *core.Session) er
 		conn.SetReadDeadline(time.Now().Add(negotiationAckTimeout))
 		ackType, ackData, ackErr := conn.ReadMessage()
 		conn.SetReadDeadline(time.Time{})
+		// ackUndecryptable — кадр ПРИШЁЛ, но расшифровать его ключами этой сессии
+		// нельзя. Отделено от «маркер не разобран» намеренно: это разные события с
+		// разной ценой, и до 2026-08-17 они были слиты в одно молчаливое
+		// `flowControlEnabled == false`. См. терминальную ветку ниже.
+		ackUndecryptable := false
 		if ackErr == nil && ackType == websocket.BinaryMessage {
-			if ackChunk, derr := session.DecryptChunkSafe(ackData); derr == nil && ackChunk.Flags == core.FlagAck {
+			ackChunk, derr := session.DecryptChunkSafe(ackData)
+			if derr != nil {
+				ackUndecryptable = true
+			}
+			if derr == nil && ackChunk.Flags == core.FlagAck {
 				// Bug #9 §3.5: parse the V2 marker so we capture the server's
 				// echoed migrate bit alongside the window. A legacy 11-byte ack
 				// parses with migrate=false (backwards compat) — migration stays
@@ -594,6 +607,47 @@ func (t *WebSocketTransport) UpgradeToWS(token []byte, session *core.Session) er
 			t.sendBestEffortSessionFIN(token, session)
 			return fmt.Errorf("ws upgrade: flowctl ack read: %w", ackErr)
 		}
+		// Ack ПРИШЁЛ, но не расшифровался — тоже ТЕРМИНАЛЬНО (2026-08-17).
+		//
+		// Это не «сеть шумит»: единственный способ получить бинарный кадр, который
+		// не открывается ключами ТОЛЬКО ЧТО согласованной сессии, — это ответ
+		// сервера, отвергшего наш first-frame auth. Сервер такой отказ намеренно
+		// маскирует: server/websocket.go:601 → fakeAckAndClose
+		// (server/websocket.go:274) пишет 200–2000 байт случайных данных, спит
+		// ackJitter() и отправляет CloseNormalClosure, чтобы отказ auth не отличался
+		// на wire от штатного закрытия. Серверная маскировка правильная и трогать
+		// её нельзя — распознать отказ обязан клиент.
+		//
+		// Прежнее поведение: ackErr == nil → терминальная ветка выше не срабатывала,
+		// DecryptChunkSafe молча проваливался, тикался FlowNegotiationTimeout, и
+		// UpgradeToWS возвращал NIL на соединении, которое сервер уже закрывает.
+		// Дальше connectSlot штампует startedAtNs, бампает generation, ставит
+		// slotReady, connectReserveSlot спавнит slotReader — и тот на первом
+		// ReadMessage получает `close 1000 (normal)` при slot_age_ms=0.
+		//
+		// Полевая цена (прогон 20260817-092533, 13 событий на девяти слотах, ~раз в
+		// 25 минут): (1) пул считал ГОТОВОЙ ячейку, через которую нельзя передать
+		// ничего — фиктивная ёмкость, AssignStream мог отдать ей стрим; (2) ложная
+		// атрибуция cause=natural (isAgeCut даёт natural при age<floor) кормила
+		// meltdown-детектор и давала backoff 6.9–9.8 с простоя вместо
+		// fast-reconnect; (3) выборка slotobs отравлена — age_min_ms=0,
+		// age_p10_ms=0, cv_age=1.3143 против ~0.08 по чистым наблюдениям.
+		//
+		// Тот же дефект закрывали 2026-08-10 для ТАЙМАУТА ack (ветка выше). Тогда
+		// «ack пришёл, но чужой» осталась дырой, и в поле она проявилась через
+		// другой серверный путь. Симметрия важнее экономии ветки.
+		//
+		// ⚠ Отделено от «маркер не разобран»: legacy-сервер шлёт валидный, но
+		// 11-байтный маркер — он РАСШИФРОВЫВАЕТСЯ, просто ParseFlowCtlMarkerV2
+		// возвращает !ok. Такой случай оставлен НЕтерминальным (обратная
+		// совместимость): flow control выключится, соединение продолжит работать.
+		// Терминальна только невозможность расшифровать.
+		if ackUndecryptable {
+			Stats.FlowAckUndecryptable.Add(1)
+			conn.Close()
+			t.sendBestEffortSessionFIN(token, session)
+			return fmt.Errorf("ws upgrade: flowctl ack read: %w", ErrAckUndecryptable)
+		}
 	}
 
 	// Async writer with priority channels: CONNECT/FIN/keepalive use the
@@ -603,9 +657,9 @@ func (t *WebSocketTransport) UpgradeToWS(token []byte, session *core.Session) er
 	w := core.NewWSAsyncWriter(conn, 256) // 256 data frames, 64 control frames
 
 	// Apply per-frame write deadline. Default (0) keeps WSAsyncWriter's own
-	// default of 30s; viaCF mode sets this to 5-8s via SetWriteTimeout so a
-	// CF-side stall kills this slot quickly and the pool can route around
-	// the bad edge instead of freezing for 30s.
+	// core.DefaultWSWriteTimeout; viaCF mode sets this to 5-8s via
+	// SetWriteTimeout so a CF-side stall kills this slot quickly and the pool
+	// can route around the bad edge instead of freezing for the full default.
 	if t.writeTimeout > 0 {
 		w.SetWriteTimeout(t.writeTimeout)
 	}
@@ -627,7 +681,7 @@ func (t *WebSocketTransport) UpgradeToWS(token []byte, session *core.Session) er
 			// Cross-check 2026-04-15 H6: the local write deadline is the
 			// real first domino under CF backpressure — we need to see it.
 			Stats.WriterExits.Add(1)
-			slog.Warn("ws async writer exit", "err", err, "writeTimeout", t.writeTimeout)
+			logAsyncWriterExit(w, t.writeTimeout, err)
 			// Close the conn so the reader goroutine gets an error and exits
 			// immediately instead of waiting up to 60s for the server's read
 			// deadline to expire (zombie connection prevention).
@@ -641,6 +695,33 @@ func (t *WebSocketTransport) UpgradeToWS(token []byte, session *core.Session) er
 	t.mu.Unlock()
 
 	return nil
+}
+
+// logAsyncWriterExit печатает строку выхода асинхронного писателя, показывая
+// ЭФФЕКТИВНЫЙ дедлайн кадра рядом с конфигурированным.
+//
+// Здесь стоял `slog.Warn("ws async writer exit", "err", err, "writeTimeout",
+// t.writeTimeout)`, и в direct-режиме поле печатало 0s, потому что ручка не
+// задана. Дедлайн при этом действует — core.DefaultWSWriteTimeout, — поэтому
+// «writeTimeout=0s» читалось как «записи идут без дедлайна» и уводило разбор
+// прогона 2026-08-17 в неверную сторону.
+//
+// Эффективное значение спрашивается у САМОГО writer'а (w.WriteTimeout()) — у
+// того, кто дедлайн и ставит. Второго места, где дефолт зашит числом, быть не
+// должно: иначе при смене дефолта лог снова начнёт врать. Сторож —
+// TestAsyncWriterExitLog_NoSecondHardcodedDefault.
+//
+// Вынесено в функцию, чтобы строку можно было проверить тестом без сети:
+// UpgradeToWS требует живого сервера, а лживое поле — нет.
+func logAsyncWriterExit(w *core.WSAsyncWriter, configured time.Duration, err error) {
+	eff := configured
+	if w != nil {
+		eff = w.WriteTimeout()
+	}
+	slog.Warn("ws async writer exit",
+		"err", err,
+		"write_timeout_effective", eff,
+		"write_timeout_configured", configured)
 }
 
 // bestEffortSessionFINHook is a test seam: when non-nil it intercepts the
@@ -659,6 +740,18 @@ const bestEffortSessionFINTimeout = 2 * time.Second
 // synchronously in UpgradeToWS. Kept short: if the server doesn't support
 // flow control the read must not stall the upgrade path.
 const negotiationAckTimeout = 500 * time.Millisecond
+
+// ErrAckUndecryptable — сервер прислал бинарный кадр, который не открывается
+// ключами только что согласованной сессии. Практически это ОДИН случай: сервер
+// отверг наш first-frame auth и замаскировал отказ под штатное закрытие
+// (server/websocket.go:601 → fakeAckAndClose — 200–2000 байт случайных данных,
+// затем CloseNormalClosure).
+//
+// Sentinel, а не просто текст: пул обязан отличать этот отказ от отказа origin.
+// Отдельная переменная позволяет вызывающим при необходимости завести для него
+// собственную ветку backoff — прямо как ErrCellOccupied, который тоже нельзя
+// считать «origin недоступен» (ws_pool.go:2844).
+var ErrAckUndecryptable = errors.New("flowctl ack does not decrypt — server rejected first-frame auth")
 
 // migrateAckTimeout bounds how long the client waits for a MIGRATE_OK /
 // RESUME_OK before degrading the stream to a hard break (F3 fail-safe,

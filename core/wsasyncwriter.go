@@ -57,6 +57,16 @@ type WSAsyncWriter struct {
 	lastWriteUnixNano atomic.Int64
 }
 
+// DefaultWSWriteTimeout is the per-frame write deadline applied when the
+// caller does not override it via SetWriteTimeout.
+//
+// ЕДИНСТВЕННЫЙ источник этой величины: и конструктор, и логи, и тесты обязаны
+// спрашивать её здесь. До 2026-08-17 число жило литералом в конструкторе, а
+// client/ws_transport.go логировал вместо него КОНФИГУРИРОВАННОЕ значение —
+// в direct-режиме 0, — из-за чего строка `ws async writer exit` читалась как
+// «записи идут без дедлайна», хотя дедлайн был 30s.
+const DefaultWSWriteTimeout = 30 * time.Second
+
 // NewWSAsyncWriter constructs a WSAsyncWriter with the given outbound data
 // buffer capacity. bufSize controls how many data frames may be queued before
 // Enqueue starts to block. The control channel gets a fixed 64-frame buffer
@@ -71,17 +81,26 @@ func NewWSAsyncWriter(conn WSConnWriter, bufSize int) *WSAsyncWriter {
 		outbound:     make(chan wsOutboundMsg, bufSize),
 		done:         make(chan struct{}),
 		runDone:      make(chan struct{}),
-		writeTimeout: 30 * time.Second,
+		writeTimeout: DefaultWSWriteTimeout,
 	}
 }
 
 // SetWriteTimeout overrides the per-frame write deadline. Must be called
-// before Run. Default is 30 seconds.
+// before Run. Default is DefaultWSWriteTimeout.
 func (w *WSAsyncWriter) SetWriteTimeout(d time.Duration) {
 	if d > 0 {
 		w.writeTimeout = d
 	}
 }
+
+// WriteTimeout returns the ЭФФЕКТИВНЫЙ per-frame write deadline — то самое
+// значение, которое writeFrame ставит на conn. Логи обязаны печатать его, а не
+// конфигурированную ручку вызывающего: в direct-режиме ручка равна 0, а дедлайн
+// при этом действует (DefaultWSWriteTimeout).
+//
+// Вызывать безопасно из горутины Run (SetWriteTimeout по контракту зовётся до
+// Run, поэтому гонки записи с чтением нет).
+func (w *WSAsyncWriter) WriteTimeout() time.Duration { return w.writeTimeout }
 
 // Run blocks draining control and outbound channels to conn until Close is
 // called or an underlying write returns an error. Control messages are always

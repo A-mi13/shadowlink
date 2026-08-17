@@ -814,6 +814,58 @@ func (p *WSPoolTransport) worstCaseTeardown() (base, stagger, sweep, deferred, t
 		base + stagger + sweep + deferred + tear
 }
 
+// inferTeardownBoundMs — верхняя граница правдоподобия наблюдения о резе (мс),
+// которую slotobs.InferWithMinAgeAndTeardown использует для отсева шума СПРАВА.
+//
+// Величина берётся из worstCaseTeardown() — единственного источника истины о
+// бюджете, никогда не складывается по месту (hard rule 8). Смысл границы: слот
+// старше полного бюджета жизни ячейки обязан был быть снят НАМИ, поэтому на нашем
+// пороге посредник не мог его срезать. Наблюдение о таком слоте описывает сбой
+// нашей ротации, а не поведение цензора, и в вывод порога идти не должно.
+//
+// Дефект, который это лечит (прогон 2026-08-17): заморозка вывода в консоль
+// (QuickEdit в PowerShell, 428 с) дала пять наблюдений 177–505 с с меткой
+// close_other. Они прошли фильтр как полноценные свидетельства и подняли CV
+// возраста с 0.081 до 0.741 — впятеро. По CV выбирается ОСЬ (age vs down_bytes),
+// то есть одна заморозка вывода способна перевернуть выбор оси.
+//
+// Функция-обёртка, а не выражение в вызывающем: у бюджета один источник, и
+// spread по месту вызова — ровно тот путь, которым лог однажды начал врать в
+// 1.6 раза. Здесь же документируется, почему граница НЕ умножается на
+// коэффициент запаса: запас уже встроен происхождением величины, а сама
+// отбраковка сделана по строгому `>` (граница включающая), потому что slot_age
+// считается с готовности соединения, а не с SYN — handshake 0.2–0.5 с в него не
+// входит (hard rule 12).
+//
+// # Почему граница ВЫКЛЮЧАЕТСЯ без gracefulDrain (найдено прогоном тестов)
+//
+// Возвращает 0 (= граница отключена), когда gracefulDrain выключен. Это не
+// перестраховка, а условие применимости: в этой ветке worstCaseTeardown НЕ
+// содержит слагаемых `deferred` и `tear` (30 + 25 = 55 с в проде, то есть 39 %
+// бюджета — см. саму функцию), потому что legacy hard-rotation дренажа не имеет.
+// Бюджет тогда описывает только «порог + stagger + свип», а не полный путь ячейки
+// до принудительного разрыва.
+//
+// Цена ошибки была проверена, а не предположена: на конфигурации без дренажа
+// (maxSlotAge 75 с, stagger 7.5 с, sweep 2 с) сумма даёт 84.5 с, и граница из неё
+// отбраковала бы ВСЕ 12 наблюдений полевого профиля 85.3–114.1 с —
+// `TestSlotDeathSummary_LogsInferenceAdvisory` покраснел ровно на этом. То есть
+// слишком узкая граница выбросила бы настоящие резы, а это единственный реальный
+// сигнал о цензоре. По памяти проекта такая ошибка хуже пропуска шума: шум
+// раздувает CV и это видно, а пустая выборка делает контур молчащим.
+//
+// Отключение согласовано с самим slotobs: teardownMs <= 0 там означает «верхней
+// границы нет» (симметрично minAgeMs). Прод ходит с gracefulDrain=ON, поэтому
+// граница в проде действует; SHADOWLINK_GRACEFUL_DRAIN=0 остаётся честной
+// бисекцией, не меняющей смысла наблюдений.
+func (p *WSPoolTransport) inferTeardownBoundMs() int64 {
+	if !p.gracefulDrain {
+		return 0
+	}
+	_, _, _, _, _, total := p.worstCaseTeardown()
+	return total.Milliseconds()
+}
+
 func (p *WSPoolTransport) slotStaggerOffset(idx int) time.Duration {
 	if idx <= 0 {
 		return 0
@@ -1695,7 +1747,7 @@ type WSPoolTransport struct {
 	skipVerify   bool
 	lockedFP     *browser.Fingerprint
 	client       *Client       // back-reference for handshake
-	writeTimeout time.Duration // per-frame write deadline (0 → 30s WSAsyncWriter default)
+	writeTimeout time.Duration // per-frame write deadline as CONFIGURED (0 → core.DefaultWSWriteTimeout applies; 0 ≠ «без дедлайна»)
 	staggerDelay time.Duration // initial/reconnect slot startup spacing (0 → no stagger)
 
 	// keepaliveBase is the base interval for the per-pool keepalive loop.
@@ -2966,7 +3018,7 @@ func (p *WSPoolTransport) connectSlot(ctx context.Context, idx int) error {
 	wst.sniHost = p.sniHost // SNI trick: domain as ServerName when connecting to origin IP
 	wst.cfIP = p.cfIP       // CF edge IP override: bypass DNS, keep domain as TLS SNI
 	if p.writeTimeout > 0 {
-		wst.SetWriteTimeout(p.writeTimeout) // viaCF: 5-8s, direct: 0 (→ 30s default)
+		wst.SetWriteTimeout(p.writeTimeout) // viaCF: 5-8s, direct: 0 (→ core.DefaultWSWriteTimeout)
 	}
 	if idx == 0 {
 		wst.WarmupRequests() // Only warmup for first slot (looks natural)
@@ -2978,6 +3030,12 @@ func (p *WSPoolTransport) connectSlot(ctx context.Context, idx int) error {
 		slot.setState(slotDead)
 		return fmt.Errorf("slot %d: ws upgrade: %w", idx, err)
 	}
+
+	// Соединение к origin СОСТОЯЛОСЬ — единственная точка учёта на пути пула
+	// (все четыре вызывающих connectSlot проходят здесь). Стоит после
+	// UpgradeToWS, поэтому отказы handshake/upgrade и ErrCellOccupied не
+	// считаются. См. Stats.WsCreated: до 2026-08-17 поле печатало вечный 0.
+	Stats.WsCreated.Add(1)
 
 	slot.transport = wst
 	if wst.flowControlEnabled {
@@ -4999,6 +5057,7 @@ func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int, cause slotDeathCa
 	// какая ветка что решит. Кулдаун по-прежнему кормится только из
 	// deathCauseNatural ниже.
 	p.bumpSlotDeaths1m(cause)
+	Stats.WsDied.Add(1) // соединения к origin больше нет — на ЛЮБОЙ причине (см. Stats.WsDied)
 
 	// Post-cleanup dispatch by cause. See slotDeathCause doc-comment for the
 	// rationale behind each branch.

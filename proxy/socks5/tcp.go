@@ -232,7 +232,10 @@ func HandleTCPConnectWSPerStream(ctx context.Context, conn net.Conn, cl *client.
 			return
 		}
 		wst = acquired
-		client.Stats.WsFromPool.Add(1)
+		// Счётчик Stats.WsFromPool удалён 2026-08-17 вместе с полем
+		// ws_from_pool в строке статистики: в прод-архитектуре (WS-пул) величина
+		// не определена и печатала вечный 0, а здесь она выводится как
+		// socks_connects − ws_created, поэтому информация не потеряна.
 	} else {
 		wst = client.NewWebSocketTransport(cfg.ServerAddr, cfg.UseTLS, cfg.SkipVerify, cfg.LockedFP)
 		if cfg.SNIHost != "" {
