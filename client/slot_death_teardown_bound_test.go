@@ -166,3 +166,74 @@ func TestSlotDeathInference_LogsAboveTeardownRejection(t *testing.T) {
 		t.Errorf("samples_used != 12 — граница задела чистые наблюдения:\n%s", out)
 	}
 }
+
+// TestSlotDeathObservability_ShowsAboveTeardownWhenSamplesInsufficient — сторож
+// против МОЛЧАЩЕГО ГЕЙТА отбраковки (ревью прогона 20260817-204549).
+//
+// Дефект: отбраковка по верхней границе исполняется при ЛЮБОМ размере выборки —
+// InferWithMinAgeAndTeardown зовётся и в ветке `samples < minSlotDeathSamplesToLog`,
+// потому что там кормится ageAdapter.Observe, — а счётчик rejected_above_teardown
+// печатался только в `slot death inference`, то есть при samples >= 12. В окне
+// между этим наблюдения молча выпадали: ни строки в логе, ни следа.
+//
+// Контур отрицательный и потому коварный: чем чище прогон, тем меньше резов, тем
+// дальше выборка от порога печати, — а чистый прогон и есть цель. В прогоне
+// 204549 (0 резов, 98 соединений) счётчик был невидим полностью.
+//
+// Это ровно тот класс, от которого в этом же файле stats.go двумя абзацами выше
+// защищали БЮДЖЕТ («прятать его за гейтом наблюдений было ошибкой категории»).
+// Правка 2026-08-17 наступила на него повторно, уже с другим полем.
+//
+// Фикстура: 3 наблюдения (< 12), из них 2 старше границы. Ожидание — строка
+// недостаточной выборки, и в ней видна отбраковка.
+func TestSlotDeathObservability_ShowsAboveTeardownWhenSamplesInsufficient(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	p := &WSPoolTransport{
+		slotDeaths:        slotobs.NewRecorder(64),
+		maxSlotAge:        70 * time.Second,
+		stickyMaxDrainAge: 25 * time.Second,
+		drainHardCap:      15 * time.Second,
+		gracefulDrain:     true,
+		staggerStep:       time.Second,
+		staggerOffsetCap:  15 * time.Second,
+		poolSize:          8,
+		ageCutMinAge:      45 * time.Second,
+		ageAdapter:        slotobs.NewAdapter(70 * time.Second),
+	}
+
+	// Одно легитимное наблюдение и два из окна заморозки вывода (> 142.5s).
+	for i, a := range []int64{85002, 209460, 293176} {
+		p.slotDeaths.Record(slotobs.Observation{
+			AgeMs: a, DownBytes: int64(i*40_000 + 2611), CloseKind: "close_other",
+		})
+	}
+
+	SetGlobalPoolForStats(p)
+	t.Cleanup(func() { SetGlobalPoolForStats(nil) })
+
+	logSlotDeathSummary()
+	out := buf.String()
+
+	// Ветка именно недостаточной выборки, а не inference: иначе тест проверял бы
+	// не тот путь.
+	if !strings.Contains(out, "insufficient samples") {
+		t.Fatalf("ожидалась ветка недостаточной выборки (3 наблюдения < 12):\n%s", out)
+	}
+	if strings.Contains(out, "slot death inference") {
+		t.Fatalf("напечатана строка inference — фикстура перешагнула гейт:\n%s", out)
+	}
+
+	// Главное: отбраковка ВИДНА, хотя выборки не хватает.
+	if !strings.Contains(out, "rejected_above_teardown=2") {
+		t.Errorf("нет rejected_above_teardown=2 в строке недостаточной выборки — "+
+			"отбраковка исполняется молча, наблюдения выпадают без следа в логе:\n%s", out)
+	}
+	// И граница, чтобы читатель мог проверить, почему отбраковано столько.
+	if !strings.Contains(out, "teardown_bound=") {
+		t.Errorf("нет teardown_bound= — величину границы не с чем сверить:\n%s", out)
+	}
+}

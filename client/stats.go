@@ -1398,6 +1398,13 @@ func logSlotDeathSummary() {
 	logSlotDeathHazard(pool)
 
 	if s.Count < minSlotDeathSamplesToLog {
+		// Инференс зовётся ОДИН раз и до печати: его результат нужен обоим
+		// потребителям — счётчику отбраковки в строке ниже и ageAdapter.Observe в
+		// конце ветки. Вторая копия вызова дала бы вторую правду (ринг между
+		// вызовами живой, его кормит слотовый ридер), и числа в одном логе
+		// однажды разошлись бы.
+		insufficientVerdict := pool.slotDeaths.InferWithMinAgeAndTeardown(
+			pool.ageCutFloor().Milliseconds(), pool.inferTeardownBoundMs())
 		// Нехватка данных — СОСТОЯНИЕ, о котором надо сказать, а не молчать.
 		//
 		// До 2026-08-12 здесь стоял голый `return`, и он глушил не только
@@ -1478,11 +1485,32 @@ func logSlotDeathSummary() {
 			// Бюджет не зависит от выборки — он считается из конфигурации, — поэтому
 			// прятать его за гейтом наблюдений было ошибкой категории.
 			bBase, bStagger, bSweep, bDeferred, bTear, bTotal := pool.worstCaseTeardown()
+			// Отбраковка по верхней границе печатается ЗДЕСЬ ТОЖЕ, а не только в
+			// `slot death inference` (ревью прогона 20260817-204549).
+			//
+			// Дефект, который это лечит, — тот же, что двумя абзацами выше про
+			// бюджет, и правка 2026-08-17 наступила на него повторно:
+			// InferWithMinAgeAndTeardown зовётся и в ЭТОЙ ветке (ниже, кормит
+			// ageAdapter.Observe), то есть отбраковка РАБОТАЕТ при любой выборке, а
+			// счётчик её виден был только при samples >= 12. Наблюдения могли молча
+			// выпадать без единой строки в логе — ровно «молчащий гейт», против
+			// которого поле и заводилось.
+			//
+			// Контур тот же отрицательный: чем чище прогон, тем меньше резов, тем
+			// дальше выборка от порога печати, — а чистый прогон и есть цель. В
+			// прогоне 204549 (0 резов) счётчик был невидим полностью.
+			//
+			// Величина берётся из ФАКТИЧЕСКОГО вызова инференса (v.Rejected), а не
+			// пересчётом: вторая копия вызова дала бы вторую правду, и по ней
+			// однажды разошлись бы числа в двух строках одного лога.
+			rejAbove := insufficientVerdict.Rejected.AboveTeardown
 			slog.Info("slot death observability: insufficient samples — adapter on configured threshold",
 				"samples", s.Count,
 				"required", minSlotDeathSamplesToLog,
 				"total_deaths", totalCuts,
 				"planned_rotations", totalPlanned,
+				"rejected_above_teardown", rejAbove,
+				"teardown_bound", time.Duration(pool.inferTeardownBoundMs())*time.Millisecond,
 				"cut_share_lifetime", fmt.Sprintf("%.4f", lifetimeShare),
 				"cut_share_ring", fmt.Sprintf("%.4f", cutShare),
 				"cut_share_ring_denom", shareTotal,
@@ -1512,8 +1540,9 @@ func logSlotDeathSummary() {
 		// Пропуск вызова оставил бы кандидата «подвешенным» между прогонами —
 		// подтверждения копились бы через произвольные промежутки времени, что
 		// ровно противоречит смыслу гистерезиса.
-		pool.ageAdapter.Observe(pool.slotDeaths.InferWithMinAgeAndTeardown(
-			pool.ageCutFloor().Milliseconds(), pool.inferTeardownBoundMs()))
+		//
+		// Вердикт взят из вызова В НАЧАЛЕ ветки (см. там же, почему один вызов).
+		pool.ageAdapter.Observe(insufficientVerdict)
 		return
 	}
 
