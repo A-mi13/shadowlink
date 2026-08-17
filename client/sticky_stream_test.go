@@ -651,3 +651,69 @@ func TestAgeExposure_AccruedOnAllTeardownPaths(t *testing.T) {
 		t.Errorf("накоплено %d мс, ожидалось ~8000: накопление не на общем пути", got)
 	}
 }
+
+// TestAgeExposure_AccruedOnCutPath — сторож против недосчёта экспозиции на пути
+// РЕЗА (полевой замер 2026-08-17, лог nixavpn-DEBUG-20260817-092533).
+//
+// Дефект, который тест ловит: accrueAgeExposure имел единственный продовый
+// call-site — tearDown внутри drainWatchdog, — а резы приходят через
+// handleSlotDeath, минуя дренаж целиком. Счётчик при этом называется
+// «экспозиция за порогом» и читается как полная.
+//
+// Величина недосчёта в том прогоне: дренажные пути дали 3010.1s, резы — ещё
+// 1112.6s (18 соединений), то есть 27% терялось. Счётчик в логе показал
+// age_exposure_over_threshold_ms=3010102 — совпадение с суммой ТОЛЬКО дренажных
+// путей до миллисекунды, что и доказало границу покрытия.
+//
+// Тот же класс, что правка 2026-08-14 (тогда накопление сидело в sticky-ветке и
+// теряло 23% на natural finish). Разница в том, что «общий путь» оказался общим
+// только для НАШИХ терминаций: комментарий на accrueAgeExposure формально верен
+// («все наши»), но рез — не наш, и имя счётчика обещает больше, чем он считает.
+//
+// ⚠ Тест обязан различать причины: deathCauseDrainTeardown приходит в
+// handleSlotDeath ПОСЛЕ tearDown, где экспозиция уже накоплена, — накопление на
+// нём означало бы двойной счёт по всем дренажным путям, то есть ровно обратную
+// ошибку. Поэтому проверяются оба знака.
+func TestAgeExposure_AccruedOnCutPath(t *testing.T) {
+	over := 9 * time.Second
+
+	newAgedSlot := func() *poolSlot {
+		s := &poolSlot{index: 0}
+		s.setState(slotReady)
+		s.startedAtNs.Store(time.Now().Add(-(ageExposureThreshold + over)).UnixNano())
+		return s
+	}
+
+	// Резы и наши преждевременные снятия НЕ проходят через дренаж, поэтому
+	// экспозиция обязана накапливаться здесь.
+	for _, cause := range []slotDeathCause{
+		deathCauseAgeCut,
+		deathCauseNatural,
+		deathCausePreemptiveRotation,
+	} {
+		p := &WSPoolTransport{poolSize: 4, log: newDiscardLogger()}
+		p.slots = make([]*poolSlot, 8)
+		p.slots[0] = newAgedSlot()
+
+		before := Stats.AgeExposureOverThresholdMs.Load()
+		p.accrueAgeExposureOnDeath(p.slots[0], cause)
+		got := Stats.AgeExposureOverThresholdMs.Load() - before
+
+		if got < 8_500 || got > 9_500 {
+			t.Errorf("cause=%v: накоплено %d мс, ожидалось ~9000 — экспозиция на пути "+
+				"реза не считается (счётчик видит только дренажные терминации)", cause, got)
+		}
+	}
+
+	// А дренажный путь здесь молчит: tearDown уже посчитал его сам.
+	p := &WSPoolTransport{poolSize: 4, log: newDiscardLogger()}
+	p.slots = make([]*poolSlot, 8)
+	p.slots[0] = newAgedSlot()
+
+	before := Stats.AgeExposureOverThresholdMs.Load()
+	p.accrueAgeExposureOnDeath(p.slots[0], deathCauseDrainTeardown)
+	if got := Stats.AgeExposureOverThresholdMs.Load() - before; got != 0 {
+		t.Errorf("deathCauseDrainTeardown накопил %d мс — двойной счёт: tearDown "+
+			"уже вызвал accrueAgeExposure до handleSlotDeath", got)
+	}
+}

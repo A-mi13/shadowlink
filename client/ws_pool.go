@@ -4916,6 +4916,13 @@ func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int, cause slotDeathCa
 	}
 	slot.lastDeathNs.Store(time.Now().UnixNano())
 
+	// Экспозиция возраста за порогом — ДО любой другой работы и сразу за CAS'ом
+	// tryMarkDead, который гарантирует один проход на одну смерть. Резы и наши
+	// преждевременные снятия дренаж не проходят, поэтому в tearDown их не видно;
+	// drainTeardown отфильтрован внутри, иначе дренажные пути посчитались бы
+	// дважды. Замер 2026-08-17: недосчёт составлял 27%. См. accrueAgeExposureOnDeath.
+	p.accrueAgeExposureOnDeath(slot, cause)
+
 	// Uniform stream cleanup (spec 2026-05-20 §3): close(streamChans[id])
 	// for every cause (natural, preemptive, drainTeardown). The earlier
 	// design had drainTeardown skip the close in favor of network EOF

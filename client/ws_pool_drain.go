@@ -930,6 +930,35 @@ func accrueAgeExposure(slot *poolSlot) time.Duration {
 	return age
 }
 
+// accrueAgeExposureOnDeath накапливает экспозицию для терминаций, которые НЕ
+// проходят через дренаж, — то есть для резов и наших преждевременных снятий.
+//
+// Зачем отдельная точка (полевой замер 2026-08-17, лог
+// nixavpn-DEBUG-20260817-092533): у accrueAgeExposure был единственный продовый
+// call-site — tearDown внутри drainWatchdog. Комментарий там говорит «все НАШИ
+// терминации», и это формально верно, но рез — не наш, а счётчик называется
+// «экспозиция за порогом» и читается как полная. В том прогоне дренажные пути
+// дали 3010.1s, резы — ещё 1112.6s на 18 соединениях: недосчёт 27%, и снова в
+// безопасную сторону. Совпадение логируемого age_exposure_over_threshold_ms
+// (3010102) с суммой только дренажных путей до миллисекунды и было тем, что
+// границу покрытия обнаружило.
+//
+// ⚠ deathCauseDrainTeardown ИСКЛЮЧЁН намеренно: он приходит в handleSlotDeath
+// уже после tearDown, где экспозиция посчитана. Без этого условия каждый
+// дренажный путь считался бы дважды — обратная ошибка, и она хуже: недосчёт
+// занижает риск, а двойной счёт создал бы ложный тренд роста, по которому стали
+// бы двигать константы (hard rule 8).
+//
+// ⚠ Защиты от повторного вызова здесь нет и не требуется: handleSlotDeath
+// возвращается раньше, если tryMarkDead() не выиграл CAS, поэтому на одну смерть
+// слота приходится ровно один проход.
+func (p *WSPoolTransport) accrueAgeExposureOnDeath(slot *poolSlot, cause slotDeathCause) {
+	if cause == deathCauseDrainTeardown {
+		return
+	}
+	accrueAgeExposure(slot)
+}
+
 // drainWatchdog polls oldSlot.streams every drainPollInterval until
 // either count reaches 0 (natural finish) or drainHardCap elapses
 // (hard cap). In both cases:
