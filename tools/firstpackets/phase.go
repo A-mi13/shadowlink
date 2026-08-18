@@ -99,25 +99,52 @@ type phaseSeries struct {
 // SYN-ACK обратно им не является. Фильтр по dst, а не по флагу вообще.
 func collectPhaseSeries(packets []packet, origin [4]byte) []phaseSeries {
 	var synTS, finTS, allTS []float64
+
+	// haveT0 — отдельный флаг, а НЕ `t0 == 0` как sentinel. При sentinel'е
+	// пакет с tsMicros == 0 сбрасывал минимум, следующий пакет безусловно
+	// перезаписывал его своим значением, и `ts - t0` на uint64 уходил в
+	// underflow: вместо секунд получалось ~1.8e13, причём молча — vectorStrength
+	// честно считал по мусору. Найдено ревью 2026-08-18, сторож —
+	// TestWirePhase_ZeroTimestampDoesNotUnderflow.
 	var t0 uint64
+	var haveT0 bool
 	for _, p := range packets {
-		if t0 == 0 || p.tsMicros < t0 {
+		if !haveT0 || p.tsMicros < t0 {
 			t0 = p.tsMicros
+			haveT0 = true
 		}
 	}
-	toSec := func(ts uint64) float64 { return float64(ts-t0) / 1e6 }
+	toSec := func(ts uint64) float64 {
+		// t0 — минимум по всем пакетам, поэтому ts >= t0 всегда; проверка
+		// оставлена как страховка от будущей правки выбора t0 (например
+		// «минимум только по пакетам к origin»), которая это сломает молча.
+		if ts < t0 {
+			return 0
+		}
+		return float64(ts-t0) / 1e6
+	}
 
 	for _, p := range packets {
 		if p.dstIP != origin {
 			continue
 		}
-		switch {
-		case p.syn:
-			synTS = append(synTS, toSec(p.tsMicros))
-			allTS = append(allTS, toSec(p.tsMicros))
-		case p.fin || p.rst:
-			finTS = append(finTS, toSec(p.tsMicros))
-			allTS = append(allTS, toSec(p.tsMicros))
+		// Флаги проверяются НЕЗАВИСИМО, а не через switch: пакет с SYN+FIN
+		// (или SYN+RST) при switch попал бы только в серию открытий, и момент
+		// закрытия потерялся бы молча. В нормальном трафике такой пакет не
+		// встречается, но серия закрытий — это ровно то, где ищут рез
+		// посредника, и терять там события нельзя.
+		ts := toSec(p.tsMicros)
+		counted := false
+		if p.syn {
+			synTS = append(synTS, ts)
+			counted = true
+		}
+		if p.fin || p.rst {
+			finTS = append(finTS, ts)
+			counted = true
+		}
+		if counted {
+			allTS = append(allTS, ts)
 		}
 	}
 	sort.Float64s(synTS)

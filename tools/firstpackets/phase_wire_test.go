@@ -183,6 +183,70 @@ func TestWirePhase_FinAndRstBothCount(t *testing.T) {
 	}
 }
 
+// SYN+FIN в одном пакете обязан попасть в ОБЕ серии. При switch по флагам он
+// учитывался только как открытие, и момент закрытия исчезал молча (P2-3, ревью
+// 2026-08-18). В серии закрытий ищут рез посредника — терять там нельзя.
+// Дубль в "SYN+FIN вместе" при этом не появляется: событие одно.
+func TestWirePhase_SynFinCountsInBothSeries(t *testing.T) {
+	local := [4]byte{192, 168, 1, 137}
+	b := newPcapngBuilder()
+	b.addPacket(1_000_000, buildTCPFrame(local, testOrigin, 50001, 443, tcpFlagSYN))
+	b.addPacket(2_000_000, buildTCPFrame(local, testOrigin, 50002, 443, tcpFlagSYN|tcpFlagFIN))
+	b.addPacket(3_000_000, buildTCPFrame(local, testOrigin, 50003, 443, tcpFlagFIN))
+
+	packets, err := parsePcapng(b.bytes())
+	if err != nil {
+		t.Fatalf("parsePcapng: %v", err)
+	}
+	series := collectPhaseSeries(packets, testOrigin)
+	if got := len(series[0].ts); got != 2 {
+		t.Fatalf("SYN-серия: n = %d, ожидалось 2 (чистый SYN + SYN|FIN)", got)
+	}
+	if got := len(series[1].ts); got != 2 {
+		t.Fatalf("FIN-серия: n = %d, ожидалось 2 (SYN|FIN + чистый FIN)", got)
+	}
+	if got := len(series[2].ts); got != 3 {
+		t.Fatalf("серия «вместе»: n = %d, ожидалось 3 события без дублей", got)
+	}
+}
+
+// Нулевой таймстамп не должен ломать нормировку. `t0 == 0` использовался и как
+// sentinel «не найдено», и как валидное значение: пакет с ts = 0 сбрасывал t0,
+// следующий безусловно перезаписывал его своим значением, и `ts - t0` на uint64
+// уходил в underflow — вместо секунд получалось ~1.8e13 БЕЗ признака ошибки.
+// Найдено ревью 2026-08-18. pktmon пишет абсолютные времена от эпохи, так что
+// в живом захвате ts = 0 маловероятен, но молчаливый мусор в замере хуже паники.
+func TestWirePhase_ZeroTimestampDoesNotUnderflow(t *testing.T) {
+	local := [4]byte{192, 168, 1, 137}
+	b := newPcapngBuilder()
+	for i, ts := range []uint64{3_000_000, 0, 9_000_000} {
+		b.addPacket(ts, buildTCPFrame(local, testOrigin, uint16(50000+i), 443, tcpFlagSYN))
+	}
+
+	packets, err := parsePcapng(b.bytes())
+	if err != nil {
+		t.Fatalf("parsePcapng: %v", err)
+	}
+	series := collectPhaseSeries(packets, testOrigin)
+	syn := series[0]
+	if len(syn.ts) != 3 {
+		t.Fatalf("n = %d, ожидалось 3", len(syn.ts))
+	}
+	// t0 обязан быть 0 (минимум), значит времена — 0, 3, 9 с в возрастающем
+	// порядке, и ни одно не должно быть астрономическим.
+	for i, v := range syn.ts {
+		if v < 0 || v > 3600 {
+			t.Fatalf("ts[%d] = %.3f — вне разумных границ (underflow?)", i, v)
+		}
+	}
+	if syn.ts[0] != 0 {
+		t.Fatalf("минимальный ts = %.3f, ожидался 0", syn.ts[0])
+	}
+	if syn.ts[2] < 8.999 || syn.ts[2] > 9.001 {
+		t.Fatalf("максимальный ts = %.3f, ожидалось 9.0", syn.ts[2])
+	}
+}
+
 // Время отсчитывается от первого пакета захвата: абсолютные таймстампы
 // pktmon — это unix-микросекунды, и без нормировки фаза считалась бы от
 // эпохи. На решётке это незаметно, а на реальном захвате сдвинуло бы фазу.

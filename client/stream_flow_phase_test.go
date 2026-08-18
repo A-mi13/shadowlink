@@ -2,6 +2,7 @@ package client
 
 import (
 	"math"
+	"sync"
 	"testing"
 	"time"
 )
@@ -60,24 +61,50 @@ func TestCreditSender_SendPhaseIsQuantizedByTicker(t *testing.T) {
 	c.streamFlow = map[uint16]*streamFlowState{9: {window: 1 << 20}}
 
 	start := time.Now()
+
+	// Мьютекс обязателен: flowSendForTest зовётся из горутины credit-sender'а
+	// (sendWindowUpdate ← creditSenderTick ← горутина startCreditSender), а
+	// слайс читается телом теста. Без него это гонка данных, и замер
+	// невалиден независимо от того, что цифра выглядит правдоподобно. На
+	// Windows -race недоступен (нет gcc), поэтому такую гонку локальный
+	// зелёный прогон НЕ покажет — hard rule 6.
+	var mu sync.Mutex
 	var sends []float64
-	done := make(chan struct{})
 
 	c.flowSendForTest = func(streamID uint16, delta uint32) bool {
-		select {
-		case <-done:
-		default:
-			sends = append(sends, time.Since(start).Seconds())
-		}
+		elapsed := time.Since(start).Seconds()
+		mu.Lock()
+		sends = append(sends, elapsed)
+		mu.Unlock()
 		return true
 	}
 
 	c.startCreditSender()
-	defer c.stopCreditSender()
 
 	// Насыщаем поток так, чтобы порог creditFlushFloor (32 KiB) был перекрыт
 	// к каждому тику: тогда решение «слать» принимается всегда и остаётся
 	// только момент пробуждения — то есть ровно фаза тикера.
+	//
+	// ⚠ Насыщение здесь ИСКУССТВЕННОЕ (64 KiB/мс ≈ 64 МБ/с), и возражение
+	// «R = 0.99 — артефакт насыщения» напрашивается само. Оно проверено и
+	// НЕ подтвердилось: замер 2026-08-18 на четырёх скоростях (подача 3 с,
+	// подвыборка TestCreditRealRates, в дерево не коммичена) дал
+	//
+	//   0.22 МБ/с (средний в поле) — n=18,  R = 0.9771, интервалы 152-207 мс
+	//   1 МБ/с    (p95 интервалов) — n=75,  R = 0.9892, интервалы 32-57 мс
+	//   4 МБ/с    (порог за тик)   — n=195, R = 0.9714, интервалы 7-17 мс
+	//   20 МБ/с   (пик)            — n=374, R = 0.9574, интервалы 6.5-9.4 мс
+	//
+	// То есть throughput меняет ЧАСТОТУ отправок, но не их ФАЗУ: каждая
+	// отправка всё равно происходит на пробуждении тикера, поэтому лежит на
+	// сетке 8 мс при любой скорости. Решётка сохраняется, редеет только
+	// плотность её заполнения.
+	//
+	// Чего этот тест всё равно НЕ доказывает: что решётка наблюдаема
+	// цензором. Измеряются моменты вызова колбэка внутри процесса, а не
+	// уход пакета в сеть, — между ними ещё шифрование, WS-фрейминг, TCP и
+	// возможная коалесценция. Для наблюдаемости нужен pcap
+	// (tools/firstpackets -phase).
 	feed := time.NewTicker(1 * time.Millisecond)
 	defer feed.Stop()
 	deadline := time.After(1200 * time.Millisecond)
@@ -90,7 +117,19 @@ loop:
 			break loop
 		}
 	}
-	close(done)
+
+	// Останов ДО чтения слайса, а не через defer: иначе последний тик мог бы
+	// дописать в sends во время подсчёта.
+	//
+	// stopCreditSender только закрывает канал и НЕ дожидается выхода
+	// горутины (stream_flow.go:124) — та может быть в середине тика и
+	// дописать ещё одну отметку после возврата. Поэтому читаем копию под
+	// мьютексом, а не полагаемся на «после stop писателя нет».
+	c.stopCreditSender()
+
+	mu.Lock()
+	sends = append([]float64(nil), sends...)
+	mu.Unlock()
 
 	if len(sends) < 20 {
 		t.Fatalf("отправок всего %d — механизм не слал, замер фазы невозможен", len(sends))
