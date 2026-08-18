@@ -3047,6 +3047,18 @@ func (p *WSPoolTransport) connectSlot(ctx context.Context, idx int) error {
 	// from the slot's session — Bearer header is gone.
 	if err := wst.UpgradeToWS(slot.token, slot.session); err != nil {
 		slot.setState(slotDead)
+		// Close ОБЯЗАТЕЛЕН: wst уже несёт свой ConnManager, а тот при
+		// MinRotation > 0 безусловно поднял горутину startRotation
+		// (connmanager.go:124, ws_transport.go:99). До правки этот путь
+		// возвращал ошибку без Close, и горутина с log-normal таймером жила до
+		// конца процесса — её stopCh не закрывался никогда. В прогоне 094311
+		// таких отказов 41 за 8 ч, то есть 41 вечная горутина, каждая со своим
+		// CloseIdleConnections по таймеру. Найдено ревью 2026-08-18.
+		//
+		// Это единственный ранний выход ПОСЛЕ создания wst и ДО присваивания
+		// slot.transport, поэтому больше закрывать здесь нечего: на успешном
+		// пути владение переходит слоту (Close на :3800, :5073, :5234).
+		wst.Close()
 		return fmt.Errorf("slot %d: ws upgrade: %w", idx, err)
 	}
 
