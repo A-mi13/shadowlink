@@ -65,6 +65,8 @@ func main() {
 		pcapPath = flag.String("pcap", "", "путь к pcapng от pktmon")
 		originIP = flag.String("origin", "104.222.177.67", "IP сервера")
 		verbose  = flag.Bool("v", false, "печатать каждый поток подробно")
+		phase    = flag.Bool("phase", false, "замер периодичности на проводе по SYN/FIN (vector strength)")
+		tick     = flag.Float64("tick", 0.5, "период тика для критерия R < 0.2, секунды")
 	)
 	flag.Parse()
 
@@ -91,6 +93,14 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "разбор pcapng: %v\n", err)
 		os.Exit(1)
+	}
+
+	// Режим фазы работает на СЫРЫХ пакетах, а не на потоках: SYN/FIN нужны
+	// все, включая соединения, которые groupFlows отбросил бы как неполные
+	// (например срезанные посредником — именно они и интересны).
+	if *phase {
+		reportPhase(packets, origin, *tick)
+		return
 	}
 
 	flows := groupFlows(packets, origin)
