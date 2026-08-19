@@ -93,6 +93,19 @@ type phaseSeries struct {
 	ts   []float64 // секунды от начала захвата, возрастают
 }
 
+// smallUplinkMaxPayload — верхняя граница «мелкого» uplink-пакета.
+//
+// Управляющие кадры (WINDOW_UPDATE, StreamAck) на проводе занимают десятки
+// байт: 6 Б payload NewWindowUpdateChunk (core/chunk.go:305) плюс AES-GCM,
+// WS-фрейм и TCP/IP дают ~71 Б. 120 — запас, чтобы поймать и соседние
+// управляющие формы, но отсечь данные (MTU-размерные пакеты).
+//
+// Зачем отдельная серия: замер 2026-08-19 показал, что линия 125 Гц
+// присутствует ровно у ОДНОГО размера (71 Б, R = 0.944), а на смеси всех
+// мелких пакетов размывается до 0.311. Разбивка по размеру — это то, что
+// отличает «линия у класса пакетов» от «шум в трафике».
+const smallUplinkMaxPayload = 120
+
 // collectPhaseSeries раскладывает пакеты на серии SYN и FIN/RST к origin.
 //
 // Направление важно: SYN от нас к origin — это НАШЕ открытие соединения, а
@@ -155,6 +168,44 @@ func collectPhaseSeries(packets []packet, origin [4]byte) []phaseSeries {
 		{name: "FIN/RST к origin (закрытие)", ts: finTS},
 		{name: "SYN+FIN вместе", ts: allTS},
 	}
+}
+
+// collectUplinkBySize группирует моменты отправки МЕЛКИХ uplink-пакетов к
+// origin по размеру payload.
+//
+// Отдельно от SYN/FIN, потому что решётка credit-sender'а (8 мс) живёт не в
+// открытиях соединений, а в потоке управляющих кадров, и проявляется только
+// при разбивке по размеру: на смеси она размывается.
+func collectUplinkBySize(packets []packet, origin [4]byte) (bySize map[int][]float64, all []float64) {
+	var t0 uint64
+	var haveT0 bool
+	for _, p := range packets {
+		if !haveT0 || p.tsMicros < t0 {
+			t0 = p.tsMicros
+			haveT0 = true
+		}
+	}
+
+	bySize = make(map[int][]float64)
+	for _, p := range packets {
+		if p.dstIP != origin {
+			continue
+		}
+		if p.payload <= 0 || p.payload > smallUplinkMaxPayload {
+			continue
+		}
+		ts := 0.0
+		if p.tsMicros >= t0 {
+			ts = float64(p.tsMicros-t0) / 1e6
+		}
+		bySize[p.payload] = append(bySize[p.payload], ts)
+		all = append(all, ts)
+	}
+	for k := range bySize {
+		sort.Float64s(bySize[k])
+	}
+	sort.Float64s(all)
+	return bySize, all
 }
 
 // reportPhase печатает замер по всем сериям.
@@ -244,5 +295,63 @@ func reportPhase(packets []packet, origin [4]byte, tick float64) {
 	if !anyData {
 		fmt.Println("Событий SYN/FIN к origin в захвате нет.")
 		fmt.Println("Проверьте: -origin совпадает с IP из лога? Захват шёл при работающем клиенте?")
+		fmt.Println("⚠ Если файл большой и pktmon отчитался о миллионах пакетов, а здесь n=0 —")
+		fmt.Println("  это НЕ пустой захват, а нераспознанный формат кадра (см. dot11.go).")
+	}
+
+	reportUplinkGrid(packets, origin, tick)
+}
+
+// reportUplinkGrid печатает замер решётки у мелких uplink-пакетов с разбивкой
+// по размеру payload.
+//
+// Порог значимости — R >= 0.2 (тот же критерий) И n >= 200: на малых выборках
+// высокий R получается случайно, а вывод о решётке по десяткам событий уже
+// приводил в этом проекте к ложным заключениям.
+func reportUplinkGrid(packets []packet, origin [4]byte, tick float64) {
+	bySize, all := collectUplinkBySize(packets, origin)
+	if len(all) < 2 {
+		return
+	}
+
+	fmt.Println("--- Мелкие uplink-пакеты к origin (управляющие кадры) ---")
+	fmt.Printf("Здесь ищется решётка credit-sender (8 мс) и ack-гейта (50 мс):\n")
+	fmt.Printf("это РЕАЛЬНЫЕ байты, а не открытия соединений.\n\n")
+
+	for _, t := range []float64{0.008, 0.05, tick} {
+		r := vectorStrength(all, t)
+		fmt.Printf("%-30s n=%-6d R@%.3fs=%.4f  шум=%.4f\n",
+			"все размеры вместе", len(all), t, r, 1/math.Sqrt(float64(len(all))))
+	}
+
+	// Разбивка: решётка обычно принадлежит ОДНОМУ классу пакетов, и на смеси
+	// она размывается. Сортируем по частоте, чтобы редкие размеры не шумели.
+	type sizeRow struct {
+		size int
+		n    int
+		r8   float64
+	}
+	var rows []sizeRow
+	for size, ts := range bySize {
+		if len(ts) < 200 {
+			continue
+		}
+		rows = append(rows, sizeRow{size, len(ts), vectorStrength(ts, 0.008)})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].n > rows[j].n })
+
+	if len(rows) == 0 {
+		fmt.Println("\n(размеров с n >= 200 нет — выборка мала для разбивки)")
+		return
+	}
+	fmt.Println("\nпо размеру payload (только n >= 200):")
+	for _, row := range rows {
+		noise := 1 / math.Sqrt(float64(row.n))
+		mark := ""
+		if row.r8 >= 0.2 {
+			mark = "  ← ЛИНИЯ 125 Гц"
+		}
+		fmt.Printf("  payload=%-4d n=%-6d R@8мс=%.4f  шум=%.4f%s\n",
+			row.size, row.n, row.r8, noise, mark)
 	}
 }

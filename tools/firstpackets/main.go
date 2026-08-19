@@ -40,14 +40,14 @@ const (
 const firstN = 20
 
 type packet struct {
-	tsMicros  uint64
-	srcIP     [4]byte
-	dstIP     [4]byte
-	srcPort   uint16
-	dstPort   uint16
-	payload   int // байт TCP payload (без заголовков)
-	syn, fin  bool
-	rst       bool
+	tsMicros uint64
+	srcIP    [4]byte
+	dstIP    [4]byte
+	srcPort  uint16
+	dstPort  uint16
+	payload  int // байт TCP payload (без заголовков)
+	syn, fin bool
+	rst      bool
 }
 
 type flowKey struct {
@@ -201,6 +201,11 @@ func parseEthernetIPv4TCP(d []byte, ts uint64) (packet, bool) {
 			// Возможно, сырой IPv4 без Ethernet-заголовка.
 			if d[0]>>4 == 4 {
 				ipOff = 0
+			} else if off, ok := dot11PayloadOffset(d); ok {
+				// 802.11 (Wi-Fi). pktmon на беспроводном адаптере пишет в IDB
+				// LinkType 1 (Ethernet), но кадры отдаёт 802.11 — поэтому
+				// попадаем сюда, а не в отдельную ветку по LinkType.
+				ipOff = off
 			} else {
 				return p, false
 			}
@@ -279,14 +284,14 @@ func groupFlows(packets []packet, origin [4]byte) []*flow {
 }
 
 type flowVerdict struct {
-	port          uint16
-	clientPkts    int
-	serverPkts    int
-	bigClientRun  int // максимальная серия подряд идущих клиентских пакетов >=411
-	bigClientTotal int
+	port            uint16
+	clientPkts      int
+	serverPkts      int
+	bigClientRun    int // максимальная серия подряд идущих клиентских пакетов >=411
+	bigClientTotal  int
 	serverMoreOften bool
-	triggers      bool
-	firstSizes    []int // размеры первых непустых пакетов, со знаком: + клиент, - сервер
+	triggers        bool
+	firstSizes      []int // размеры первых непустых пакетов, со знаком: + клиент, - сервер
 }
 
 func analyze(f *flow, origin [4]byte) flowVerdict {
