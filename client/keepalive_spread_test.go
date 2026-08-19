@@ -1,8 +1,11 @@
 package client
 
 import (
+	"context"
 	"testing"
 	"time"
+
+	"github.com/nixavpn/shadowlink/core"
 )
 
 // Разнесение keepalive по слотам.
@@ -42,14 +45,8 @@ func TestKeepaliveSpread_NeverExtendsSilenceBeyondCutFloor(t *testing.T) {
 	// возможных, поэтому эмпирический максимум + 400 мс укладывается в порог
 	// даже у дефектной версии — такой тест был бы слепым (проверено:
 	// он проходил и без вычитания).
-	//
-	// Инвариант формулируется на константах: «максимум сэмплера ПЛЮС полное
-	// время прохода не превышает порог реза». Единственный способ его
-	// выполнить — вычитать время прохода из интервала.
 	maxSamplerDraw := p.keepaliveBase * 2
 	if maxSamplerDraw+keepaliveSpreadMax > middleboxSilentCutFloor {
-		// Дефектная конфигурация: либо разнос добавляется к интервалу, либо
-		// вычитание не покрывает полное время прохода.
 		if !keepaliveDelayCompensatesSpread(p) {
 			t.Errorf("максимум сэмплера %v + проход %v = %v превышает порог реза "+
 				"по тишине %v, и nextKeepaliveDelay НЕ компенсирует проход — "+
@@ -58,6 +55,95 @@ func TestKeepaliveSpread_NeverExtendsSilenceBeyondCutFloor(t *testing.T) {
 				maxSamplerDraw+keepaliveSpreadMax, middleboxSilentCutFloor)
 		}
 	}
+
+	// ⚠ ГЛАВНАЯ проверка, и её отсутствие пропустило P0 (ревью 2026-08-19):
+	// компенсация вычитает ОДИН keepaliveSpreadMax, поэтому корректна только
+	// если полное время прохода тоже ограничено одним keepaliveSpreadMax
+	// НЕЗАВИСИМО от числа слотов. Первая версия спала кумулятивно
+	// (`spread - delay` на каждом слоте), проход стоил Σ по слотам: замер дал
+	// max 2.8 с при 8 слотах и худшее молчание 12.4 с против порога 10 с.
+	// Сторож этого не видел, потому что считал один разнос вместо poolSize.
+	//
+	// Инвариант: время прохода = МАКСИМУМ абсолютных смещений, а не их сумма.
+	// Проверяется на числе слотов вплоть до полной ёмкости массива (2*poolSize).
+	for _, slots := range []int{1, 4, 8, 16} {
+		var worstPass time.Duration
+		const passes = 20000
+		for range passes {
+			offsets := make([]time.Duration, 0, slots)
+			for i := 0; i < slots; i++ {
+				offsets = append(offsets, keepaliveSlotDelay(i))
+			}
+			// Модель прохода: сон до абсолютных моментов, значит длительность
+			// равна наибольшему смещению. Кумулятивная версия дала бы сумму.
+			var pass time.Duration
+			for _, o := range offsets {
+				if o > pass {
+					pass = o
+				}
+			}
+			if pass > worstPass {
+				worstPass = pass
+			}
+		}
+		if worstPass > keepaliveSpreadMax {
+			t.Errorf("slots=%d: проход %v превышает keepaliveSpreadMax %v — "+
+				"смещения складываются вместо параллельного окна",
+				slots, worstPass, keepaliveSpreadMax)
+		}
+		if worst := maxSamplerDraw - keepaliveSpreadMax + worstPass; worst > middleboxSilentCutFloor {
+			t.Errorf("slots=%d: худшее молчание %v превышает порог реза %v",
+				slots, worst, middleboxSilentCutFloor)
+		}
+	}
+
+	// И проверка на РЕАЛЬНОМ проходе, а не на модели: выше считалась формула
+	// «проход = максимум смещений», но она описывает мою реализацию, а не
+	// проверяет её. Кумулятивная версия прошла бы модельный тест, если бы
+	// модель повторяла её ошибку. Поэтому здесь измеряется фактическая
+	// длительность sendKeepaliveToAllSlots на пуле из 8 готовых слотов.
+	t.Run("реальный проход ограничен окном", func(t *testing.T) {
+		pool := NewWSPoolTransport(&Client{streamChans: make(map[uint16]chan []byte)},
+			WSPoolConfig{Size: 8, ServerAddr: "127.0.0.1:0"})
+		pool.ctx = context.Background()
+		// Слоты обязаны быть ПОЛНОСТЬЮ готовыми (transport + session), иначе
+		// они отфильтровываются при построении очереди — до разноса, — и тест
+		// измеряет пустой проход. Первая версия этой проверки ставила nil
+		// transport и давала worst=0s, то есть не проверяла ничего.
+		for i := range pool.slots {
+			s := &poolSlot{index: i}
+			s.transport = &countingTransport{}
+			s.session = core.NewSession(uint32(i+1), make([]byte, 32), make([]byte, 32))
+			s.setState(slotReady)
+			pool.slots[i] = s
+		}
+		ready := 0
+		for _, s := range pool.slots {
+			if s != nil && s.getState() == slotReady && s.transport != nil && s.session != nil {
+				ready++
+			}
+		}
+		if ready < 8 {
+			t.Fatalf("готовых слотов %d, ожидалось >= 8 — проход не отработает разнос", ready)
+		}
+
+		var worst time.Duration
+		for range 20 {
+			start := time.Now()
+			pool.sendKeepaliveToAllSlots()
+			if d := time.Since(start); d > worst {
+				worst = d
+			}
+		}
+		// Допуск на планировщик: окно + 20 %. Кумулятивная версия дала бы
+		// ~1.6 с в среднем при 8 слотах, то есть промахнулась бы на порядок.
+		limit := keepaliveSpreadMax + keepaliveSpreadMax/5
+		if worst > limit {
+			t.Errorf("фактический проход %v превышает допуск %v (окно %v) — "+
+				"смещения складываются", worst, limit, keepaliveSpreadMax)
+		}
+		t.Logf("фактический проход при 8 слотах: worst=%v (окно %v)", worst, keepaliveSpreadMax)
+	})
 
 	// Эмпирическая проверка компенсации: верхняя граница выборки после
 	// вычитания обязана быть ниже, чем без него. Сравниваем с максимумом

@@ -340,9 +340,9 @@ Steganographic VPN. Go 1.25, `module github.com/nixavpn/shadowlink`. Отдел�
    maxConcurrentDrains` ставит `drainStormBrakeBackoff` (быстрый повтор), а не
    отменяет ротацию; `capacity_floor_deferred_total` при этом 0 в обоих прогонах.
    ⚠ Расхождение «счётчик 27, строк в логе 3» — **не потеря**, а намеренный
-   rate-limit логирования (`shouldLogDeferred`, 30 с на гейт;
-   `ws_pool_drain.go:659`). Счётчик инкрементится всегда, `total_count` в строке
-   даёт реальный темп через дельту. Не искать здесь фантомный счётчик.
+   rate-limit логирования (`shouldLogDeferred`, `ws_pool_drain.go:165`; вызов из
+   гейта — `:659`). Счётчик инкрементится всегда, `total_count` в строке даёт
+   реальный темп через дельту. Не искать здесь фантомный счётчик.
 
 11. **Периодического healer'а ёмкости в пуле НЕТ** — каждая цепочка
    `reconnectLoop` одноразова, единственный вызов на старте это начальный connect.

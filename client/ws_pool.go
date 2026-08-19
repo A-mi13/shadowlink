@@ -9,6 +9,7 @@ import (
 	"math"
 	mrand "math/rand"
 	"math/rand/v2"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2865,22 +2866,45 @@ func keepaliveSlotDelay(idx int) time.Duration {
 }
 
 func (p *WSPoolTransport) sendKeepaliveToAllSlots() {
-	sent := 0
-	for i, slot := range p.snapshotSlots() {
+	slots := p.snapshotSlots()
+
+	// Смещения считаются ЗАРАНЕЕ и сортируются, а сон идёт до АБСОЛЮТНЫХ
+	// моментов от начала прохода. Это принципиально: полное время прохода тогда
+	// ограничено keepaliveSpreadMax независимо от числа слотов.
+	//
+	// ⚠ Так сделано после ревью 2026-08-19, которое нашло P0 в первой версии.
+	// Там сон стоял внутри цикла (`keepaliveSpreadMax - delay` на каждом слоте),
+	// то есть был КУМУЛЯТИВНЫМ: проход стоил Σ по всем готовым слотам — замер
+	// дал mean 1.6 с и max 2.8 с при 8 слотах, а худшее молчание слота
+	// 12.4 с против порога реза по тишине 10 с (middleboxSilentCutFloor).
+	// «Компенсирующим» стало лишь одно слагаемое, а не структура прохода, и
+	// правка возвращала ровно тот Bug #9, от которого защищает.
+	type pending struct {
+		idx  int
+		slot *poolSlot
+		at   time.Duration // абсолютное смещение от начала прохода
+	}
+	queue := make([]pending, 0, len(slots))
+	for i, slot := range slots {
 		if slot == nil || slot.getState() != slotReady || slot.transport == nil || slot.session == nil {
 			continue
 		}
-		// Разнос по слотам: каждый кадр уходит со своим смещением, поэтому на
-		// проводе нет синхронного burst'а. Смещение КОМПЕНСИРУЮЩЕЕ — сон равен
-		// `keepaliveSpreadMax - delay`, то есть кадр уходит раньше номинального
-		// момента прохода, а не позже (обоснование у keepaliveSpreadMax: запас
-		// до порога реза по тишине нулевой, добавка сдвинула бы слот за него).
-		// Первый слот тоже смещён: иначе он остался бы якорем burst'а, а
-		// наблюдателю достаточно самого раннего кадра, чтобы увидеть шаблон.
+		queue = append(queue, pending{idx: i, slot: slot, at: keepaliveSlotDelay(i)})
+	}
+	sort.Slice(queue, func(a, b int) bool { return queue[a].at < queue[b].at })
+
+	start := time.Now()
+	sent := 0
+	for _, it := range queue {
+		i, slot := it.idx, it.slot
+		// Спим до момента `start + at`, а не на фиксированную величину: если
+		// предыдущая запись заняла время, оно вычитается из ожидания, и проход
+		// не растягивается. Первый слот тоже смещён — иначе он остался бы
+		// якорем burst'а, а наблюдателю достаточно самого раннего кадра.
 		//
 		// Прерываемся по ctx: без этого проход держал бы горутину до
-		// keepaliveSpreadMax на каждом слоте при остановке пула.
-		if wait := keepaliveSpreadMax - keepaliveSlotDelay(i); wait > 0 {
+		// keepaliveSpreadMax при остановке пула.
+		if wait := it.at - time.Since(start); wait > 0 {
 			select {
 			case <-p.ctx.Done():
 				return
@@ -2905,7 +2929,13 @@ func (p *WSPoolTransport) sendKeepaliveToAllSlots() {
 		}
 	}
 	if sent > 0 {
-		Trace("keepalive sent", "slots", sent)
+		// ⚠ Метка этой строки — момент ЗАВЕРШЕНИЯ прохода, а не отправки кадров:
+		// с введением разноса они размазаны по окну keepaliveSpreadMax до неё.
+		// Печатается spread_ms, чтобы это было видно из самой строки — иначе
+		// «keepalive sent» читалось бы как «в этот момент ушли 8 кадров», что и
+		// есть класс дефекта «лог врёт о механизме» (правило про имена полей).
+		// Для фазового замера пригодны только SYN/FIN на проводе, не эта метка.
+		Trace("keepalive sent", "slots", sent, "spread_ms", keepaliveSpreadMax.Milliseconds())
 	}
 }
 
