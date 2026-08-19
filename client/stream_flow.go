@@ -88,10 +88,43 @@ const (
 	creditFlushFloor = 32 * 1024
 )
 
+// nextCreditSenderWakeup возвращает задержку до следующего пробуждения
+// credit-sender'а: creditSenderInterval + uniform[0, creditSenderInterval).
+//
+// Джиттер сэмплируется ЗАНОВО на каждом вызове. Один сэмпл, переиспользованный
+// на весь сеанс, дал бы ту же решётку с другим шагом — антипаттерн
+// «single-sample reused», разобранный у slotStaggerOffset и nextWatchdogWakeup.
+//
+// # Почему это не задерживает возврат credits
+//
+// Константа 8 мс НЕ менялась (hard rule 8) — джиттер добавляется сверху, то есть
+// период пробуждения лежит в [8, 16) мс, среднее 12 мс. Отправку гейтит не тик,
+// а объём: creditFlushFloor = 32 KiB накопленных байт либо creditWatchdogNs =
+// 200 мс для «залежавшегося хвоста». Тик — лишь частота ПРОВЕРКИ этих условий,
+// поэтому +4 мс к среднему интервалу проверки не приближает нас к watchdog'у
+// (200 мс) и на порядок меньше его. Верхняя граница 16 мс против порога 200 мс —
+// запас 12x.
+//
+// Риск, который тем не менее надо мерить: из-за задержки возврата credits сервер
+// уже вставал в waitForCredit (~242 мс/блок), downlink шёл зубцами, слот
+// простаивал и его жали с close 1006 (см. комментарий в creditSenderTick).
+// Поэтому сторож TestCreditSender_JitteredWakeupBreaksGrid проверяет не только
+// исчезновение решётки, но и максимальный интервал между отправками.
+func nextCreditSenderWakeup() time.Duration {
+	return creditSenderInterval + time.Duration(rand.Float64()*float64(creditSenderInterval))
+}
+
 // startCreditSender launches the single per-client credit-sender goroutine.
-// It scans Client.streamFlow each tick and emits WINDOW_UPDATE for any stream
-// whose pendingDelta crossed the (jittered 40-60%) threshold, or whose tail has
-// been waiting longer than the watchdog window. Idempotent via flowStop.
+// It scans Client.streamFlow on each (jittered) wakeup and emits WINDOW_UPDATE
+// for any stream that accumulated creditFlushFloor consumed bytes, or whose tail
+// has been waiting longer than creditWatchdogNs. Idempotent via flowStop.
+//
+// ⚠ Здесь стояло «crossed the (jittered 40-60%) threshold» — описание механизма,
+// которого НЕТ: thresholdRatio не гейтит отправку (`_ = thresholdRatio` в
+// creditSenderTick), гейт идёт по абсолютному объёму creditFlushFloor. Из этой
+// формулировки родилось ложное «фаза защищена джиттером», тогда как джиттер был
+// приложен к порогу, а решётка жила на периоде тикера и была видна на проводе.
+// Сторож: TestCreditSender_ThresholdRatioDoesNotGateSend.
 func (c *Client) startCreditSender() {
 	if !c.flowControlEnabled {
 		return
@@ -106,15 +139,28 @@ func (c *Client) startCreditSender() {
 	c.streamMu.Unlock()
 
 	go func() {
-		t := time.NewTicker(creditSenderInterval)
+		// time.Timer с перевзводом, а НЕ time.NewTicker: тикер даёт постоянный
+		// период, то есть решётку на wire. Замер на проводе 2026-08-19 (pcap,
+		// pktmon): uplink-пакеты payload 71 Б дали R@8мс = 0.9445 при n=21 991,
+		// тогда как соседние размеры (75/65/99 Б) чисты — то есть линия 125 Гц
+		// принадлежала именно WINDOW_UPDATE и была наблюдаема.
+		//
+		// Лечение то же, что применялось к rotationWatchdogTick (см.
+		// nextWatchdogWakeup): джиттер на ПЕРИОД пробуждения, сэмплируется
+		// заново каждый взвод. Джиттер на пороге (прежний thresholdRatio) фазу
+		// не размазывает — порог проверяется всё равно только на тике.
+		t := time.NewTimer(nextCreditSenderWakeup())
 		defer t.Stop()
 		for {
 			select {
 			case <-stop:
 				return
 			case <-t.C:
-				ratio := 0.4 + rand.Float64()*0.2 // jitter 40-60% (§16)
-				c.creditSenderTick(ratio)
+				t.Reset(nextCreditSenderWakeup())
+				// thresholdRatio сохранён в подписи для тестового seam'а; он
+				// давно не гейтит отправку (см. creditSenderTick), поэтому на
+				// фазу не влияет и передаётся как есть.
+				c.creditSenderTick(0.4 + rand.Float64()*0.2)
 			}
 		}
 	}()
