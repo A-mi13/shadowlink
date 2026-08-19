@@ -1512,6 +1512,71 @@ func TestReconnectLoop_RecycleNoHealWhenPoolFull(t *testing.T) {
 	}
 }
 
+// TestClaimFreeCellForHealing_DistinguishesSkipReasons — два разных отказа не
+// должны выглядеть в логе одинаково.
+//
+// «Ёмкость уже полная» — штатный и самый частый исход (в поле 2026-08-19 слот
+// успел подключиться за 2 мс до строки лога, health показывал alive=8 при
+// poolSize=8). «Свободных ячеек нет» — состояние, где лечить физически негде.
+// До правки оба печатались как "not needed (no free cell)", и первое читалось
+// как второе, то есть как деградация: на этом чтении разбор 2026-08-19 едва не
+// завёл ложную гипотезу о гонке против claimFreeSlot.
+func TestClaimFreeCellForHealing_DistinguishesSkipReasons(t *testing.T) {
+	// Ёмкость полная: 4 живых при poolSize=4, свободные ячейки ЕСТЬ.
+	full := &WSPoolTransport{poolSize: 4}
+	full.slots = make([]*poolSlot, 8)
+	for i := 0; i < 4; i++ {
+		s := &poolSlot{index: i}
+		s.setState(slotReady)
+		full.slots[i] = s
+	}
+	idx, reason := full.claimFreeCellForHealingWithReason()
+	if idx != -1 {
+		t.Errorf("полная ёмкость: idx = %d, ожидался -1", idx)
+	}
+	if reason != healingNotNeededCapacityFull {
+		t.Errorf("полная ёмкость: причина %q, ожидалась %q", reason, healingNotNeededCapacityFull)
+	}
+
+	// Недостача есть, но все ячейки заняты дренирующимися — лечить негде.
+	packed := &WSPoolTransport{poolSize: 4}
+	packed.slots = make([]*poolSlot, 4)
+	for i := range packed.slots {
+		s := &poolSlot{index: i}
+		s.setState(slotDraining)
+		packed.slots[i] = s
+	}
+	idx, reason = packed.claimFreeCellForHealingWithReason()
+	if idx != -1 {
+		t.Errorf("нет свободных ячеек: idx = %d, ожидался -1", idx)
+	}
+	if reason != healingBlockedNoFreeCell {
+		t.Errorf("нет свободных ячеек: причина %q, ожидалась %q", reason, healingBlockedNoFreeCell)
+	}
+
+	// Недостача и свободная ячейка есть — лечение идёт, причина пустая.
+	short := &WSPoolTransport{poolSize: 4}
+	short.slots = make([]*poolSlot, 8)
+	for i := 0; i < 3; i++ {
+		s := &poolSlot{index: i}
+		s.setState(slotReady)
+		short.slots[i] = s
+	}
+	idx, reason = short.claimFreeCellForHealingWithReason()
+	if idx < 0 {
+		t.Errorf("недостача при свободной ячейке: idx = %d, ожидался >= 0", idx)
+	}
+	if reason != healingProceeds {
+		t.Errorf("лечение идёт: причина %q, ожидалась пустая", reason)
+	}
+
+	// Обёртка обязана сохранять прежнее поведение — на ней держатся остальные
+	// call-site'ы и тесты.
+	if got := full.claimFreeCellForHealing(); got != -1 {
+		t.Errorf("обёртка при полной ёмкости: got %d, want -1", got)
+	}
+}
+
 // TestClaimFreeCellForHealing_CountsOnlyLiveStates — что считается недостачей.
 //
 // Дренирующиеся НЕ живые: у них уже есть replacement, и учёт их как живых занизил

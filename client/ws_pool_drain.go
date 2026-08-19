@@ -306,6 +306,26 @@ func (p *WSPoolTransport) claimFreeSlot() int {
 // Обратная ошибка (заглушить лечение placeholder'ом) по-прежнему стоит дороже —
 // именно она и была исходным дефектом.
 func (p *WSPoolTransport) claimFreeCellForHealing() int {
+	idx, _ := p.claimFreeCellForHealingWithReason()
+	return idx
+}
+
+// healingSkipReason объясняет, ПОЧЕМУ лечение не понадобилось. Нужен только для
+// лога: «ёмкость уже полная» и «свободных ячеек нет» — принципиально разные
+// состояния, а под одним текстом первое читается как второе, то есть как
+// деградация. Ровно на этом чтении разбор 2026-08-19 едва не завёл ложную
+// гипотезу о гонке claimFreeCellForHealing против claimFreeSlot.
+type healingSkipReason string
+
+const (
+	healingNotNeededCapacityFull healingSkipReason = "not needed (capacity already full)"
+	healingBlockedNoFreeCell     healingSkipReason = "blocked (no free cell)"
+	healingProceeds              healingSkipReason = ""
+)
+
+// claimFreeCellForHealingWithReason — то же, что claimFreeCellForHealing, но
+// возвращает и причину отказа для лога.
+func (p *WSPoolTransport) claimFreeCellForHealingWithReason() (int, healingSkipReason) {
 	p.reserveMu.Lock()
 	defer p.reserveMu.Unlock()
 
@@ -324,10 +344,16 @@ func (p *WSPoolTransport) claimFreeCellForHealing() int {
 			healthy++
 		}
 	}
-	if healthy >= p.poolSize || freeIdx < 0 {
-		return -1
+	// Порядок проверок = приоритет объяснения: полная ёмкость означает, что
+	// лечить НЕЧЕГО (штатный исход), и это надо сообщить именно так, даже если
+	// свободных ячеек тоже нет.
+	if healthy >= p.poolSize {
+		return -1, healingNotNeededCapacityFull
 	}
-	return freeIdx
+	if freeIdx < 0 {
+		return -1, healingBlockedNoFreeCell
+	}
+	return freeIdx, healingProceeds
 }
 
 // emergencyEvictAgeMultiplier — the drain target's age threshold for

@@ -2817,10 +2817,54 @@ func (p *WSPoolTransport) nextKeepaliveDelay() time.Duration {
 	return JitteredIntervalLogNormal(base, keepaliveSigma)
 }
 
+// keepaliveSpreadMax — верхняя граница разноса keepalive по слотам.
+//
+// Зачем разнос: nextKeepaliveDelay джиттерует МОМЕНТ пробуждения, но не
+// распределяет кадры внутри прохода — до 2026-08-19 цикл писал всем 8 слотам
+// подряд, и на wire это синхронный burst 8 фреймов к одному origin в пределах
+// миллисекунд. Джиттер периода двигает такой burst целиком, то есть шаблон
+// «8 TLS-сессий оживают одновременно» сохраняется при любом джиттере периода.
+//
+// 400 мс выбраны из двух ограничений: заметно больше времени прохода цикла
+// (микросекунды) — иначе разнос не наблюдаем; и на порядок меньше минимального
+// интервала keepalive (base 5 с, сэмплер усечён снизу ~2.5 с) — иначе разнос
+// съедал бы запас по максимальному молчанию слота, а на нём держится Bug #9.
+// Сторож: TestKeepaliveSpread_BoundedByInterval.
+const keepaliveSpreadMax = 400 * time.Millisecond
+
+// keepaliveSlotDelay возвращает задержку перед отправкой keepalive для слота idx.
+//
+// Равномерно на [0, keepaliveSpreadMax) и сэмплируется ЗАНОВО на каждом проходе.
+// Намеренно НЕ функция индекса (idx*step): детерминированная лестница — это тот
+// же шаблон, только растянутый, ровно как у Connect fan-out (правило 9, п. 2).
+// Индекс принимается для симметрии с остальными per-slot хелперами и для
+// читаемости call-site'а; на величину он не влияет.
+func keepaliveSlotDelay(idx int) time.Duration {
+	_ = idx
+	return time.Duration(rand.Float64() * float64(keepaliveSpreadMax))
+}
+
 func (p *WSPoolTransport) sendKeepaliveToAllSlots() {
 	sent := 0
 	for i, slot := range p.snapshotSlots() {
 		if slot == nil || slot.getState() != slotReady || slot.transport == nil || slot.session == nil {
+			continue
+		}
+		// Разнос по слотам: каждый кадр уходит со своей задержкой, поэтому на
+		// проводе нет синхронного burst'а. Спим ПЕРЕД записью, включая первый
+		// слот — иначе slot 0 остался бы якорем, а наблюдателю достаточно
+		// самого раннего кадра, чтобы увидеть шаблон.
+		//
+		// Прерываемся по ctx: без этого проход держал бы горутину до
+		// keepaliveSpreadMax на каждом слоте при остановке пула.
+		select {
+		case <-p.ctx.Done():
+			return
+		case <-time.After(keepaliveSlotDelay(i)):
+		}
+		// Состояние перечитывается ПОСЛЕ сна: за время разноса слот мог уйти в
+		// дренаж или умереть, и запись в него дала бы ложную ошибку в логе.
+		if slot.getState() != slotReady || slot.transport == nil || slot.session == nil {
 			continue
 		}
 		// Each slot has its own crypto session — must use slot.session, not global client session.
@@ -3401,7 +3445,8 @@ func (p *WSPoolTransport) reconnectLoopInner(idx int, fastFirstAttempt bool) {
 				Stats.HealingRetargetGaveUpTotal.Add(1)
 				return
 			}
-			if free := p.claimFreeCellForHealing(); free >= 0 {
+			free, skipReason := p.claimFreeCellForHealingWithReason()
+			if free >= 0 {
 				retargets++
 				p.log.Info("WS pool reconnect re-targeted — cell recycled by drain",
 					"slot", idx, "healing_on", free, "retargets", retargets)
@@ -3427,10 +3472,17 @@ func (p *WSPoolTransport) reconnectLoopInner(idx int, fastFirstAttempt bool) {
 				//     описывают ячейку, на которой поднимается соединение.
 				continue
 			}
-			// Свободных ячеек нет — значит недостачи тоже нет: все 2*poolSize
-			// заняты живыми или дренирующимися слотами. Отказ безопасен.
+			// Лечение не понадобилось. Причина различается и печатается как есть:
+			// «capacity already full» — ёмкость восполнена без нас (штатный и
+			// самый частый исход: в поле 2026-08-19 слот успел подключиться за
+			// 2 мс до этой строки, health показывал alive=8 при poolSize=8);
+			// «no free cell» — все 2*poolSize ячеек заняты живыми или
+			// дренирующимися слотами. Оба безопасны, но сливать их в один текст
+			// нельзя: первое читается как второе, то есть как деградация, и на
+			// этом чтении разбор 2026-08-19 едва не завёл ложную гипотезу о
+			// гонке claimFreeCellForHealing против claimFreeSlot.
 			p.log.Info("WS pool reconnect short-circuited — cell recycled by drain",
-				"slot", idx, "healing", "not needed (no free cell)")
+				"slot", idx, "healing", string(skipReason))
 			return
 		}
 
@@ -3478,7 +3530,8 @@ func (p *WSPoolTransport) reconnectLoopInner(idx int, fastFirstAttempt bool) {
 				Stats.HealingRetargetGaveUpTotal.Add(1)
 				return
 			}
-			if free := p.claimFreeCellForHealing(); free >= 0 {
+			free, skipReason := p.claimFreeCellForHealingWithReason()
+			if free >= 0 {
 				retargets++
 				p.log.Info("WS pool reconnect re-targeted — cell taken at install time",
 					"slot", idx, "healing_on", free, "retargets", retargets)
@@ -3487,7 +3540,7 @@ func (p *WSPoolTransport) reconnectLoopInner(idx int, fastFirstAttempt bool) {
 				continue
 			}
 			p.log.Info("WS pool reconnect short-circuited — cell taken at install time",
-				"slot", idx, "healing", "not needed (no free cell)")
+				"slot", idx, "healing", string(skipReason))
 			return
 		}
 
