@@ -1221,7 +1221,24 @@ func (c *Client) sendStreamAckThrottled(wst StreamTransport, streamID uint16, ac
 		c.streamAckLast = make(map[uint16]int64)
 	}
 	last, seen := c.streamAckLast[streamID]
-	if !forced && seen && nowNs-last < int64(streamAckThrottleInterval) {
+	// Окно ДЖИТТЕРОВАНО, а не постоянно. Гейт «не чаще раза в T от последней
+	// отправки» сам по себе не тикер, но при непрерывном насыщении (onFlush на
+	// каждый пришедший чанк) он пропускает ровно один ack за T, то есть даёт
+	// самосинхронизирующуюся линию 20 Гц с фазой от начала насыщения. Замер
+	// 2026-08-19 (TestStreamAck_ThrottleGridUnderSaturation): интервалы
+	// 50.0-52.2 мс, R@50мс = 0.4722 при шуме 0.2041.
+	//
+	// Джиттер сэмплируется на КАЖДОЙ проверке, поэтому окно не имеет постоянной
+	// величины и пропуски не ложатся на сетку. Константа
+	// streamAckThrottleInterval не менялась (hard rule 8) — она стала нижней
+	// границей диапазона [T, 1.5T).
+	//
+	// Коалесценция burst'а сохраняется: окно всегда >= T, то есть троттлинг не
+	// слабее прежнего. Это важнее, чем кажется — поток мелких ack-фреймов вместо
+	// одного хуже решётки для DPI-гигиены (см. докстринг константы).
+	window := int64(streamAckThrottleInterval)
+	window += int64(rand.Float64() * float64(streamAckThrottleInterval) / 2)
+	if !forced && seen && nowNs-last < window {
 		c.streamAckMu.Unlock()
 		return // coalesce: within the throttle window, skip this ack
 	}
