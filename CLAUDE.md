@@ -651,6 +651,16 @@ bash build-client.sh           # → $CLIENT_BIN_DIR (default ./bin = D:\shadowl
 
 ## Planned work
 
-1. **Embedded tun2socks** — сейчас внешний бинарь, встроить как Go-пакет.
+1. ~~**Embedded tun2socks**~~ — **СДЕЛАНО**: уже in-process Go-библиотека
+   (`github.com/xjasonlyu/tun2socks/v2`, `cmd/nixavpn-client/engine.go`).
+   Запись «сейчас внешний бинарь» устарела, проверено 2026-08-21.
+1a. **gomobile-обёртка** — пакета `mobile/` НЕТ, хотя README описывал сборку
+   `.aar`/`.xcframework` как готовую (исправлено 2026-08-21). `client/`
+   кросс-компилируется под `android/arm64` и `ios/arm64` без правок — ядро
+   готово, нужен плоский фасад: gomobile не экспортирует структуры по значению
+   и `context.Context`, а текущий API это `NewClient(ClientConfig)` +
+   `Connect(ctx)`. iOS отдельно блокирован лимитом памяти NetworkExtension
+   (~15 МБ против gvisor-стека) — архитектуру выбрать ДО начала работ.
+   Статус: `docs/plans/2026-08-21-native-readiness.md`.
 2. **NixaVPN integration** — deploy orchestrator, config assembler, admin handlers.
 3. **18-й раунд аудита** — многотрековый, с web-research (запрошен 2026-07-25).

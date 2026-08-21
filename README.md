@@ -121,11 +121,23 @@ sudo ./connect-system-vpn-linux.sh
 <details>
 <summary><b>Android / iOS</b></summary>
 
-Compiles to native libraries via `gomobile`:
-- **Android**: `.aar` → Kotlin/Java
-- **iOS**: `.xcframework` → Swift/ObjC
+⚠ **ROADMAP, не готовая возможность** (проверено 2026-08-21).
 
-No external tun2socks needed — uses native VPN APIs.
+Что уже есть: `client/` **кросс-компилируется** под `android/arm64` и
+`ios/arm64` без правок, tun2socks встроен как Go-библиотека (внешний бинарь не
+нужен).
+
+Чего ещё нет: пакета-обёртки под `gomobile` и build-скриптов. Текущий API
+(`NewClient(ClientConfig)`, `Connect(ctx)`) для биндинга непригоден напрямую —
+gomobile не экспортирует структуры по значению и `context.Context`, нужен
+плоский фасад.
+
+- **Android**: `.aar` → Kotlin/Java — путь чистый, блокеров нет
+- **iOS**: `.xcframework` → Swift/ObjC — есть архитектурный блокер: лимит
+  памяти NetworkExtension (~15 МБ) не вмещает gvisor-стек, архитектуру надо
+  выбрать до начала работ
+
+Статус и порядок работ — `docs/plans/2026-08-21-native-readiness.md`.
 </details>
 
 ### Config Example
@@ -242,8 +254,8 @@ shadowlink-client --import "sl://PUBKEY@host:port?tls=1&ws=1&auto=1" --save conf
 | **Windows** | `shadowlink-client.exe --config config.yaml` | `connect-system-vpn.bat` (администратор) |
 | **macOS** | `./connect-browser-mac.sh` | `sudo ./connect-system-vpn-mac.sh` |
 | **Linux** | `./shadowlink-client-linux --config config.yaml` | `sudo ./connect-system-vpn-linux.sh` |
-| **Android** | gomobile `.aar` | VpnService API |
-| **iOS** | gomobile `.xcframework` | NEPacketTunnelProvider |
+| **Android** | gomobile `.aar` — ⚠ roadmap, обёртки нет | VpnService API — ⚠ roadmap |
+| **iOS** | gomobile `.xcframework` — ⚠ roadmap, обёртки нет | NEPacketTunnelProvider — ⚠ roadmap + лимит памяти extension |
 
 ### Пример конфига
 
