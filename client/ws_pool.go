@@ -2853,6 +2853,42 @@ func (p *WSPoolTransport) nextKeepaliveDelay() time.Duration {
 // сам интервал. Сторож: TestKeepaliveSpread_NeverExtendsSilenceBeyondCutFloor.
 const keepaliveSpreadMax = 400 * time.Millisecond
 
+// keepaliveWantsState — получает ли слот в этом состоянии keepalive.
+//
+// slotReady — очевидно. slotDraining добавлен 2026-08-21 по полевому замеру
+// (лог nixavpn-DEBUG-20260820-121231, 10 ч 37 м): ВСЕ пять взрослых резов
+// (close 1006, возрасты 88.4-108.8 с) пришли в слоты, которые уже были в
+// дренаже, через 8.9-22.3 с после `drain started`, и в трёх случаях
+// last_write_age_ms составил 11.4 / 18.3 / 28.2 с — то есть выше порога реза по
+// тишине (10 с), под который настроен весь Bug #9. Дренируемый слот с малым
+// трафиком замолкал ровно в момент перехода и висел так до stickyMaxDrainAge
+// (25 с в поле) — то есть keepalive защищал слот всю его активную жизнь и
+// отпускал именно там, где до реза оставались секунды.
+//
+// ⚠ Дренаж это НЕ удерживает, и проверено это по коду, а не рассуждением:
+// решение «слот пуст, можно закрывать» принимается по lastWriteNs КАЖДОГО
+// СТРИМА (allStreamsIdle, stream_entry.go), а keepalive — кадр уровня слота,
+// он ни одного стрима не касается. Транспорт и async-writer при входе в дренаж
+// живы (закрытие только в tearDown), поэтому кадру есть куда уйти.
+//
+// ⚠ Цена на wire ограничена и это здесь главный сдерживающий довод (лишний
+// трафик к origin — P0-класс, policing по числу и частоте): дренаж занимает
+// 0.8 % слото-времени (замер: 2053 с из 259 200), а 90.7 % дренажей закрываются
+// на первом же тике с drain_duration=0s, то есть до keepalive не доживают.
+//
+// ⚠ Причинность «рез именно по тишине» НЕ доказана: возрасты этих слотов
+// (88-109 с) лежат в полосе, где hazard растёт и сам по себе, поэтому «рез по
+// тишине» и «рез по возрасту» этим замером не различаются. Правка снимает одно
+// из двух конкурирующих объяснений; проверка — уйдут ли резы в дренаже на
+// следующем полевом прогоне.
+//
+// Мёртвые состояния (slotDead, slotConnecting-placeholder) исключены намеренно:
+// запись туда дала бы ложную ошибку в логе, а на wire — кадр в закрытое
+// соединение. Сторож: TestKeepalive_ReachesDrainingSlots.
+func keepaliveWantsState(st slotState) bool {
+	return st == slotReady || st == slotDraining
+}
+
 // keepaliveSlotDelay возвращает задержку перед отправкой keepalive для слота idx.
 //
 // Равномерно на [0, keepaliveSpreadMax) и сэмплируется ЗАНОВО на каждом проходе.
@@ -2886,7 +2922,7 @@ func (p *WSPoolTransport) sendKeepaliveToAllSlots() {
 	}
 	queue := make([]pending, 0, len(slots))
 	for i, slot := range slots {
-		if slot == nil || slot.getState() != slotReady || slot.transport == nil || slot.session == nil {
+		if slot == nil || !keepaliveWantsState(slot.getState()) || slot.transport == nil || slot.session == nil {
 			continue
 		}
 		queue = append(queue, pending{idx: i, slot: slot, at: keepaliveSlotDelay(i)})
@@ -2911,9 +2947,10 @@ func (p *WSPoolTransport) sendKeepaliveToAllSlots() {
 			case <-time.After(wait):
 			}
 		}
-		// Состояние перечитывается ПОСЛЕ сна: за время разноса слот мог уйти в
-		// дренаж или умереть, и запись в него дала бы ложную ошибку в логе.
-		if slot.getState() != slotReady || slot.transport == nil || slot.session == nil {
+		// Состояние перечитывается ПОСЛЕ сна: за время разноса слот мог умереть,
+		// и запись в него дала бы ложную ошибку в логе. Уход в ДРЕНАЖ причиной
+		// пропуска больше не является — см. keepaliveWantsState.
+		if !keepaliveWantsState(slot.getState()) || slot.transport == nil || slot.session == nil {
 			continue
 		}
 		// Each slot has its own crypto session — must use slot.session, not global client session.
@@ -2935,7 +2972,26 @@ func (p *WSPoolTransport) sendKeepaliveToAllSlots() {
 		// «keepalive sent» читалось бы как «в этот момент ушли 8 кадров», что и
 		// есть класс дефекта «лог врёт о механизме» (правило про имена полей).
 		// Для фазового замера пригодны только SYN/FIN на проводе, не эта метка.
-		Trace("keepalive sent", "slots", sent, "spread_ms", keepaliveSpreadMax.Milliseconds())
+		//
+		// ⚠ Уровень DEBUG, а не Trace (правка 2026-08-21). На Trace эта строка
+		// была невидима в полевых прогонах (они идут с -log=debug), из-за чего
+		// разнос по слотам нельзя было ни подтвердить, ни опровергнуть замером:
+		// в логе 08-20 ноль строк `keepalive sent` и ни одного `spread_ms`.
+		// По собственному определению Trace (log.go) там живут per-chunk
+		// per-stream call-site'ы, а keepalive назван среди тех, кого хотят
+		// видеть на -log=debug. Строка одна на проход пула (раз в ~5 с), то есть
+		// корзину DEBUG она не топит.
+		//
+		// ⚠ `spread_ms` — ФАКТИЧЕСКАЯ длительность прохода, не константа окна.
+		// Печатать константу здесь было бы ровно тем дефектом, от которого
+		// предупреждает комментарий выше: величина «подтверждала» бы разнос,
+		// повторяя настройку вместо измерения — а именно кумулятивность прохода
+		// была P0 в первой версии правки, и по константе её не увидеть.
+		// `spread_cap_ms` оставлен рядом, чтобы факт был сравним с потолком.
+		p.log.Debug("keepalive sent",
+			"slots", sent,
+			"spread_ms", time.Since(start).Milliseconds(),
+			"spread_cap_ms", keepaliveSpreadMax.Milliseconds())
 	}
 }
 

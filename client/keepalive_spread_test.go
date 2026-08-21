@@ -181,6 +181,74 @@ func TestKeepaliveSpread_NeverExtendsSilenceBeyondCutFloor(t *testing.T) {
 	}
 }
 
+// TestKeepalive_ReachesDrainingSlots — слот в дренаже обязан получать keepalive.
+//
+// Полевой замер 2026-08-20 (лог nixavpn-DEBUG-20260820-121231, 10 ч 37 м): ВСЕ
+// пять взрослых резов (close 1006, возрасты 88.4-108.8 с) пришли в слоты,
+// находившиеся в дренаже, через 8.9-22.3 с после `drain started`, и в трёх
+// случаях `last_write_age_ms` был 11.4 / 18.3 / 28.2 с — то есть выше порога
+// реза по тишине (10 с), под которым весь Bug #9 и настроен.
+//
+// Причина: sendKeepaliveToAllSlots фильтровал по `getState() != slotReady`, а
+// дренируемый слот живёт после этого ещё до stickyMaxDrainAge (25 с в поле).
+// Слот с малым трафиком в дренаже замолкал ровно в момент перехода.
+//
+// ⚠ Почему это НЕ ломает дренаж (проверено по коду, а не предположено): дренаж
+// закрывается по `lastWriteNs` КАЖДОГО СТРИМА (allStreamsIdle, stream_entry.go),
+// а keepalive — кадр уровня слота, стримов он не касается. Транспорт при входе в
+// дренаж жив, закрытие только в tearDown, поэтому кадру есть куда уйти.
+//
+// ⚠ Сторож проверяет ВЛАСТЬ, а не зелёный цвет: считается фактический
+// controlWrites на стабе. Мёртвые состояния проверяются тем же проходом — иначе
+// «пишем всем подряд» тоже прошло бы тест.
+func TestKeepalive_ReachesDrainingSlots(t *testing.T) {
+	pool := NewWSPoolTransport(&Client{streamChans: make(map[uint16]chan []byte)},
+		WSPoolConfig{Size: 4, ServerAddr: "127.0.0.1:0"})
+	pool.ctx = context.Background()
+
+	// По одному слоту на каждое интересующее состояние. Полностью готовые
+	// (transport + session), иначе фильтр отсеет их ДО проверки состояния и тест
+	// измерит пустой проход — на этом уже наступали выше в этом файле.
+	states := []slotState{slotReady, slotDraining, slotDead, slotConnecting}
+	transports := make([]*countingTransport, len(states))
+	for i, st := range states {
+		ct := &countingTransport{}
+		transports[i] = ct
+		s := &poolSlot{index: i}
+		s.transport = ct
+		s.session = core.NewSession(uint32(i+1), make([]byte, 32), make([]byte, 32))
+		s.setState(st)
+		pool.slots[i] = s
+	}
+	for i := len(states); i < len(pool.slots); i++ {
+		pool.slots[i] = nil
+	}
+
+	pool.sendKeepaliveToAllSlots()
+
+	// slotReady — контроль предпосылки: если он не получил кадр, сломан сам
+	// проход, и вывод о дренаже был бы недействителен.
+	if transports[0].controlWrites == 0 {
+		t.Fatal("предпосылка сломана: slotReady не получил keepalive — " +
+			"проход не отработал, о дренаже судить нельзя")
+	}
+
+	if transports[1].controlWrites == 0 {
+		t.Error("слот в slotDraining НЕ получил keepalive: он молчит весь дренаж " +
+			"(до stickyMaxDrainAge = 25 с) при пороге реза по тишине 10 с — " +
+			"ровно тот путь, на котором в поле 2026-08-20 легли все 5 резов")
+	}
+
+	// Мёртвые состояния keepalive получать не должны: запись в них дала бы
+	// ложную ошибку в логе, а на wire — кадр в закрытое соединение.
+	for i, st := range []slotState{slotDead, slotConnecting} {
+		if got := transports[i+2].controlWrites; got != 0 {
+			t.Errorf("слот в состоянии %v получил %d keepalive-кадров, ожидалось 0 — "+
+				"фильтр состояний ослаблен слишком широко", st, got)
+		}
+	}
+}
+
 // keepaliveDelayCompensatesSpread — компенсирует ли nextKeepaliveDelay время
 // прохода. Проверяется поведением, а не чтением исходника: сравниваются
 // распределения паузы цикла и сырого сэмплера на одинаковом числе тяг.
