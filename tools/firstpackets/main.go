@@ -40,14 +40,14 @@ const (
 const firstN = 20
 
 type packet struct {
-	tsMicros  uint64
-	srcIP     [4]byte
-	dstIP     [4]byte
-	srcPort   uint16
-	dstPort   uint16
-	payload   int // байт TCP payload (без заголовков)
-	syn, fin  bool
-	rst       bool
+	tsMicros uint64
+	srcIP    [4]byte
+	dstIP    [4]byte
+	srcPort  uint16
+	dstPort  uint16
+	payload  int // байт TCP payload (без заголовков)
+	syn, fin bool
+	rst      bool
 }
 
 type flowKey struct {
@@ -65,6 +65,8 @@ func main() {
 		pcapPath = flag.String("pcap", "", "путь к pcapng от pktmon")
 		originIP = flag.String("origin", "104.222.177.67", "IP сервера")
 		verbose  = flag.Bool("v", false, "печатать каждый поток подробно")
+		phase    = flag.Bool("phase", false, "замер периодичности на проводе по SYN/FIN (vector strength)")
+		tick     = flag.Float64("tick", 0.5, "период тика для критерия R < 0.2, секунды")
 	)
 	flag.Parse()
 
@@ -91,6 +93,14 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "разбор pcapng: %v\n", err)
 		os.Exit(1)
+	}
+
+	// Режим фазы работает на СЫРЫХ пакетах, а не на потоках: SYN/FIN нужны
+	// все, включая соединения, которые groupFlows отбросил бы как неполные
+	// (например срезанные посредником — именно они и интересны).
+	if *phase {
+		reportPhase(packets, origin, *tick)
+		return
 	}
 
 	flows := groupFlows(packets, origin)
@@ -191,6 +201,11 @@ func parseEthernetIPv4TCP(d []byte, ts uint64) (packet, bool) {
 			// Возможно, сырой IPv4 без Ethernet-заголовка.
 			if d[0]>>4 == 4 {
 				ipOff = 0
+			} else if off, ok := dot11PayloadOffset(d); ok {
+				// 802.11 (Wi-Fi). pktmon на беспроводном адаптере пишет в IDB
+				// LinkType 1 (Ethernet), но кадры отдаёт 802.11 — поэтому
+				// попадаем сюда, а не в отдельную ветку по LinkType.
+				ipOff = off
 			} else {
 				return p, false
 			}
@@ -269,14 +284,14 @@ func groupFlows(packets []packet, origin [4]byte) []*flow {
 }
 
 type flowVerdict struct {
-	port          uint16
-	clientPkts    int
-	serverPkts    int
-	bigClientRun  int // максимальная серия подряд идущих клиентских пакетов >=411
-	bigClientTotal int
+	port            uint16
+	clientPkts      int
+	serverPkts      int
+	bigClientRun    int // максимальная серия подряд идущих клиентских пакетов >=411
+	bigClientTotal  int
 	serverMoreOften bool
-	triggers      bool
-	firstSizes    []int // размеры первых непустых пакетов, со знаком: + клиент, - сервер
+	triggers        bool
+	firstSizes      []int // размеры первых непустых пакетов, со знаком: + клиент, - сервер
 }
 
 func analyze(f *flow, origin [4]byte) flowVerdict {

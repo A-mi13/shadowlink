@@ -9,6 +9,7 @@ import (
 	"math"
 	mrand "math/rand"
 	"math/rand/v2"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2814,13 +2815,181 @@ func (p *WSPoolTransport) nextKeepaliveDelay() time.Duration {
 	if base <= 0 {
 		base = keepaliveDefaultBase
 	}
-	return JitteredIntervalLogNormal(base, keepaliveSigma)
+	d := JitteredIntervalLogNormal(base, keepaliveSigma)
+	// Проход sendKeepaliveToAllSlots занимает до keepaliveSpreadMax (разнос по
+	// слотам), и это время добавляется к паузе цикла. Без вычитания худшее
+	// молчание слота стало бы base*2 + keepaliveSpreadMax = 10.4 с при пороге
+	// реза по тишине 10 с (middleboxSilentCutFloor) — запас там нулевой, см.
+	// обоснование у keepaliveSpreadMax.
+	//
+	// Кламп по нижней границе сэмплера (base/2), а не по нулю: сокращать паузу
+	// ниже минимального интервала нельзя, это лишние кадры к origin.
+	if d -= keepaliveSpreadMax; d < base/2 {
+		d = base / 2
+	}
+	return d
+}
+
+// keepaliveSpreadMax — верхняя граница разноса keepalive по слотам.
+//
+// Зачем разнос: nextKeepaliveDelay джиттерует МОМЕНТ пробуждения, но не
+// распределяет кадры внутри прохода — до 2026-08-19 цикл писал всем 8 слотам
+// подряд, и на wire это синхронный burst 8 фреймов к одному origin в пределах
+// миллисекунд. Джиттер периода двигает такой burst целиком, то есть шаблон
+// «8 TLS-сессий оживают одновременно» сохраняется при любом джиттере периода.
+//
+// ⚠ **Разнос ВЫЧИТАЕТСЯ из интервала, а не добавляется к нему.** Первая версия
+// правки спала перед записью в каждый слот, то есть отодвигала кадры ПОЗЖЕ — и
+// это был дефект: запас до порога реза по тишине ровно нулевой. Худшее молчание
+// слота = `keepaliveBase*2` = 10 с (сэмплер усечён в [base/2, base*2]), а
+// `middleboxSilentCutFloor` = 10 с, то есть Bug #9 держится на равенстве без
+// зазора (поле: смерти при last_write_age_ms 10000-15000). Любая добавка сверху
+// выводит слот за порог: 400 мс дали бы 10.4 с. Поэтому цикл теперь спит ДО
+// прохода на `keepaliveSpreadMax - delay`, а сами кадры уходят раньше
+// номинального момента — молчание от этого только сокращается.
+//
+// 400 мс: заметно больше времени прохода цикла (микросекунды), иначе разнос не
+// наблюдаем; и много меньше минимального интервала 2.5 с, иначе сдвиг съедал бы
+// сам интервал. Сторож: TestKeepaliveSpread_NeverExtendsSilenceBeyondCutFloor.
+const keepaliveSpreadMax = 400 * time.Millisecond
+
+// middleboxSilentCutFloor — возраст тишины, начиная с которого посредник
+// считает соединение мёртвым и режет его.
+//
+// Величина ограничивает keepaliveSpreadMax и запас Bug #9 (см. комментарий
+// выше), поэтому объявлена здесь, рядом с тем, что она ограничивает.
+//
+// ⚠ Число НАБЛЮДАЕМОЕ, но НЕ доказанное как порог цензора, и правило 15
+// CLAUDE.md требует не выдавать одно за другое. Основание: в прогоне
+// 2026-08-20 три из пяти взрослых резов пришли при last_write_age_ms
+// 11.4 / 18.3 / 28.2 с, то есть выше 10 с; после правки keepalive в дренаже
+// (прогон 2026-08-21) тишина у всех резов упала до 4.3-5.6 с, а резы остались
+// — значит 10 с это НЕ единственная и, судя по всему, не действующая ось.
+// Верхняя граница «тишина ≤ 10 с» держится как консервативный инвариант
+// разноса, а не как измеренный порог.
+//
+// ⚠ До 2026-08-21 константа существовала ТОЛЬКО в ws_pool_keepalive_test.go,
+// из-за чего сторожа сравнивали продовую keepaliveSpreadMax с тестовой
+// величиной: изменить порог в проде было физически негде, а тест продолжал бы
+// проходить. Не возвращать объявление в _test.go.
+const middleboxSilentCutFloor = 10 * time.Second
+
+// keepaliveWantsState — получает ли слот в этом состоянии keepalive.
+//
+// slotReady — очевидно. slotDraining добавлен 2026-08-21 по полевому замеру
+// (лог nixavpn-DEBUG-20260820-121231, 10 ч 37 м): ВСЕ пять взрослых резов
+// (close 1006, возрасты 88.4-108.8 с) пришли в слоты, которые уже были в
+// дренаже, через 8.9-22.3 с после `drain started`, и в трёх случаях
+// last_write_age_ms составил 11.4 / 18.3 / 28.2 с — то есть выше порога реза по
+// тишине (10 с), под который настроен весь Bug #9. Дренируемый слот с малым
+// трафиком замолкал ровно в момент перехода и висел так до stickyMaxDrainAge
+// (25 с в поле) — то есть keepalive защищал слот всю его активную жизнь и
+// отпускал именно там, где до реза оставались секунды.
+//
+// ⚠ Дренаж это НЕ удерживает, и проверено это по коду, а не рассуждением:
+// решение «слот пуст, можно закрывать» принимается по lastWriteNs КАЖДОГО
+// СТРИМА (allStreamsIdle, stream_entry.go), а keepalive — кадр уровня слота,
+// он ни одного стрима не касается. Транспорт и async-writer при входе в дренаж
+// живы (закрытие только в tearDown), поэтому кадру есть куда уйти.
+//
+// ⚠ Цена на wire ограничена и это здесь главный сдерживающий довод (лишний
+// трафик к origin — P0-класс, policing по числу и частоте): дренаж занимает
+// 0.79 % слото-времени — 2053 с из 259 991, то есть (длина прогона минус два
+// зависания) × 8 слотов, — средняя занятость 0.063 слота, а 90.7 % дренажей
+// (3166 из 3490) закрываются на первом же тике с drain_duration=0s и до
+// keepalive не доживают. В кадрах это +39/ч против базовых 5760 (+0.67 %), и
+// это WS-фреймы в УЖЕ существующих соединениях, а не новые TLS к origin.
+//
+// ⚠ Знаменатель здесь обязан быть в слото-секундах, однородно числителю: делить
+// те же 2053 с на время прогона дало бы 5.38 %, но это ДРУГАЯ величина — доля
+// времени, когда дренирует хоть один слот. См. правило 15 в CLAUDE.md, там же
+// разобраны две ловушки при подсчёте самого числителя.
+//
+// ⚠ Причинность «рез именно по тишине» НЕ доказана: возрасты этих слотов
+// (88-109 с) лежат в полосе, где hazard растёт и сам по себе, поэтому «рез по
+// тишине» и «рез по возрасту» этим замером не различаются. Правка снимает одно
+// из двух конкурирующих объяснений; проверка — уйдут ли резы в дренаже на
+// следующем полевом прогоне.
+//
+// Мёртвые состояния (slotDead, slotConnecting-placeholder) исключены намеренно:
+// запись туда дала бы ложную ошибку в логе, а на wire — кадр в закрытое
+// соединение. Сторож: TestKeepalive_ReachesDrainingSlots.
+//
+// ⚠ **Отсюда следует запрет, который легко нарушить не глядя** (ревью
+// 2026-08-21): нельзя переносить sendSlotSessionFIN на ВХОД в дренаж, не сняв
+// сначала slotDraining из этого предиката. Сейчас порядок безопасен только
+// потому, что session-FIN зовётся из handleSlotDeath, то есть в самом конце
+// пути, прямо перед transport.Close(). Перенос FIN в startDrain — естественная
+// на вид оптимизация (сервер отпускал бы сессию на 25 с раньше) — заставил бы
+// keepalive лететь в сессию, которую сервер уже удалил из карты: кадр молча
+// дропается на AcceptSeqNum, защита от реза по тишине исчезает, а тесты
+// остаются зелёными, потому что стаб транспорта запись принимает.
+func keepaliveWantsState(st slotState) bool {
+	return st == slotReady || st == slotDraining
+}
+
+// keepaliveSlotDelay возвращает задержку перед отправкой keepalive для слота idx.
+//
+// Равномерно на [0, keepaliveSpreadMax) и сэмплируется ЗАНОВО на каждом проходе.
+// Намеренно НЕ функция индекса (idx*step): детерминированная лестница — это тот
+// же шаблон, только растянутый, ровно как у Connect fan-out (правило 9, п. 2).
+// Индекс принимается для симметрии с остальными per-slot хелперами и для
+// читаемости call-site'а; на величину он не влияет.
+func keepaliveSlotDelay(idx int) time.Duration {
+	_ = idx
+	return time.Duration(rand.Float64() * float64(keepaliveSpreadMax))
 }
 
 func (p *WSPoolTransport) sendKeepaliveToAllSlots() {
+	slots := p.snapshotSlots()
+
+	// Смещения считаются ЗАРАНЕЕ и сортируются, а сон идёт до АБСОЛЮТНЫХ
+	// моментов от начала прохода. Это принципиально: полное время прохода тогда
+	// ограничено keepaliveSpreadMax независимо от числа слотов.
+	//
+	// ⚠ Так сделано после ревью 2026-08-19, которое нашло P0 в первой версии.
+	// Там сон стоял внутри цикла (`keepaliveSpreadMax - delay` на каждом слоте),
+	// то есть был КУМУЛЯТИВНЫМ: проход стоил Σ по всем готовым слотам — замер
+	// дал mean 1.6 с и max 2.8 с при 8 слотах, а худшее молчание слота
+	// 12.4 с против порога реза по тишине 10 с (middleboxSilentCutFloor).
+	// «Компенсирующим» стало лишь одно слагаемое, а не структура прохода, и
+	// правка возвращала ровно тот Bug #9, от которого защищает.
+	type pending struct {
+		idx  int
+		slot *poolSlot
+		at   time.Duration // абсолютное смещение от начала прохода
+	}
+	queue := make([]pending, 0, len(slots))
+	for i, slot := range slots {
+		if slot == nil || !keepaliveWantsState(slot.getState()) || slot.transport == nil || slot.session == nil {
+			continue
+		}
+		queue = append(queue, pending{idx: i, slot: slot, at: keepaliveSlotDelay(i)})
+	}
+	sort.Slice(queue, func(a, b int) bool { return queue[a].at < queue[b].at })
+
+	start := time.Now()
 	sent := 0
-	for i, slot := range p.snapshotSlots() {
-		if slot == nil || slot.getState() != slotReady || slot.transport == nil || slot.session == nil {
+	for _, it := range queue {
+		i, slot := it.idx, it.slot
+		// Спим до момента `start + at`, а не на фиксированную величину: если
+		// предыдущая запись заняла время, оно вычитается из ожидания, и проход
+		// не растягивается. Первый слот тоже смещён — иначе он остался бы
+		// якорем burst'а, а наблюдателю достаточно самого раннего кадра.
+		//
+		// Прерываемся по ctx: без этого проход держал бы горутину до
+		// keepaliveSpreadMax при остановке пула.
+		if wait := it.at - time.Since(start); wait > 0 {
+			select {
+			case <-p.ctx.Done():
+				return
+			case <-time.After(wait):
+			}
+		}
+		// Состояние перечитывается ПОСЛЕ сна: за время разноса слот мог умереть,
+		// и запись в него дала бы ложную ошибку в логе. Уход в ДРЕНАЖ причиной
+		// пропуска больше не является — см. keepaliveWantsState.
+		if !keepaliveWantsState(slot.getState()) || slot.transport == nil || slot.session == nil {
 			continue
 		}
 		// Each slot has its own crypto session — must use slot.session, not global client session.
@@ -2836,7 +3005,32 @@ func (p *WSPoolTransport) sendKeepaliveToAllSlots() {
 		}
 	}
 	if sent > 0 {
-		Trace("keepalive sent", "slots", sent)
+		// ⚠ Метка этой строки — момент ЗАВЕРШЕНИЯ прохода, а не отправки кадров:
+		// с введением разноса они размазаны по окну keepaliveSpreadMax до неё.
+		// Печатается spread_ms, чтобы это было видно из самой строки — иначе
+		// «keepalive sent» читалось бы как «в этот момент ушли 8 кадров», что и
+		// есть класс дефекта «лог врёт о механизме» (правило про имена полей).
+		// Для фазового замера пригодны только SYN/FIN на проводе, не эта метка.
+		//
+		// ⚠ Уровень DEBUG, а не Trace (правка 2026-08-21). На Trace эта строка
+		// была невидима в полевых прогонах (они идут с -log=debug), из-за чего
+		// разнос по слотам нельзя было ни подтвердить, ни опровергнуть замером:
+		// в логе 08-20 ноль строк `keepalive sent` и ни одного `spread_ms`.
+		// По собственному определению Trace (log.go) там живут per-chunk
+		// per-stream call-site'ы, а keepalive назван среди тех, кого хотят
+		// видеть на -log=debug. Строка одна на проход пула (раз в ~5 с), то есть
+		// корзину DEBUG она не топит.
+		//
+		// ⚠ `spread_ms` — ФАКТИЧЕСКАЯ длительность прохода, не константа окна.
+		// Печатать константу здесь было бы ровно тем дефектом, от которого
+		// предупреждает комментарий выше: величина «подтверждала» бы разнос,
+		// повторяя настройку вместо измерения — а именно кумулятивность прохода
+		// была P0 в первой версии правки, и по константе её не увидеть.
+		// `spread_cap_ms` оставлен рядом, чтобы факт был сравним с потолком.
+		p.log.Debug("keepalive sent",
+			"slots", sent,
+			"spread_ms", time.Since(start).Milliseconds(),
+			"spread_cap_ms", keepaliveSpreadMax.Milliseconds())
 	}
 }
 
@@ -3047,6 +3241,18 @@ func (p *WSPoolTransport) connectSlot(ctx context.Context, idx int) error {
 	// from the slot's session — Bearer header is gone.
 	if err := wst.UpgradeToWS(slot.token, slot.session); err != nil {
 		slot.setState(slotDead)
+		// Close ОБЯЗАТЕЛЕН: wst уже несёт свой ConnManager, а тот при
+		// MinRotation > 0 безусловно поднял горутину startRotation
+		// (connmanager.go:124, ws_transport.go:99). До правки этот путь
+		// возвращал ошибку без Close, и горутина с log-normal таймером жила до
+		// конца процесса — её stopCh не закрывался никогда. В прогоне 094311
+		// таких отказов 41 за 8 ч, то есть 41 вечная горутина, каждая со своим
+		// CloseIdleConnections по таймеру. Найдено ревью 2026-08-18.
+		//
+		// Это единственный ранний выход ПОСЛЕ создания wst и ДО присваивания
+		// slot.transport, поэтому больше закрывать здесь нечего: на успешном
+		// пути владение переходит слоту (Close на :3800, :5073, :5234).
+		wst.Close()
 		return fmt.Errorf("slot %d: ws upgrade: %w", idx, err)
 	}
 
@@ -3389,7 +3595,8 @@ func (p *WSPoolTransport) reconnectLoopInner(idx int, fastFirstAttempt bool) {
 				Stats.HealingRetargetGaveUpTotal.Add(1)
 				return
 			}
-			if free := p.claimFreeCellForHealing(); free >= 0 {
+			free, skipReason := p.claimFreeCellForHealingWithReason()
+			if free >= 0 {
 				retargets++
 				p.log.Info("WS pool reconnect re-targeted — cell recycled by drain",
 					"slot", idx, "healing_on", free, "retargets", retargets)
@@ -3415,10 +3622,17 @@ func (p *WSPoolTransport) reconnectLoopInner(idx int, fastFirstAttempt bool) {
 				//     описывают ячейку, на которой поднимается соединение.
 				continue
 			}
-			// Свободных ячеек нет — значит недостачи тоже нет: все 2*poolSize
-			// заняты живыми или дренирующимися слотами. Отказ безопасен.
+			// Лечение не понадобилось. Причина различается и печатается как есть:
+			// «capacity already full» — ёмкость восполнена без нас (штатный и
+			// самый частый исход: в поле 2026-08-19 слот успел подключиться за
+			// 2 мс до этой строки, health показывал alive=8 при poolSize=8);
+			// «no free cell» — все 2*poolSize ячеек заняты живыми или
+			// дренирующимися слотами. Оба безопасны, но сливать их в один текст
+			// нельзя: первое читается как второе, то есть как деградация, и на
+			// этом чтении разбор 2026-08-19 едва не завёл ложную гипотезу о
+			// гонке claimFreeCellForHealing против claimFreeSlot.
 			p.log.Info("WS pool reconnect short-circuited — cell recycled by drain",
-				"slot", idx, "healing", "not needed (no free cell)")
+				"slot", idx, "healing", string(skipReason))
 			return
 		}
 
@@ -3466,7 +3680,8 @@ func (p *WSPoolTransport) reconnectLoopInner(idx int, fastFirstAttempt bool) {
 				Stats.HealingRetargetGaveUpTotal.Add(1)
 				return
 			}
-			if free := p.claimFreeCellForHealing(); free >= 0 {
+			free, skipReason := p.claimFreeCellForHealingWithReason()
+			if free >= 0 {
 				retargets++
 				p.log.Info("WS pool reconnect re-targeted — cell taken at install time",
 					"slot", idx, "healing_on", free, "retargets", retargets)
@@ -3475,7 +3690,7 @@ func (p *WSPoolTransport) reconnectLoopInner(idx int, fastFirstAttempt bool) {
 				continue
 			}
 			p.log.Info("WS pool reconnect short-circuited — cell taken at install time",
-				"slot", idx, "healing", "not needed (no free cell)")
+				"slot", idx, "healing", string(skipReason))
 			return
 		}
 

@@ -18,11 +18,10 @@ import (
 // These tests pin the invariant: the worst-case keepalive silence window
 // (base*2) must stay at or under the middlebox silent-cut threshold.
 
-// middleboxSilentCutFloor is the empirically-observed lower bound of the
-// direct-mode silent-cut window (Bug #9 field log: deaths at
-// last_write_age_ms 10000-15000). The keepalive max gap must not exceed this,
-// or a quiet slot can be reaped before the next keepalive lands.
-const middleboxSilentCutFloor = 10 * time.Second
+// middleboxSilentCutFloor объявлена в ws_pool.go рядом с keepaliveSpreadMax,
+// которую она ограничивает. Здесь её быть не должно: пока константа жила в
+// _test.go, сторожа сравнивали продовую величину с тестовой, то есть менять
+// порог в проде было негде.
 
 // TestKeepalive_DefaultBaseUnderMiddleboxCut is the RED test for Bug #9:
 // with the default config the keepalive max silence window (base*2 from the
