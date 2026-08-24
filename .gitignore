@@ -58,3 +58,7 @@ leakguard-state.json
 
 # Windows DLL
 wintun.dll
+
+# Agent worktrees (временные копии репозитория; убираются автоматически,
+# но правило страхует от `git add .` в момент, когда агент ещё работает)
+.claude/worktrees/
