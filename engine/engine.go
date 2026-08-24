@@ -46,6 +46,13 @@ type ShadowLinkEngine struct {
 }
 
 func NewShadowLinkEngine(cfg *Config) (*ShadowLinkEngine, error) {
+	// Конструктор разыменовывает cfg сразу, поэтому nil здесь — паника, а не
+	// отложенная ошибка на Connect. Сигнатура уже возвращает error; вернуть его
+	// дешевле, чем ронять вызывающего, тем более что у мобильного фасада
+	// конфиг приходит с другой стороны языковой границы.
+	if cfg == nil {
+		return nil, fmt.Errorf("engine: config is nil")
+	}
 	return &ShadowLinkEngine{
 		socksAddr: cfg.SOCKS,
 		cfg:       cfg,

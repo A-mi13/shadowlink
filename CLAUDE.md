@@ -137,9 +137,9 @@ Steganographic VPN. Go 1.25, `module github.com/nixavpn/shadowlink`. Отдел�
       ⚠ **Но «мёртвый код» — формулировка сильнее данных** (ревью 2026-08-18).
       Есть ТРИ конфигурации, где 20-мс циклы живые и это основной режим:
       (а) весь блок создания WS-транспорта под гейтом
-      `if e.cfg.SystemVPN || slCfg.WebSocket` (`engine_shadowlink.go:220`) —
+      `if e.cfg.SystemVPN || slCfg.WebSocket` (`engine/engine.go:220`) —
       клиент как обычный SOCKS5-прокси без `websocket: true` даёт `WST == nil`;
-      (б) стартовый fallback `engine_shadowlink.go:619-628`: при `!poolOK &&
+      (б) стартовый fallback `engine/engine.go:619-628`: при `!poolOK &&
       !SystemVPN` пробуется single WS, и при неудаче — буквально
       `Warn("Single WS не удался, используем poll-mode")`, то есть fallback
       существует, просто на этапе установления, а не при деградации;

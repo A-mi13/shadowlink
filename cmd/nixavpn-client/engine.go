@@ -16,6 +16,8 @@ import (
 // артефакт. Поля перечислены явно, чтобы добавление нового в CLI не протекало
 // в движок молча.
 func toEngineConfig(cfg *Config) *engine.Config {
+	// nil пробрасывается как nil: NewShadowLinkEngine отвергает его ошибкой,
+	// поэтому глушить случай здесь нечем и не нужно.
 	if cfg == nil {
 		return nil
 	}
@@ -63,11 +65,15 @@ type ErrorSignaller interface {
 // перенос в другой пакет), сборка упадёт здесь, а не деградирует молча в main.
 var _ ErrorSignaller = (*engine.ShadowLinkEngine)(nil)
 
-// Те же compile-time проверки для остальных интерфейсов, через которые main
-// работает с движком. Без них перенос движка в отдельный пакет мог бы тихо
-// разорвать связь: обе точки в main.go — type assertion с comma-ok, то есть
-// промах даёт не ошибку сборки, а молчаливое отключение функциональности
-// (W8-контур и in-process dialer соответственно).
+// InProcessDialerProvider проверяется по той же причине, что и ErrorSignaller:
+// main.go берёт его через type assertion с comma-ok (main.go:241), поэтому
+// промах отключил бы in-process dialer молча — TUN-трафик пошёл бы через
+// loopback-сокет, чего Bug #5 как раз и избегает.
+//
+// Engine в этом списке — сторож-ТАВТОЛОГИЯ, и это осознанно (ревью 2026-08-24
+// проверило удалением строки): NewEngine ниже возвращает Engine, поэтому
+// присваиваемость уже проверяется компилятором на return. Строка оставлена как
+// декларация намерения, но новой информации не несёт — не считать её защитой.
 var (
 	_ Engine                  = (*engine.ShadowLinkEngine)(nil)
 	_ InProcessDialerProvider = (*engine.ShadowLinkEngine)(nil)
