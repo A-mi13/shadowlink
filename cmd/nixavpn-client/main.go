@@ -375,8 +375,8 @@ func main() {
 
 	// W8: also watch for engine crash (WS reconnect exhausted, SOCKS5 died, etc.)
 	var engineErr <-chan error
-	if slEng, ok := eng.(*ShadowLinkEngine); ok {
-		engineErr = slEng.ErrorCh()
+	if sig, ok := eng.(ErrorSignaller); ok {
+		engineErr = sig.ErrorCh()
 	}
 
 	select {

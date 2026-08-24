@@ -62,17 +62,17 @@ func TestStickyDrainBudget_DefaultDerivedFromMeasurement(t *testing.T) {
 	}
 }
 
-// Дефолт не должен дублироваться литералом в cmd/ — раньше там лежала вторая
+// Дефолт не должен дублироваться литералом в engine/ — раньше там лежала вторая
 // копия 10m, и правка в одном месте не затрагивала другое.
 func TestStickyDrainBudget_SingleSourceOfDefault(t *testing.T) {
-	src, err := os.ReadFile("../cmd/nixavpn-client/engine_shadowlink.go")
+	src, err := os.ReadFile("../engine/engine.go")
 	if err != nil {
-		t.Fatalf("не прочитан engine_shadowlink.go: %v", err)
+		t.Fatalf("не прочитан engine/engine.go: %v", err)
 	}
 	code := string(src)
 
 	if !strings.Contains(code, "client.DefaultStickyMaxDrainAge") {
-		t.Error("cmd/ не ссылается на client.DefaultStickyMaxDrainAge — " +
+		t.Error("engine/ не ссылается на client.DefaultStickyMaxDrainAge — " +
 			"дефолт снова задублирован")
 	}
 	// Литерал 10*time.Minute рядом с STICKY означает возврат старого дубля.
@@ -182,10 +182,10 @@ func TestStickyDrainBudget_HardCapNotBelowSticky(t *testing.T) {
 // удовлетворять тому же условию. Этот тест не скипается никогда — именно тихий
 // скип .bat-сторожей позволил дефекту дожить до полевого замера.
 func TestStickyDrainBudget_DefaultsSatisfyStickyReachability(t *testing.T) {
-	// Дефолт hard_cap берётся из cmd/, дефолт sticky — из client/.
-	src, err := os.ReadFile("../cmd/nixavpn-client/engine_shadowlink.go")
+	// Дефолт hard_cap берётся из engine/, дефолт sticky — из client/.
+	src, err := os.ReadFile("../engine/engine.go")
 	if err != nil {
-		t.Fatalf("не прочитан engine_shadowlink.go: %v", err)
+		t.Fatalf("не прочитан engine/engine.go: %v", err)
 	}
 	hardCapDefault := defaultDurationForEnv(string(src), "SHADOWLINK_DRAIN_HARD_CAP")
 	if hardCapDefault == 0 {
@@ -201,7 +201,7 @@ func TestStickyDrainBudget_DefaultsSatisfyStickyReachability(t *testing.T) {
 }
 
 // defaultDurationForEnv достаёт литерал длительности из окрестности упоминания
-// env-ключа в исходнике cmd/ (там дефолты задаются рядом с чтением env).
+// env-ключа в исходнике engine/ (там дефолты задаются рядом с чтением env).
 func defaultDurationForEnv(code, key string) time.Duration {
 	i := strings.Index(code, key)
 	if i < 0 {
