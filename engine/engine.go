@@ -53,6 +53,14 @@ type ShadowLinkEngine struct {
 	// one instantly instead of paying the ~250ms TCP+TLS+WS-upgrade cost.
 	readyPool *client.WSReadyPool
 
+	// pool публикует поднятый WS-пул для наблюдателей здоровья (ReadySlots).
+	// Пишется один раз, при успешном Connect пула; nil в остальных режимах.
+	//
+	// Отдельное поле, а не чтение stream под streamMu: наблюдателю здоровья
+	// нужен дешёвый неблокирующий доступ (его зовут из UI-потока мобильного
+	// клиента), а stream перезаписывается на каждом реконнекте.
+	pool atomic.Pointer[client.WSPoolTransport]
+
 	// Download stream coordination: poll pauses when download stream is active.
 	downloadActive atomic.Bool
 	streamCtx      context.Context // stored for deferred download stream start
@@ -166,8 +174,20 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) (retErr error) {
 	// legacy v0 handshake. Раньше тут было []byte("nixavpn-client") = 14 bytes,
 	// что роняло handshake на server retire'нувшем v0. Генерируем UUIDv4 per-process;
 	// сервер в open-mode (authorized_clients пуст) принимает любой UUID.
-	u := uuid.New()
-	clientID := u[:]
+	// Вызывающий может передать свой ID (Config.ClientID): у мобильного клиента
+	// процесс переживает десятки подключений, и UUID на каждый Connect означал бы
+	// новую идентичность при каждом выходе из фона. ID остаётся НЕПРОЗРАЧНЫМ —
+	// движок его не интерпретирует; предсказуемые (аккаунтные) ID требуют правки
+	// handshake (§4.4 спеки) и здесь не подразумеваются.
+	clientID := e.cfg.ClientID
+	if len(clientID) != 16 {
+		if len(clientID) != 0 {
+			slog.Warn("engine: ClientID не 16 байт — игнорирую, генерирую UUID",
+				"len", len(clientID))
+		}
+		u := uuid.New()
+		clientID = u[:]
+	}
 
 	clientCfg := client.ClientConfig{
 		ServerAddr:   slCfg.Server,
@@ -176,6 +196,10 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) (retErr error) {
 		UseTLS:       slCfg.TLS,
 		CDNDomain:    slCfg.CDN,
 		ECHEnabled:   slCfg.ECH,
+		// Пустая строка = не персистить (поведение CLI). Мобильный фасад сюда
+		// передаёт системный каталог: без него профиль отпечатка выбирается
+		// заново на каждый старт, а дрейф отпечатка — это сигнал (hard rule 2).
+		FPCacheDir: e.cfg.StateDir,
 	}
 	// Resolve full-direct mode parameters. Two URL inputs activate it:
 	//   1. Explicit ?sni=<domain> + Server=<IP:port> — caller knew enough to
@@ -647,6 +671,8 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) (retErr error) {
 					pool.Close()
 				} else {
 					e.setStream(pool)
+					// Публикуем пул для наблюдателей здоровья (ReadySlots).
+					e.pool.Store(pool)
 					e.spawnStreamReader(ctx2)
 					slog.Info("WS Pool подключён",
 						"slots", pool.HealthySlots(),
@@ -903,6 +929,34 @@ func (e *ShadowLinkEngine) StartDownloadStream() {
 
 func (e *ShadowLinkEngine) SOCKSAddr() string { return e.socksAddr }
 func (e *ShadowLinkEngine) Name() string      { return "shadowlink" }
+
+// SOCKSListenAddr возвращает ФАКТИЧЕСКИЙ адрес листенера SOCKS5 или nil, пока
+// его нет.
+//
+// Отличие от SOCKSAddr() существенно и ради него метод и заведён: тот отдаёт
+// строку из конфига, а вызывающий может передать порт 0 ("127.0.0.1:0") —
+// единственный безопасный вариант на телефоне, где 1080 может быть занят
+// другим VPN-приложением. Узнать выбранный ядром порт можно только у листенера.
+func (e *ShadowLinkEngine) SOCKSListenAddr() net.Addr {
+	if e.socks == nil {
+		return nil
+	}
+	return e.socks.ListenAddr()
+}
+
+// ReadySlots возвращает число готовых слотов WS-пула, или -1 если транспорт не
+// пуловый либо ещё не поднят.
+//
+// Нужен потребителю, который показывает здоровье туннеля: SOCKS5-порт
+// продолжает принимать соединения и при мёртвом пуле, поэтому «сессия жива»
+// без этой величины наблюдаемостью не является (§4.8.2 спеки — в прод-режиме
+// ErrorCh не сигналит вовсе).
+func (e *ShadowLinkEngine) ReadySlots() int {
+	if p := e.pool.Load(); p != nil {
+		return p.HealthySlots()
+	}
+	return -1
+}
 
 // InProcessDialer returns the in-process tun2socks dialer (Bug #5), tunnelling
 // TUN traffic over the WS transport without a loopback SOCKS5 socket — which
