@@ -1149,7 +1149,7 @@ func TestPoolSlot_ByteBudgetStableWithinSession(t *testing.T) {
 // Why this test exists separately from _StableWithinSession: that one
 // checks the field is stable AFTER write. This one checks the WRITE
 // side — that Sample → Store → Load round-trip is lossless and that a
-// production code path (engine_shadowlink direct mode: 8 MiB base, 8
+// production code path (engine/engine.go direct mode: 8 MiB base, 8
 // slots) produces non-zero budgets for every slot.
 func TestConnectSlot_ByteBudgetSetExactlyOnce(t *testing.T) {
 	pool := &WSPoolTransport{

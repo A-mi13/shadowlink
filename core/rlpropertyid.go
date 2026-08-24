@@ -40,7 +40,7 @@ import (
 // its own Host, the client knows the SNI/host it dialled. Both call this with
 // the same normalised host and get the same string. Note that a shared X25519
 // pubkey does NOT work as input — backup endpoints deliberately share one key
-// (cmd/nixavpn-client/engine_shadowlink.go), so keying on it would hand several
+// (engine/engine.go), so keying on it would hand several
 // hosts the same identifier and rebuild the very problem this removes.
 //
 // Host normalisation: lowercased, port stripped, trailing dot stripped. An
