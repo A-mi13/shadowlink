@@ -121,11 +121,14 @@ sudo ./connect-system-vpn-linux.sh
 <details>
 <summary><b>Android / iOS</b></summary>
 
-⚠ **ROADMAP, не готовая возможность** (проверено 2026-08-21).
+**Go-ядро готово, нативные приложения — нет** (статус на 2026-08-24).
 
-Что уже есть: `client/` **кросс-компилируется** под `android/arm64` и
-`ios/arm64` без правок, tun2socks встроен как Go-библиотека (внешний бинарь не
-нужен).
+Что есть: `client/` кросс-компилируется под `android/arm64` и `ios/arm64`,
+tun2socks встроен как Go-библиотека (внешний бинарь не нужен), пакет `mobile/`
+даёт gomobile-фасад, `.aar` собирается.
+
+Чего нет: самих приложений — `VpnService` (Android) и `NEPacketTunnelProvider`
+(iOS) должны быть написаны нативными командами поверх SDK.
 
 **Пакет `mobile/` есть с 2026-08-24** — плоский фасад над `engine/`, пригодный
 для `gomobile`: `Session` с `Start`/`Stop`/`State`/`SocksPort`/`NetworkChanged`,
@@ -145,9 +148,14 @@ gomobile bind -androidapi 21 -target=android/arm64 -o shadowlink.aar ./mobile/
   «~15 МБ» — лимит другого provider'а, ошибка исправлена 2026-08-24). Влезает ли
   туда пул из 8 слотов — **не измерено**.
 
-Дизайн, оговорки и открытые вопросы —
-`docs/superpowers/specs/2026-08-24-mobile-facade-design.md`;
-статус платформ — `docs/plans/2026-08-21-native-readiness.md`.
+**Документация для нативных команд — `docs/integration/mobile-sdk.md`**
+(English): quick start на Kotlin, полный API, контракт колбэков, что нативка
+обязана реализовать сама (защита DNS, `networkChanged()`, персист ClientID),
+сборка `.aar`, troubleshooting.
+
+Дизайн и обоснования — `docs/superpowers/specs/2026-08-24-mobile-facade-design.md`
+(⚠ документ проектирования, не описание текущего кода); статус платформ —
+`docs/plans/2026-08-21-native-readiness.md`.
 </details>
 
 ### Config Example
