@@ -127,17 +127,27 @@ sudo ./connect-system-vpn-linux.sh
 `ios/arm64` без правок, tun2socks встроен как Go-библиотека (внешний бинарь не
 нужен).
 
-Чего ещё нет: пакета-обёртки под `gomobile` и build-скриптов. Текущий API
-(`NewClient(ClientConfig)`, `Connect(ctx)`) для биндинга непригоден напрямую —
-gomobile не экспортирует структуры по значению и `context.Context`, нужен
-плоский фасад.
+**Пакет `mobile/` есть с 2026-08-24** — плоский фасад над `engine/`, пригодный
+для `gomobile`: `Session` с `Start`/`Stop`/`State`/`SocksPort`/`NetworkChanged`,
+интерфейсы `Logger` и `EventHandler` для колбэков в платформу.
 
-- **Android**: `.aar` → Kotlin/Java — путь чистый, блокеров нет
-- **iOS**: `.xcframework` → Swift/ObjC — есть архитектурный блокер: лимит
-  памяти NetworkExtension (~15 МБ) не вмещает gvisor-стек, архитектуру надо
-  выбрать до начала работ
+```bash
+gomobile bind -androidapi 21 -target=android/arm64 -o shadowlink.aar ./mobile/
+```
 
-Статус и порядок работ — `docs/plans/2026-08-21-native-readiness.md`.
+- **Android** — `.aar` **собирается** (проверено: 9.18 МиБ, Java-API совпадает
+  со спекой). Нативке отдаётся SOCKS5 на `127.0.0.1` со случайным портом и
+  сгенерированными credentials; что с ним делать — `VpnService` + tun2socks или
+  иначе — решает платформа.
+- **iOS** — `client/` и `engine/` кросс-компилируются под `ios/arm64`, но
+  `.xcframework` требует Xcode/macOS, поэтому `gobind` под iOS **не проверен**.
+  ⚠ Про лимит памяти: 50 MiB у `NEPacketTunnelProvider` с iOS 15 (прежние
+  «~15 МБ» — лимит другого provider'а, ошибка исправлена 2026-08-24). Влезает ли
+  туда пул из 8 слотов — **не измерено**.
+
+Дизайн, оговорки и открытые вопросы —
+`docs/superpowers/specs/2026-08-24-mobile-facade-design.md`;
+статус платформ — `docs/plans/2026-08-21-native-readiness.md`.
 </details>
 
 ### Config Example
@@ -254,8 +264,8 @@ shadowlink-client --import "sl://PUBKEY@host:port?tls=1&ws=1&auto=1" --save conf
 | **Windows** | `shadowlink-client.exe --config config.yaml` | `connect-system-vpn.bat` (администратор) |
 | **macOS** | `./connect-browser-mac.sh` | `sudo ./connect-system-vpn-mac.sh` |
 | **Linux** | `./shadowlink-client-linux --config config.yaml` | `sudo ./connect-system-vpn-linux.sh` |
-| **Android** | gomobile `.aar` — ⚠ roadmap, обёртки нет | VpnService API — ⚠ roadmap |
-| **iOS** | gomobile `.xcframework` — ⚠ roadmap, обёртки нет | NEPacketTunnelProvider — ⚠ roadmap + лимит памяти extension |
+| **Android** | gomobile `.aar` — ✅ собирается (`./mobile/`) | VpnService API — ⚠ нативная часть не написана |
+| **iOS** | `.xcframework` — ⚠ нужен Xcode/macOS, `gobind` не проверен | NEPacketTunnelProvider — ⚠ бюджет памяти 50 MiB не измерен |
 
 ### Пример конфига
 

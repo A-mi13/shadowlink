@@ -673,12 +673,21 @@ origin. В workflow стоит guard-шаг, проверяющий это по 
 1. ~~**Embedded tun2socks**~~ — **СДЕЛАНО**: уже in-process Go-библиотека
    (`github.com/xjasonlyu/tun2socks/v2`, `cmd/nixavpn-client/engine.go`).
    Запись «сейчас внешний бинарь» устарела, проверено 2026-08-21.
-1a. **gomobile-обёртка** — пакета `mobile/` НЕТ, хотя README описывал сборку
-   `.aar`/`.xcframework` как готовую (исправлено 2026-08-21). `client/`
-   кросс-компилируется под `android/arm64` и `ios/arm64` без правок — ядро
-   готово, нужен плоский фасад: gomobile не экспортирует структуры по значению
-   и `context.Context`, а текущий API это `NewClient(ClientConfig)` +
-   `Connect(ctx)`.
+1a. ~~**gomobile-обёртка**~~ — **СДЕЛАНО 2026-08-24**: пакет `mobile/` есть,
+   `.aar` собирается (9.18 МиБ, Java-API сверен через `javap`). Движок вынесен
+   из `package main` в `engine/`; фасад отдаёт нативке SOCKS5 на `127.0.0.1:0`
+   со сгенерированными credentials.
+   ⚠ **Что НЕ сделано, чтобы это не читалось как «готово к релизу»:**
+   `.xcframework` с Windows собрать нельзя (нужен Xcode/macOS) — для iOS
+   подтверждена только кросс-компиляция, `gobind` не проверен; нативные части
+   (VpnService / NEPacketTunnelProvider) не написаны; влезает ли пул из 8 слотов
+   в 50 MiB бюджета iOS — **не измерено**; SystemVPN-путь десктопа после
+   рефакторинга проверен только статически (автотестами он не покрывается —
+   нужны админские права и TUN).
+   ⚠ Порог размера `.aar` до сборки задан не был → 9.18 МиБ это baseline для
+   сравнения, а не пройденная проверка.
+   Дизайн и открытые вопросы —
+   `docs/superpowers/specs/2026-08-24-mobile-facade-design.md`.
    ⚠ **«iOS блокирован лимитом ~15 МБ» — было НЕВЕРНО ПО ЧИСЛУ** (проверено
    2026-08-24 по источникам). 15 MiB — лимит `NEAppProxyProvider` и
    `NEDNSProxyProvider`; у **`NEPacketTunnelProvider` с iOS 15 — 50 MiB**
