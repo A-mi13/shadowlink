@@ -120,7 +120,8 @@ func TestDownlinkExit_WakesUplinkInCircuit(t *testing.T) {
 	downlinkPayload := []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
 	tr := newCloseOnWriteTransport(cl, downlinkPayload)
 
-	srv := &Server{Client: cl, WST: tr}
+	srv := &Server{Client: cl}
+	srv.SetWST(tr)
 	engineCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -179,7 +180,8 @@ func TestLoopback_EarlyDownlinkClose_NoIdleGraceWait(t *testing.T) {
 	downlinkPayload := []byte("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
 	tr := newCloseOnWriteTransport(cl, downlinkPayload)
 
-	srv := &Server{Client: cl, WST: tr}
+	srv := &Server{Client: cl}
+	srv.SetWST(tr)
 	engineCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 

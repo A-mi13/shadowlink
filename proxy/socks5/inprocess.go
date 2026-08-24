@@ -50,12 +50,17 @@ type inProcessDialer struct {
 func newInProcessDialer(engineCtx context.Context, srv *Server) *inProcessDialer {
 	d := &inProcessDialer{engineCtx: engineCtx, srv: srv}
 	d.runRelay = func(ctx context.Context, conn net.Conn, destAddr string) {
+		// Транспорт берётся ПО ВЫЗОВУ, а не защёлкивается в замыкании: диалер
+		// живёт весь сеанс, а транспорт переставляется реконнектом. Захват
+		// значения здесь означал бы релей в закрытый WS после первого же
+		// переподключения.
+		wst := srv.WST()
 		// socks5Replies=false: tun2socks established the flow itself and expects
 		// the memConn to carry ONLY raw application bytes. Writing SOCKS5 reply
 		// framing here would prepend `05 00 00 01 ...` to the downlink and
 		// corrupt the first read (tls handshake / garbage). A failed CONNECT is
 		// instead signalled by the relay returning → memConn close → app EOF.
-		tunnelTCPStream(ctx, conn, srv.Client, srv.WST, destAddr, srv, false)
+		tunnelTCPStream(ctx, conn, srv.Client, wst, destAddr, srv, false)
 	}
 	return d
 }
@@ -91,11 +96,17 @@ func (d *inProcessDialer) DialContext(_ context.Context, m *M.Metadata) (net.Con
 // UnregisterStream) on Close — critical under DNS bursts where many short-lived
 // 5-tuples would otherwise leak server stream slots (review HIGH-3).
 func (d *inProcessDialer) DialUDP(m *M.Metadata) (net.PacketConn, error) {
-	if d.srv == nil || d.srv.Client == nil || d.srv.WST == nil {
+	if d.srv == nil || d.srv.Client == nil {
 		return nil, fmt.Errorf("in-process dialer: transport not ready")
 	}
 	cl := d.srv.Client
-	wst := d.srv.WST
+	// Один снимок на весь вызов: проверка на nil и последующее использование
+	// обязаны говорить об одном и том же объекте, иначе реконнект между ними
+	// даёт nil-разыменование в send/cleanup замыканиях ниже.
+	wst := d.srv.WST()
+	if wst == nil {
+		return nil, fmt.Errorf("in-process dialer: transport not ready")
+	}
 
 	// PoolReadiness gate (review HIGH-3 / CLAUDE.md C12 F6): refuse UDP when the
 	// WS pool has too few ready slots, so a UDP stream doesn't bind to a slot

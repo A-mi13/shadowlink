@@ -121,7 +121,8 @@ func TestInProcessDialer_DownlinkReachesAppConn(t *testing.T) {
 	wantDownlink := []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
 	echo := newEchoTransport(cl, wantDownlink)
 
-	srv := &Server{Client: cl, WST: echo}
+	srv := &Server{Client: cl}
+	srv.SetWST(echo)
 
 	engineCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()

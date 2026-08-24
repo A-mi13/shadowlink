@@ -107,7 +107,8 @@ func TestInProcess_KeepAliveSurvivesIdleGrace(t *testing.T) {
 	wantDownlink := []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
 	echo := &keepAliveEchoTransport{cl: cl, downlink: wantDownlink, delay: 400 * time.Millisecond}
 
-	srv := &Server{Client: cl, WST: echo}
+	srv := &Server{Client: cl}
+	srv.SetWST(echo)
 
 	engineCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -148,7 +149,8 @@ func TestInProcess_FullCloseTerminatesStream(t *testing.T) {
 	// end the stream is the app's full Close.
 	echo := &keepAliveEchoTransport{cl: cl, downlink: nil, delay: time.Hour}
 
-	srv := &Server{Client: cl, WST: echo}
+	srv := &Server{Client: cl}
+	srv.SetWST(echo)
 
 	engineCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()

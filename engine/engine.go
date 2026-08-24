@@ -22,17 +22,30 @@ import (
 
 type ShadowLinkEngine struct {
 	cl        *client.Client
-	stream    client.StreamTransport // WebSocketTransport or SplitTransport
 	socks     *socks5.Server
 	socksAddr string
 	cfg       *Config
 	cancel    context.CancelFunc
 	engineCtx context.Context // long-lived engine ctx; relay lifetime for in-process dialer (Bug #5)
 
+	// streamMu защищает stream. Транспорт переставляется на лету из
+	// streamReaderLoop (реконнект одиночного WS), а читается из Close() и
+	// InProcessDialer() — другие горутины. Без лока Close() мог закрыть СТАРЫЙ
+	// транспорт, а новый оставался висеть: утечка TLS-соединения к origin, а это
+	// P0-класс по модели угроз (policing по числу соединений).
+	streamMu sync.Mutex
+	stream   client.StreamTransport // WebSocketTransport or SplitTransport
+
 	// W8: error channel — signals main loop when engine dies
-	errCh         chan error
-	once          sync.Once
-	pollWG        sync.WaitGroup   // tracks poll worker goroutines for clean shutdown
+	errCh  chan error
+	once   sync.Once
+	pollWG sync.WaitGroup // tracks poll worker goroutines for clean shutdown
+	// streamWG считает горутины streamReaderLoop. ОТДЕЛЬНО от pollWG намеренно:
+	// ждать их в одной точке нельзя. pollWG.Wait() стоит ДО socks.Close(), а
+	// stream-ридер в момент останова может висеть внутри UpgradeToWebSocket до
+	// HandshakeTimeout (10 с) — ожидание там заблокировало бы закрытие SOCKS5 на
+	// всё это время. Поэтому streamWG ждётся ПОСЛЕ socks.Close() и с таймаутом.
+	streamWG      sync.WaitGroup
 	pollTransport client.Transport // dedicated transport for polls (separate from CONNECTs)
 
 	// Pre-warmed WS pool for per-stream CF CDN mode. Nil in other transport modes.
@@ -43,6 +56,16 @@ type ShadowLinkEngine struct {
 	// Download stream coordination: poll pauses when download stream is active.
 	downloadActive atomic.Bool
 	streamCtx      context.Context // stored for deferred download stream start
+
+	// closed делает Close() идемпотентным. Нужен именно как флаг, а не sync.Once:
+	// Close() возвращает error, и Once скрыл бы факт повторного вызова.
+	closed atomic.Bool
+
+	// closeRuns считает, сколько раз тело Close() было исполнено ПОЛНОСТЬЮ.
+	// Заведён ради наблюдаемости гейта: без него «идемпотентность» проверялась бы
+	// по числу закрытий транспорта, а то зануляется в самом Close() и потому
+	// молчит о повторном проходе — зелёный сторож, ничего не измеряющий.
+	closeRuns atomic.Int32
 }
 
 func NewShadowLinkEngine(cfg *Config) (*ShadowLinkEngine, error) {
@@ -60,6 +83,50 @@ func NewShadowLinkEngine(cfg *Config) (*ShadowLinkEngine, error) {
 	}, nil
 }
 
+// setStream переставляет активный транспорт и синхронно — тот же транспорт в
+// SOCKS5-сервере. Обе записи в одном месте, потому что рассинхрон между ними
+// означал бы, что CONNECT'ы уходят в закрытый WS.
+func (e *ShadowLinkEngine) setStream(t client.StreamTransport) {
+	// После Close() установка ЗАПРЕЩЕНА, и запрет обязан быть здесь, а не только
+	// в ожидании ридера. Ожидание ограничено сверху (streamReaderShutdownGrace),
+	// поэтому зависший ридер может проснуться уже ПОСЛЕ того, как Close() снял
+	// поле, и поставить свежий транспорт — тот не закрыл бы никто, и это ровно
+	// та утечка TLS-соединения к origin, ради которой правка и делалась.
+	// Закрываем такой транспорт сразу: владельца у него больше нет.
+	if e.closed.Load() {
+		if t != nil {
+			t.Close()
+		}
+		return
+	}
+	e.streamMu.Lock()
+	e.stream = t
+	e.streamMu.Unlock()
+	if e.socks != nil {
+		e.socks.SetWST(t)
+	}
+}
+
+// getStream возвращает текущий транспорт.
+func (e *ShadowLinkEngine) getStream() client.StreamTransport {
+	e.streamMu.Lock()
+	defer e.streamMu.Unlock()
+	return e.stream
+}
+
+// spawnStreamReader запускает streamReaderLoop под учётом streamWG.
+//
+// Единая точка запуска заведена намеренно: до неё `go e.streamReaderLoop(...)`
+// стояло в трёх местах, и любое четвёртое (или забытое при правке) молча
+// выпадало бы из учёта, а Close() не имел бы способа это заметить.
+func (e *ShadowLinkEngine) spawnStreamReader(ctx context.Context) {
+	e.streamWG.Add(1)
+	go func() {
+		defer e.streamWG.Done()
+		e.streamReaderLoop(ctx)
+	}()
+}
+
 // ErrorCh returns channel that receives a fatal error if engine dies.
 func (e *ShadowLinkEngine) ErrorCh() <-chan error { return e.errCh }
 
@@ -73,7 +140,18 @@ func (e *ShadowLinkEngine) signalError(err error) {
 	})
 }
 
-func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
+// Connect поднимает сессию ShadowLink: handshake, транспорт, SOCKS5.
+//
+// При ЛЮБОМ неуспехе после подключения клиента вызывается Close() — иначе
+// повисали client.Client, WS-пул из 8 слотов, горутина streamReaderLoop и
+// stats-логгер. Отдельно важен pool.Close(): без него серверу не уходит
+// session-FIN, и на нём остаются ghost-сессии до idle-таймаута. Раньше ранние
+// return звали только cancel(), который отменяет контекст, но ничего не
+// закрывает: отменённый контекст сам по себе не шлёт FIN и не рвёт TLS.
+//
+// Именованный результат нужен именно для этого defer — по err он отличает
+// неуспех от успеха.
+func (e *ShadowLinkEngine) Connect(ctx context.Context) (retErr error) {
 	slCfg := e.cfg.ShadowLink
 	if slCfg == nil {
 		return fmt.Errorf("конфиг ShadowLink не задан")
@@ -141,6 +219,17 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 
 	ctx2, cancel := context.WithCancel(ctx)
 	e.cancel = cancel
+	// Единая точка уборки на всех путях неуспеха. Ставится сразу после
+	// присвоения e.cancel, потому что первый же отказ ниже (handshake) случается
+	// уже после того, как клиент мог поднять соединения.
+	//
+	// Close() идемпотентен, поэтому вызывающему не нужно знать, убрались мы уже
+	// или нет: его собственный defer Close() безопасен.
+	defer func() {
+		if retErr != nil {
+			e.Close()
+		}
+	}()
 	// engineCtx is the long-lived context for the whole engine session. The
 	// in-process tun2socks dialer (Bug #5) uses it as the relay lifetime ctx so
 	// streams aren't bound to tun2socks' 5s dial ctx (review HIGH-5).
@@ -192,7 +281,7 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 		}
 	}
 	if err != nil {
-		cancel()
+		// cancel() здесь больше не нужен — его зовёт Close() из defer-cleanup.
 		return fmt.Errorf("ошибка подключения ShadowLink: %w", err)
 	}
 
@@ -557,8 +646,8 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 					// p.ctx so all reconnect loops exit cleanly.
 					pool.Close()
 				} else {
-					e.stream = pool
-					go e.streamReaderLoop(ctx2)
+					e.setStream(pool)
+					e.spawnStreamReader(ctx2)
 					slog.Info("WS Pool подключён",
 						"slots", pool.HealthySlots(),
 						"total", poolSize,
@@ -576,7 +665,6 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 		if !poolOK && e.cfg.SystemVPN {
 			token := e.cl.Token()
 			if token == nil {
-				cancel()
 				return fmt.Errorf("SplitHTTP: нет токена после handshake")
 			}
 			splitAddr := slCfg.Server
@@ -611,10 +699,10 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 			pollTransport := client.NewCDNTransport(splitAddr)
 			e.pollTransport = pollTransport
 
-			e.stream = split
+			e.setStream(split)
 
 			e.startPollWorkers(ctx2, pollTransport)
-			go e.streamReaderLoop(ctx2)
+			e.spawnStreamReader(ctx2)
 			e.streamCtx = ctx2
 
 			// V5 / P0.3: start decoy GET traffic only after the session is
@@ -629,8 +717,8 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 			if wsErr != nil {
 				slog.Warn("Single WS не удался, используем poll-mode", "err", wsErr)
 			} else {
-				e.stream = wst
-				go e.streamReaderLoop(ctx2)
+				e.setStream(wst)
+				e.spawnStreamReader(ctx2)
 			}
 		}
 	}
@@ -667,13 +755,13 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 	} else {
 		e.socks = &socks5.Server{
 			Client:   e.cl,
-			WST:      e.stream,
 			Router:   router,
 			Addr:     e.socksAddr,
 			Username: e.cfg.ProxyUser,
 			Password: e.cfg.ProxyPass,
 			ViaCDN:   slCfg.CDN != "" && slCfg.Origin == "",
 		}
+		e.socks.SetWST(e.getStream())
 	}
 
 	socksErrCh := make(chan error, 1)
@@ -682,11 +770,9 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) error {
 	// C4: give SOCKS5 time to bind — if it fails immediately, catch the error.
 	select {
 	case err := <-socksErrCh:
-		cancel()
 		return fmt.Errorf("SOCKS5 не запустился: %w", err)
 	case <-time.After(300 * time.Millisecond):
 		if e.socks.ListenAddr() == nil {
-			cancel()
 			return fmt.Errorf("SOCKS5 не смог создать listener на %s", e.socksAddr)
 		}
 	}
@@ -712,7 +798,8 @@ func (e *ShadowLinkEngine) streamReaderLoop(ctx context.Context) {
 	for {
 		e.downloadActive.Store(true)
 		startedAt := time.Now()
-		err := e.stream.StartReader(ctx, e.cl)
+		cur := e.getStream()
+		err := cur.StartReader(ctx, e.cl)
 		e.downloadActive.Store(false)
 		if ctx.Err() != nil {
 			return // normal shutdown
@@ -733,7 +820,7 @@ func (e *ShadowLinkEngine) streamReaderLoop(ctx context.Context) {
 		// For SplitTransport: just reconnect the download stream (StartReader opens a new GET).
 		// For WSPoolTransport: pool handles per-slot reconnection internally.
 		// For WebSocketTransport: need to create a new WS connection.
-		if _, isSplit := e.stream.(*client.SplitTransport); isSplit {
+		if _, isSplit := cur.(*client.SplitTransport); isSplit {
 			// SplitTransport reconnects automatically in StartReader (opens new GET).
 			backoff = min(backoff*2, maxBackoff)
 			slog.Info("SplitHTTP download stream переподключается...", "nextBackoff", backoff)
@@ -743,7 +830,7 @@ func (e *ShadowLinkEngine) streamReaderLoop(ctx context.Context) {
 		// WSPoolTransport: F1 architectural fix (2026-05-20) — StartReader
 		// now polls and supervises readers for the pool's lifetime, returning
 		// ONLY on ctx.Done. Any non-nil return here means VPN shutdown.
-		if _, isPool := e.stream.(*client.WSPoolTransport); isPool {
+		if _, isPool := cur.(*client.WSPoolTransport); isPool {
 			slog.Info("WS Pool: StartReader вернулся (ctx.Done)",
 				"err", err)
 			return // exit streamReaderLoop — context is cancelled
@@ -766,10 +853,7 @@ func (e *ShadowLinkEngine) streamReaderLoop(ctx context.Context) {
 			continue
 		}
 
-		e.stream = newWST
-		if e.socks != nil {
-			e.socks.WST = newWST
-		}
+		e.setStream(newWST)
 		backoff = 2 * time.Second
 		slog.Info("WS переподключён")
 	}
@@ -811,8 +895,8 @@ func (e *ShadowLinkEngine) startPollWorkers(ctx context.Context, pollTransport c
 // Must be called AFTER TUN + LeakGuard are configured in system VPN mode,
 // otherwise the TCP connection to CF breaks when TUN changes the routing table.
 func (e *ShadowLinkEngine) StartDownloadStream() {
-	if e.streamCtx != nil && e.stream != nil {
-		go e.streamReaderLoop(e.streamCtx)
+	if e.streamCtx != nil && e.getStream() != nil {
+		e.spawnStreamReader(e.streamCtx)
 		slog.Info("download stream started (post-TUN)")
 	}
 }
@@ -826,13 +910,46 @@ func (e *ShadowLinkEngine) Name() string      { return "shadowlink" }
 // if the engine isn't ready (no SOCKS server / transport yet), so callers fall
 // back to the loopback dialer. Implements InProcessDialerProvider.
 func (e *ShadowLinkEngine) InProcessDialer() proxy.Dialer {
-	if e.socks == nil || e.socks.WST == nil || e.cl == nil || e.engineCtx == nil {
+	if e.socks == nil || e.socks.WST() == nil || e.cl == nil || e.engineCtx == nil {
 		return nil
 	}
 	return socks5.NewInProcessDialer(e.engineCtx, e.socks)
 }
 
+// NetworkChanged форсирует переустановку слотов пула после смены сети (Wi-Fi↔LTE,
+// Wi-Fi↔Ethernet, выход из сна). Без неё слоты держат TCP со старого локального
+// адреса и ЗАВИСАЮТ до TCP-таймаута — туннель встаёт на десятки секунд. Метод
+// платформо-независим (чистый Go): его зовут NIC-вотчер десктопа, а на мобильных —
+// фасад из ConnectivityManager.NetworkCallback / NWPathMonitor.
+//
+// No-op вне режима пула: одиночный WS-транспорт своей ротации слотов не имеет,
+// а poll-режим переустанавливается собственным контуром. Тип проверяется через
+// интерфейс NetworkChangeNotifier, а не жёстким assertion, чтобы добавление
+// второго его носителя не потребовало правки здесь.
+func (e *ShadowLinkEngine) NetworkChanged() {
+	if n, ok := e.getStream().(interface{ NetworkChanged() }); ok {
+		n.NetworkChanged()
+	}
+}
+
+// streamReaderShutdownGrace — сколько Close() ждёт выхода streamReaderLoop.
+//
+// Не тайминговая константа протокола (hard rule 8 не про неё): она не влияет ни
+// на один кадр на проводе, а только на длительность собственного останова. Взята
+// с запасом к HandshakeTimeout=10с из ws_transport: ридер, висящий в
+// UpgradeToWebSocket, освободится по своему дедлайну, а не по нашему. Верхняя
+// граница нужна, чтобы Close() был конечен при любом зависании — на iOS весь
+// бюджет stopTunnel исчисляется секундами.
+const streamReaderShutdownGrace = 2 * time.Second
+
 func (e *ShadowLinkEngine) Close() error {
+	// Идемпотентность обязательна, а не желательна: defer-cleanup неуспешного
+	// Connect зовёт Close(), и следом его же зовёт вызывающий по своему defer.
+	// Второй проход раньше закрывал уже закрытый listener и закрытые транспорты.
+	if !e.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	e.closeRuns.Add(1)
 	if e.cancel != nil {
 		e.cancel()
 	}
@@ -840,6 +957,17 @@ func (e *ShadowLinkEngine) Close() error {
 	e.pollWG.Wait()
 	if e.socks != nil {
 		e.socks.Close()
+	}
+	// streamWG ждётся ЗДЕСЬ, а не рядом с pollWG: ридер может висеть в
+	// UpgradeToWebSocket до HandshakeTimeout, и ожидание перед socks.Close()
+	// удерживало бы SOCKS5-листенер открытым всё это время. Ждём с потолком,
+	// потому что нам важно не «дождаться любой ценой», а гарантировать, что
+	// после Close() не осталось горутины, способной переставить e.stream уже
+	// после того, как мы его закрыли, — а этого не будет: ридер сам смотрит на
+	// отменённый ctx.
+	if !e.waitStreamReaders(streamReaderShutdownGrace) {
+		slog.Warn("stream reader не завершился в отведённое окно — закрываем транспорт всё равно",
+			"grace", streamReaderShutdownGrace)
 	}
 	if e.readyPool != nil {
 		// Close the pool before cl.Close() so pool workers don't race with
@@ -849,13 +977,37 @@ func (e *ShadowLinkEngine) Close() error {
 	if e.pollTransport != nil {
 		e.pollTransport.Close()
 	}
-	if e.stream != nil {
-		e.stream.Close()
+	// Забираем транспорт ПОД ЛОКОМ и обнуляем поле: после этого никакой
+	// припозднившийся ридер не закроет объект второй раз и не подставит новый.
+	e.streamMu.Lock()
+	stream := e.stream
+	e.stream = nil
+	e.streamMu.Unlock()
+	if stream != nil {
+		stream.Close()
 	}
 	if e.cl != nil {
 		e.cl.Close()
 	}
 	return nil
+}
+
+// waitStreamReaders ждёт выхода всех streamReaderLoop не дольше d.
+// Возвращает false, если окно истекло.
+func (e *ShadowLinkEngine) waitStreamReaders(d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		e.streamWG.Wait()
+		close(done)
+	}()
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-done:
+		return true
+	case <-t.C:
+		return false
+	}
 }
 
 // envBoolDefault reads a boolean env var with the same lenient semantics

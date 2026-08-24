@@ -70,8 +70,7 @@ var errInvalidAcquireType = errors.New("socks5: pool dispatcher returned unexpec
 // If PerStreamWS is non-nil, each SOCKS5 CONNECT gets a dedicated WS (CDN mode).
 type Server struct {
 	Client      *client.Client
-	WST         client.StreamTransport // nil = poll-mode (WebSocketTransport or SplitTransport)
-	PerStreamWS *PerStreamWSConfig     // nil = use WST; non-nil = per-stream WS (CDN mode)
+	PerStreamWS *PerStreamWSConfig // nil = use WST; non-nil = per-stream WS (CDN mode)
 	Router      *client.Router
 	Addr        string // "127.0.0.1:1080"
 	Username    string // если задан — требуется RFC 1929 auth
@@ -79,6 +78,21 @@ type Server struct {
 	ViaCDN      bool // true when traffic goes through CF CDN (shorter CONNECT timeout)
 	listener    net.Listener
 	mu          sync.Mutex
+
+	// wst — активный stream-транспорт; nil = poll-mode.
+	//
+	// Поле СПЕЦИАЛЬНО приватное. Оно переприсваивается на лету при реконнекте
+	// одиночного WS (engine.streamReaderLoop), а читается из совсем другой
+	// горутины — на КАЖДЫЙ SOCKS5 CONNECT (handleConn) и на каждый dial
+	// in-process диалера (inprocess.go). Пока поле было публичным, эта запись
+	// была настоящей гонкой данных МЕЖДУ ПАКЕТАМИ, и мьютекс в engine/ её бы не
+	// закрыл: читатели живут здесь. Поэтому синхронизация обязана стоять у
+	// владельца поля — отсюда WST()/SetWST() под тем же mu, что и listener.
+	//
+	// Альтернатива «WSTProvider func() client.StreamTransport» отвергнута: она
+	// размножает nil-семантику на два измерения (nil-функция и nil-результат),
+	// и пропуск любой из проверок даёт панику на data-path основного режима.
+	wst client.StreamTransport
 
 	// connectSem limits concurrent pending CONNECT requests over WebSocket.
 	// Without this, system VPN opens 80+ connections in seconds,
@@ -161,6 +175,24 @@ func (s *Server) ListenAddr() net.Addr {
 	return nil
 }
 
+// WST возвращает активный stream-транспорт (nil = poll-mode).
+//
+// Читается на горячем пути (каждый CONNECT), поэтому под тем же mu, что и
+// listener: захват короткий, сетевых операций под локом нет.
+func (s *Server) WST() client.StreamTransport {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.wst
+}
+
+// SetWST переставляет активный stream-транспорт. Зовётся при реконнекте
+// одиночного WS из горутины streamReaderLoop, то есть параллельно с читателями.
+func (s *Server) SetWST(t client.StreamTransport) {
+	s.mu.Lock()
+	s.wst = t
+	s.mu.Unlock()
+}
+
 // AcquireConnect acquires a slot for a pending WS CONNECT.
 // Returns true if acquired, false if timed out.
 func (s *Server) AcquireConnect(timeout time.Duration) bool {
@@ -240,6 +272,12 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 
+	// Снимок транспорта делается ОДИН раз на соединение: раньше здесь стояли два
+	// чтения поля (проверка на nil и передача в хендлер), и между ними реконнект
+	// мог переставить транспорт — тогда проверенный на nil и переданный были
+	// разными объектами.
+	wst := s.WST()
+
 	switch buf[1] {
 	case CmdConnect:
 		destAddr := ParseDestAddr(buf, n)
@@ -249,14 +287,14 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		}
 		if s.PerStreamWS != nil {
 			HandleTCPConnectWSPerStream(ctx, conn, s.Client, s.Router, destAddr, s.PerStreamWS)
-		} else if s.WST != nil {
-			HandleTCPConnectWS(ctx, conn, s.Client, s.WST, s.Router, destAddr, s)
+		} else if wst != nil {
+			HandleTCPConnectWS(ctx, conn, s.Client, wst, s.Router, destAddr, s)
 		} else {
 			HandleTCPConnect(ctx, conn, s.Client, s.Router, destAddr)
 		}
 	case CmdUDPAssociate:
-		if s.WST != nil {
-			HandleUDPAssociateWS(ctx, conn, s.Client, s.WST, s.Router)
+		if wst != nil {
+			HandleUDPAssociateWS(ctx, conn, s.Client, wst, s.Router)
 		} else {
 			HandleUDPAssociate(ctx, conn, s.Client, s.Router)
 		}
