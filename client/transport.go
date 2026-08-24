@@ -92,13 +92,26 @@ type DirectTransport struct {
 	sessionToken []byte
 	coverMu      sync.Mutex
 	stopCover    chan struct{}
+
+	// dataPathBodyPrefix — эффективный per-instance выбор формата data-path,
+	// снятый на конструировании (дефолт из env либо явное поле ClientConfig).
+	// Заменяет чтение пакетной переменной в SendChunk/SendChunkRawBody: глобал
+	// недоступен мобильному фасаду, у которого нет env до импорта пакета.
+	dataPathBodyPrefix bool
 }
 
 // NewDirectTransport creates a transport that connects directly to the server.
 // serverAddr is "host:port" (e.g., "example.com:443").
 // useTLS enables TLS with browser-identical fingerprinting. skipVerify for testing.
 func NewDirectTransport(serverAddr string, useTLS bool, skipVerify bool) *DirectTransport {
-	return newDirectTransportFull(serverAddr, useTLS, skipVerify, false, "", "")
+	return newDirectTransportFull(serverAddr, useTLS, skipVerify, false, "", "", defaultDataPathBodyPrefix)
+}
+
+// newDirectTransportBP — как NewDirectTransport, но с явным выбором формата
+// data-path (bodyPrefix). Используется NewClient для проброса
+// ClientConfig.DataPathBodyPrefix; при nil-поле NewClient передаёт сюда дефолт.
+func newDirectTransportBP(serverAddr string, useTLS, skipVerify, bodyPrefix bool) *DirectTransport {
+	return newDirectTransportFull(serverAddr, useTLS, skipVerify, false, "", "", bodyPrefix)
 }
 
 // NewDirectTransportWithSNI creates a direct transport that dials serverAddr (IP:port)
@@ -112,16 +125,24 @@ func NewDirectTransport(serverAddr string, useTLS bool, skipVerify bool) *Direct
 // X25519 public key at the protocol layer — TLS here is only for steganographic
 // packet shape, not for authentication.
 func NewDirectTransportWithSNI(serverAddr, sniDomain string, useTLS bool) *DirectTransport {
-	return newDirectTransportFull(serverAddr, useTLS, false, false, "", sniDomain)
+	return newDirectTransportFull(serverAddr, useTLS, false, false, "", sniDomain, defaultDataPathBodyPrefix)
+}
+
+// newDirectTransportWithSNIBP — как NewDirectTransportWithSNI, но с явным
+// bodyPrefix (проброс ClientConfig.DataPathBodyPrefix из NewClient).
+func newDirectTransportWithSNIBP(serverAddr, sniDomain string, useTLS, bodyPrefix bool) *DirectTransport {
+	return newDirectTransportFull(serverAddr, useTLS, false, false, "", sniDomain, bodyPrefix)
 }
 
 // newDirectTransportECH is kept for backward compatibility with existing callers.
 func newDirectTransportECH(serverAddr string, useTLS bool, skipVerify bool, echEnabled bool, echDomain string) *DirectTransport {
-	return newDirectTransportFull(serverAddr, useTLS, skipVerify, echEnabled, echDomain, "")
+	return newDirectTransportFull(serverAddr, useTLS, skipVerify, echEnabled, echDomain, "", defaultDataPathBodyPrefix)
 }
 
-// newDirectTransportFull is the unified internal constructor.
-func newDirectTransportFull(serverAddr string, useTLS bool, skipVerify bool, echEnabled bool, echDomain, sniOverride string) *DirectTransport {
+// newDirectTransportFull is the unified internal constructor. bodyPrefix — уже
+// разрешённый эффективный выбор формата data-path (снимок дефолта либо явное
+// поле конфига), потому что глобал недоступен мобильному фасаду.
+func newDirectTransportFull(serverAddr string, useTLS bool, skipVerify bool, echEnabled bool, echDomain, sniOverride string, bodyPrefix bool) *DirectTransport {
 	scheme := "http"
 	if useTLS {
 		scheme = "https"
@@ -170,15 +191,16 @@ func newDirectTransportFull(serverAddr string, useTLS bool, skipVerify bool, ech
 	}
 
 	t := &DirectTransport{
-		baseURL:     baseURL,
-		publicURL:   publicURL,
-		publicHost:  publicHost,
-		signalHost:  core.SignalHost(sniOverride, serverAddr),
-		urlPool:     browser.NewURLPool(),
-		connManager: cm,
-		rlDetector:  DefaultDetector(&Stats),
-		rc:          browser.NewRatioController(2.5, 3.5),
-		stopCover:   make(chan struct{}),
+		baseURL:            baseURL,
+		publicURL:          publicURL,
+		publicHost:         publicHost,
+		signalHost:         core.SignalHost(sniOverride, serverAddr),
+		urlPool:            browser.NewURLPool(),
+		connManager:        cm,
+		rlDetector:         DefaultDetector(&Stats),
+		rc:                 browser.NewRatioController(2.5, 3.5),
+		stopCover:          make(chan struct{}),
+		dataPathBodyPrefix: bodyPrefix,
 	}
 	t.startCoverTraffic()
 	return t
@@ -541,8 +563,8 @@ func (t *DirectTransport) SendHandshakeRaw(ctx context.Context, payload []byte) 
 
 // SendChunk sends an encrypted data chunk.
 //
-// Transport behavior is gated on dataPathBodyPrefixEnabled (env
-// SHADOWLINK_DATAPATH_BODYPREFIX):
+// Transport behavior is gated on t.dataPathBodyPrefix (per-instance; дефолт из
+// env SHADOWLINK_DATAPATH_BODYPREFIX, переопределяем ClientConfig.DataPathBodyPrefix):
 //   - on  → body-prefix wire format, no Authorization header (Phase T1.4)
 //   - off → legacy Authorization: Bearer header (pre-migration contract)
 //
@@ -557,7 +579,7 @@ func (t *DirectTransport) SendChunk(ctx context.Context, encryptedChunk []byte, 
 
 	var evtBody []byte
 	var headers http.Header
-	if dataPathBodyPrefixEnabled {
+	if t.dataPathBodyPrefix {
 		var err error
 		evtBody, err = buildDataEnvelope(sessionToken, encryptedChunk)
 		if err != nil {
@@ -658,7 +680,7 @@ func (t *DirectTransport) SendChunk(ctx context.Context, encryptedChunk []byte, 
 // SendChunkRawBody sends a chunk and returns the raw JSON response body (not parsed).
 // Used by PollVia to handle multi-chunk server responses. Flag-gated identically
 // to SendChunk — see that function's docstring for the semantics of
-// dataPathBodyPrefixEnabled (env SHADOWLINK_DATAPATH_BODYPREFIX).
+// t.dataPathBodyPrefix (per-instance; дефолт из env SHADOWLINK_DATAPATH_BODYPREFIX).
 //
 // seqNum is accepted for API compatibility but is not transmitted at the
 // transport layer — sequence numbering lives inside the encrypted core.Chunk
@@ -668,7 +690,7 @@ func (t *DirectTransport) SendChunkRawBody(ctx context.Context, encryptedChunk [
 
 	var evtBody []byte
 	var headers http.Header
-	if dataPathBodyPrefixEnabled {
+	if t.dataPathBodyPrefix {
 		var err error
 		evtBody, err = buildDataEnvelope(sessionToken, encryptedChunk)
 		if err != nil {

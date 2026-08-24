@@ -280,6 +280,14 @@ type ClientConfig struct {
 	// profile survives restarts and server-pushed weight updates apply on
 	// the next cold start.
 	FPCacheDir string
+
+	// DataPathBodyPrefix переопределяет выбор формата data-path (body-prefix vs
+	// legacy Authorization: Bearer). nil — взять пакетный дефолт из env
+	// SHADOWLINK_DATAPATH_BODYPREFIX (поведение CLI без правок); non-nil —
+	// программный override побеждает env. Поле нужно мобильному фасаду
+	// (gomobile): он не может выставить окружение до импорта пакета, а раньше
+	// флаг читался только на инициализации пакетной переменной.
+	DataPathBodyPrefix *bool
 }
 
 // NewClient creates a client with the given config.
@@ -314,17 +322,22 @@ func NewClient(config ClientConfig) *Client {
 	// distribution across fleet instances in real time (spec §6.3).
 	Stats.SetActiveProfile(profileName)
 
+	// Эффективный выбор формата data-path: явное поле конфига побеждает, иначе
+	// пакетный дефолт (env). Разрешаем здесь, чтобы транспорт получил снимок и не
+	// зависел от глобала, недоступного мобильному фасаду.
+	bodyPrefix := resolveDataPathBodyPrefix(config.DataPathBodyPrefix)
+
 	var transport Transport
 	switch {
 	case config.SNIOverride != "":
 		// Full-direct: dial to ServerAddr (IP), TLS SNI = SNIOverride (domain).
 		// Used when client knows the origin IP and wants to bypass CF entirely
 		// while keeping the legitimate SNI so nginx server_name still matches.
-		transport = NewDirectTransportWithSNI(config.ServerAddr, config.SNIOverride, config.UseTLS)
+		transport = newDirectTransportWithSNIBP(config.ServerAddr, config.SNIOverride, config.UseTLS, bodyPrefix)
 	case config.CDNDomain != "":
 		transport = NewCDNTransportWithECH(config.CDNDomain, config.ECHEnabled)
 	default:
-		transport = NewDirectTransport(config.ServerAddr, config.UseTLS, config.SkipVerify)
+		transport = newDirectTransportBP(config.ServerAddr, config.UseTLS, config.SkipVerify, bodyPrefix)
 	}
 
 	return &Client{

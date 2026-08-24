@@ -13,16 +13,22 @@ import (
 	"github.com/nixavpn/shadowlink/skins/browser"
 )
 
-// dataPathBodyPrefixEnabled is true when the client routes SendChunk /
-// SendChunkRawBody through the body-prefix wire format instead of the legacy
-// Authorization: Bearer header. Gated via SHADOWLINK_DATAPATH_BODYPREFIX env
-// var. Default ON since 2026-04-26 (Phase 0 T1.4 flip after canary soak).
-// Set SHADOWLINK_DATAPATH_BODYPREFIX=0 (or "false"/"no"/"off") for emergency
-// disable — restores legacy Authorization-header data path.
+// defaultDataPathBodyPrefix — ДЕФОЛТ выбора формата data-path (body-prefix vs
+// legacy Authorization: Bearer), считанный из SHADOWLINK_DATAPATH_BODYPREFIX на
+// инициализации пакета. Default ON с 2026-04-26 (Phase 0 T1.4 flip после canary
+// soak); SHADOWLINK_DATAPATH_BODYPREFIX=0 (или "false"/"no"/"off") — аварийный
+// откат на legacy Authorization-header путь.
 //
-// Package-init read (not per-request) so tests can override by setting the
-// env var before importing, or via the `withDataPathBodyPrefix` helper.
-var dataPathBodyPrefixEnabled = parseDataPathBodyPrefixEnv(os.Getenv("SHADOWLINK_DATAPATH_BODYPREFIX"))
+// ⚠ Это лишь ДЕФОЛТ, а не единственный источник истины. Мобильный фасад
+// (gomobile) физически не может выставить окружение до импорта пакета — там нет
+// процесса, стартующего с env. Поэтому эффективное значение живёт per-instance в
+// DirectTransport.dataPathBodyPrefix, а ClientConfig.DataPathBodyPrefix может
+// его переопределить программно (см. resolveDataPathBodyPrefix). Package-var
+// остаётся дефолтом, чтобы CLI продолжал управляться через env без правок.
+//
+// Снимок берётся на КОНСТРУИРОВАНИИ транспорта, поэтому withDataPathBodyPrefix,
+// выставленный тестом до NewDirectTransport, наследуется этим транспортом.
+var defaultDataPathBodyPrefix = parseDataPathBodyPrefixEnv(os.Getenv("SHADOWLINK_DATAPATH_BODYPREFIX"))
 
 func parseDataPathBodyPrefixEnv(raw string) bool {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
@@ -33,13 +39,26 @@ func parseDataPathBodyPrefixEnv(raw string) bool {
 	}
 }
 
-// withDataPathBodyPrefix temporarily overrides the flag for the duration of a
-// test. Use via t.Cleanup for restore. Not safe for concurrent tests that
-// observe the flag value from different goroutines.
+// withDataPathBodyPrefix временно переопределяет ДЕФОЛТ на время теста. Транспорт
+// снимает значение на конструировании, поэтому вызывать до NewDirectTransport.
+// Use via t.Cleanup for restore. Not safe for concurrent tests that observe the
+// value from different goroutines.
 func withDataPathBodyPrefix(enabled bool) func() {
-	prev := dataPathBodyPrefixEnabled
-	dataPathBodyPrefixEnabled = enabled
-	return func() { dataPathBodyPrefixEnabled = prev }
+	prev := defaultDataPathBodyPrefix
+	defaultDataPathBodyPrefix = enabled
+	return func() { defaultDataPathBodyPrefix = prev }
+}
+
+// resolveDataPathBodyPrefix вычисляет эффективный флаг data-path для конкретного
+// клиента: явное поле ClientConfig побеждает, иначе берётся пакетный дефолт (env).
+// Приоритет — «дефолт(env) → явное поле», ровно как требует спека мобильного
+// фасада: CLI работает через env без правок, а нативка задаёт значение
+// программно, не имея возможности выставить окружение до импорта пакета.
+func resolveDataPathBodyPrefix(override *bool) bool {
+	if override != nil {
+		return *override
+	}
+	return defaultDataPathBodyPrefix
 }
 
 // buildDataEnvelope wraps an encrypted chunk in the analytics JSON envelope
