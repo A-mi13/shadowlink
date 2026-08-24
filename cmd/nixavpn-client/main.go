@@ -31,7 +31,12 @@ import (
 	"github.com/nixavpn/shadowlink/client/leakguard"
 )
 
-const version = "0.1.0"
+// version — то, что печатает `nixavpn-client version`.
+//
+// Держать в согласии с git-тегом релиза: расходящиеся числа означают, что по
+// ответу клиента нельзя понять, какая сборка у пользователя, а это первое, что
+// спрашивают при разборе полевого отказа.
+const version = "0.2.0"
 
 func main() {
 	if len(os.Args) > 1 {
