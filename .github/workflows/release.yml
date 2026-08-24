@@ -1,0 +1,147 @@
+name: Release
+
+# Триггер — пуш тега вида v1.2.3. Всё остальное CI делает сам: тесты, сборку
+# обеих целей, контрольные суммы и публикацию. Локальный release.sh при этом
+# остаётся рабочим (он умеет то, чего не умеет CI: печатает штампы
+# vcs.revision собранных бинарников для сверки с задеплоенным сервером).
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Тег для ручного прогона (напр. v0.2.0)"
+        required: true
+
+permissions:
+  contents: write # нужно, чтобы создать Release; личный токен не требуется
+
+env:
+  # Версия драйвера TUN закреплена явно, а не «latest»: обновление драйвера —
+  # это смена поведения сетевого стека у пользователя, она должна быть видимой
+  # правкой в этом файле, а не молча приехать со сборкой.
+  WINTUN_VERSION: "0.14.1"
+  # SHA-256 файла wintun/bin/amd64/wintun.dll из официального архива.
+  # Сверено 2026-08-24 с копией, которой ведутся полевые прогоны, — байт в байт.
+  # Проверка обязательна: без неё CI молча положил бы в релиз что угодно,
+  # что отдал бы сайт, а это драйвер, работающий в ядре у пользователя.
+  WINTUN_SHA256: "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce"
+
+jobs:
+  release:
+    name: Build and publish
+    # Одного linux-раннера достаточно: Go кросс-компилируется, поэтому и
+    # windows-клиент, и linux-сервер собираются здесь же. Приватный репозиторий
+    # тратит квоту Actions, так что второй раннер был бы платой ни за что.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod # источник истины один — go.mod (сейчас 1.26)
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        # Релиз не собирается по красному дереву. -count=1 отключает кеш:
+        # зелёный результат из кеша ничего не проверяет.
+        run: go test ./... -count=1
+
+      - name: Cross-compile check (android/ios)
+        # Ядро обязано оставаться переносимым — под это готовится пакет mobile/.
+        # Ломается это молча и обнаруживается через недели, поэтому проверка
+        # стоит в релизном пути, а не «когда-нибудь потом».
+        run: |
+          GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build ./client/ ./engine/
+          GOOS=ios     GOARCH=arm64 CGO_ENABLED=0 go build ./client/ ./engine/
+
+      - name: Build artifacts
+        run: |
+          mkdir -p dist
+          # Клиент НЕ стрипуется: полевые прогоны идут с -log debug, а strip
+          # убирает символы из стектрейсов (см. build-client.sh).
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
+            go build -trimpath -o dist/nixavpn-client.exe ./cmd/nixavpn-client/
+          # Сервер стрипуется: debug-символы на проде не нужны, бинарь меньше.
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags="-s -w" -o dist/shadowlink-server-linux ./cmd/shadowlink-server/
+
+      - name: Fetch wintun.dll
+        # Драйвер сторонний (WireGuard LLC) и в репозитории не хранится, но без
+        # него клиент не поднимет TUN — то есть релиз без него неполон.
+        run: |
+          curl -fsSL -o wintun.zip "https://www.wintun.net/builds/wintun-${WINTUN_VERSION}.zip"
+          unzip -q wintun.zip
+          echo "${WINTUN_SHA256}  wintun/bin/amd64/wintun.dll" | sha256sum -c -
+          cp wintun/bin/amd64/wintun.dll dist/
+
+      - name: Add user README
+        run: cp bin/README-nixavpn-client.txt dist/
+
+      - name: Guard against leaking secrets
+        # Страховка от недосмотра: .bat-launcher'ы несут боевой sl://-ключ и IP
+        # origin, они под .gitignore и в релиз попасть не должны никогда.
+        # Проверка по факту содержимого dist/, а не по намерению.
+        run: |
+          if ls dist/*.bat dist/*.sh dist/*.yaml dist/*.yml 2>/dev/null | grep -q .; then
+            echo "::error::в dist/ попали скрипты/конфиги — возможна утечка ключа"
+            exit 1
+          fi
+          if grep -rlI "sl://" dist/ 2>/dev/null | grep -q .; then
+            echo "::error::в артефактах найдена sl://-ссылка"
+            exit 1
+          fi
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum ./* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Release notes
+        run: |
+          TAG="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
+          {
+            echo "### Артефакты"
+            echo ""
+            echo "- \`nixavpn-client.exe\` — клиент Windows (x64)"
+            echo "- \`wintun.dll\` — драйвер TUN ${WINTUN_VERSION}; **обязателен** рядом с клиентом"
+            echo "- \`shadowlink-server-linux\` — сервер (linux/amd64)"
+            echo "- \`SHA256SUMS\` — контрольные суммы"
+            echo ""
+            echo "### Установка клиента"
+            echo ""
+            echo "1. Положите \`nixavpn-client.exe\` и \`wintun.dll\` в одну папку."
+            echo "2. Рядом — свой launcher (\`.bat\` с параметрами подключения)."
+            echo "3. Запуск от имени администратора: без прав не поднимется TUN."
+            echo ""
+            echo "> Launcher с ключом доступа в релиз не входит и выдаётся"
+            echo "> индивидуально: ключ в нём — это доступ к вашему серверу."
+            echo ""
+            echo "### Проверка целостности"
+            echo ""
+            echo '```powershell'
+            echo 'Get-FileHash -Algorithm SHA256 .\nixavpn-client.exe'
+            echo '```'
+          } > release_notes.md
+          cat release_notes.md
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "ShadowLink ${{ github.ref_name }}"
+          files: |
+            dist/nixavpn-client.exe
+            dist/shadowlink-server-linux
+            dist/wintun.dll
+            dist/README-nixavpn-client.txt
+            dist/SHA256SUMS
+          body_path: release_notes.md
+          # Тег с дефисом (v0.2.0-rc1) публикуется как pre-release.
+          prerelease: ${{ contains(github.ref_name, '-') }}

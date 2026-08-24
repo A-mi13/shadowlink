@@ -626,6 +626,25 @@ bash build-server.sh           # → bin/shadowlink-server-linux
 bash build-client.sh           # → $CLIENT_BIN_DIR (default ./bin = D:\shadowlink\bin)
 ```
 
+**Релиз — пуш тега, больше ничего** (с 2026-08-24):
+
+```bash
+git tag -a v0.2.0 -m "release v0.2.0" && git push origin v0.2.0
+```
+
+`.github/workflows/release.yml` сам прогонит `vet` + `go test -count=1`,
+проверит кросс-сборку под android/ios, соберёт клиента и сервер, скачает
+`wintun.dll` (версия и SHA-256 закреплены в workflow), посчитает `SHA256SUMS`
+и опубликует Release. Локального `gh` не требуется.
+
+⚠ Бинарники **не версионируются** с 2026-08-24 (были 82 % веса `.git`).
+`bin/` остаётся рабочим каталогом для полевых прогонов — hard rule 5 про
+единственную копию серверного бинаря в силе, но раздача идёт релизами.
+⚠ `bin/*.bat` в релиз не попадают **никогда**: в них боевой `sl://`-ключ и IP
+origin. В workflow стоит guard-шаг, проверяющий это по факту содержимого
+`dist/`, а не по намерению.
+⚠ Репозиторий приватный → релизы видны только тем, у кого есть доступ.
+
 ## Triggers → load skills
 
 | Задача | Skill |
