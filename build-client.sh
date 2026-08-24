@@ -38,6 +38,10 @@ go vet ./cmd/nixavpn-client/ ./client/...
 if [ -f "$OUT" ]; then
   cp "$OUT" "${OUT}.bak-${STAMP}"
   echo ">> бэкап: ${OUT}.bak-${STAMP}"
+  # Ротация: держим 2 последних. Клиент весит ~53 МБ, и без чистки каталог
+  # растёт линейно по числу сборок — за один рабочий день 2026-08-24 набралось
+  # 58 бэкапов на 2.3 ГБ. Откат нужен на шаг-два назад, не на полгода.
+  ls -t "${OUT}".bak-* 2>/dev/null | tail -n +3 | xargs -r rm -f
 fi
 
 echo ">> build windows/amd64 -> $OUT"
