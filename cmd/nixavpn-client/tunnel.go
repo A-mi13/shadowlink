@@ -75,6 +75,15 @@ type Tunnel struct {
 	// ephemeral port exhaustion). Nil → fall back to proxy.NewSocks5 (loopback).
 	inProcessDialer proxy.Dialer
 
+	// onNetworkChange, when set, is invoked by runNICWatcher when the default
+	// interface changes (Wi-Fi↔Ethernet, dock, wake-from-sleep). It forces the
+	// WS pool to tear down slots bound to the OLD local path and reconnect —
+	// without it those sockets hang until the TCP timeout (P0, see
+	// WSPoolTransport.NetworkChanged). Held as a plain func so tunnel.go does not
+	// import client/ or engine/; the closure is wired in main.go from the engine's
+	// NetworkChangeNotifier. Nil → the watcher only fixes the bypass dialer.
+	onNetworkChange func()
+
 	mu      sync.Mutex
 	started bool
 
@@ -186,6 +195,15 @@ func (t *Tunnel) WithBootstrapDomains(domains ...string) *Tunnel {
 // nil (or don't call) to keep the loopback path.
 func (t *Tunnel) WithInProcessDialer(d proxy.Dialer) *Tunnel {
 	t.inProcessDialer = d
+	return t
+}
+
+// WithNetworkChangeHook sets the callback runNICWatcher invokes when it detects a
+// default-interface change. Wire it to the engine's NetworkChanged so the WS pool
+// re-establishes slots promptly instead of hanging on the old path. Pass nil (or
+// don't call) to keep the legacy behaviour (bypass-dialer fix only).
+func (t *Tunnel) WithNetworkChangeHook(hook func()) *Tunnel {
+	t.onNetworkChange = hook
 	return t
 }
 
@@ -580,6 +598,14 @@ func (t *Tunnel) runNICWatcher(initialIdx int, stop chan struct{}) {
 			slog.Info("NIC switched, обновили DefaultDialer",
 				"old_idx", currentIdx, "new_name", iface.Name, "new_idx", iface.Index)
 			currentIdx = iface.Index
+			// Помимо bypass-диалера (выше) дёргаем WS-пул: его слоты держат TCP со
+			// СТАРОГО адреса и без этого зависли бы до TCP-таймаута (P0, см.
+			// WSPoolTransport.NetworkChanged). Вызов синхронный, но метод не
+			// блокирует (teardown best-effort, реконнекты уходят в горутины) —
+			// 30-секундный цикл вотчера он не задерживает.
+			if t.onNetworkChange != nil {
+				t.onNetworkChange()
+			}
 		}
 	}
 }

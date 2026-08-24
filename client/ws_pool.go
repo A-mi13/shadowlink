@@ -257,6 +257,12 @@ const (
 	// no FIN (transport already dead). See the doc-comment above for the full
 	// rationale. Added 2026-06-01 (pool-capacity-dip-fix).
 	deathCauseAgeCut
+	// deathCauseNetworkChange — ОС сообщила о смене сети. Слот держит TCP со
+	// СТАРОГО локального адреса и ЗАВИСНЕТ до TCP-таймаута (RST никто не пришлёт).
+	// Рвём сами; FIN НЕ шлём, meltdown НЕ кормим; реконнект — по
+	// reconnectLoopNetworkChange с решёткой reconnectJitterOffset. См. hard rule
+	// про смену сети. Добавлено 2026-08-24.
+	deathCauseNetworkChange
 )
 
 func (c slotDeathCause) String() string {
@@ -269,6 +275,8 @@ func (c slotDeathCause) String() string {
 		return "drain_teardown"
 	case deathCauseAgeCut:
 		return "age_cut"
+	case deathCauseNetworkChange:
+		return "network_change"
 	default:
 		return "unknown"
 	}
@@ -3437,6 +3445,88 @@ func (p *WSPoolTransport) reconnectLoopFast(idx int) {
 	p.reconnectLoopInner(idx, true)
 }
 
+// reconnectLoopNetworkChange is the reconnect path used after the OS reports a
+// network change (see deathCauseNetworkChange). Unlike the age-cut fast path,
+// which spreads a SINGLE cut's reconnect by U(0, ageCutReconnectJitter), here
+// ALL 8 slots die at once, so their reconnects must be spread by the same
+// per-slot GRID used post-meltdown — reconnectJitterOffset(idx) — otherwise 8
+// identical-JA4 TLS handshakes hit origin within a millisecond (hard rule 11).
+// idx 0 gets 0 offset (anchor), idx>=1 gets idx*200ms +/- 100ms (~0-1.6s spread).
+//
+// After the spread the loop enters the FAST inner path (fastFirstAttempt=true):
+// once the OS has a working path, attempt-0 connect must succeed quickly rather
+// than sit in the 5-10s exponential — the whole point is to cut a tens-of-seconds
+// stall to seconds. If attempt 0 genuinely fails (new network not ready yet), the
+// shared inner loop falls into the exponential ladder from attempt=1, so a real
+// outage still backs off. Recycle-guard / ctx-cancel / rate-limit machinery is
+// shared verbatim with the other two entry points.
+func (p *WSPoolTransport) reconnectLoopNetworkChange(idx int) {
+	// Разнесение по детерминированной решётке idx — ГЛАВНЫЙ разброс здесь,
+	// потому что умирают все слоты разом. idx=0 → 0 (якорь), дальше растёт.
+	if off := reconnectJitterOffset(idx); off > 0 {
+		p.log.Debug("WS pool network-change reconnect spread", "slot", idx, "offset", off)
+		sleepWithCancel(p.ctx, off)
+	}
+	p.reconnectLoopInner(idx, true)
+}
+
+// NetworkChanged forces the pool to abandon slots bound to the OLD local path and
+// reconnect on the new one. Pure-Go, platform-agnostic entry point called from
+// every platform's network-change signal: Android ConnectivityManager.Network-
+// Callback, iOS NWPathMonitor, and the Windows NIC watcher (tunnel.go
+// runNICWatcher).
+//
+// Why (P0, all platforms): on a Wi-Fi<->LTE / Wi-Fi<->Ethernet switch or wake-
+// from-sleep every slot's TCP is still bound to the old local address. Those
+// sockets do NOT fail — they HANG until the TCP timeout (no RST is coming).
+// Without this the death is only noticed by a reader read-error / keepalive
+// timeout, then reconnect climbs an exponential backoff that clamps to exactly
+// 60.000s at attempt>=4 (hard rule 8). Net: the tunnel stalls tens of seconds,
+// up to a minute — while the OS knew instantly.
+//
+// Steps: (1) stamp recentMeltdownNs=now — this ONLY arms the reconnect spread
+// gate (reconnectJitterOffset); it does NOT feed recordSlotDeath/meltdownUntil,
+// so no reconnect-pausing cooldown fires. (2) wake slots parked in backoff via
+// signalNetworkRevival() — this REUSES the ladder-reset invariant: the gate at
+// the reconnect loop keeps the ladder when lastWasRateLimited is set (запрет
+// 2026-05-18), because rate limiting can be per-carrier and a blind reset would
+// turn a network change into a way to bypass our own backoff. We do NOT reset any
+// ladder ourselves. (3) tear down every non-dead slot with deathCauseNetworkChange
+// (no FIN into a black-hole socket, no meltdown feed), reconnecting via the spread
+// path.
+//
+// Idempotent and safe against reader-observed deaths: handleSlotDeath's
+// tryMarkDead CAS means one teardown wins per slot; an already-dead slot is
+// skipped and relies on step 2's wake. No exec, no route calls, no syscalls.
+func (p *WSPoolTransport) NetworkChanged() {
+	select {
+	case <-p.ctx.Done():
+		return // пул останавливается — не запускаем веер реконнектов в мёртвый ctx
+	default:
+	}
+
+	// (1) Взводим ТОЛЬКО spread-гейт (recentMeltdownNs — отдельный атомик,
+	// читаемый лишь reconnectJitterOffset), НЕ трогая meltdownUntil/recordSlotDeath.
+	p.recentMeltdownNs.Store(time.Now().UnixNano())
+
+	// (2) Будим слоты в backoff. Сброс лестницы гейтится lastWasRateLimited ВНУТРИ
+	// reconnectLoopInner (запрет 2026-05-18) — мы его НЕ трогаем, только сигналим.
+	p.signalNetworkRevival()
+
+	// (3) Рвём все живые слоты. Мёртвые пропускаем — их обслужил шаг 2.
+	// tryMarkDead (CAS) в handleSlotDeath делает шаг идемпотентным.
+	torn := 0
+	for idx, slot := range p.snapshotSlots() {
+		if slot == nil || slot.getState() == slotDead {
+			continue
+		}
+		p.handleSlotDeath(p.client, idx, deathCauseNetworkChange)
+		torn++
+	}
+	p.log.Info("WS pool network change — slots torn down for reconnect",
+		"torn", torn, "pool_size", p.poolSize)
+}
+
 // reconnectLoopInner is the shared reconnect loop body. fastFirstAttempt selects
 // the age-cut fast path on attempt 0 (ageCutReconnectJitter, with age-cut
 // counters); false is the legacy natural/rotation path (exponential backoff,
@@ -5013,7 +5103,11 @@ func (p *WSPoolTransport) waitBackoffOrRevival(d time.Duration) bool {
 func (p *WSPoolTransport) bumpSlotDeaths1m(cause slotDeathCause) {
 	var split *atomic.Int32
 	switch cause {
-	case deathCausePreemptiveRotation, deathCauseDrainTeardown:
+	case deathCausePreemptiveRotation, deathCauseDrainTeardown, deathCauseNetworkChange:
+		// deathCauseNetworkChange — НАШЕ решение снять слот по сигналу ОС, не рез
+		// посредника. Смена сети рвёт все слоты разом; попади они в slotCuts1m,
+		// агрегат «резов» дал бы ложный диагноз «пул умирает» (класс дефектов из
+		// докстринга про полевой отказ 2026-08-11).
 		split = &p.slotTeardowns1m
 	default:
 		split = &p.slotCuts1m
@@ -5280,7 +5374,11 @@ func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int, cause slotDeathCa
 	// an age-cut session is impossible: the dead transport carries no session, and
 	// there is no on-wire session addressing to route a FIN over a live sibling —
 	// see docs/sl-capacity-dip-spec-review.md BLOCKER-1).
-	if cause != deathCauseNatural && cause != deathCauseAgeCut {
+	// deathCauseNetworkChange — то же исключение, что и age-cut: сокет привязан к
+	// СТАРОМУ локальному адресу и зависнет; FIN ушёл бы в мёртвый TCP и мог бы
+	// заблокировать WriteControlMessage до write-таймаута прямо здесь, в teardown,
+	// зовущемся синхронно из NetworkChanged. Полагаемся на серверный ghost-sweep.
+	if cause != deathCauseNatural && cause != deathCauseAgeCut && cause != deathCauseNetworkChange {
 		p.sendSlotSessionFIN(slot)
 	}
 
@@ -5331,6 +5429,12 @@ func (p *WSPoolTransport) handleSlotDeath(cl *Client, idx int, cause slotDeathCa
 			p.recordCapacityDip()
 		}
 		go p.reconnectLoopFast(idx)
+	case deathCauseNetworkChange:
+		// Смена сети: реконнектим ТОТ ЖЕ idx (замены в другой ячейке нет — рвём
+		// все слоты разом). Meltdown НЕ кормим: это не отказ origin. Разнесение
+		// хендшейков — по reconnectJitterOffset(idx) внутри
+		// reconnectLoopNetworkChange (hard rule 11).
+		go p.reconnectLoopNetworkChange(idx)
 	case deathCausePreemptiveRotation:
 		// OUR rotation — do NOT advance meltdown (would falsely trip under
 		// steady-state rotation load, see field log 2026-05-18), but DO

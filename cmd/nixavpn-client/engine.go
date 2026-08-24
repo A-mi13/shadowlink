@@ -77,7 +77,18 @@ var _ ErrorSignaller = (*engine.ShadowLinkEngine)(nil)
 var (
 	_ Engine                  = (*engine.ShadowLinkEngine)(nil)
 	_ InProcessDialerProvider = (*engine.ShadowLinkEngine)(nil)
+	_ NetworkChangeNotifier   = (*engine.ShadowLinkEngine)(nil)
 )
+
+// NetworkChangeNotifier — опциональный интерфейс: движок, который его реализует,
+// умеет форсировать переустановку соединений после смены сети. main.go берёт его
+// через comma-ok (как InProcessDialerProvider), поэтому промах assertion молча
+// отключил бы обработку смены сети на десктопе — слоты зависали бы до TCP-таймаута.
+// Compile-time сторож выше делает связь наблюдаемой для компилятора. Реализован
+// только *ShadowLinkEngine; VLESS его не реализует и обработки смены сети не имеет.
+type NetworkChangeNotifier interface {
+	NetworkChanged()
+}
 
 // InProcessDialerProvider — опциональный интерфейс (Bug #5). Engine, который его
 // реализует, отдаёт in-process tun2socks dialer: TUN-трафик туннелируется через

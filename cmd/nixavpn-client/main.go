@@ -244,6 +244,16 @@ func main() {
 			}
 		}
 
+		// Смена сети (Wi-Fi↔Ethernet, док, выход из сна): NIC-вотчер уже
+		// детектирует смену интерфейса, но раньше чинил только bypass-диалер.
+		// Прокидываем движок в вотчер, чтобы тот же сигнал форсировал
+		// переустановку WS-слотов — иначе они висят на старом пути до TCP-таймаута
+		// (P0). Опциональный интерфейс: только ShadowLink его реализует, VLESS —
+		// нет и остаётся без обработки смены сети (как и был).
+		if n, ok := eng.(NetworkChangeNotifier); ok {
+			tun = tun.WithNetworkChangeHook(n.NetworkChanged)
+		}
+
 		// H1/C3-b: create LeakGuard BEFORE tun.Start() so its crash-recovery
 		// (Windows New() → removeKillSwitch + policy restore + WFP
 		// DeleteByProvider) clears any stale SL-* rules / blockoutbound default
