@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/nixavpn/shadowlink/client"
+	"github.com/nixavpn/shadowlink/engine"
 	"gopkg.in/yaml.v3"
 )
 
@@ -30,31 +31,13 @@ type Config struct {
 	ProxyPass string `yaml:"-"`
 }
 
-// ShadowLinkConfig holds ShadowLink protocol connection settings.
-type ShadowLinkConfig struct {
-	Server     string                `yaml:"server"`
-	PubKey     string                `yaml:"pubkey"`
-	WebSocket  bool                  `yaml:"websocket"`
-	TLS        bool                  `yaml:"tls"`
-	Auto       bool                  `yaml:"auto"`
-	CDN        string                `yaml:"cdn,omitempty"`
-	ECH        bool                  `yaml:"ech,omitempty"`
-	Routing    *client.RoutingConfig `yaml:"routing,omitempty"`
-	Origin     string                `yaml:"origin,omitempty"`       // origin IP for direct WS (bypass CF CDN)
-	SNI        string                `yaml:"sni,omitempty"`          // TLS ServerName override for full-direct mode (IP host + domain SNI)
-	CFIP       string                `yaml:"cfip,omitempty"`         // specific Cloudflare edge IP (bypass DNS for WS)
-	WSPool     bool                  `yaml:"ws_pool,omitempty"`      // enable WS pool (default true for CDN+WS)
-	WSPoolSize int                   `yaml:"ws_pool_size,omitempty"` // pool size (default 6)
-	// BackupServers are fallback "host:port" endpoints tried in order when
-	// the primary Server handshake fails (ТСПУ blocks the CF SNI, DNS
-	// poisoning, etc.). Must share the same X25519 pubkey.
-	BackupServers []string `yaml:"backup_servers,omitempty"`
-	// CDNs is the SNI rotation pool (DomainPool). Distinct from BackupServers
-	// (alternative host:port endpoints). When non-empty, the engine installs a
-	// DomainPool on the transport's ConnManager and rotates SNI per reconnect
-	// against this list. Max enforced by client.maxCDNs (=8) on URL parsing.
-	CDNs []string `yaml:"cdns,omitempty"`
-}
+// ShadowLinkConfig — параметры протокола ShadowLink.
+//
+// Определение живёт в пакете engine: движок переносим между платформами
+// (десктоп, gomobile-фасад), и конфиг обязан ехать вместе с ним. Здесь
+// оставлен алиас, чтобы YAML-разбор и CLI-код продолжали писать привычное
+// имя без квалификатора.
+type ShadowLinkConfig = engine.ShadowLinkConfig
 
 // VLESSConfig holds VLESS+Reality connection settings.
 type VLESSConfig struct {

@@ -375,8 +375,8 @@ func main() {
 
 	// W8: also watch for engine crash (WS reconnect exhausted, SOCKS5 died, etc.)
 	var engineErr <-chan error
-	if slEng, ok := eng.(*ShadowLinkEngine); ok {
-		engineErr = slEng.ErrorCh()
+	if sig, ok := eng.(ErrorSignaller); ok {
+		engineErr = sig.ErrorCh()
 	}
 
 	select {
@@ -512,7 +512,7 @@ func resolveServerIPs(protocol string, cfg *Config) []string {
 		if cfg.ShadowLink != nil {
 			// Origin override has the highest priority. When ?origin=<IP> is set
 			// the data path is forced to dial that IP directly (see
-			// engine_shadowlink.go::full-direct activation). Returning ONLY the
+			// engine/engine.go::full-direct activation). Returning ONLY the
 			// origin IP here ensures the TUN escape list does NOT include any
 			// CF edge IP — without this, a reconnect-handshake that for any
 			// reason resolved through DNS would still have a usable escape route

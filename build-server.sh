@@ -22,6 +22,8 @@ go vet ./cmd/shadowlink-server/ ./server/... ./core/...
 if [ -f "$OUT" ]; then
   cp "$OUT" "${OUT}.bak-${STAMP}"
   echo ">> бэкап: ${OUT}.bak-${STAMP}"
+  # Ротация: держим 2 последних (см. тот же комментарий в build-client.sh).
+  ls -t "${OUT}".bak-* 2>/dev/null | tail -n +3 | xargs -r rm -f
 fi
 
 echo ">> build linux/amd64 -> $OUT"

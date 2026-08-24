@@ -137,9 +137,9 @@ Steganographic VPN. Go 1.25, `module github.com/nixavpn/shadowlink`. Отдел�
       ⚠ **Но «мёртвый код» — формулировка сильнее данных** (ревью 2026-08-18).
       Есть ТРИ конфигурации, где 20-мс циклы живые и это основной режим:
       (а) весь блок создания WS-транспорта под гейтом
-      `if e.cfg.SystemVPN || slCfg.WebSocket` (`engine_shadowlink.go:220`) —
+      `if e.cfg.SystemVPN || slCfg.WebSocket` (`engine/engine.go:220`) —
       клиент как обычный SOCKS5-прокси без `websocket: true` даёт `WST == nil`;
-      (б) стартовый fallback `engine_shadowlink.go:619-628`: при `!poolOK &&
+      (б) стартовый fallback `engine/engine.go:619-628`: при `!poolOK &&
       !SystemVPN` пробуется single WS, и при неудаче — буквально
       `Warn("Single WS не удался, используем poll-mode")`, то есть fallback
       существует, просто на этапе установления, а не при деградации;
@@ -651,6 +651,43 @@ bash build-client.sh           # → $CLIENT_BIN_DIR (default ./bin = D:\shadowl
 
 ## Planned work
 
-1. **Embedded tun2socks** — сейчас внешний бинарь, встроить как Go-пакет.
+1. ~~**Embedded tun2socks**~~ — **СДЕЛАНО**: уже in-process Go-библиотека
+   (`github.com/xjasonlyu/tun2socks/v2`, `cmd/nixavpn-client/engine.go`).
+   Запись «сейчас внешний бинарь» устарела, проверено 2026-08-21.
+1a. **gomobile-обёртка** — пакета `mobile/` НЕТ, хотя README описывал сборку
+   `.aar`/`.xcframework` как готовую (исправлено 2026-08-21). `client/`
+   кросс-компилируется под `android/arm64` и `ios/arm64` без правок — ядро
+   готово, нужен плоский фасад: gomobile не экспортирует структуры по значению
+   и `context.Context`, а текущий API это `NewClient(ClientConfig)` +
+   `Connect(ctx)`.
+   ⚠ **«iOS блокирован лимитом ~15 МБ» — было НЕВЕРНО ПО ЧИСЛУ** (проверено
+   2026-08-24 по источникам). 15 MiB — лимит `NEAppProxyProvider` и
+   `NEDNSProxyProvider`; у **`NEPacketTunnelProvider` с iOS 15 — 50 MiB**
+   (канонический тред Apple DTS 73148; независимо подтверждён ядерным логом
+   jetsam `ActiveHard 50 MB` в sing-box#3976 и блогом Tailscale «iOS 15 quietly
+   gave us 35MB more»). Разница в 3.3 раза: вывод «gvisor не влезает» заменяется
+   на «влезает в steady state, риск — срыв на пиках».
+   ⚠ Держать вместе с числом, иначе оно снова станет сильнее данных: лимиты
+   **официально не документированы**, Apple просит не зашивать их в код; есть
+   **неразрешённый контрпример** (iOS 17.3.1, убийство на 15 МБ вопреки 50 —
+   причина не найдена); на старых устройствах порог ниже при той же ОС.
+   ✅ Замерено 2026-08-24: **`client/` тянет 0 пакетов gVisor, tun2socks — 41**,
+   то есть память gVisor — цена TUN-режима, отделимая от ядра протокола.
+   `client/` собирается под `android/arm64` **с CGO=1** (режим gomobile) и под
+   `ios/arm64`. Тулчейн (gomobile+gobind+NDK 27.2+JDK 21) поставлен, go.mod
+   поднят до `go 1.26.0` — 18/18 пакетов зелёные, сервер кросс-собирается.
+   ⚠ Структурная развилка: WireGuard дёшев по памяти не из-за оптимизаций, а
+   потому что он **L3 и не терминирует TCP** (это делает ядро iOS). ShadowLink
+   TCP терминирует → мы в лиге Tailscale/sing-box, копировать WireGuard нельзя.
+   ⚠ Пики памяти в extension приходятся на **переподключение**, а не на steady
+   state (независимо у Psiphon и Tailscale; лечится снижением конкурентности —
+   Tailscale урезал DoH 1000→10). У нас пул из 8 слотов с ротацией 70–142 с =
+   непрерывный поток реконнектов, а `staggerDelay` в reconnect-пути НЕТ (п. 8).
+   ⚠ `runtime.ReadMemStats` в extension **может врать** (Psiphon видел память
+   основного приложения) — мерить `os_proc_available_memory()`; при jetsam
+   **крэш-лога нет**, «VPN просто отвалился» — ожидаемая симптоматика.
+   ⚠ `FreeOSMemory`/`madvdontneed` на iOS **не нужны**: `mem_darwin.go` шлёт
+   `MADV_FREE_REUSABLE`, корректно обновляющий учёт ядра (в апстриме с Go 1.13).
+   Статус: `docs/plans/2026-08-21-native-readiness.md`.
 2. **NixaVPN integration** — deploy orchestrator, config assembler, admin handlers.
 3. **18-й раунд аудита** — многотрековый, с web-research (запрошен 2026-07-25).

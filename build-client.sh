@@ -21,7 +21,14 @@ set -euo pipefail
 cd "$(dirname "$0")"                       # shadowlink/
 CLIENT_BIN_DIR="${CLIENT_BIN_DIR:-$(pwd)/bin}"
 mkdir -p "$CLIENT_BIN_DIR"
-OUT="$CLIENT_BIN_DIR/nixavpn-client-graceful-drain.exe"
+# Имя сведено к каноническому 2026-08-24. До этого скрипт собирал
+# nixavpn-client-graceful-drain.exe, который .gitignore не пускал в git, а
+# версионировался nixavpn-client.exe — то есть собиралось одно, хранилось
+# другое, синхронизировалось руками через cp. Ровно та вторая копия, что уже
+# давала молчаливое «binary identical, skipping upload» (hard rule 5).
+# Суффикс graceful-drain к тому же устарел: дренаж давно в проде, отдельной
+# сборки под него нет.
+OUT="$CLIENT_BIN_DIR/nixavpn-client.exe"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 
 echo ">> go test (быстрая проверка перед сборкой)"
@@ -31,6 +38,10 @@ go vet ./cmd/nixavpn-client/ ./client/...
 if [ -f "$OUT" ]; then
   cp "$OUT" "${OUT}.bak-${STAMP}"
   echo ">> бэкап: ${OUT}.bak-${STAMP}"
+  # Ротация: держим 2 последних. Клиент весит ~53 МБ, и без чистки каталог
+  # растёт линейно по числу сборок — за один рабочий день 2026-08-24 набралось
+  # 58 бэкапов на 2.3 ГБ. Откат нужен на шаг-два назад, не на полгода.
+  ls -t "${OUT}".bak-* 2>/dev/null | tail -n +3 | xargs -r rm -f
 fi
 
 echo ">> build windows/amd64 -> $OUT"
