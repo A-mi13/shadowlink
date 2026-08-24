@@ -659,8 +659,35 @@ bash build-client.sh           # → $CLIENT_BIN_DIR (default ./bin = D:\shadowl
    кросс-компилируется под `android/arm64` и `ios/arm64` без правок — ядро
    готово, нужен плоский фасад: gomobile не экспортирует структуры по значению
    и `context.Context`, а текущий API это `NewClient(ClientConfig)` +
-   `Connect(ctx)`. iOS отдельно блокирован лимитом памяти NetworkExtension
-   (~15 МБ против gvisor-стека) — архитектуру выбрать ДО начала работ.
+   `Connect(ctx)`.
+   ⚠ **«iOS блокирован лимитом ~15 МБ» — было НЕВЕРНО ПО ЧИСЛУ** (проверено
+   2026-08-24 по источникам). 15 MiB — лимит `NEAppProxyProvider` и
+   `NEDNSProxyProvider`; у **`NEPacketTunnelProvider` с iOS 15 — 50 MiB**
+   (канонический тред Apple DTS 73148; независимо подтверждён ядерным логом
+   jetsam `ActiveHard 50 MB` в sing-box#3976 и блогом Tailscale «iOS 15 quietly
+   gave us 35MB more»). Разница в 3.3 раза: вывод «gvisor не влезает» заменяется
+   на «влезает в steady state, риск — срыв на пиках».
+   ⚠ Держать вместе с числом, иначе оно снова станет сильнее данных: лимиты
+   **официально не документированы**, Apple просит не зашивать их в код; есть
+   **неразрешённый контрпример** (iOS 17.3.1, убийство на 15 МБ вопреки 50 —
+   причина не найдена); на старых устройствах порог ниже при той же ОС.
+   ✅ Замерено 2026-08-24: **`client/` тянет 0 пакетов gVisor, tun2socks — 41**,
+   то есть память gVisor — цена TUN-режима, отделимая от ядра протокола.
+   `client/` собирается под `android/arm64` **с CGO=1** (режим gomobile) и под
+   `ios/arm64`. Тулчейн (gomobile+gobind+NDK 27.2+JDK 21) поставлен, go.mod
+   поднят до `go 1.26.0` — 18/18 пакетов зелёные, сервер кросс-собирается.
+   ⚠ Структурная развилка: WireGuard дёшев по памяти не из-за оптимизаций, а
+   потому что он **L3 и не терминирует TCP** (это делает ядро iOS). ShadowLink
+   TCP терминирует → мы в лиге Tailscale/sing-box, копировать WireGuard нельзя.
+   ⚠ Пики памяти в extension приходятся на **переподключение**, а не на steady
+   state (независимо у Psiphon и Tailscale; лечится снижением конкурентности —
+   Tailscale урезал DoH 1000→10). У нас пул из 8 слотов с ротацией 70–142 с =
+   непрерывный поток реконнектов, а `staggerDelay` в reconnect-пути НЕТ (п. 8).
+   ⚠ `runtime.ReadMemStats` в extension **может врать** (Psiphon видел память
+   основного приложения) — мерить `os_proc_available_memory()`; при jetsam
+   **крэш-лога нет**, «VPN просто отвалился» — ожидаемая симптоматика.
+   ⚠ `FreeOSMemory`/`madvdontneed` на iOS **не нужны**: `mem_darwin.go` шлёт
+   `MADV_FREE_REUSABLE`, корректно обновляющий учёт ядра (в апстриме с Go 1.13).
    Статус: `docs/plans/2026-08-21-native-readiness.md`.
 2. **NixaVPN integration** — deploy orchestrator, config assembler, admin handlers.
 3. **18-й раунд аудита** — многотрековый, с web-research (запрошен 2026-07-25).

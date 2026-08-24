@@ -1,6 +1,6 @@
 module github.com/nixavpn/shadowlink
 
-go 1.25.7
+go 1.26.0
 
 require (
 	github.com/bogdanfinn/fhttp v0.6.8
