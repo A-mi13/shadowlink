@@ -3,7 +3,7 @@
 *.exe~
 shadowlink-client-mac
 shadowlink-server-linux
-shadowlink-server
+/shadowlink-server
 nixavpn-client-mac-arm64
 shadowlink-metrics-dump-linux
 
