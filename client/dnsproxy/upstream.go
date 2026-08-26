@@ -261,7 +261,7 @@ func (r *dohResolver) Resolve(ctx context.Context, q *dns.Msg) (*dns.Msg, error)
 	var lastErr error
 	// Ровно две попытки максимум: основной апстрим, затем резервный. Лестницы
 	// по всем апстримам нет намеренно — бюджет вызывающего (perUpstreamTimeout
-	// внутри overallTimeout) не резиновый, см. dohAttemptBudget.
+	// внутри overallTimeout) не резиновый, см. dohAttemptContext.
 	attempts := len(r.upstreams)
 	if attempts > maxDoHAttempts {
 		attempts = maxDoHAttempts

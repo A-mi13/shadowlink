@@ -25,4 +25,41 @@ func TestDoHServerIP_MatchesBypassrouteGuard(t *testing.T) {
 			"маршрутная защита DoH-пина охраняет не тот адрес, который дайлит "+
 			"DoH-клиент; синхронизируйте константы", bypassroute.DoHResolverIP, dohServerIP)
 	}
+	if bypassroute.DoHBackupResolverIP != dohBackupServerIP {
+		t.Fatalf("bypassroute.DoHBackupResolverIP = %q, client.dohBackupServerIP = %q — "+
+			"резервный апстрим охраняется не по тому адресу, который дайлится; "+
+			"синхронизируйте константы", bypassroute.DoHBackupResolverIP, dohBackupServerIP)
+	}
+}
+
+// TestDoHUpstreams_AllPinnedInBypassroute — вторая половина сшивки, и она про
+// ПОЛНОТУ, а не про равенство отдельных значений.
+//
+// Предыдущий тест сверяет две пары констант поимённо, поэтому ТРЕТИЙ апстрим,
+// добавленный в DoHUpstreams(), прошёл бы мимо него молча: обе существующие
+// пары остались бы согласованы, а новый адрес не был бы защищён guard'ом в
+// route() — то есть ровно тот дефект, который ревью нашло у резервного
+// (guard знал один адрес из двух), повторился бы на следующем добавлении.
+//
+// Здесь проверяется включение: КАЖДЫЙ апстрим из живого списка должен быть
+// известен маршрутной защите. Строковое сравнение — намеренно: bypassroute
+// экспортирует пины как строки, и разбор их в netip.Addr здесь дублировал бы
+// логику, которую и проверяем.
+func TestDoHUpstreams_AllPinnedInBypassroute(t *testing.T) {
+	pinned := map[string]bool{
+		bypassroute.DoHResolverIP:       true,
+		bypassroute.DoHBackupResolverIP: true,
+	}
+	ups := DoHUpstreams()
+	if len(ups) == 0 {
+		t.Fatal("DoHUpstreams() пуст — сверять нечего, проверьте источник")
+	}
+	for _, u := range ups {
+		if !pinned[u.IP] {
+			t.Errorf("DoH-апстрим %s (%s, SNI %s) НЕ известен bypassroute — "+
+				"route() не короткозамкнёт его на туннель, и admin override сможет "+
+				"увести его хендшейк на физический NIC открытым текстом. Добавьте "+
+				"константу в bypassroute и в dohResolverAddrs.", u.IP, u.Label, u.SNI)
+		}
+	}
 }

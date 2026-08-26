@@ -99,6 +99,51 @@ func TestDoHBackupServerIP_NotInRUTrie(t *testing.T) {
 	}
 }
 
+// TestDoHUpstreams_AdminOverrideCannotExposeAny closes the gap the primary-only
+// guard left open (review finding, 2026-08-26).
+//
+// The original guard compared against a single address, so the backup upstream
+// kept exactly the exposure the primary had just been protected from: an
+// AdminOverride.Adds entry covering it — and Adds is fetched from the admin
+// server (admin_fetch.go), i.e. genuinely remote operator input — would make
+// route() return routeDirect and put a cleartext ClientHello with SNI
+// unfiltered.adguard-dns.com on the user's own NIC.
+//
+// The irony that makes this worth a dedicated test: the backup exists precisely
+// to survive a Cloudflare block, so it gets dialled exactly when the primary is
+// already unusable. An unprotected backup fails at the only moment it matters.
+//
+// This iterates dohResolverAddrs rather than naming addresses, so a third
+// upstream added later cannot silently escape the check.
+func TestDoHUpstreams_AdminOverrideCannotExposeAny(t *testing.T) {
+	if len(dohResolverAddrs) < 2 {
+		t.Fatalf("expected at least primary+backup pinned upstreams, got %d",
+			len(dohResolverAddrs))
+	}
+
+	for _, addr := range dohResolverAddrs {
+		// Both shapes an override could take: a broad /24 and the exact /32.
+		for _, bits := range []int{24, 32} {
+			pref := netip.PrefixFrom(addr, bits).Masked()
+			resolved, err := Load(Source{
+				Embedded: true,
+				Override: &AdminOverride{Adds: []netip.Prefix{pref}},
+			})
+			if err != nil {
+				t.Fatalf("load with override %s: %v", pref, err)
+			}
+
+			d := &BypassDialer{resolved: resolved}
+			if got := d.route(metaForIP(addr)); got != routeTunnel {
+				t.Errorf("admin override %s exposes pinned DoH upstream %s: route()=%v, "+
+					"want routeTunnel — its handshake would leave the physical NIC in "+
+					"cleartext, the exact signature RU ISPs began resetting in August 2026",
+					pref, addr, got)
+			}
+		}
+	}
+}
+
 // TestDoHServerIP_AdminOverrideCannotExposeIt asserts the protection that closes
 // the last route-level way to expose the DoH dial.
 //

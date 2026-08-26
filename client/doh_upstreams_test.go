@@ -112,7 +112,8 @@ func TestNewDoHKeepAliveClientFor_UsesUTLSTransport(t *testing.T) {
 }
 
 // Запрос к апстриму обязан нести Host/URL ЭТОГО апстрима. Хардкод одного имени
-// на все апстримы отправил бы на Quad9 запрос с Host: cloudflare-dns.com —
+// на все апстримы отправил бы на резервный AdGuard запрос с Host:
+// cloudflare-dns.com —
 // чужой Host на чужом IP это в лучшем случае 404, в худшем — явная аномалия
 // в логах посредника.
 func TestDoHRequestURLFor_MatchesUpstreamSNI(t *testing.T) {
