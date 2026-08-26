@@ -699,8 +699,92 @@ func (f *Forwarder) handleQuery(ctx context.Context, q *dns.Msg, key cacheKey) (
 // семантика не меняется.
 func (f *Forwarder) handleNonA(ctx context.Context, q *dns.Msg, key cacheKey) (*dns.Msg, error) {
 	return f.resolveCachedSF(ctx, key, func() (*dns.Msg, error) {
-		return f.forwardCloudflare(ctx, q, key)
+		resp, err := f.forwardCloudflare(ctx, q, key)
+		if err == nil {
+			return resp, nil
+		}
+		// CF отказал — пробуем Yandex, но ТОЛЬКО для типов, где это безопасно
+		// (см. nonAFallbackAllowed). Единственная точка отказа, пункт 3.
+		return f.tryServeNonAFallback(ctx, q, key, err)
 	})
+}
+
+// nonAFallbackAllowed сообщает, допустим ли Yandex-фолбэк для типа запроса при
+// недоступном CF.
+//
+// ⚠ ЭТО НЕ СПИСОК УДОБСТВА, А ГРАНИЦА МОДЕЛИ ДОВЕРИЯ. У A-пути неарбитрированный
+// Yandex-ответ обставлен двумя проверками — yandexIsRU (хоть один A-IP в
+// RU-снапшоте) и containsStubIP (известная заглушка РКН). Обе работают через
+// a4Set, то есть разбирают ЗАПИСИ ТИПА A. Для не-A типов их применить не к чему,
+// и это меняет цену подмены по типам:
+//
+//   - MX / TXT / SRV / PTR / NS / SOA / CNAME — фолбэк РАЗРЕШЁН. Эти записи не
+//     маршрутизируют трафик сами по себе: подменённый MX/SRV/CNAME даёт имя,
+//     которое клиент затем резолвит ЧЕРЕЗ НАШ ЖЕ A-путь — там арбитраж и
+//     stub-фильтр никуда не делись, — а дальше упирается в проверку TLS-серта.
+//     Подменённый TXT портит SPF/верификацию домена, но соединение никуда не
+//     уводит. То есть подмена ловится ниже по стеку.
+//
+//   - HTTPS / SVCB (type 65) — фолбэк ЗАПРЕЩЁН, fail-closed. Эта запись несёт
+//     МАРШРУТИЗИРУЮЩИЕ данные: ipv4hint/ipv6hint уводят соединение на указанный
+//     IP в обход A-пути (то есть в обход арбитража), и при этом они НЕ видны
+//     stub-фильтру — ipv4hint лежит в SvcParam, а не в *dns.A, поэтому a4Set о
+//     нём не знает и containsStubIP на нём слеп. Вдобавок подменённый параметр
+//     ech= снимает ECH (downgrade), а alpn= может сбить протокол. Цена
+//     fail-closed при этом почти нулевая: на SERVFAIL по type-65 клиент штатно
+//     откатывается на A/AAAA и соединение всё равно устанавливается — просто
+//     без SVCB-оптимизации. Асимметрия «высокая цена ошибки / нулевая цена
+//     отказа» и решает вопрос.
+//
+// AAAA сюда не доходит (ServeDNS отвечает NODATA раньше), A — тем более
+// (у него своя лестница).
+func nonAFallbackAllowed(qtype uint16) bool {
+	switch qtype {
+	case dns.TypeMX, dns.TypeTXT, dns.TypeSRV, dns.TypePTR, dns.TypeNS, dns.TypeSOA, dns.TypeCNAME:
+		return true
+	default:
+		// HTTPS/SVCB и всё незнакомое — fail-closed. Умолчание намеренно
+		// закрытое: новый тип записи может нести маршрутизирующие данные, и
+		// «разрешить по умолчанию» означало бы тихо расширить доверие.
+		return false
+	}
+}
+
+// tryServeNonAFallback обслуживает не-A запрос Yandex'ом при недоступном CF.
+// Возвращает исходную ошибку CF, если фолбэк неприменим или не удался.
+//
+// Защиты повторяют неарбитрированный A-путь настолько, насколько это осмысленно
+// для не-A типов: тип из белого списка, cfOnly-режим исключён, ответ обязан быть
+// NOERROR с непустым Answer, кэш — жёсткий короткий unarbitratedCacheTTL, плюс
+// учёт в serveUnarbitratedTotal (тот же счётчик, что у A-пути: это ровно то же
+// доверие без сверки).
+func (f *Forwarder) tryServeNonAFallback(ctx context.Context, q *dns.Msg, key cacheKey, cfErr error) (*dns.Msg, error) {
+	if !nonAFallbackAllowed(key.qtype) {
+		return nil, cfErr
+	}
+	// cfOnly (нет RU-снапшота) — Yandex не трогаем НИКОГДА (M-4): без снапшота
+	// его ответ и на A-пути не мог бы быть использован, а plaintext-запрос в
+	// него — чистая утечка имени.
+	if f.cfOnly {
+		return nil, cfErr
+	}
+
+	uctx, cancel := context.WithTimeout(ctx, f.perUpstreamTimeout)
+	defer cancel()
+
+	resp, err := f.yandex.Resolve(uctx, upstreamQuery(q))
+	if err != nil || resp == nil || !usableRcode(resp) || resp.Rcode != dns.RcodeSuccess || len(resp.Answer) == 0 {
+		// Пустой/отказной ответ Yandex ничего не чинит: NXDOMAIN от него без
+		// сверки с CF не доверяем (РКН умеет отвечать NXDOMAIN'ом), а NODATA
+		// бесполезен. Отдаём исходную ошибку CF → SERVFAIL.
+		return nil, cfErr
+	}
+
+	f.serveUnarbitratedTotal.Add(1)
+	f.cache.putWithLifetime(key, resp, unarbitratedCacheTTL)
+	slog.Debug("split-DNS: не-A запрос обслужен Yandex-фолбэком (CF недоступен)",
+		"name", key.name, "qtype", dns.TypeToString[key.qtype])
+	return resp, nil
 }
 
 // resolveCachedSF — общий конверт «cache-get → singleflight → семафор» для

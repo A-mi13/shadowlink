@@ -13,19 +13,52 @@ import (
 	"testing"
 )
 
-// dohResolver хранит долгоживущий клиент с ВКЛЮЧЁННЫМ keep-alive (один
-// инстанс на всё время жизни резолвера; Resolve переиспользует его).
-func TestNewDoHResolver_HoldsSingleKeepAliveClient(t *testing.T) {
+// dohResolver держит по ОДНОМУ долгоживящему keep-alive клиенту НА АПСТРИМ и
+// переиспользует его между запросами (DNS-M6). С появлением резервного
+// апстрима (2026-08-26) клиентов стало несколько — по одному на IP-пин, потому
+// что пин задаётся при сборке дайлера и один клиент два разных IP обслужить не
+// может, — но свойство «клиент переиспользуется, а не создаётся на запрос»
+// сохранено, и именно оно здесь проверяется.
+func TestDoHResolver_HoldsKeepAliveClientPerUpstream(t *testing.T) {
 	r := newDoHResolver()
-	if r.client == nil {
-		t.Fatal("dohResolver должен держать долгоживущий HTTP-клиент")
+	if len(r.upstreams) < 2 {
+		t.Fatalf("ожидался резервный апстрим, получено %d", len(r.upstreams))
 	}
-	tr, ok := r.client.Transport.(*http.Transport)
-	if !ok {
-		t.Fatalf("ожидался *http.Transport, получен %T", r.client.Transport)
+
+	for _, u := range r.upstreams {
+		c := r.clientFor(u)
+		if c == nil {
+			t.Fatalf("апстрим %s: клиент не создан", u.label)
+		}
+		tr, ok := c.Transport.(*http.Transport)
+		if !ok {
+			t.Fatalf("апстрим %s: ожидался *http.Transport, получен %T", u.label, c.Transport)
+		}
+		if tr.DisableKeepAlives {
+			t.Fatalf("DNS-M6: keep-alive должен быть ВКЛЮЧЁН у DoH-клиента (%s)", u.label)
+		}
+		// Тот же апстрим обязан отдавать ТОТ ЖЕ инстанс — иначе keep-alive
+		// бессмысленен: каждый запрос открывал бы новое соединение.
+		if again := r.clientFor(u); again != c {
+			t.Fatalf("апстрим %s: клиент должен переиспользоваться, получены разные инстансы", u.label)
+		}
 	}
-	if tr.DisableKeepAlives {
-		t.Fatal("DNS-M6: keep-alive должен быть ВКЛЮЧЁН у DoH-клиента форвардера")
+}
+
+// Резервный апстрим не должен открывать НИ ОДНОГО сокета, пока основной жив:
+// клиент создаётся лениво, при первом обращении именно к нему. Иначе на wire
+// появлялся бы лишний класс TLS-хендшейков (к 94.140.14.140) даже когда
+// Cloudflare прекрасно отвечает.
+func TestDoHResolver_BackupClientCreatedLazily(t *testing.T) {
+	r := newDoHResolver()
+	if len(r.clients) != 0 {
+		t.Fatalf("до первого запроса клиентов быть не должно, есть %d", len(r.clients))
+	}
+
+	r.clientFor(r.upstreams[0]) // трогаем ТОЛЬКО основной
+	if _, ok := r.clients[r.upstreams[1].ip]; ok {
+		t.Fatal("клиент резервного апстрима создан, хотя к нему не обращались — " +
+			"это лишний класс хендшейков на wire")
 	}
 }
 

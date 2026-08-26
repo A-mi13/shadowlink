@@ -22,6 +22,18 @@ func metaForIP(ip netip.Addr) *M.Metadata {
 // and the comment below tells the next reader where to look.
 const dohServerIPLiteral = "1.1.1.1"
 
+// dohBackupServerIPLiteral mirrors the BACKUP upstream (client/ech.go
+// dohBackupServerIP, AdGuard unfiltered). Duplicated as a literal for the same
+// import-cycle reason as above, and covered from the other side by
+// cmd/nixavpn-client's TestDoHUpstreams_HaveNoEscapeRoute, which iterates the
+// live client.DoHUpstreams() list.
+//
+// Added 2026-08-26 together with the backup upstream: the trie guard below
+// protected only the primary, so a trie that matched the backup would have sent
+// its handshake DIRECT from the user's NIC (cleartext SNI
+// unfiltered.adguard-dns.com) with every existing test still green.
+const dohBackupServerIPLiteral = "94.140.14.140"
+
 // TestDoHServerIP_NotInRUTrie guards the fourth (and least visible) way the DoH
 // path could be pushed onto the wire in cleartext.
 //
@@ -57,6 +69,33 @@ func TestDoHServerIP_NotInRUTrie(t *testing.T) {
 	if got := d.route(metaForIP(doh)); got != routeTunnel {
 		t.Fatalf("route(%s) = %v, want routeTunnel — the DoH dial must stay inside "+
 			"the tunnel", doh, got)
+	}
+}
+
+// TestDoHBackupServerIP_NotInRUTrie is the same guard for the BACKUP upstream.
+//
+// The backup is dialled by the same bare net.Dialer as the primary and enjoys
+// exactly the same (emergent, route-derived) protection — so it needs exactly
+// the same guard. Without this, the RU trie could classify the AdGuard IP as
+// routeDirect and hand its handshake to the physical NIC, defeating the point
+// of having a backup that survives a Cloudflare block.
+func TestDoHBackupServerIP_NotInRUTrie(t *testing.T) {
+	backup := netip.MustParseAddr(dohBackupServerIPLiteral)
+
+	resolved, err := Load(Source{Embedded: true})
+	if err != nil {
+		t.Fatalf("load embedded: %v", err)
+	}
+	if resolved.Match(backup) {
+		t.Fatalf("embedded RU trie matches backup DoH IP %s → BypassDialer would "+
+			"send its TLS handshake DIRECT from the user's NIC (cleartext SNI "+
+			"unfiltered.adguard-dns.com)", backup)
+	}
+
+	d := &BypassDialer{resolved: resolved}
+	if got := d.route(metaForIP(backup)); got != routeTunnel {
+		t.Fatalf("route(%s) = %v, want routeTunnel — the backup DoH dial must stay "+
+			"inside the tunnel", backup, got)
 	}
 }
 

@@ -3,6 +3,7 @@ package main
 import (
 	"net/netip"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/nixavpn/shadowlink/client"
@@ -103,6 +104,52 @@ func TestDoHServerIP_HasNoEscapeRoute(t *testing.T) {
 	if sameSixteen.coversIP(t, doh) || sameSixteen.containsHost(doh) {
 		t.Errorf("server IP in the DoH /16 dragged DoH IP %s out of the TUN; plan=%+v",
 			doh, sameSixteen)
+	}
+}
+
+// TestDoHUpstreams_HaveNoEscapeRoute extends the guard above to EVERY upstream,
+// not just the primary.
+//
+// Why this exists as a separate test (2026-08-26): a backup DoH upstream was
+// added, and the guard above reads only client.DoHServerIP() — the FIRST
+// upstream. A backup with an escape route would put a cleartext ClientHello
+// with SNI unfiltered.adguard-dns.com on the user's own NIC, and the original
+// guard would stay green while doing it. The protection must cover the whole
+// list, because the whole list gets dialled.
+//
+// Iterating DoHUpstreams() rather than a second literal also means adding a
+// third upstream later cannot silently escape the check.
+func TestDoHUpstreams_HaveNoEscapeRoute(t *testing.T) {
+	ups := client.DoHUpstreams()
+	if len(ups) < 2 {
+		t.Fatalf("expected a backup DoH upstream to guard, got %d", len(ups))
+	}
+
+	for _, u := range ups {
+		narrow := buildEscapePlan([]string{prodServerIP}, true)
+		if narrow.containsHost(u.IP) || narrow.coversIP(t, u.IP) {
+			t.Errorf("narrow escape exempts DoH upstream %s (%s) from the TUN — its "+
+				"handshake would leave the physical NIC in cleartext with SNI %s; plan=%+v",
+				u.IP, u.Label, u.SNI, narrow)
+		}
+
+		cdn := buildEscapePlan([]string{prodServerIP}, false)
+		if cdn.containsHost(u.IP) || cdn.coversIP(t, u.IP) {
+			t.Errorf("CDN escape exempts DoH upstream %s (%s); plan=%+v", u.IP, u.Label, cdn)
+		}
+
+		// Adversarial: a server IP sharing the upstream's /16 must not drag it
+		// out of the TUN through the sweep.
+		octets := strings.Split(u.IP, ".")
+		if len(octets) != 4 {
+			t.Fatalf("upstream %s: malformed IP", u.IP)
+		}
+		neighbour := octets[0] + "." + octets[1] + ".9.9"
+		same := buildEscapePlan([]string{neighbour}, true)
+		if same.containsHost(u.IP) || same.coversIP(t, u.IP) {
+			t.Errorf("server IP %s in upstream %s's /16 dragged it out of the TUN; plan=%+v",
+				neighbour, u.IP, same)
+		}
 	}
 }
 
