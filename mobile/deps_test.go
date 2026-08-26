@@ -16,6 +16,20 @@ import (
 //     Приезжает он не сам: стрелка направлена в другую сторону (leakguard
 //     зависит от client), поэтому связь возникнет ровно тогда, когда кто-нибудь
 //     потянет обратно, например dnsproxy.DefaultYandexIPs().
+//   - dnsproxy: НЕ дубль предыдущего пункта, хотя и связан с ним. leakguard
+//     стерегут за платформенные вызовы; здесь причина другая и она про wire.
+//     Форвардер несёт DoH-ногу (client/ech.go, пин на 1.1.1.1, SNI
+//     cloudflare-dns.com) с ГОЛЫМ net.Dialer: в туннель она попадает не кодом,
+//     а таблицей маршрутов ОС — split-маршруты 0/1+128/1 десктопного TUN
+//     (см. TestDoHServerIP_HasNoEscapeRoute в cmd/nixavpn-client). У мобильного
+//     фасада этих маршрутов нет по построению: TUN поднимает платформа, а
+//     SystemVPN=false (config.go). Значит форвардер, приехавший сюда молча,
+//     слал бы открытый ClientHello с физического интерфейса — ровно ту
+//     сигнатуру, которую РКН начал резать в августе 2026 (DoH/DoT к CF и
+//     Google рвутся на хендшейке). Сегодня связи нет: dnsproxy импортируют
+//     только cmd/nixavpn-client/tunnel.go (под cfg.SystemVPN) и leakguard/rules.go
+//     (ради одной DefaultYandexIPs()) — проверено 2026-08-26. Тест держит это
+//     свойство, пока фасад развивается.
 //   - tun2socks/v2/engine: за ним стоит gVisor, а gVisor — главный потребитель
 //     памяти. Для iOS-extension это прямой путь к jetsam.
 //   - xray-core: приезжает вместе с VLESS-конфигом CLI и по размеру неприемлем.
@@ -27,6 +41,7 @@ func TestMobile_DoesNotPullPlatformOrGVisorPackages(t *testing.T) {
 
 	forbidden := []string{
 		"github.com/nixavpn/shadowlink/client/leakguard",
+		"github.com/nixavpn/shadowlink/client/dnsproxy",
 		"github.com/xjasonlyu/tun2socks/v2/engine",
 		"gvisor.dev/gvisor",
 		"github.com/xtls/xray-core",
