@@ -2,7 +2,6 @@ package client
 
 import (
 	"io"
-	"log/slog"
 	"math/rand/v2"
 	"sync"
 	"time"
@@ -54,10 +53,6 @@ type ConnManager struct {
 	stopCh        chan struct{}
 	stopped       bool
 
-	echEnabled bool
-	echDomain  string
-	echCache   *ECHConfig
-
 	sniOverride string      // TLS ServerName override (full-direct mode OR DomainPool pick)
 	domainPool  *DomainPool // optional: rotates sniOverride per reconnect
 }
@@ -79,8 +74,6 @@ type ConnManagerConfig struct {
 	LockedProfile *browser.Fingerprint // If set, use this fingerprint instead of rotating
 	MinRotation   time.Duration        // default 2m (mimicry: shorter rotation defeats connection-duration fingerprinting)
 	MaxRotation   time.Duration        // default 8m
-	ECHEnabled    bool
-	ECHDomain     string
 	SNIOverride   string // TLS ServerName override. Set when dialing origin IP with CF-domain SNI (full-direct mode).
 }
 
@@ -115,8 +108,6 @@ func NewConnManager(config ConnManagerConfig) *ConnManager {
 		lifecycle:     browser.NewSessionLifecycle(),
 		warmupEnabled: true,
 		stopCh:        make(chan struct{}),
-		echEnabled:    config.ECHEnabled,
-		echDomain:     config.ECHDomain,
 		sniOverride:   config.SNIOverride,
 	}
 
@@ -240,25 +231,13 @@ func (cm *ConnManager) connect() {
 		cm.tlsClient = client
 		cm.stdClient = nil
 
-		// ECH: resolve and cache ECH config for CDN mode.
-		// Chrome 133+ profiles already include GREASE ECH via BoringGREASEECH().
-		// With a real ECHConfigList the TLS handshake would need utls-level changes.
-		// For MVP we resolve and cache the config, logging success for observability,
-		// and prepare for utls integration. GREASE ECH already provides partial protection.
-		if cm.echEnabled && cm.echDomain != "" {
-			if cm.echCache == nil || cm.echCache.IsExpired() {
-				if echBytes, err := ResolveECHConfig(cm.echDomain); err == nil {
-					cm.echCache = &ECHConfig{
-						ConfigList: echBytes,
-						ResolvedAt: time.Now(),
-						TTL:        5 * time.Minute,
-					}
-					slog.Info("ECH config resolved", "domain", cm.echDomain, "size", len(echBytes))
-				} else {
-					slog.Warn("ECH resolution failed, using GREASE ECH", "error", err)
-				}
-			}
-		}
+		// ⚠ Здесь была ветка резолва реального ECHConfigList из DNS HTTPS-записи
+		// (удалена 2026-08-26). Она делала DoH-запрос на КАЖДОМ connect и клала
+		// результат в поле-кэш на менеджере, которое никогда не читалось: в TLS
+		// конфиг не применялся. Достижима она была только в CDN-режиме, который
+		// запрещён hard rule 1. GREASE ECH живёт в Chrome-профиле uTLS
+		// (browser.BoringGREASEECH) и от этой ветки не зависел.
+		// Сторож: TestECHResolve_NotInConnManagerSource (ech_removed_test.go).
 	} else {
 		// Non-TLS: use bogdanfinn/fhttp client directly (for testing)
 		stdTimeout := 30 * time.Second

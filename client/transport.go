@@ -104,14 +104,14 @@ type DirectTransport struct {
 // serverAddr is "host:port" (e.g., "example.com:443").
 // useTLS enables TLS with browser-identical fingerprinting. skipVerify for testing.
 func NewDirectTransport(serverAddr string, useTLS bool, skipVerify bool) *DirectTransport {
-	return newDirectTransportFull(serverAddr, useTLS, skipVerify, false, "", "", defaultDataPathBodyPrefix)
+	return newDirectTransportFull(serverAddr, useTLS, skipVerify, "", defaultDataPathBodyPrefix)
 }
 
 // newDirectTransportBP — как NewDirectTransport, но с явным выбором формата
 // data-path (bodyPrefix). Используется NewClient для проброса
 // ClientConfig.DataPathBodyPrefix; при nil-поле NewClient передаёт сюда дефолт.
 func newDirectTransportBP(serverAddr string, useTLS, skipVerify, bodyPrefix bool) *DirectTransport {
-	return newDirectTransportFull(serverAddr, useTLS, skipVerify, false, "", "", bodyPrefix)
+	return newDirectTransportFull(serverAddr, useTLS, skipVerify, "", bodyPrefix)
 }
 
 // NewDirectTransportWithSNI creates a direct transport that dials serverAddr (IP:port)
@@ -125,24 +125,19 @@ func newDirectTransportBP(serverAddr string, useTLS, skipVerify, bodyPrefix bool
 // X25519 public key at the protocol layer — TLS here is only for steganographic
 // packet shape, not for authentication.
 func NewDirectTransportWithSNI(serverAddr, sniDomain string, useTLS bool) *DirectTransport {
-	return newDirectTransportFull(serverAddr, useTLS, false, false, "", sniDomain, defaultDataPathBodyPrefix)
+	return newDirectTransportFull(serverAddr, useTLS, false, sniDomain, defaultDataPathBodyPrefix)
 }
 
 // newDirectTransportWithSNIBP — как NewDirectTransportWithSNI, но с явным
 // bodyPrefix (проброс ClientConfig.DataPathBodyPrefix из NewClient).
 func newDirectTransportWithSNIBP(serverAddr, sniDomain string, useTLS, bodyPrefix bool) *DirectTransport {
-	return newDirectTransportFull(serverAddr, useTLS, false, false, "", sniDomain, bodyPrefix)
-}
-
-// newDirectTransportECH is kept for backward compatibility with existing callers.
-func newDirectTransportECH(serverAddr string, useTLS bool, skipVerify bool, echEnabled bool, echDomain string) *DirectTransport {
-	return newDirectTransportFull(serverAddr, useTLS, skipVerify, echEnabled, echDomain, "", defaultDataPathBodyPrefix)
+	return newDirectTransportFull(serverAddr, useTLS, false, sniDomain, bodyPrefix)
 }
 
 // newDirectTransportFull is the unified internal constructor. bodyPrefix — уже
 // разрешённый эффективный выбор формата data-path (снимок дефолта либо явное
 // поле конфига), потому что глобал недоступен мобильному фасаду.
-func newDirectTransportFull(serverAddr string, useTLS bool, skipVerify bool, echEnabled bool, echDomain, sniOverride string, bodyPrefix bool) *DirectTransport {
+func newDirectTransportFull(serverAddr string, useTLS bool, skipVerify bool, sniOverride string, bodyPrefix bool) *DirectTransport {
 	scheme := "http"
 	if useTLS {
 		scheme = "https"
@@ -165,8 +160,6 @@ func newDirectTransportFull(serverAddr string, useTLS bool, skipVerify bool, ech
 		FPPool:      fpPool,
 		MinRotation: 5 * time.Minute,
 		MaxRotation: 10 * time.Minute,
-		ECHEnabled:  echEnabled,
-		ECHDomain:   echDomain,
 		SNIOverride: sniOverride,
 	})
 
@@ -777,16 +770,12 @@ type CDNTransport struct {
 }
 
 // NewCDNTransport creates a transport through Cloudflare CDN.
+//
+// ⚠ 2026-08-26: парная NewCDNTransportWithECH удалена вместе с ECH-веткой —
+// она была ЕДИНСТВЕННЫМ способом включить резолв ECHConfigList, а сам резолв
+// в TLS не применялся (см. client/ech.go). Прод к CDN не ходит (hard rule 1).
 func NewCDNTransport(cdnDomain string) *CDNTransport {
-	direct := newDirectTransportECH(cdnDomain, true, false, false, "")
-	return &CDNTransport{direct: direct}
-}
-
-// NewCDNTransportWithECH creates a CDN transport with optional ECH support.
-// When echEnabled is true, the ConnManager will resolve and cache ECH config
-// from DNS HTTPS records for the CDN domain, preparing for utls-level ECH injection.
-func NewCDNTransportWithECH(cdnDomain string, echEnabled bool) *CDNTransport {
-	direct := newDirectTransportECH(cdnDomain, true, false, echEnabled, cdnDomain)
+	direct := newDirectTransportFull(cdnDomain, true, false, "", defaultDataPathBodyPrefix)
 	return &CDNTransport{direct: direct}
 }
 

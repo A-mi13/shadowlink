@@ -269,7 +269,6 @@ type ClientConfig struct {
 	UseTLS      bool   // enable TLS (default true for production)
 	SkipVerify  bool   // skip TLS cert verification (testing only)
 	CDNDomain   string // if set, use CDN transport via this domain
-	ECHEnabled  bool   // enable ECH (Encrypted Client Hello) for CDN mode
 	SNIOverride string // if set, TLS ServerName = SNIOverride (full-direct mode: IP host + domain SNI). Requires UseTLS=true.
 
 	// FPCacheDir is the directory where the fingerprint profile state is
@@ -335,7 +334,7 @@ func NewClient(config ClientConfig) *Client {
 		// while keeping the legitimate SNI so nginx server_name still matches.
 		transport = newDirectTransportWithSNIBP(config.ServerAddr, config.SNIOverride, config.UseTLS, bodyPrefix)
 	case config.CDNDomain != "":
-		transport = NewCDNTransportWithECH(config.CDNDomain, config.ECHEnabled)
+		transport = NewCDNTransport(config.CDNDomain)
 	default:
 		transport = newDirectTransportBP(config.ServerAddr, config.UseTLS, config.SkipVerify, bodyPrefix)
 	}

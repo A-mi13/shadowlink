@@ -25,7 +25,8 @@ func TestParseSLURL_BasicValid(t *testing.T) {
 	assert.Equal(t, true, cfg.Auto)
 	assert.Equal(t, "cdn.example.com", cfg.CDN)
 	assert.Equal(t, "127.0.0.1:9050", cfg.Socks)
-	assert.Equal(t, true, cfg.ECH)
+	// ech=1 в этом URL присутствует намеренно: он больше не парсится (ECH-ветка
+	// удалена), и его наличие не должно ломать разбор остальных параметров.
 	assert.Equal(t, "my-client-42", cfg.ClientID)
 }
 
@@ -41,7 +42,6 @@ func TestParseSLURL_DefaultPort(t *testing.T) {
 	assert.Equal(t, "127.0.0.1:1080", cfg.Socks)
 	assert.Equal(t, false, cfg.WebSocket)
 	assert.Equal(t, false, cfg.Auto)
-	assert.Equal(t, false, cfg.ECH)
 	assert.Equal(t, "", cfg.CDN)
 	assert.Equal(t, "", cfg.ClientID)
 }
@@ -53,7 +53,6 @@ func TestParseSLURL_WithCDN(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, "cloudflare.example.com", cfg.CDN)
-	assert.Equal(t, true, cfg.ECH)
 	assert.Equal(t, "vpn.example.com:443", cfg.Server)
 }
 
@@ -108,7 +107,6 @@ func TestBuildSLURL_Roundtrip(t *testing.T) {
 		WebSocket: true,
 		Auto:      true,
 		CDN:       "cdn.example.com",
-		ECH:       true,
 	}
 
 	url := BuildSLURL(original)
@@ -125,7 +123,6 @@ func TestBuildSLURL_Roundtrip(t *testing.T) {
 	assert.Equal(t, original.WebSocket, parsed.WebSocket)
 	assert.Equal(t, original.Auto, parsed.Auto)
 	assert.Equal(t, original.CDN, parsed.CDN)
-	assert.Equal(t, original.ECH, parsed.ECH)
 	// Socks is default, so BuildSLURL may omit it, but ParseSLURL sets default
 	assert.Equal(t, original.Socks, parsed.Socks)
 }
@@ -141,7 +138,8 @@ func TestBuildSLURL_OmitsDefaults(t *testing.T) {
 	url := BuildSLURL(cfg)
 	// Should not contain socks param (it's the default)
 	assert.NotContains(t, url, "socks=")
-	// Should not contain ws, auto, ech, cdn, id params (all zero/empty)
+	// Should not contain ws, auto, cdn, id params (all zero/empty); ech= не
+	// эмитится никогда — поле удалено вместе с ECH-веткой.
 	assert.NotContains(t, url, "ws=")
 	assert.NotContains(t, url, "auto=")
 	assert.NotContains(t, url, "ech=")

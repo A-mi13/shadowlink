@@ -136,7 +136,6 @@ func parseSLURL(rawURL string) (*ShadowLinkConfig, error) {
 		TLS:           cfc.TLS,
 		Auto:          cfc.Auto,
 		CDN:           cfc.CDN,
-		ECH:           cfc.ECH,
 		Origin:        cfc.Origin,
 		SNI:           cfc.SNI,
 		CFIP:          cfc.CFIP,

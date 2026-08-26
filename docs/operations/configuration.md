@@ -175,7 +175,7 @@ by design: an externally settable value could be made weak.
 | `tls` | bool | `false` | TLS for the transport dial | VERIFIED |
 | `auto` | bool | `false` | Carried through from the URL; not consulted by the engine's transport selection | VERIFIED |
 | `cdn` | string | `""` | **Legacy, and the name lies about the mechanism** — see §8.1 | VERIFIED |
-| `ech` | bool | `false` | Carried through; parsed from `ech=1` | VERIFIED |
+| ~~`ech`~~ | — | — | **REMOVED 2026-08-26.** The field is gone from `ShadowLinkConfig`, `ClientFileConfig` and `ClientConfig`. A legacy `ech: true` in YAML or `ech=1` in an `sl://` URL still parses fine — both are now **silently ignored**, because unknown YAML keys and unread query params are no-ops. Nothing is lost: the branch resolved a real `ECHConfigList` over DoH on every connect and **never applied it to the TLS handshake**, and it was reachable only in pure-CDN mode, which hard rule 1 forbids. GREASE ECH in the Chrome uTLS profile (`BoringGREASEECH`) is a different mechanism and stays | VERIFIED |
 | `routing` | object | nil | `bypass` / `force` / `block` lists, §3.5 | VERIFIED |
 | `origin` | string | `""` | Origin IP for a direct WS dial; sets WS target to `origin:443` with SNI from `server` (`engine/engine.go:344-348`) | VERIFIED |
 | `sni` | string | `""` | TLS ServerName override — the full-direct mode (IP host + domain SNI) | VERIFIED |
@@ -376,7 +376,7 @@ sl://0000000000000000000000000000000000000000000000000000000000000000@203.0.113.
 | `tls` | `tls` | Truthy only for the literal string `1` |
 | `ws` | `websocket` | Literal `1` |
 | `auto` | `auto` | Literal `1` |
-| `ech` | `ech` | Literal `1` |
+| ~~`ech`~~ | *(nothing)* | **Accepted and ignored since 2026-08-26.** The parser no longer reads the key, so an old key carrying `ech=1` still parses; `BuildSLURL` never emits it. See §3.2 |
 | `cdn` | `cdn` | ⚠ Changes the transport — §8.1 |
 | `origin` | `origin` | Origin IP for a direct WS dial |
 | `sni` | `sni` | TLS ServerName; the full-direct mode |

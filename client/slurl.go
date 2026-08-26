@@ -25,7 +25,14 @@ const maxCDNs = 8
 
 // ParseSLURL parses an sl:// URL into a ClientFileConfig.
 //
-// Format: sl://PUBKEY@HOST:PORT?tls=1&ws=1&auto=1&cdn=DOMAIN&sni=DOMAIN&origin=IP&socks=ADDR&ech=1&id=CLIENT_ID
+// Format: sl://PUBKEY@HOST:PORT?tls=1&ws=1&auto=1&cdn=DOMAIN&sni=DOMAIN&origin=IP&socks=ADDR&id=CLIENT_ID
+//
+// Обратная совместимость: параметр `ech=1` из старых ключей ПРИНИМАЕТСЯ и
+// молча игнорируется — неизвестные query-параметры парсер не читает, поэтому
+// чужой ключ с ech=1 разбирается как обычно. Поле убрано из конфига вместе с
+// мёртвой ECH-веткой 2026-08-26 (client/ech.go): резолв ECHConfigList делал
+// DoH-запрос и никогда не применял результат в TLS. Сторож —
+// TestParseSLURL_LegacyECHParamIgnored.
 //
 // Modes:
 //   - Full-CF:     @DOMAIN:443?tls=1&cdn=DOMAIN                       — all traffic via CF
@@ -90,7 +97,6 @@ func ParseSLURL(rawURL string) (*ClientFileConfig, error) {
 		TLS:       q.Get("tls") == "1",
 		WebSocket: q.Get("ws") == "1",
 		Auto:      q.Get("auto") == "1",
-		ECH:       q.Get("ech") == "1",
 		CDN:       q.Get("cdn"),
 		Origin:    q.Get("origin"),
 		SNI:       q.Get("sni"),
@@ -166,9 +172,6 @@ func BuildSLURL(cfg *ClientFileConfig) string {
 	}
 	if cfg.Auto {
 		params.Set("auto", "1")
-	}
-	if cfg.ECH {
-		params.Set("ech", "1")
 	}
 	if cfg.CDN != "" {
 		params.Set("cdn", cfg.CDN)

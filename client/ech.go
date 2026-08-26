@@ -36,8 +36,7 @@ import (
 // tun2socks hands it to BypassDialer, which classifies non-RU → routeTunnel.
 // In plain SOCKS5 mode (no TUN) there are no split routes and this dial goes
 // DIRECT from the physical NIC, putting a cleartext ClientHello with SNI
-// cloudflare-dns.com on the wire. Same for the ECH cold-start caller, which
-// runs before routes exist. Guards: TestDoHServerIP_HasNoEscapeRoute
+// cloudflare-dns.com on the wire. Guards: TestDoHServerIP_HasNoEscapeRoute
 // (cmd/nixavpn-client) and TestDoHServerIP_NotInRUTrie (client/bypassroute).
 const dohServerIP = "1.1.1.1"
 
@@ -77,9 +76,12 @@ func DoHServerIP() string { return dohServerIP }
 //
 // B1 (2026-06-11): the client now dials the LITERAL 1.1.1.1 via
 // buildUTLSHTTPClientPinned — no DNS lookup of `cloudflare-dns.com`. This is
-// the cure for the split-DNS forwarder loop (see dohServerIP doc) and is also
-// correct for the ECH cold-start caller (1.1.1.1 is the right edge for the
-// cloudflare-dns.com cert, so pinning never hurts).
+// the cure for the split-DNS forwarder loop (see dohServerIP doc).
+//
+// ⚠ 2026-08-26: после удаления ECH-ветки продовых call-site'ов у one-shot пути
+// (newDoHClient → DoHQueryRaw) в репозитории не осталось — это публичная
+// обёртка «запрос без keep-alive», сохранённая намеренно. Держатель горячего
+// DNS-пути — NewDoHKeepAliveClient + DoHQueryRawWith (client/dnsproxy).
 func newDoHClient() *http.Client {
 	// Pick a Chrome fingerprint for DoH. Chrome is the most common browser
 	// fingerprint, so a Chrome JA3 hitting 1.1.1.1 is the highest-volume
@@ -96,8 +98,8 @@ func newDoHClient() *http.Client {
 // держит ОДИН инстанс на весь свой lifecycle и обязан звать
 // CloseIdleConnections при остановке (Forwarder.Stop → dohResolver.Close).
 // Тот же IP-пин 1.1.1.1 и тот же Chrome-fingerprint, что у newDoHClient;
-// ECH bootstrap путь (DoHQueryRaw → newDoHClient) НЕ переводится и остаётся
-// one-shot, как был.
+// one-shot путь (DoHQueryRaw → newDoHClient) НЕ переводится и остаётся
+// без keep-alive, как был.
 func NewDoHKeepAliveClient() *http.Client {
 	fp := browser.NewFingerprint(browser.ProfileChrome)
 	return buildUTLSHTTPClientPinnedKeepAlive(dohServerIP, dohSNI, fp, false, 5*time.Second, "http/1.1")
@@ -117,8 +119,8 @@ func NewDoHKeepAliveClient() *http.Client {
 // Chrome User-Agent + sec-ch-ua header set can be attached; stdlib Post sends
 // no UA, which would leave a uTLS Chrome ClientHello followed by a UA-less POST.
 func DoHQueryRaw(ctx context.Context, m *dns.Msg) (*dns.Msg, error) {
-	// One-shot клиент per-call — поведение ECH bootstrap пути сохранено как
-	// есть (DNS-M6 меняет только dnsproxy-путь через DoHQueryRawWith).
+	// One-shot клиент per-call — поведение сохранено как есть (DNS-M6 меняет
+	// только dnsproxy-путь через DoHQueryRawWith).
 	httpClient := newDoHClient()
 	defer httpClient.CloseIdleConnections()
 	return DoHQueryRawWith(ctx, m, httpClient)
@@ -169,69 +171,17 @@ func DoHQueryRawWith(ctx context.Context, m *dns.Msg, httpClient *http.Client) (
 	return r, nil
 }
 
-// DoHQuery is DoHQueryRaw plus the strict-success contract: a non-Success
-// Rcode is treated as an error. Used by ResolveECHConfig (TypeHTTPS), which
-// expects a failed resolve in that case. Callers that must distinguish
-// NXDOMAIN/NODATA from transport failure (the dnsproxy forwarder) use
-// DoHQueryRaw directly.
-func DoHQuery(ctx context.Context, m *dns.Msg) (*dns.Msg, error) {
-	r, err := DoHQueryRaw(ctx, m)
-	if err != nil {
-		return nil, err
-	}
-
-	if r.Rcode != dns.RcodeSuccess {
-		return nil, fmt.Errorf("dns query returned %s", dns.RcodeToString[r.Rcode])
-	}
-
-	return r, nil
-}
-
-// ResolveECHConfig queries DNS HTTPS record (type 65) for domain
-// and extracts ECHConfigList from the ech= SvcParam.
-// Uses DNS-over-HTTPS (DoH) to prevent plaintext DNS leaking the target domain.
-func ResolveECHConfig(domain string) ([]byte, error) {
-	m := new(dns.Msg)
-	m.SetQuestion(dns.Fqdn(domain), dns.TypeHTTPS)
-	m.RecursionDesired = true
-
-	r, err := DoHQuery(context.Background(), m)
-	if err != nil {
-		return nil, fmt.Errorf("resolve ech for %s: %w", domain, err)
-	}
-
-	for _, ans := range r.Answer {
-		https, ok := ans.(*dns.HTTPS)
-		if !ok {
-			continue
-		}
-		for _, v := range https.Value {
-			if v.Key() == dns.SVCB_ECHCONFIG {
-				echVal, ok := v.(*dns.SVCBECHConfig)
-				if !ok {
-					continue
-				}
-				if len(echVal.ECH) > 0 {
-					return echVal.ECH, nil
-				}
-			}
-		}
-	}
-
-	return nil, fmt.Errorf("no ECH config found in DNS HTTPS record for %s", domain)
-}
-
-// ECHConfig holds cached ECH configuration with TTL.
-type ECHConfig struct {
-	ConfigList []byte
-	ResolvedAt time.Time
-	TTL        time.Duration
-}
-
-// IsExpired returns true if the cached ECH config has expired.
-func (e *ECHConfig) IsExpired() bool {
-	if e == nil || len(e.ConfigList) == 0 {
-		return true
-	}
-	return time.Since(e.ResolvedAt) > e.TTL
-}
+// ⚠ УДАЛЕНО 2026-08-26: ResolveECHConfig / ECHConfig / IsExpired / DoHQuery.
+// Ветка «реальный ECHConfigList из DNS HTTPS-записи» была мёртвой по построению:
+// она исполнялась только при `cdn=` + `ech=1` БЕЗ `origin=` и БЕЗ `sni=`, то есть
+// в чистом CDN-режиме, запрещённом hard rule 1 (прод = DIRECT к голому origin IP).
+// Обе full-direct ветки engine обнуляют CDNDomain, мобильный фасад поле ECH не
+// пробрасывает вовсе, а сам код по собственному комментарию только резолвил и
+// кэшировал конфиг, НИКОГДА не применяя его в TLS: сетевой DoH-запрос делался,
+// результат не использовался. GREASE ECH из Chrome-профиля (BoringGREASEECH)
+// к этой ветке отношения не имеет и остаётся на месте.
+//
+// Строгая обёртка DoHQuery (Rcode != Success → ошибка) удалена вместе с ней:
+// её единственным потребителем был ResolveECHConfig. Форвардеру dnsproxy нужен
+// ровно противоположный контракт — NXDOMAIN/NODATA как валидный ответ, — и он
+// ходит через DoHQueryRawWith.

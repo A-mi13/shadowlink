@@ -23,7 +23,12 @@ type ClientFileConfig struct {
 	Auto       bool          `yaml:"auto"`
 	Routing    RoutingConfig `yaml:"routing"`
 	Warmup     *bool         `yaml:"warmup"`
-	ECH        bool          `yaml:"ech"`
+	// ⚠ Поле ECH (`yaml:"ech"` / `ech=1` в sl://) удалено 2026-08-26 вместе с
+	// мёртвой ECH-веткой. И YAML-ключ `ech:`, и query-параметр `ech=1` теперь
+	// ЯВНО ИГНОРИРУЮТСЯ: yaml.Unmarshal без KnownFields не падает на лишнем
+	// ключе, ParseSLURL неизвестные query-параметры не читает. То есть старые
+	// конфиги и старые ключи продолжают работать, просто без эффекта — эффекта
+	// не было и раньше (см. client/ech.go).
 	Origin     string        `yaml:"origin"` // Origin IP for direct WS (bypass CF CDN)
 	SNI        string        `yaml:"sni"`    // TLS ServerName override when connecting to IP directly (full-direct mode)
 	CFIP       string        `yaml:"cfip"`   // Specific Cloudflare edge IP (bypass DNS, keep domain as TLS SNI)

@@ -195,7 +195,6 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) (retErr error) {
 		ClientID:     clientID,
 		UseTLS:       slCfg.TLS,
 		CDNDomain:    slCfg.CDN,
-		ECHEnabled:   slCfg.ECH,
 		// Пустая строка = не персистить (поведение CLI). Мобильный фасад сюда
 		// передаёт системный каталог: без него профиль отпечатка выбирается
 		// заново на каждый старт, а дрейф отпечатка — это сигнал (hard rule 2).

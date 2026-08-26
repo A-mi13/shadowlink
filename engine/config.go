@@ -74,7 +74,6 @@ type ShadowLinkConfig struct {
 	TLS        bool                  `yaml:"tls"`
 	Auto       bool                  `yaml:"auto"`
 	CDN        string                `yaml:"cdn,omitempty"`
-	ECH        bool                  `yaml:"ech,omitempty"`
 	Routing    *client.RoutingConfig `yaml:"routing,omitempty"`
 	Origin     string                `yaml:"origin,omitempty"`       // origin IP for direct WS (bypass CF CDN)
 	SNI        string                `yaml:"sni,omitempty"`          // TLS ServerName override for full-direct mode (IP host + domain SNI)
