@@ -4,10 +4,22 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 
 	M "github.com/xjasonlyu/tun2socks/v2/metadata"
 	"github.com/xjasonlyu/tun2socks/v2/proxy"
 )
+
+// DoHResolverIP — пиннутый IP DoH-резолвера (Cloudflare 1.1.1.1), который
+// клиент дайлит из client/ech.go. Литерал-дубликат: bypassroute НЕ МОЖЕТ
+// импортировать client (client уже импортирует bypassroute — import cycle).
+// Дрейф сшит с двух сторон: client/doh_pin_stitch_test.go сверяет эту
+// константу с живым client.dohServerIP, а doh_route_test.go — с локальным
+// dohServerIPLiteral.
+const DoHResolverIP = "1.1.1.1"
+
+// dohResolverAddr — разобранный DoHResolverIP для сравнения в route().
+var dohResolverAddr = netip.MustParseAddr(DoHResolverIP)
 
 // errDropUnreachable is returned for dials to unreachable-by-design reserved
 // addresses (cloud metadata, loopback, multicast, broadcast). Rejecting here —
@@ -136,6 +148,19 @@ func (d *BypassDialer) route(m *M.Metadata) route {
 	}
 	if isReservedIPv4(addr) {
 		return routeDirect
+	}
+	// DoH-пин: 1.1.1.1 никогда не уходит с физического NIC, что бы ни лежало
+	// в trie. Embedded-baseline его не содержит (TestEmbedded_NonRUIPsMiss),
+	// но AdminOverride.Adds — операторский список и может принести любой CIDR,
+	// включая покрывающий резолвер; routeDirect для него означал бы открытый
+	// TLS ClientHello с SNI cloudflare-dns.com с адреса абонента — ровно та
+	// сигнатура, которую РКН начал резать в августе 2026. Проверка стоит ЗДЕСЬ,
+	// а не Exclude'ом в Load: route() — единственная точка решения для
+	// tun2socks (TCP и UDP), она покрывает Resolved любого происхождения и не
+	// трогает SnapshotPrefixes (экспорт allow-правил для leakguard).
+	// Сторож: TestDoHServerIP_AdminOverrideCannotExposeIt.
+	if addr == dohResolverAddr {
+		return routeTunnel
 	}
 	if d.resolved == nil {
 		return routeTunnel

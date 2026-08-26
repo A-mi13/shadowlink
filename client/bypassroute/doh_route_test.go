@@ -60,43 +60,54 @@ func TestDoHServerIP_NotInRUTrie(t *testing.T) {
 	}
 }
 
-// TestDoHServerIP_AdminOverrideCannotExposeIt documents the residual risk rather
-// than asserting a protection that does not exist.
+// TestDoHServerIP_AdminOverrideCannotExposeIt asserts the protection that closes
+// the last route-level way to expose the DoH dial.
 //
-// An admin override CAN currently pull the DoH IP into the RU trie, which would
-// route it direct. There is no code today that prevents it. This test pins that
-// behaviour so the exposure is visible and intentional: if someone later adds a
-// hard exclusion for the DoH IP (the natural fix — an Excludes entry, since
-// Match applies include-minus-exclude), this test fails and must be inverted,
-// which is the moment to confirm the fix works.
+// HISTORY: until 2026-08-26 this test asserted the OPPOSITE — that an admin
+// override covering 1.1.1.1 routes the DoH dial DIRECT. It was written that way
+// on purpose: back then no code prevented the exposure, and a test asserting
+// "override cannot expose it" would have been green only because it asserted
+// nothing real. The protection now exists — route() short-circuits the pinned
+// DoH resolver IP (DoHResolverIP) to routeTunnel BEFORE consulting the trie —
+// so the test is inverted, as its own comment demanded.
 //
-// Written this way on purpose: a test asserting "override cannot expose it"
-// would be green today only because it asserted nothing real.
+// The guard sits in route() rather than as a hard Excludes entry in Load()
+// deliberately: route() is the function tun2socks actually consults (both
+// DialContext and DialUDP), it covers ANY Resolved regardless of how it was
+// built, and it leaves SnapshotPrefixes — the leakguard allow-rule export —
+// untouched. An Excludes entry would protect only tries built via Load and
+// would not change SnapshotPrefixes for a covering /24 anyway (the snapshot
+// drops a prefix only when its NETWORK address is excluded; 1.1.1.0 is not
+// matched by a 1.1.1.1/32 exclude).
 func TestDoHServerIP_AdminOverrideCannotExposeIt(t *testing.T) {
+	// Package-local drift stitch: the prod guard constant must protect the same
+	// address this test pins as a literal. The cross-package half (guard vs the
+	// live client.DoHServerIP()) lives in client/doh_pin_stitch_test.go.
+	if DoHResolverIP != dohServerIPLiteral {
+		t.Fatalf("DoHResolverIP = %q, test pins %q — the route() guard protects a "+
+			"different address than the DoH client actually dials", DoHResolverIP,
+			dohServerIPLiteral)
+	}
+
 	doh := netip.MustParseAddr(dohServerIPLiteral)
 
-	resolved, err := Load(Source{
-		Embedded: true,
-		Override: &AdminOverride{Adds: []netip.Prefix{netip.MustParsePrefix("1.1.1.0/24")}},
-	})
-	if err != nil {
-		t.Fatalf("load with override: %v", err)
-	}
+	// Both override shapes that could cover the resolver: a broad /24 and the
+	// exact /32. Either one, without the guard, flips route() to routeDirect.
+	for _, cidr := range []string{"1.1.1.0/24", "1.1.1.1/32"} {
+		resolved, err := Load(Source{
+			Embedded: true,
+			Override: &AdminOverride{Adds: []netip.Prefix{netip.MustParsePrefix(cidr)}},
+		})
+		if err != nil {
+			t.Fatalf("load with override %s: %v", cidr, err)
+		}
 
-	d := &BypassDialer{resolved: resolved}
-	got := d.route(metaForIP(doh))
-
-	if got == routeTunnel {
-		t.Fatalf("admin override no longer exposes the DoH IP (route=%v). If this is "+
-			"an intentional new protection (e.g. a hard Excludes entry for the DoH "+
-			"resolver), invert this test: the documented residual risk is now closed.", got)
+		d := &BypassDialer{resolved: resolved}
+		if got := d.route(metaForIP(doh)); got != routeTunnel {
+			t.Fatalf("admin override %s exposes the DoH IP %s: route()=%v, want "+
+				"routeTunnel. A direct dial would put a cleartext ClientHello with "+
+				"SNI cloudflare-dns.com on the wire from the user's NIC — the exact "+
+				"signature RU ISPs began resetting in August 2026.", cidr, doh, got)
+		}
 	}
-	if got != routeDirect {
-		t.Fatalf("unexpected classification %v for overridden DoH IP; expected "+
-			"routeDirect (the documented residual risk)", got)
-	}
-	t.Logf("documented residual risk holds: an admin override covering %s routes "+
-		"the DoH dial DIRECT (route=%v), exposing a cleartext ClientHello with SNI "+
-		"cloudflare-dns.com. Mitigation if ever needed: add the DoH IP to Excludes.",
-		doh, got)
 }
