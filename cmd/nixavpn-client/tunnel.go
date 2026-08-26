@@ -826,6 +826,45 @@ func createTUNLinux(device string) error {
 // должен совпадать — сторожится TestYandexDNSIPs_MatchResolvers.
 var yandexDNSIPs = dnsproxy.DefaultYandexIPs()
 
+// escapePlan — полный набор адресов/сетей, которые setupRoutes выводит из TUN
+// через физический шлюз. Всё, чего здесь НЕТ, попадает под split-маршруты
+// 0/1+128/1 и уходит в туннель.
+//
+// Вынесено в чистую функцию (buildEscapePlan) ровно по той же причине, что и
+// buildWindowsSetDNSCommands: escape-список — это политика безопасности, а не
+// деталь исполнения, и она должна быть проверяема без exec/админских прав.
+// Пустой escape для DoH-IP — не отсутствие настройки, а сама защита; сторож
+// TestDoHServerIP_HasNoEscapeRoute держит этот инвариант.
+type escapePlan struct {
+	Hosts []string // /32 (или /128) escape через физ. шлюз
+	CIDRs []string // /16 sweep, только в CDN-режиме (без origin-pin)
+}
+
+// buildEscapePlan строит escape-план. Чистая: без exec, без сети, без gateway.
+// narrowEscape=true (URL содержит ?origin=) выключает /16 sweep.
+func buildEscapePlan(serverIPs []string, narrowEscape bool) escapePlan {
+	plan := escapePlan{}
+	plan.Hosts = append(plan.Hosts, serverIPs...)
+	plan.Hosts = append(plan.Hosts, yandexDNSIPs...)
+
+	if narrowEscape {
+		return plan
+	}
+	added := make(map[string]bool)
+	for _, ip := range serverIPs {
+		parts := strings.SplitN(ip, ".", 4)
+		if len(parts) != 4 {
+			continue
+		}
+		cidr := parts[0] + "." + parts[1] + ".0.0"
+		if !added[cidr] {
+			added[cidr] = true
+			plan.CIDRs = append(plan.CIDRs, cidr)
+		}
+	}
+	return plan
+}
+
 // setupRoutes настраивает split-routing для системного VPN.
 // Сначала добавляет escape-маршруты для каждого IP VPN-сервера через реальный шлюз,
 // затем один раз добавляет split-маршруты (0.0.0.0/1 + 128.0.0.0/1) через TUN.
@@ -835,25 +874,17 @@ func setupRoutes(device string, serverIPs []string, narrowEscape bool) error {
 		return fmt.Errorf("определение шлюза: %w", err)
 	}
 
-	// 1. Escape-маршруты для каждого IP сервера (/32).
-	for _, ip := range serverIPs {
+	// План escape-маршрутов (чистая функция — сторожится в tunnel_routes_test.go).
+	// 1/1a. /32 для каждого IP сервера и для Yandex DNS (77.88.8.8 / 77.88.8.1).
+	// Yandex — БЕЗУСЛОВНО (не зависит от split-DNS): он резолвится напрямую в
+	// обоих режимах. С forwarder'ом: тот шлёт Yandex plain-UDP DIRECT — без
+	// escape split-маршруты 0/1+128/1 утянули бы эти UDP-пакеты обратно в TUN
+	// и зациклили. Без forwarder'а (legacy): TUN DNS = Yandex напрямую — те же
+	// пакеты тоже должны идти мимо TUN.
+	plan := buildEscapePlan(serverIPs, narrowEscape)
+	for _, ip := range plan.Hosts {
 		if err := addEscapeRoute(ip, gw); err != nil {
 			slog.Warn("escape route не добавлен", "ip", ip, "err", err)
-		}
-	}
-
-	// 1a. Escape-маршруты /32 для Yandex DNS (77.88.8.8 / 77.88.8.1) через
-	// физический шлюз. Добавляем БЕЗУСЛОВНО (не зависит от split-DNS): Yandex
-	// DNS должен резолвиться напрямую в обоих режимах. С forwarder'ом: он шлёт
-	// Yandex plain-UDP DIRECT — без escape split-маршруты 0/1+128/1 утянули бы
-	// эти UDP-пакеты обратно в TUN и зациклили. Без forwarder'а (legacy): TUN
-	// DNS = Yandex напрямую — те же пакеты тоже должны идти мимо TUN. Безвредно
-	// в любом случае: Yandex IP через физ.gw корректен всегда.
-	for _, ip := range yandexDNSIPs {
-		if err := addEscapeRoute(ip, gw); err != nil {
-			slog.Warn("Yandex DNS escape route не добавлен", "ip", ip, "err", err)
-		} else {
-			slog.Info("Yandex DNS escape route добавлен", "ip", ip)
 		}
 	}
 
@@ -865,25 +896,18 @@ func setupRoutes(device string, serverIPs []string, narrowEscape bool) error {
 	// SKIPPED in narrowEscape mode (URL has ?origin=). When the data path is
 	// pinned to a known origin IP, the WS dial target never rotates, so the
 	// /16 sweep adds no value AND is harmful: it covers ~65k unrelated IPs
-	// (every neighbour on the same /16) and exempts them from the TUN. In
-	// CDN mode (no origin pin) the /16 sweep is correct and kept.
-	if !narrowEscape {
-		addedCIDR := make(map[string]bool)
-		for _, ip := range serverIPs {
-			parts := strings.SplitN(ip, ".", 4)
-			if len(parts) == 4 {
-				cidr := parts[0] + "." + parts[1] + ".0.0"
-				if !addedCIDR[cidr] {
-					addedCIDR[cidr] = true
-					if err := addEscapeRouteCIDR(cidr, "255.255.0.0", gw); err != nil {
-						slog.Warn("escape CIDR route не добавлен", "cidr", cidr+"/16", "err", err)
-					} else {
-						slog.Info("escape CIDR route добавлен", "cidr", cidr+"/16")
-					}
-				}
+	// (every neighbour on the same /16) and exempts them from the TUN — including,
+	// if a server IP ever landed in 1.1.0.0/16, the pinned DoH resolver itself.
+	// In CDN mode (no origin pin) the /16 sweep is correct and kept.
+	if len(plan.CIDRs) > 0 {
+		for _, cidr := range plan.CIDRs {
+			if err := addEscapeRouteCIDR(cidr, "255.255.0.0", gw); err != nil {
+				slog.Warn("escape CIDR route не добавлен", "cidr", cidr+"/16", "err", err)
+			} else {
+				slog.Info("escape CIDR route добавлен", "cidr", cidr+"/16")
 			}
 		}
-	} else {
+	} else if narrowEscape {
 		slog.Info("narrow escape mode: /16 CIDR sweep skipped (origin pin)",
 			"escape_ips", serverIPs)
 	}

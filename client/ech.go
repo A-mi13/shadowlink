@@ -21,16 +21,46 @@ import (
 // In the split-DNS forwarder that name lookup re-enters the forwarder (TUN-DNS
 // is the forwarder once setTUNDNS runs) → Cloudflare branch → DoHQuery → resolve
 // `cloudflare-dns.com` → loop (cascade timeouts → SERVFAIL). Pinning the dial to
-// the literal 1.1.1.1 removes the DNS step entirely; the connect is a plain TCP
-// to 1.1.1.1 (not in the RU snapshot → routed through the tunnel by BypassDialer
-// → exits at the VPN server → reaches CF uncensored). The ECH cold-start path
-// also benefits — it stops resolving the resolver name too.
+// the literal 1.1.1.1 removes the DNS step entirely.
+//
+// ⚠ HOW this connect reaches CF, stated precisely (the earlier wording said
+// "routed through the tunnel by BypassDialer" and misled a 2026-08-26 review
+// into believing the Go code routes it): the dialer here is a BARE net.Dialer
+// (utls_http.go buildUTLSHTTPClientCommon) — no BypassDialer, no tun2socks in
+// this call path. Reaching CF over the tunnel is a property of the OS ROUTING
+// TABLE, not of this code, and only in TUN/SystemVPN mode:
+//   - no /32 escape route exists for this IP (tunnel.go buildEscapePlan), and
+//   - the /16 sweep is skipped under origin-pin,
+//
+// so the 0/1+128/1 split routes swallow the packet into the TUN, where
+// tun2socks hands it to BypassDialer, which classifies non-RU → routeTunnel.
+// In plain SOCKS5 mode (no TUN) there are no split routes and this dial goes
+// DIRECT from the physical NIC, putting a cleartext ClientHello with SNI
+// cloudflare-dns.com on the wire. Same for the ECH cold-start caller, which
+// runs before routes exist. Guards: TestDoHServerIP_HasNoEscapeRoute
+// (cmd/nixavpn-client) and TestDoHServerIP_NotInRUTrie (client/bypassroute).
 const dohServerIP = "1.1.1.1"
 
 // dohSNI — the ServerName presented in the TLS handshake. Cloudflare's 1.1.1.1
 // DoH endpoint serves a cert valid for `cloudflare-dns.com` and `one.one.one.one`;
 // we use `cloudflare-dns.com` because it's the canonical public name.
 const dohSNI = "cloudflare-dns.com"
+
+// DoHServerIP exposes the pinned DoH dial target to other packages so route- and
+// trie-level guards can assert against the LIVE constant instead of a parallel
+// literal. Same single-source-of-truth role dnsproxy.DefaultYandexIPs() plays for
+// the Yandex escape routes (invariant N2) — but with the OPPOSITE sign: Yandex
+// MUST have a /32 escape (plain UDP, direct by design), while this IP must have
+// NONE, because its protection is that it falls through to the tunnel.
+//
+// Why an accessor is needed at all: the DoH dialer is a bare net.Dialer
+// (utls_http.go buildUTLSHTTPClientCommon) — nothing in Go code routes it. It
+// reaches CF through the tunnel only because the OS routing table has no escape
+// for it, so the 0/1+128/1 split routes swallow it into the TUN. That protection
+// is emergent from three independent decisions and is not visible at this call
+// site; see TestDoHServerIP_HasNoEscapeRoute (cmd/nixavpn-client) and
+// TestDoHServerIP_NotInRUTrie (client/bypassroute) for the guards.
+func DoHServerIP() string { return dohServerIP }
 
 // newDoHClient constructs the HTTP client used for DNS-over-HTTPS queries to
 // Cloudflare's 1.1.1.1 endpoint.
