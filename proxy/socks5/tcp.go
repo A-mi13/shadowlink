@@ -15,6 +15,27 @@ import (
 	"github.com/nixavpn/shadowlink/core"
 )
 
+// Log level on the per-stream relay path (2026-08-31, integration review).
+//
+// Every normal stream completion here — "uplink done", the four "downlink done"
+// variants, "downlink cancelled", "Split CONNECT OK", and their per-stream
+// twins — logs at DEBUG, not INFO. Two reasons, in order of weight:
+//
+//  1. Volume. These fire twice per CONNECT (measured 1:1:1 —
+//     socks_connects = uplink done = downlink done, see
+//     docs/plans/2026-08-13-age-wall-probe.md:155), so they, not the periodic
+//     pool summaries, are what dominates a long log. The NixaVPN client team
+//     reported 1.9M lines in a day on mobile, where log size costs battery and
+//     disk, and the client has no log rotation.
+//  2. Metadata. Each line carries `dest=IP:port`. Note the asymmetry this
+//     fixes: "SOCKS5 CONNECT" (tcp.go:55) was already Debug, so the request was
+//     quieter than its own completion.
+//
+// Nothing diagnostic is lost: every actual failure on this path logs at WARN
+// (CONNECT_FAIL, encrypt/write errors, throttling, stream-limit) and is
+// untouched. Do not raise these back to INFO to debug a field run — run the
+// client with `-log=debug`, which is what the field prompts already do.
+
 // wsReadyPoolAdapter wraps *client.WSReadyPool so it satisfies PoolAcquirer
 // (which returns `any` to keep coalesce.go free of client/ imports). The
 // type assertion in the consumer recovers *client.WebSocketTransport.
@@ -324,7 +345,7 @@ func HandleTCPConnectWSPerStream(ctx context.Context, conn net.Conn, cl *client.
 		for {
 			n, err := conn.Read(buf)
 			if err != nil {
-				slog.Info("per-stream uplink done", "dest", destAddr, "stream", streamID,
+				slog.Debug("per-stream uplink done", "dest", destAddr, "stream", streamID,
 					"bytes", total, "elapsed", time.Since(relayStart).Round(time.Millisecond))
 				// SEC-H5: wait for downlink idle (reset on every received
 				// frame) instead of a fixed 15s, so an active response stream
@@ -376,7 +397,7 @@ func HandleTCPConnectWSPerStream(ctx context.Context, conn net.Conn, cl *client.
 				if netErr, ok := err.(interface{ Timeout() bool }); ok && netErr.Timeout() {
 					continue
 				}
-				slog.Info("per-stream downlink done", "dest", destAddr, "stream", streamID,
+				slog.Debug("per-stream downlink done", "dest", destAddr, "stream", streamID,
 					"bytes", total, "chunks", chunks, "elapsed", time.Since(relayStart).Round(time.Millisecond))
 				return
 			}
@@ -792,7 +813,7 @@ func tunnelTCPStream(ctx context.Context, conn net.Conn, cl *client.Client, wst 
 			reply(ReplyConnRefused)
 			return
 		}
-		slog.Info("Split CONNECT OK", "dest", destAddr, "stream", streamID, "elapsed", connectElapsed)
+		slog.Debug("Split CONNECT OK", "dest", destAddr, "stream", streamID, "elapsed", connectElapsed)
 	} else {
 		// WebSocket (or WS pool): OPTIMISTIC CONNECT — send CONNECT chunk,
 		// immediately reply SOCKS5 success, start relay. Server buffers data
@@ -887,7 +908,7 @@ func tunnelTCPStream(ctx context.Context, conn net.Conn, cl *client.Client, wst 
 		for {
 			n, err := conn.Read(buf)
 			if err != nil {
-				slog.Info("uplink done", "dest", destAddr, "stream", streamID,
+				slog.Debug("uplink done", "dest", destAddr, "stream", streamID,
 					"bytes", total, "uploads", uploads, "elapsed", time.Since(relayStart).Round(time.Millisecond),
 					"err", err)
 
@@ -1068,7 +1089,7 @@ func tunnelTCPStream(ctx context.Context, conn net.Conn, cl *client.Client, wst 
 				},
 			}
 			downlinkReassemblyLoop(ctx2, incomingSeqCh, conn, peerFullClose, dep)
-			slog.Info("downlink done (migration)", "dest", destAddr, "stream", streamID,
+			slog.Debug("downlink done (migration)", "dest", destAddr, "stream", streamID,
 				"bytes", total, "chunks", chunks, "elapsed", time.Since(relayStart).Round(time.Millisecond))
 			return
 		}
@@ -1077,7 +1098,7 @@ func tunnelTCPStream(ctx context.Context, conn net.Conn, cl *client.Client, wst 
 			select {
 			case data, ok := <-incomingCh:
 				if !ok || data == nil {
-					slog.Info("downlink done (ch closed)", "dest", destAddr, "stream", streamID,
+					slog.Debug("downlink done (ch closed)", "dest", destAddr, "stream", streamID,
 						"bytes", total, "chunks", chunks, "elapsed", time.Since(relayStart).Round(time.Millisecond))
 					return
 				}
@@ -1150,11 +1171,11 @@ func tunnelTCPStream(ctx context.Context, conn net.Conn, cl *client.Client, wst 
 				// returned. Tear the stream down. nil channel (loopback) never
 				// fires this case. peerFullClose only closes on appConn.Close,
 				// never on appConn.CloseWrite, so keep-alive half-close is unaffected.
-				slog.Info("downlink done (app full close)", "dest", destAddr, "stream", streamID,
+				slog.Debug("downlink done (app full close)", "dest", destAddr, "stream", streamID,
 					"bytes", total, "chunks", chunks, "elapsed", time.Since(relayStart).Round(time.Millisecond))
 				return
 			case <-ctx2.Done():
-				slog.Info("downlink cancelled", "dest", destAddr, "stream", streamID,
+				slog.Debug("downlink cancelled", "dest", destAddr, "stream", streamID,
 					"bytes", total, "chunks", chunks, "elapsed", time.Since(relayStart).Round(time.Millisecond))
 				return
 			}

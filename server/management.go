@@ -13,6 +13,30 @@ import (
 // bulk-операции. Применяется в ServeHTTP, до делегирования в mux (раунд 18).
 const mgmtMaxBodyBytes = 64 << 10
 
+// redactClientID renders a client_id for logs without writing the whole value.
+//
+// clientID is not an opaque account label — it is a long-lived shared secret.
+// The client seals it to the server's static key and it is mixed into the
+// session-key HKDF (core/crypto.go:118-124), so possession of it is what
+// authenticates the server to that client (there is no ServerHello signature —
+// see core/server_auth_test.go). The very same string is the authorization key
+// here (handler.go:717 calls IsAuthorized on the decrypted handshake value), so
+// a management log line was writing an authentication secret to disk in
+// plaintext, where it outlives the request and lands in log shipping.
+//
+// A prefix keeps the line useful for operations (correlating "added" with
+// "removed", spotting the tenant) while leaving the value unusable: the
+// operational format is `u<user>:d<device>`, so the head is the low-entropy
+// part anyway. Short values are dropped entirely rather than half-shown —
+// showing 4 of 5 characters is not redaction.
+func redactClientID(id string) string {
+	const keep = 4
+	if len(id) <= keep*2 {
+		return "[redacted]"
+	}
+	return id[:keep] + "…[redacted]"
+}
+
 // ManagementHandler exposes an HTTP API for controlling client authorization
 // and device limits at runtime. Protected by X-Management-Key header
 // (X-API-Key also accepted as alias for Prometheus scrapers that only support
@@ -116,7 +140,7 @@ func (mh *ManagementHandler) handleAddClient(w http.ResponseWriter, r *http.Requ
 	}
 
 	mh.clientAuth.AddClient(req.ClientID)
-	slog.Info("management: client added", "client_id", req.ClientID)
+	slog.Info("management: client added", "client_id", redactClientID(req.ClientID))
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -136,7 +160,7 @@ func (mh *ManagementHandler) handleRemoveClient(w http.ResponseWriter, r *http.R
 	// Atomically remove authorization and clean up session tracking.
 	mh.clientAuth.GetAndDestroyClientSession(clientID)
 
-	slog.Info("management: client removed", "client_id", clientID)
+	slog.Info("management: client removed", "client_id", redactClientID(clientID))
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
