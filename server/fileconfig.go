@@ -79,6 +79,25 @@ type FileConfig struct {
 	// turns it on; this pointer is propagated (not deref'd) so absence stays nil.
 	OriginDeathTeardown *bool `yaml:"origin_death_teardown,omitempty"`
 
+	// FlowMaxWindow is the per-stream flow-control window ceiling the server
+	// grants (bytes). nil → leave Config.FlowMaxWindow as the flag layer set it
+	// (default 1 MiB). An explicit 0 disables flow control server-side.
+	//
+	// Exposed here 2026-08-31: the effective window is min(client, server)
+	// (negotiateFlowWindow), and the server default of 1 MiB was reachable ONLY
+	// via the -flow-max-window CLI flag while production deploys run
+	// `ExecStart=... -config config.yaml` (install-server.sh:752). So the ceiling
+	// was effectively unconfigurable in the deployed shape, and a client raising
+	// SHADOWLINK_FLOW_WINDOW got no effect — which is exactly what cost the
+	// NixaVPN client team an invalid throughput measurement (they read
+	// 28.3 vs 27.4 Mbit/s and concluded the window was not the limiter, having
+	// in fact compared 1 MiB with 1 MiB).
+	//
+	// Sizing note for ops: the window bounds a single stream's in-flight bytes,
+	// so per-stream throughput is capped at roughly window/RTT. At the 241 ms RTT
+	// measured from Thailand to the Poland origin, 1 MiB ≈ 35 Mbit/s per stream.
+	FlowMaxWindow *int `yaml:"flow_max_window,omitempty"`
+
 	// IdleTimeoutSec is the HTTP server IdleTimeout in seconds.
 	// Valid range: [60, 600]. Default (when nil): 300 (Wave 2.3 hardcoded).
 	// Task 5.1 (2026-05-17): exposed via YAML for ops tuning. Wiring through
@@ -294,6 +313,23 @@ func validateMimicryRanges(fc *FileConfig) error {
 			return fmt.Errorf("idle_timeout_sec must be in [60,600], got %d", v)
 		}
 	}
+	if fc.FlowMaxWindow != nil {
+		v := *fc.FlowMaxWindow
+		// 0 is legal and means "disable flow control"; negatives are not, and a
+		// value under MinChunk could never satisfy a single chunk, stalling every
+		// stream. The upper bound mirrors the client clamp (client/stream_flow.go
+		// maxFlowWindow = 6 MiB), beyond which window/minChunk overflows the
+		// per-stream incomingCh capacity of 512 frames on the client side.
+		if v < 0 {
+			return fmt.Errorf("flow_max_window must be >= 0, got %d", v)
+		}
+		if v > 0 && v < 64*1024 {
+			return fmt.Errorf("flow_max_window must be 0 (off) or >= 65536, got %d", v)
+		}
+		if v > 6*1024*1024 {
+			return fmt.Errorf("flow_max_window must be <= 6291456 (client clamp), got %d", v)
+		}
+	}
 	return nil
 }
 
@@ -387,6 +423,12 @@ func (fc *FileConfig) ApplyTo(cfg *Config) {
 	// flag still wins over this in main.go (applied after ApplyTo).
 	if fc.OriginDeathTeardown != nil {
 		cfg.OriginDeathTeardown = fc.OriginDeathTeardown
+	}
+	// 2026-08-31: a CLI -flow-max-window still wins (main.go applies it after
+	// ApplyTo, but only when explicitly passed — it used to overwrite this
+	// unconditionally, which made the YAML key unreachable).
+	if fc.FlowMaxWindow != nil {
+		cfg.FlowMaxWindow = uint64(*fc.FlowMaxWindow)
 	}
 	if fc.Management != nil {
 		if fc.Management.Port != nil {

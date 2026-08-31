@@ -153,6 +153,12 @@ func main() {
 	// -session-timeout / -cleanup-interval в CLI.
 	config := server.DefaultConfig()
 
+	// flowWindowFromYAML records whether config.yaml carried a flow_max_window
+	// key. It cannot be inferred from config.FlowMaxWindow afterwards: 0 is a
+	// legal YAML value meaning "disable flow control", and it is also the
+	// zero-value of a config that never mentioned the key.
+	flowWindowFromYAML := false
+
 	if *configFile != "" {
 		fc, err := server.LoadConfigFile(*configFile)
 		if err != nil {
@@ -160,6 +166,7 @@ func main() {
 			os.Exit(1)
 		}
 		fc.ApplyTo(&config)
+		flowWindowFromYAML = fc.FlowMaxWindow != nil
 		// Task 5.1 (2026-05-17): surface mimicry config in startup logs for ops
 		// verification. Only `inflation` is currently wired through to runtime
 		// behavior (UseInflatedResponses); the other knobs (ws_pool_size, decoy
@@ -222,9 +229,21 @@ func main() {
 	if explicitly["default-max-devices"] {
 		config.DefaultMaxDevices = *defaultMaxDevices
 	}
-	// Always apply flow-max-window: flag default (1048576) applies when not
-	// explicitly set; explicit 0 disables flow control on the server.
-	config.FlowMaxWindow = uint64(*flowMaxWindow)
+	// flow-max-window: an explicit flag wins; otherwise YAML (flow_max_window)
+	// wins; otherwise the flag default (1 MiB) applies. Explicit 0 — from either
+	// layer — disables flow control on the server.
+	//
+	// This used to be an unconditional assignment with the comment "Always apply
+	// flow-max-window", which silently overwrote whatever ApplyTo had read from
+	// YAML. Since production runs `ExecStart=... -config config.yaml` with no
+	// flags (install-server.sh:752), the ceiling was pinned at 1 MiB and no
+	// config change could move it. The effective window is min(client, server),
+	// so this also made client-side SHADOWLINK_FLOW_WINDOW a no-op above 1 MiB —
+	// the trap that produced an invalid throughput measurement in the 2026-08-31
+	// integration review. Guard: TestFlowMaxWindow_YAMLIsNotOverwritten.
+	if explicitly["flow-max-window"] || !flowWindowFromYAML {
+		config.FlowMaxWindow = uint64(*flowMaxWindow)
+	}
 	// Bug #9 §3.5: only override the YAML/default when -stream-migration was
 	// explicitly passed. Unset leaves Config.StreamMigrationEnabled untouched
 	// (nil → default ON via streamMigrationEnabledOrDefault). The full env table
