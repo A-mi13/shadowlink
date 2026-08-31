@@ -121,9 +121,10 @@ func newDirectTransportBP(serverAddr string, useTLS, skipVerify, bodyPrefix bool
 // presentation work normally.
 //
 // Implementation uses tls-client's WithServerNameOverwrite, which requires
-// InsecureSkipVerify. This is acceptable because ShadowLink pins the server's
-// X25519 public key at the protocol layer — TLS here is only for steganographic
-// packet shape, not for authentication.
+// InsecureSkipVerify. TLS here carries steganographic packet shape, not
+// authentication — see newDirectTransportFull for what actually authenticates
+// the server, and for why the old "pins the server's X25519 public key"
+// wording was wrong.
 func NewDirectTransportWithSNI(serverAddr, sniDomain string, useTLS bool) *DirectTransport {
 	return newDirectTransportFull(serverAddr, useTLS, false, sniDomain, defaultDataPathBodyPrefix)
 }
@@ -144,9 +145,24 @@ func newDirectTransportFull(serverAddr string, useTLS bool, skipVerify bool, sni
 	}
 
 	// Full-direct mode: tls-client's WithServerNameOverwrite requires
-	// InsecureSkipVerify. This is acceptable because ShadowLink authenticates
-	// the server via X25519 pubkey pin inside the encrypted payload — TLS
-	// certificate validation here is cosmetic (for steganographic shape only).
+	// InsecureSkipVerify, so TLS certificate validation is off on this path and
+	// serves steganographic shape only. What replaces it:
+	//
+	// The client seals clientID to the server's static X25519 key with NaCl Box
+	// (core/handshake.go:50) and mixes clientID into the HKDF info of the
+	// session keys (core/crypto.go:118-124). Only the holder of the static
+	// private key can recover clientID, so only it derives the same keys — and
+	// the client verifies that by AES-GCM-opening EncryptedSessionToken with
+	// them (core/handshake.go:177). A MITM without the static key cannot
+	// produce an openable token, and CompleteHandshake fails.
+	//
+	// Precision matters here because the previous comment claimed a "X25519
+	// pubkey pin", which does not exist: HandshakeClientState.ServerPub
+	// (core/handshake.go:39) is stored and never read back for comparison, and
+	// there is no signature or MAC over ServerHello. The guarantee is
+	// authentication-by-key-agreement, and it is only as strong as the secrecy
+	// of clientID — a long-lived shared secret with no rotation in the
+	// protocol. Guard: TestFullDirect_ServerAuthRestsOnClientIDNotPin.
 	effSkipVerify := skipVerify
 	if sniOverride != "" {
 		effSkipVerify = true

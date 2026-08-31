@@ -318,6 +318,25 @@ func (s *Session) isExpiredAndDestroy(timeout time.Duration) bool {
 // pointing sendEpochPtr at a fresh sendEpoch with counter=0. Concurrent EncryptChunk
 // callers either observe the OLD epoch (with its OLD counter) or the NEW epoch
 // (with counter starting from 0) — never a mixed pair.
+//
+// ⚠ NOT WIRED IN PRODUCTION (verified 2026-08-31, integration review). Nothing
+// outside tests calls this or RekeyNeeded; FlagControl on the server is a
+// keepalive shim (server/handler.go:1629-1633) despite its "Control chunks
+// handle rekeying" comment. So do not read this function as a live guarantee of
+// intra-session forward secrecy.
+//
+// What actually rotates keys today is slot rotation: each WS pool slot runs its
+// own handshake and gets its own Session, so keys change every MaxSlotAge
+// (engine/engine.go:508, 75s by default) plus stagger. That covers forward
+// secrecy but NOT the sendSeq overflow gate below, which is per-session and
+// unchecked by anyone.
+//
+// Blocker before enabling (May-audit C13): session tokens are sealed with the
+// server's RecvKey and are NOT re-issued on rekey, while
+// findSessionByHint verifies the client token against the CURRENT key
+// (server/handler.go:1837-1838). Rekeying without re-issuing the token breaks
+// every subsequent WS upgrade for that session. Enabling this is a protocol
+// change, not a one-line call. Guard: TestRekey_NotWiredInProduction.
 func (s *Session) Rekey(newSendKey, newRecvKey []byte) error {
 	newSendGCM, err := newGCM(newSendKey)
 	if err != nil {
@@ -366,6 +385,14 @@ func (s *Session) OldRecvKey() []byte {
 
 // RekeyNeeded returns true if more than 1 hour has passed since last rekey,
 // OR if seq_num is approaching overflow.
+//
+// ⚠ Nobody calls this in production (see Rekey). The "1 hour" and the overflow
+// gate describe a policy that is not enforced — treat this as the predicate a
+// future scheduler would use, not as a property the running system has. The
+// overflow side is currently safe only because slot rotation retires sessions
+// long before sendSeq (uint32) gets near the threshold; core/chunk.go:117
+// assumes "rekey at ~2^32 well before wrap", and that assumption rests on the
+// timing constants, not on this function.
 // A1-M5 fix: bumped threshold from 0x80000000 (~2^31) to 0xFF000000 (~2^32 - 16M safety margin).
 // At normal traffic rates the time-based 1h trigger fires far earlier; the seq-num gate is a
 // last-resort overflow protection. The previous 2^31 threshold gave up half the address space

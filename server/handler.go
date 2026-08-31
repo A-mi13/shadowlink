@@ -1626,9 +1626,19 @@ func (h *Handler) relayStreamFromTarget(session *core.Session, tunnel *Tunnel, s
 	}
 }
 
+// handleControl acknowledges a FlagControl chunk and does nothing else.
+//
+// The previous comment said "Control chunks handle rekeying, chunk_size
+// negotiation, etc." — none of that is implemented here (verified 2026-08-31).
+// There is no rekey path on the wire at all: core.Session.Rekey exists but is
+// unreachable from production code, and chunk_size is fixed at handshake. The
+// chunk is deliberately ignored past the ack, which keeps the transport
+// forward-compatible: an older server answers a newer client's control frame
+// with a well-formed encrypted FlagAck instead of dropping the connection.
+//
+// The ack must be an encrypted FlagAck chunk — bare JSON here causes client
+// parse errors.
 func (h *Handler) handleControl(w http.ResponseWriter, session *core.Session, chunk *core.Chunk) {
-	// Control chunks handle rekeying, chunk_size negotiation, etc.
-	// Respond with proper encrypted FlagAck chunk — bare JSON causes client parse errors.
 	h.handleKeepalive(w, session)
 }
 
