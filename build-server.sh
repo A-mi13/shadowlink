@@ -32,10 +32,38 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 
 ls -la "$OUT"
 echo ">> готово."
+
+# Путь на сервере СПРАШИВАЕТСЯ у systemd, а не зашивается здесь.
+#
+# 2026-08-31: в подсказке стоял хардкод /usr/local/bin/shadowlink-server, тогда
+# как юнит запускает /opt/shadowlink/shadowlink-server. Деплой по подсказке
+# обновлял копию, которую никто не запускает: бинарь ложился рядом, systemctl
+# restart проходил успешно, приёмка «сервис active» тоже — а на проде
+# продолжала работать сборка трёхнедельной давности. Обнаружилось только
+# потому, что новых метрик не оказалось в /metrics при совпадающем md5 на
+# «обновлённом» пути. Ровно тот класс ошибки, от которого предостерегает
+# hard rule 5: вторая копия бинаря даёт молчаливый неверный деплой.
+SRV_HOST="${SHADOWLINK_DEPLOY_HOST:-root@104.222.177.67}"
+echo ">> путь на сервере (читаю ExecStart из юнита):"
+REMOTE_BIN="$(ssh -o ConnectTimeout=10 -o BatchMode=yes "$SRV_HOST" \
+  "systemctl show -p ExecStart --value shadowlink 2>/dev/null | grep -oP 'path=\K[^ ;]+'" 2>/dev/null || true)"
+
+if [ -z "$REMOTE_BIN" ]; then
+  echo "   !! не удалось прочитать ExecStart (нет доступа по ssh?)."
+  echo "   !! УЗНАЙТЕ ПУТЬ ПЕРЕД ДЕПЛОЕМ, не угадывайте:"
+  echo "      ssh $SRV_HOST 'systemctl show -p ExecStart --value shadowlink'"
+  REMOTE_BIN="<путь-из-ExecStart>"
+else
+  echo "   $REMOTE_BIN"
+fi
+
 echo ">> ДЕПЛОЙ (сервер первым, по правилу staged):"
-echo "   scp $OUT root@104.222.177.67:/usr/local/bin/shadowlink-server.new"
-echo "   ssh root@104.222.177.67 'systemctl stop shadowlink && \\"
-echo "       cp /usr/local/bin/shadowlink-server /usr/local/bin/shadowlink-server.bak-${STAMP} && \\"
-echo "       mv /usr/local/bin/shadowlink-server.new /usr/local/bin/shadowlink-server && \\"
-echo "       chmod +x /usr/local/bin/shadowlink-server && systemctl start shadowlink'"
-echo "   ssh root@104.222.177.67 'systemctl status shadowlink --no-pager | head'"
+echo "   scp $OUT $SRV_HOST:${REMOTE_BIN}.new"
+echo "   ssh $SRV_HOST '${REMOTE_BIN}.new -validate-config /etc/shadowlink/config.yaml'"
+echo "   ssh $SRV_HOST 'systemctl stop shadowlink && \\"
+echo "       cp ${REMOTE_BIN} ${REMOTE_BIN}.bak-${STAMP} && \\"
+echo "       mv ${REMOTE_BIN}.new ${REMOTE_BIN} && \\"
+echo "       chmod +x ${REMOTE_BIN} && systemctl start shadowlink'"
+echo ">> ПРИЁМКА (обязательна — «active» не доказывает, что запущен новый бинарь):"
+echo "   ssh $SRV_HOST 'md5sum ${REMOTE_BIN}' && md5sum $OUT"
+echo "   go run ./tools/facade-probe/ -url '<sl://...>' -check"

@@ -301,13 +301,21 @@ Guards: `TestStickyDrainBudget_HardCapNotBelowSticky`,
 defaulting to 4 MiB; corrected 2026-08-31. The literal is `1 << 20` at
 `client/ws_pool.go:2359`.
 
-⚠ **Raising the client window alone changes nothing.** The effective window is
-`min(client, server)` and the server default is *also* 1 MiB
-(`-flow-max-window` = 1048576, `cmd/shadowlink-server/main.go:100`; the min is
-taken in `server/stream_credit.go:7-15`). A throughput A/B that moves only
-`SHADOWLINK_FLOW_WINDOW` compares 1 MiB against 1 MiB — this already produced
-one invalid measurement (28.3 vs 27.4 Mbit/s, wrongly read as "the window is not
-the limiter"). There is **no** `SHADOWLINK_FLOW_MAX_WINDOW` env var.
+⚠ **The effective window is `min(client, server)` — check BOTH sides before
+concluding anything from a throughput measurement.** The min is taken in
+`server/stream_credit.go:7-15`; the client default is 1 MiB and the server flag
+default is also 1 MiB (`cmd/shadowlink-server/main.go:100`). There is **no**
+`SHADOWLINK_FLOW_MAX_WINDOW` env var.
+
+⚠ **What the deployed server actually grants is not the default.** pl1 runs with
+`-flow-max-window 4194304` in its `ExecStart`, i.e. a 4 MiB ceiling, so on that
+host the binding constraint is the **client's** 1 MiB. This matters for reading
+the 2026-08-31 integration measurement: raising only `SHADOWLINK_FLOW_WINDOW`
+to 6 MiB should have moved the effective window to 4 MiB and did not visibly
+change throughput (28.3 vs 27.4 Mbit/s) — so the result is not explained by "the
+window never changed" alone, and the window's role remains **unmeasured** rather
+than disproven. Read the negotiated value out of the FLOWCTL ack, not out of
+either side's configuration.
 
 Raise the server ceiling with the YAML key `flow_max_window` (added 2026-08-31;
 `0` disables flow control, otherwise `[65536, 6291456]` — the upper bound is the
