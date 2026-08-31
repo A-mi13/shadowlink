@@ -118,30 +118,58 @@ func (d *inProcessDialer) DialUDP(m *M.Metadata) (net.PacketConn, error) {
 		}
 	}
 
-	session := cl.Session()
-	if session == nil {
-		return nil, fmt.Errorf("in-process dialer: no session for UDP")
-	}
-
 	streamID := cl.NextStreamID()
 	incomingCh, regErr := cl.RegisterStream(streamID)
 	if regErr != nil {
 		return nil, fmt.Errorf("in-process dialer: UDP stream register: %w", regErr)
 	}
 
+	// Bind to a slot before resolving the session — SessionForStream is keyed on
+	// the pool's streamMap and returns nil until the stream is in it. Also keeps
+	// the slot's stream count honest so the drain path does not treat the slot as
+	// idle mid-flow (client/ws_pool_drain.go:1256).
+	pa, isPool := wst.(client.PoolAware)
+	if isPool {
+		pa.AssignStream(streamID)
+	}
+
+	// Same field defect as HandleUDPAssociateWS (2026-08-31, iOS/macOS): this
+	// path used cl.Session() — the global handshake session — while the server
+	// decrypts every frame of a pooled WS with that slot's own session
+	// (server/websocket.go:159 resolves it once at upgrade). Mismatched frames
+	// are dropped by `continue` at server/websocket.go:917-919: no log, no
+	// metric, UDP silently dead while TCP works.
+	if client.StreamSession(wst, cl, streamID) == nil {
+		if isPool {
+			pa.ReleaseStream(streamID)
+		}
+		cl.UnregisterStream(streamID)
+		return nil, fmt.Errorf("in-process dialer: no session for UDP stream %d", streamID)
+	}
+
 	dst := m.DestinationAddrPort()
 
 	send := func(targetAddr string, data []byte) error {
+		// Resolved per datagram: the stream may migrate to another slot (aging
+		// watchdog, emergency evict, RESUME-on-death) and each slot keys its own
+		// session. A captured session would seal for the wrong slot after that.
+		session := client.StreamSession(wst, cl, streamID)
+		if session == nil {
+			return fmt.Errorf("in-process dialer: stream %d has no session", streamID)
+		}
 		chunk := core.NewUDPDataChunk(session.ID, session.NextSeqNum(), streamID, targetAddr, data)
 		enc, err := session.EncryptChunk(chunk)
 		if err != nil {
 			return err
 		}
-		return wst.WriteMessage(enc)
+		return client.StreamWrite(wst, streamID, enc)
 	}
 	cleanup := func() {
 		// Send a per-stream FIN so the server frees the slot immediately, then
 		// unregister locally. Mirrors HandleUDPAssociateWS teardown.
+		// CloseStream is already pool-aware — it resolves the slot session and
+		// calls ReleaseStream itself (client/client.go:900-907), so releasing
+		// here too would unpair the slot's stream counter.
 		cl.CloseStream(streamID, wst)
 	}
 
