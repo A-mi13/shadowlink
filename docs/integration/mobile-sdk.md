@@ -293,9 +293,31 @@ Accepted levels: `info`, `quiet`, `warn`, `error`, `debug`, `trace`.
 Unrecognised values fall back to `info` — never an error, so a typo in your
 settings will not silence the log.
 
-Level filtering happens **before** the JNI boundary. At `debug` the core emits
-thousands of lines per hour; paying a JNI crossing for lines Java would discard
-is not acceptable, so the filter sits in the Go handler.
+Level filtering happens **before** the JNI boundary (`bridgeHandler.Enabled`,
+`mobile/callbacks.go:234`). At `debug` the core emits thousands of lines per
+hour; paying a JNI crossing for lines Java would discard is not acceptable, so
+the filter sits in the Go handler.
+
+**For production builds use `warn`.** This is the knob for log volume, and it is
+the only one — there is nothing else to configure:
+
+- `setLogLevel("warn")` takes effect immediately and costs nothing per suppressed
+  line (no JNI crossing, no string formatting on the Java side).
+- The SDK does **not** rotate or cap any log file. There is no `lumberjack`, no
+  size limit, no backup count anywhere in `cmd/`, `client/`, or `engine/`
+  (VERIFIED by grep, 2026-08-31). Whatever your `Logger` writes to, it grows
+  without bound until you do something about it. If you persist logs, rotation is
+  yours to implement.
+- At `info` the volume is dominated by connection lifecycle, not per-stream
+  traffic: per-stream relay completions ("uplink done", the four "downlink done"
+  variants, "downlink cancelled", "Split CONNECT OK", and their per-stream twins
+  — 8 call sites in `proxy/socks5/tcp.go`) were moved from `Info` to `Debug` on
+  2026-08-31. Before that change `info` produced on the order of several lines
+  per TCP connection, which on a mobile device with a busy app mix reached
+  millions of lines per day (reported by an integrator: ~1.9 M lines in 24 h,
+  costing battery and disk). Those lines also carried destination addresses.
+- At `debug`/`trace` per-stream events come back, including destinations. See
+  §9.3.
 
 Level strings delivered to your `Logger.log(level, msg)` are uppercase:
 `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR`. Structured attributes are flattened
@@ -582,6 +604,8 @@ UNVERIFIED. This command has never been run. See §11.
 | 8 | **Doze / long sleep / clock-jump behaviour is unverified on device.** See §7.3. | UNVERIFIED |
 | 9 | **IPv6 policy is undefined.** `serverAddr` is a bare IP; if it is IPv4-only and the carrier network is IPv6-only, the connection will not establish. The desktop leak guard that suppressed IPv6 is not in the mobile tree. Untested. | UNVERIFIED |
 | 10 | Error messages from validation and from `start()` are in Russian. Do not surface them to end users; map on behaviour. | VERIFIED |
+| 11 | **The `.aar`/`.xcframework` cannot coexist with another gomobile-bound framework in the same process.** Two bound modules mean two Go runtimes sharing one `seq` reference table; the process dies on the first allocation. Requires a single `gomobile bind` over both packages. | REPORTED by integrator, §12.1 |
+| 12 | **No log file rotation or size cap.** `setLogLevel` is the only volume control; persistence and rotation are entirely the platform's. | VERIFIED, §5.3 |
 
 ---
 
@@ -603,6 +627,48 @@ UNVERIFIED. This command has never been run. See §11.
 | Server-side sessions accumulate after crashes | Process killed without `stop()`; session-FIN never sent. | §7.3. They expire on the server's idle timeout (default 90 s). Call `stop()` from `onRevoke()`/`onDestroy()`. |
 | Missing `Session` / `Config` methods in the generated Java | gobind silently dropped an unsupported type. | Run `go test -tags gomobileguard ./mobile/`. |
 | NDK rejects the build | `-androidapi 21` was omitted. | §10. |
+| `fatal error: bad sweepgen in refill` on the very first facade call | Two gomobile-bound frameworks linked into one process. | §12.1 — this is a link-time problem, not a bug in the call that crashed. |
+
+### 12.1 Two gomobile frameworks in one process — `bad sweepgen in refill`
+
+REPORTED BY AN INTEGRATOR (NixaVPN client team, iOS/macOS, 2026-08-31),
+reproduced on their side. This is **not** a measurement of ours — we have never
+built an iOS framework (§11 #1) — but the mechanism is specific enough, and the
+cost was high enough (two days), that it belongs here.
+
+**Symptom.** The process dies on the first memory allocation inside the first
+facade call, with no Go panic you can catch:
+
+```
+fatal error: bad sweepgen in refill
+
+runtime.(*mcache).refill → runtime.mallocgc → runtime.newobject
+github.com/nixavpn/shadowlink/mobile.NewConfig  (mobile/config.go:81)
+```
+
+`NewConfig` is incidental — it is simply the first thing that allocates. Any
+other entry point would crash the same way.
+
+**Cause.** `gomobile bind` emits **static** frameworks. Link two separately-bound
+gomobile modules into one process — for example sing-box's `libbox` alongside
+`shadowlink/mobile` — and the linker keeps a **single** copy of the `seq`
+reference-table symbols (`_IncGoRef`, `_DestroyRef`). Those belong to a specific
+Go runtime; each bound module ships its own. The surviving copy hands one
+runtime's allocator state to the other, and the first `mallocgc` trips the
+consistency check.
+
+**Fix.** One `gomobile bind` invocation covering both packages, so there is one
+runtime and one `seq`:
+
+```bash
+gomobile bind -target=ios/arm64 -o Combined.xcframework ./wrapper/
+```
+
+where `./wrapper/` is a Go package that imports both modules and re-exports the
+API surface each side needs. Their working setup is exactly this: a shared
+wrapper module bound once. Partial measures do not work — linking the two
+frameworks separately fails regardless of order, and there is no build flag that
+splits the symbols.
 
 ---
 
@@ -617,6 +683,7 @@ UNVERIFIED. This command has never been run. See §11.
 - [ ] `setLogger(null)` + `setEventHandler(null)` on teardown (§6.4)
 - [ ] `start()` never called from the UI thread (§5.1)
 - [ ] `socksPort()` re-read after every `start()` (§7.2)
-- [ ] Log level not `debug`/`trace` in release builds (§9.3)
+- [ ] `setLogLevel("warn")` in release builds, and log persistence capped/rotated by you (§5.3, §9.3)
+- [ ] Only one `gomobile bind` in the process, if you link another Go framework (§12.1)
 - [ ] Own package excluded from the tunnel routes
 - [ ] `stop()` attempted from `onRevoke()` / `onDestroy()` (§7.3)

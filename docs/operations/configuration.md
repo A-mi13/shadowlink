@@ -297,8 +297,19 @@ Guards: `TestStickyDrainBudget_HardCapNotBelowSticky`,
 | `SHADOWLINK_REASSEMBLY_GAP_TIMEOUT` | duration | **2 s** (`proxy/socks5/tcp.go:435`) | Hole-fill backstop in downlink reassembly. `≤ 0` or unparseable → default | `proxy/socks5/tcp.go:442` | VERIFIED |
 | `SHADOWLINK_REASSEMBLY_BUFFER` | int (bytes) | **4 MiB** (`tcp.go:436`) | Per-stream reorder cap. `≤ 0` → default | `proxy/socks5/tcp.go:456` | VERIFIED |
 
-⚠ The `anti-tspu-tuning` skill table lists `SHADOWLINK_FLOW_WINDOW` as
-defaulting to 4 MiB. The literal is `1 << 20` at `client/ws_pool.go:2359`.
+⚠ The `anti-tspu-tuning` skill table used to list `SHADOWLINK_FLOW_WINDOW` as
+defaulting to 4 MiB; corrected 2026-08-31. The literal is `1 << 20` at
+`client/ws_pool.go:2359`.
+
+⚠ **Raising the client window alone changes nothing.** The effective window is
+`min(client, server)` and the server default is *also* 1 MiB
+(`-flow-max-window` = 1048576, `cmd/shadowlink-server/main.go:100`, applied
+unconditionally at `main.go:225-227`; the min is taken in
+`server/stream_credit.go:7-15`). A throughput A/B that moves only
+`SHADOWLINK_FLOW_WINDOW` compares 1 MiB against 1 MiB — this already produced
+one invalid measurement (28.3 vs 27.4 Mbit/s, wrongly read as "the window is not
+the limiter"). There is **no** `SHADOWLINK_FLOW_MAX_WINDOW` env var: the server
+side is a CLI flag only.
 
 ### 4.5 TLS fingerprint
 
