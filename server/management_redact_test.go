@@ -13,35 +13,53 @@ import (
 // files and log shipping. redactClientID is what keeps it out.
 
 func TestRedactClientID_DoesNotLeakFullValue(t *testing.T) {
-	const id = "u42:d1-abcdef0123456789"
+	// The format actually used in production, from the management API docs.
+	// A prefix-based redaction fails precisely here: six characters cannot be
+	// partially shown, so the earlier implementation suppressed the whole thing
+	// and left the log with no correlation handle at all.
+	for _, id := range []string{"u42:d1", "u1:d5", "test:dev", "u42:d1-abcdef0123456789"} {
+		got := redactClientID(id)
 
-	got := redactClientID(id)
-
-	if strings.Contains(got, id) {
-		t.Fatalf("redaction returned the full client_id: %q", got)
-	}
-	if !strings.Contains(got, "redacted") {
-		t.Errorf("redacted value should be self-describing in a log line, got %q", got)
-	}
-	// Enough head to correlate "added" with "removed" for the same tenant.
-	if !strings.HasPrefix(got, "u42:") {
-		t.Errorf("expected a usable prefix for ops correlation, got %q", got)
-	}
-	// And no more than that: the tail must be gone.
-	if strings.Contains(got, "abcdef") {
-		t.Errorf("secret tail survived redaction: %q", got)
+		if strings.Contains(got, id) {
+			t.Errorf("redaction returned the full client_id: %q", got)
+		}
+		// No substring of the secret may survive. Checked over every window of
+		// 3+ characters rather than a hand-picked tail, so a future change that
+		// re-introduces a prefix is caught for short ids too.
+		for n := 3; n <= len(id); n++ {
+			for i := 0; i+n <= len(id); i++ {
+				if window := id[i : i+n]; strings.Contains(got, window) {
+					t.Errorf("redactClientID(%q) = %q leaks the substring %q",
+						id, got, window)
+				}
+			}
+		}
 	}
 }
 
-// A short id has too little head to show without showing nearly all of it.
-// Truncating "u1:d1" to "u1:d" would be theatre, not redaction.
-func TestRedactClientID_ShortValuesFullyRedacted(t *testing.T) {
-	for _, id := range []string{"", "u1", "u1:d1", "u42:d1x"} {
-		got := redactClientID(id)
-		if got != "[redacted]" {
-			t.Errorf("redactClientID(%q) = %q, want fully redacted — a short id "+
-				"cannot be partially shown without disclosing it", id, got)
-		}
+// Correlation is the whole point of logging anything at all: an operator must be
+// able to match "client added" with the later "client removed". A hash gives
+// that for every id length, which a prefix could not.
+func TestRedactClientID_IsStableAndDistinguishing(t *testing.T) {
+	const a, b = "u42:d1", "u42:d2"
+
+	if redactClientID(a) != redactClientID(a) {
+		t.Error("redaction is not stable — added/removed lines could not be correlated")
+	}
+	if redactClientID(a) == redactClientID(b) {
+		t.Errorf("two different client_ids rendered identically (%q) — neighbouring "+
+			"devices of one user must stay distinguishable", redactClientID(a))
+	}
+	// Self-describing, so nobody mistakes the token for the id itself.
+	if got := redactClientID(a); !strings.HasPrefix(got, "sha256:") {
+		t.Errorf("expected a self-describing token, got %q", got)
+	}
+}
+
+func TestRedactClientID_Empty(t *testing.T) {
+	if got := redactClientID(""); got != "[empty]" {
+		t.Errorf("redactClientID(\"\") = %q, want [empty] — hashing the empty "+
+			"string would print a constant that looks like a real client", got)
 	}
 }
 

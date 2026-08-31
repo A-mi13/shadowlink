@@ -303,13 +303,19 @@ defaulting to 4 MiB; corrected 2026-08-31. The literal is `1 << 20` at
 
 ⚠ **Raising the client window alone changes nothing.** The effective window is
 `min(client, server)` and the server default is *also* 1 MiB
-(`-flow-max-window` = 1048576, `cmd/shadowlink-server/main.go:100`, applied
-unconditionally at `main.go:225-227`; the min is taken in
-`server/stream_credit.go:7-15`). A throughput A/B that moves only
+(`-flow-max-window` = 1048576, `cmd/shadowlink-server/main.go:100`; the min is
+taken in `server/stream_credit.go:7-15`). A throughput A/B that moves only
 `SHADOWLINK_FLOW_WINDOW` compares 1 MiB against 1 MiB — this already produced
 one invalid measurement (28.3 vs 27.4 Mbit/s, wrongly read as "the window is not
-the limiter"). There is **no** `SHADOWLINK_FLOW_MAX_WINDOW` env var: the server
-side is a CLI flag only.
+the limiter"). There is **no** `SHADOWLINK_FLOW_MAX_WINDOW` env var.
+
+Raise the server ceiling with the YAML key `flow_max_window` (added 2026-08-31;
+`0` disables flow control, otherwise `[65536, 6291456]` — the upper bound is the
+client clamp, above which the window is unreachable). Precedence is **explicit
+flag > YAML > flag default**. Before that change `main.go` overwrote the YAML
+value unconditionally, which made the ceiling unreachable in the deployed shape:
+`ExecStart` runs `-config config.yaml` with no flags
+(`install-server.sh:752`), so it was pinned at 1 MiB regardless of config.
 
 ### 4.5 TLS fingerprint
 

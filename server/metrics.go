@@ -241,6 +241,12 @@ type Metrics struct {
 	// using a session other than the one this connection was authenticated with.
 	// WSFramesReplayed rising means the seq window rejected frames, which is
 	// either an actual replay or a client resending after a migration bug.
+	//
+	// Scope: the WebSocket transport only — both the first-frame auth
+	// (authenticateFirstFrame) and the relay loop. The POST/SplitHTTP data path
+	// is NOT counted here; its rejections already log at WARN
+	// (handler.go "rejected seq_num"), so they are not silent and did not need a
+	// counter. Do not read a zero here as "no rejections anywhere".
 	WSFramesUndecryptable atomic.Uint64
 	WSFramesReplayed      atomic.Uint64
 

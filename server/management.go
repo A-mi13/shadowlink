@@ -1,7 +1,9 @@
 package server
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -24,17 +26,25 @@ const mgmtMaxBodyBytes = 64 << 10
 // a management log line was writing an authentication secret to disk in
 // plaintext, where it outlives the request and lands in log shipping.
 //
-// A prefix keeps the line useful for operations (correlating "added" with
-// "removed", spotting the tenant) while leaving the value unusable: the
-// operational format is `u<user>:d<device>`, so the head is the low-entropy
-// part anyway. Short values are dropped entirely rather than half-shown —
-// showing 4 of 5 characters is not redaction.
+// The rendering is a truncated SHA-256, not a prefix of the value. A prefix was
+// the first attempt and it fails on the format actually used in production:
+// `u<user>:d<device>` is about six characters (`u42:d1`), so any prefix long
+// enough to identify a tenant is nearly the whole secret, and a prefix short
+// enough to be safe gets suppressed entirely — leaving the log with no
+// correlation at all. A hash keeps both properties: the same client_id always
+// renders the same token, so "added" and "removed" lines still match up, while
+// nothing about the input is recoverable from the output.
+//
+// 6 hex characters (24 bits) is chosen for readability. Collisions are possible
+// in principle and irrelevant in practice: the value identifies a line to a
+// human reading a management log, it is not an authorization key, and the
+// authorized set is orders of magnitude smaller than 2^24.
 func redactClientID(id string) string {
-	const keep = 4
-	if len(id) <= keep*2 {
-		return "[redacted]"
+	if id == "" {
+		return "[empty]"
 	}
-	return id[:keep] + "…[redacted]"
+	sum := sha256.Sum256([]byte(id))
+	return "sha256:" + hex.EncodeToString(sum[:])[:6]
 }
 
 // ManagementHandler exposes an HTTP API for controlling client authorization

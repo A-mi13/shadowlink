@@ -78,28 +78,43 @@ func TestWSRelayLoop_CountsSilentDrops(t *testing.T) {
 	require.NoError(t, err, "read websocket.go")
 	src := string(raw)
 
-	// Locate the relay-loop decrypt and seq-window checks and require a counter
-	// next to each. Anchors are the exact expressions in the loop.
+	// Both discard checks appear TWICE in this file — once in
+	// authenticateFirstFrame and once in the relay loop — and both occurrences
+	// must count. An earlier version of this guard anchored with strings.Index
+	// and so only ever inspected the first one, passing by coincidence while
+	// leaving the relay loop unchecked. Every occurrence is verified instead.
 	for _, anchor := range []struct {
 		check   string
 		counter string
 	}{
-		{"chunk, err := session.DecryptChunkSafe(data)", "WSFramesUndecryptable"},
+		{"session.DecryptChunkSafe(data", "WSFramesUndecryptable"},
 		{"if !session.AcceptSeqNum(chunk.SeqNum) {", "WSFramesReplayed"},
 	} {
-		idx := strings.Index(src, anchor.check)
-		if idx < 0 {
-			t.Fatalf("anchor %q no longer present in websocket.go — the relay "+
-				"loop was restructured; re-point this guard", anchor.check)
+		occurrences := 0
+		for off := 0; ; {
+			rel := strings.Index(src[off:], anchor.check)
+			if rel < 0 {
+				break
+			}
+			idx := off + rel
+			occurrences++
+			// The counter must appear within the branch that follows. A short
+			// window keeps this from reaching into unrelated code: the guarded
+			// block is a couple of lines plus its comment.
+			end := idx + 600
+			if end > len(src) {
+				end = len(src)
+			}
+			window := src[idx:end]
+			assert.True(t, strings.Contains(window, anchor.counter),
+				"the silent-drop branch at occurrence #%d of %q does not increment %s "+
+					"— that drop would be invisible again", occurrences, anchor.check,
+				anchor.counter)
+			off = idx + len(anchor.check)
 		}
-		// Look at the block that follows: the counter must appear before the
-		// next `switch` (i.e. still inside the drop handling).
-		window := src[idx:]
-		if end := strings.Index(window, "switch chunk.Flags"); end > 0 {
-			window = window[:end]
-		}
-		assert.True(t, strings.Contains(window, anchor.counter),
-			"the silent-drop branch after %q does not increment %s — the drop "+
-				"would be invisible again", anchor.check, anchor.counter)
+		require.GreaterOrEqual(t, occurrences, 2,
+			"expected %q in both authenticateFirstFrame and the relay loop, found %d "+
+				"— the file was restructured; re-point this guard",
+			anchor.check, occurrences)
 	}
 }

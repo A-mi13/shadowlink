@@ -166,7 +166,17 @@ func (d *inProcessDialer) DialUDP(m *M.Metadata) (net.PacketConn, error) {
 	}
 	cleanup := func() {
 		// Send a per-stream FIN so the server frees the slot immediately, then
-		// unregister locally. Mirrors HandleUDPAssociateWS teardown.
+		// unregister locally.
+		//
+		// This is NOT what HandleUDPAssociateWS does, despite what this comment
+		// claimed until 2026-08-31: that path only unregisters locally and lets
+		// the server reclaim the stream on its idle timeout. The asymmetry is
+		// pre-existing and left alone deliberately — tun2socks opens a UDP flow
+		// per 5-tuple, so DNS bursts would leak server-side stream slots without
+		// an explicit FIN, whereas a SOCKS5 UDP ASSOCIATE is one long-lived
+		// association per client. Changing the SOCKS5 side is a behaviour change
+		// that wants a field measurement, not a drive-by edit.
+		//
 		// CloseStream is already pool-aware — it resolves the slot session and
 		// calls ReleaseStream itself (client/client.go:900-907), so releasing
 		// here too would unpair the slot's stream counter.

@@ -27,7 +27,13 @@
 // Flags of note:
 //
 //	-check      run a built-in TCP reachability check through the tunnel and exit
-//	            with a non-zero status on failure (suitable for CI or a smoke gate)
+//	            with a non-zero status on failure
+//
+// Note on -check in CI: it fetches an external URL (api.ipify.org), so a failure
+// means "the tunnel did not carry a request" OR "that host was unreachable".
+// That is the right trade for a human smoke gate, and the wrong one for a
+// blocking CI job — an ipify outage would redden the build with no defect
+// present. Use it as a manual or non-blocking check.
 //	-hold       how long to stay up in interactive mode (default 10m)
 //	-log        facade log level: quiet|info|debug|trace
 //

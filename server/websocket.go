@@ -161,11 +161,19 @@ func (h *Handler) authenticateFirstFrame(conn *websocket.Conn) (*core.Session, u
 		return nil, 0, false
 	}
 
+	// Counted here as well as in the relay loop, so the two discard counters
+	// describe every inbound frame on the WS transport rather than only the
+	// post-auth ones. Without this, a session/key mismatch that shows up on the
+	// very first frame — the shape the pooled-UDP defect took — would appear only
+	// in the coarse WSFirstFrameAuthRejected bucket, which cannot distinguish it
+	// from a stale token or a lost attach race.
 	chunk, err := session.DecryptChunkSafe(data[tokenLen:])
 	if err != nil {
+		h.metrics.WSFramesUndecryptable.Add(1)
 		return nil, 0, false
 	}
 	if !session.AcceptSeqNum(chunk.SeqNum) {
+		h.metrics.WSFramesReplayed.Add(1)
 		return nil, 0, false
 	}
 
