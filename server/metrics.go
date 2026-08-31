@@ -223,6 +223,36 @@ type Metrics struct {
 	FlowWindowUpdatesRecv atomic.Uint64
 	UnknownFlag           atomic.Uint64
 	FlowSessionsActive    atomic.Int64
+
+	// Silently discarded inbound WS frames (added 2026-08-31 after the pooled-UDP
+	// defect). The WS relay loop drops undecryptable and replayed frames with a
+	// bare `continue` (server/websocket.go) — no log line, by design: an
+	// attacker must not be able to fill our disk, and a legitimate client never
+	// produces them.
+	//
+	// The cost of that silence was a real outage class. Pooled UDP sealed frames
+	// with the wrong session for months; the server discarded every one of them
+	// and reported nothing, so the failure was invisible from our side and only
+	// surfaced when an integrator noticed UDP hanging while TCP worked. A
+	// counter restores observability without restoring the log-flood risk.
+	//
+	// Reading them: both should sit at zero. WSFramesUndecryptable rising on a
+	// session whose TCP is healthy means a key/session mismatch — some sender is
+	// using a session other than the one this connection was authenticated with.
+	// WSFramesReplayed rising means the seq window rejected frames, which is
+	// either an actual replay or a client resending after a migration bug.
+	WSFramesUndecryptable atomic.Uint64
+	WSFramesReplayed      atomic.Uint64
+
+	// WSFirstFrameAuthRejected — WS upgrades that completed but whose first
+	// binary frame failed auth, so the connection got fakeAckAndClose instead of
+	// a session. Same silence problem, worse consequence: the client's slot
+	// reaches slotReady and then never carries traffic, which CLAUDE.md hard
+	// rule 12 records as having produced a false "startedAtNs is not set"
+	// diagnosis. Non-zero here with healthy handshakes means clients are
+	// presenting tokens this server no longer recognises — stale sessions after
+	// a restart, or a session/key mismatch.
+	WSFirstFrameAuthRejected atomic.Uint64
 	// Bug #8 credit-wait canary metrics (MEDIUM-2).
 	// FlowStreamCreditWaitsTotal — number of waitForCredit calls that actually blocked
 	// (available was <=0 on entry; threshold >1ms filters instant-return paths).
@@ -529,6 +559,11 @@ type MetricsSnapshot struct {
 	FlowWindowUpdatesRecv uint64 `json:"flow_window_updates_recv"`
 	UnknownFlag           uint64 `json:"unknown_flag"`
 	FlowSessionsActive    int64  `json:"flow_sessions_active"`
+	// Silently discarded inbound frames (2026-08-31). Both should be zero;
+	// see the field docs on Metrics for how to read a non-zero value.
+	WSFramesUndecryptable    uint64 `json:"ws_frames_undecryptable"`
+	WSFramesReplayed         uint64 `json:"ws_frames_replayed"`
+	WSFirstFrameAuthRejected uint64 `json:"ws_first_frame_auth_rejected"`
 	// Bug #8 credit-wait canary (MEDIUM-2, 2026-05-30).
 	FlowStreamCreditWaitsTotal  uint64 `json:"flow_stream_credit_waits_total"`
 	FlowStreamCreditWaitMsTotal uint64 `json:"flow_stream_credit_wait_ms_total"`
@@ -633,6 +668,9 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		FlowWindowUpdatesRecv:              m.FlowWindowUpdatesRecv.Load(),
 		UnknownFlag:                        m.UnknownFlag.Load(),
 		FlowSessionsActive:                 m.FlowSessionsActive.Load(),
+		WSFramesUndecryptable:              m.WSFramesUndecryptable.Load(),
+		WSFramesReplayed:                   m.WSFramesReplayed.Load(),
+		WSFirstFrameAuthRejected:           m.WSFirstFrameAuthRejected.Load(),
 		FlowStreamCreditWaitsTotal:         m.FlowStreamCreditWaitsTotal.Load(),
 		FlowStreamCreditWaitMsTotal:        m.FlowStreamCreditWaitMsTotal.Load(),
 		MigrateOK:                          m.MigrateOK.Load(),
@@ -949,6 +987,13 @@ func writePromMetrics(w io.Writer, s *MetricsSnapshot) {
 	fmt.Fprintf(w, "# HELP shadowlink_unknown_flag_total Unknown chunk flags seen in the WS reader switch (Bug #8 observability)\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_unknown_flag_total counter\n")
 	fmt.Fprintf(w, "shadowlink_unknown_flag_total %d\n", s.UnknownFlag)
+	fmt.Fprintf(w, "# HELP shadowlink_ws_frames_discarded_total Inbound WS frames dropped without a log line: AEAD failure (session/key mismatch) or seq-window rejection\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_ws_frames_discarded_total counter\n")
+	fmt.Fprintf(w, "shadowlink_ws_frames_discarded_total{reason=\"undecryptable\"} %d\n", s.WSFramesUndecryptable)
+	fmt.Fprintf(w, "shadowlink_ws_frames_discarded_total{reason=\"replayed\"} %d\n", s.WSFramesReplayed)
+	fmt.Fprintf(w, "# HELP shadowlink_ws_first_frame_auth_rejected_total WS upgrades whose first frame failed auth (client sees a ready-but-silent slot)\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_ws_first_frame_auth_rejected_total counter\n")
+	fmt.Fprintf(w, "shadowlink_ws_first_frame_auth_rejected_total %d\n", s.WSFirstFrameAuthRejected)
 	fmt.Fprintf(w, "# HELP shadowlink_flow_sessions_active WS sessions with per-stream flow control negotiated ON (Bug #8)\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_flow_sessions_active gauge\n")
 	fmt.Fprintf(w, "shadowlink_flow_sessions_active %d\n", s.FlowSessionsActive)
