@@ -297,8 +297,33 @@ Guards: `TestStickyDrainBudget_HardCapNotBelowSticky`,
 | `SHADOWLINK_REASSEMBLY_GAP_TIMEOUT` | duration | **2 s** (`proxy/socks5/tcp.go:435`) | Hole-fill backstop in downlink reassembly. `≤ 0` or unparseable → default | `proxy/socks5/tcp.go:442` | VERIFIED |
 | `SHADOWLINK_REASSEMBLY_BUFFER` | int (bytes) | **4 MiB** (`tcp.go:436`) | Per-stream reorder cap. `≤ 0` → default | `proxy/socks5/tcp.go:456` | VERIFIED |
 
-⚠ The `anti-tspu-tuning` skill table lists `SHADOWLINK_FLOW_WINDOW` as
-defaulting to 4 MiB. The literal is `1 << 20` at `client/ws_pool.go:2359`.
+⚠ The `anti-tspu-tuning` skill table used to list `SHADOWLINK_FLOW_WINDOW` as
+defaulting to 4 MiB; corrected 2026-08-31. The literal is `1 << 20` at
+`client/ws_pool.go:2359`.
+
+⚠ **The effective window is `min(client, server)` — check BOTH sides before
+concluding anything from a throughput measurement.** The min is taken in
+`server/stream_credit.go:7-15`; the client default is 1 MiB and the server flag
+default is also 1 MiB (`cmd/shadowlink-server/main.go:100`). There is **no**
+`SHADOWLINK_FLOW_MAX_WINDOW` env var.
+
+⚠ **What the deployed server actually grants is not the default.** pl1 runs with
+`-flow-max-window 4194304` in its `ExecStart`, i.e. a 4 MiB ceiling, so on that
+host the binding constraint is the **client's** 1 MiB. This matters for reading
+the 2026-08-31 integration measurement: raising only `SHADOWLINK_FLOW_WINDOW`
+to 6 MiB should have moved the effective window to 4 MiB and did not visibly
+change throughput (28.3 vs 27.4 Mbit/s) — so the result is not explained by "the
+window never changed" alone, and the window's role remains **unmeasured** rather
+than disproven. Read the negotiated value out of the FLOWCTL ack, not out of
+either side's configuration.
+
+Raise the server ceiling with the YAML key `flow_max_window` (added 2026-08-31;
+`0` disables flow control, otherwise `[65536, 6291456]` — the upper bound is the
+client clamp, above which the window is unreachable). Precedence is **explicit
+flag > YAML > flag default**. Before that change `main.go` overwrote the YAML
+value unconditionally, which made the ceiling unreachable in the deployed shape:
+`ExecStart` runs `-config config.yaml` with no flags
+(`install-server.sh:752`), so it was pinned at 1 MiB regardless of config.
 
 ### 4.5 TLS fingerprint
 

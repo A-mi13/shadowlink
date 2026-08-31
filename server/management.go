@@ -1,7 +1,9 @@
 package server
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -12,6 +14,38 @@ import (
 // короткий JSON ({"client_id":"u42:d1"}), 64 KB даётся с запасом на будущие
 // bulk-операции. Применяется в ServeHTTP, до делегирования в mux (раунд 18).
 const mgmtMaxBodyBytes = 64 << 10
+
+// redactClientID renders a client_id for logs without writing the whole value.
+//
+// clientID is not an opaque account label — it is a long-lived shared secret.
+// The client seals it to the server's static key and it is mixed into the
+// session-key HKDF (core/crypto.go:118-124), so possession of it is what
+// authenticates the server to that client (there is no ServerHello signature —
+// see core/server_auth_test.go). The very same string is the authorization key
+// here (handler.go:717 calls IsAuthorized on the decrypted handshake value), so
+// a management log line was writing an authentication secret to disk in
+// plaintext, where it outlives the request and lands in log shipping.
+//
+// The rendering is a truncated SHA-256, not a prefix of the value. A prefix was
+// the first attempt and it fails on the format actually used in production:
+// `u<user>:d<device>` is about six characters (`u42:d1`), so any prefix long
+// enough to identify a tenant is nearly the whole secret, and a prefix short
+// enough to be safe gets suppressed entirely — leaving the log with no
+// correlation at all. A hash keeps both properties: the same client_id always
+// renders the same token, so "added" and "removed" lines still match up, while
+// nothing about the input is recoverable from the output.
+//
+// 6 hex characters (24 bits) is chosen for readability. Collisions are possible
+// in principle and irrelevant in practice: the value identifies a line to a
+// human reading a management log, it is not an authorization key, and the
+// authorized set is orders of magnitude smaller than 2^24.
+func redactClientID(id string) string {
+	if id == "" {
+		return "[empty]"
+	}
+	sum := sha256.Sum256([]byte(id))
+	return "sha256:" + hex.EncodeToString(sum[:])[:6]
+}
 
 // ManagementHandler exposes an HTTP API for controlling client authorization
 // and device limits at runtime. Protected by X-Management-Key header
@@ -116,7 +150,7 @@ func (mh *ManagementHandler) handleAddClient(w http.ResponseWriter, r *http.Requ
 	}
 
 	mh.clientAuth.AddClient(req.ClientID)
-	slog.Info("management: client added", "client_id", req.ClientID)
+	slog.Info("management: client added", "client_id", redactClientID(req.ClientID))
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -136,7 +170,7 @@ func (mh *ManagementHandler) handleRemoveClient(w http.ResponseWriter, r *http.R
 	// Atomically remove authorization and clean up session tracking.
 	mh.clientAuth.GetAndDestroyClientSession(clientID)
 
-	slog.Info("management: client removed", "client_id", clientID)
+	slog.Info("management: client removed", "client_id", redactClientID(clientID))
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)

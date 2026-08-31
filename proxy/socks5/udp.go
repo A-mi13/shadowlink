@@ -123,8 +123,27 @@ func HandleUDPAssociateWS(ctx context.Context, conn net.Conn, cl *client.Client,
 	}
 	defer cl.UnregisterStream(streamID)
 
-	session := cl.Session()
-	if session == nil {
+	// Bind the stream to a slot BEFORE resolving its session: SessionForStream
+	// looks the stream up in the pool's streamMap and returns nil until then
+	// (client/ws_pool.go:4367). Assignment also makes the slot account this
+	// stream, without which the drain path sees an empty slot and tears it down
+	// mid-association (client/ws_pool_drain.go:1256).
+	if pa, ok := wst.(client.PoolAware); ok {
+		pa.AssignStream(streamID)
+		defer pa.ReleaseStream(streamID)
+	}
+
+	// Field defect 2026-08-31 (iOS/macOS integration): this used to be
+	// cl.Session() — the global handshake session, which no pooled WS
+	// connection is authenticated against. The server resolves a session once
+	// at upgrade (server/websocket.go:159) and decrypts every later frame with
+	// that slot's session only, so a frame sealed with the global session fails
+	// AES-GCM and is dropped by `continue` (server/websocket.go:917-919) with
+	// no log line and no metric. Symptom: UDP hangs until the tunnel drops
+	// while TCP over the same pool works. Guard:
+	// TestUDPAssociateWS_SealsWithSlotSessionNotGlobal.
+	if client.StreamSession(wst, cl, streamID) == nil {
+		slog.Warn("UDP ASSOCIATE: no session for stream", "stream_id", streamID)
 		return
 	}
 
@@ -169,13 +188,24 @@ func HandleUDPAssociateWS(ctx context.Context, conn net.Conn, cl *client.Client,
 				continue
 			}
 
-			// Create UDP chunk and send via WS
+			// Resolve the session per datagram, not once outside the loop: the
+			// stream can be migrated to another slot mid-association (aging
+			// watchdog, emergency evict, RESUME-on-death), and each slot has
+			// its own keys. A captured session would keep sealing frames for a
+			// slot the stream no longer lives on.
+			session := client.StreamSession(wst, cl, streamID)
+			if session == nil {
+				return
+			}
 			chunk := core.NewUDPDataChunk(session.ID, session.NextSeqNum(), streamID, targetAddr, data)
 			enc, err := session.EncryptChunk(chunk)
 			if err != nil {
 				return
 			}
-			if err := wst.WriteMessage(enc); err != nil {
+			// StreamWrite routes to the slot that owns this stream's session;
+			// WriteMessage would pick any ready slot and the server there
+			// cannot decrypt the frame.
+			if err := client.StreamWrite(wst, streamID, enc); err != nil {
 				return
 			}
 		}

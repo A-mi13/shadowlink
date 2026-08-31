@@ -161,11 +161,19 @@ func (h *Handler) authenticateFirstFrame(conn *websocket.Conn) (*core.Session, u
 		return nil, 0, false
 	}
 
+	// Counted here as well as in the relay loop, so the two discard counters
+	// describe every inbound frame on the WS transport rather than only the
+	// post-auth ones. Without this, a session/key mismatch that shows up on the
+	// very first frame — the shape the pooled-UDP defect took — would appear only
+	// in the coarse WSFirstFrameAuthRejected bucket, which cannot distinguish it
+	// from a stale token or a lost attach race.
 	chunk, err := session.DecryptChunkSafe(data[tokenLen:])
 	if err != nil {
+		h.metrics.WSFramesUndecryptable.Add(1)
 		return nil, 0, false
 	}
 	if !session.AcceptSeqNum(chunk.SeqNum) {
+		h.metrics.WSFramesReplayed.Add(1)
 		return nil, 0, false
 	}
 
@@ -598,6 +606,14 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	session, flowWindow, migrateEnabled := h.authenticateFirstFrame(conn)
 	if session == nil {
+		// Also counted rather than logged (2026-08-31). fakeAckAndClose is
+		// deliberately indistinguishable on the wire from a healthy close, so
+		// without this counter a rejected first frame is invisible on both
+		// ends: the client sees a slot that reached slotReady and then went
+		// quiet (CLAUDE.md hard rule 12 documents exactly that confusion).
+		// Every rejection reason funnels through here — unknown session, AEAD
+		// failure, replayed seq, wrong flag, missing tunnel, lost attach race.
+		h.metrics.WSFirstFrameAuthRejected.Add(1)
 		h.fakeAckAndClose(conn)
 		return
 	}
@@ -916,9 +932,16 @@ func (h *Handler) runWebSocketSession(conn *websocket.Conn, session *core.Sessio
 
 			chunk, err := session.DecryptChunkSafe(data)
 			if err != nil {
+				// Counted, never logged: an attacker could otherwise flood our
+				// disk, and a correct client never lands here. The counter is
+				// what makes the drop visible — pooled UDP sealed frames with
+				// the wrong session and this branch swallowed all of them
+				// without a trace (fixed 2026-08-31).
+				h.metrics.WSFramesUndecryptable.Add(1)
 				continue
 			}
 			if !session.AcceptSeqNum(chunk.SeqNum) {
+				h.metrics.WSFramesReplayed.Add(1)
 				continue
 			}
 
