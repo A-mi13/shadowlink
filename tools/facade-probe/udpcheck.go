@@ -21,6 +21,19 @@ import (
 // A probe that uses one socket therefore measures nothing about the class of
 // failure that actually reached the field. This one resolves several names over
 // one association, each from its own socket, and reports per-socket results.
+//
+// Measured signature of the defect, reproduced 2026-09-01 against the original
+// code (full-address pin, first sender wins): this check reports exactly
+// **1/4** — the first socket is the one the pin points at, so it is answered
+// and the remaining three time out. That single success is the whole reason a
+// hand check scored 8/8.
+//
+// Note what this means for the drop counters added alongside the fix: they stay
+// **silent** on this defect. `no_client_yet` fires only when no sender was ever
+// recorded, and here one was — merely the wrong one; the reply goes to a closed
+// loopback port, which does not fail the write, so `unroutable_reply` does not
+// move either. "Answered somebody, just not the asker" is not a discard on any
+// branch. This probe, not a metric, is what catches it.
 
 // udpCheckDomains are resolved through the tunnel, one per source socket.
 var udpCheckDomains = []string{
