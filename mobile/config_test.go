@@ -77,6 +77,7 @@ func TestBuildEngineConfig_Validation(t *testing.T) {
 		{"pubkey короткий", func(c *Config) { c.PubKeyHex = "aabb" }, "32 байта"},
 		{"clientID не 16 байт", func(c *Config) { c.ClientIDHex = "aabb" }, "16 байт"},
 		{"отрицательный пул", func(c *Config) { c.WSPoolSize = -1 }, "WSPoolSize"},
+		{"отрицательное окно", func(c *Config) { c.FlowWindowKB = -1 }, "FlowWindowKB"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

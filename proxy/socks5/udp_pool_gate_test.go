@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/nixavpn/shadowlink/client"
+	"github.com/nixavpn/shadowlink/core"
 )
 
 // stubStarvedTransport implements client.StreamTransport AND
@@ -137,12 +139,31 @@ func TestUDPAssociate_FailsAtBoundary(t *testing.T) {
 // past the gate and call WriteMessage / StartReader on the stub. We don't
 // drive it past the SOCKS5 success reply — once that reply is written, the
 // test stops. This proves the gate itself does not reject.
+//
+// It supplies a session because the success reply now waits until the relay is
+// genuinely usable (2026-09-01): before that change the reply was written
+// before the session was resolved, so this test could assert REP=0x00 against a
+// transport that could never carry a datagram. That made it a weaker test than
+// it read as — it would have passed on a completely dead relay.
 type stubAcceptedTransport struct {
 	ready    int
 	writeErr error
+
+	assigned atomic.Bool
+	session  *core.Session
 }
 
 func (s *stubAcceptedTransport) ReadyCount() int { return s.ready }
+
+func (s *stubAcceptedTransport) AssignStream(streamID uint16)  { s.assigned.Store(true) }
+func (s *stubAcceptedTransport) ReleaseStream(streamID uint16) { s.assigned.Store(false) }
+
+func (s *stubAcceptedTransport) SessionForStream(streamID uint16) *core.Session {
+	if !s.assigned.Load() {
+		return nil
+	}
+	return s.session
+}
 func (s *stubAcceptedTransport) WriteMessage(data []byte) error {
 	if s.writeErr != nil {
 		return s.writeErr
@@ -165,7 +186,11 @@ func (s *stubAcceptedTransport) Close() error { return nil }
 // streamChans; cl.RegisterStream needs streamChans. Both are zero-value
 // safe on a fresh struct.
 func TestUDPAssociate_AcceptsWhenPoolReady(t *testing.T) {
-	stub := &stubAcceptedTransport{ready: udpMinReadySlots}
+	key := make([]byte, 32)
+	stub := &stubAcceptedTransport{
+		ready:   udpMinReadySlots,
+		session: core.NewSession(0x1234, key, key),
+	}
 	cp, peer := newConnPipe()
 	defer cp.Close()
 	defer peer.Close()
@@ -183,7 +208,7 @@ func TestUDPAssociate_AcceptsWhenPoolReady(t *testing.T) {
 		peer.Close()
 	}()
 
-	cl := &client.Client{}
+	cl := client.NewTestClientWithSession(core.NewSession(0x5678, key, key))
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

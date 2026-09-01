@@ -34,6 +34,12 @@
 // That is the right trade for a human smoke gate, and the wrong one for a
 // blocking CI job — an ipify outage would redden the build with no defect
 // present. Use it as a manual or non-blocking check.
+//	-check-udp  resolve several names over ONE UDP ASSOCIATE, each from a
+//	            different local source port, and exit non-zero on failure.
+//	            Distinct ports are the point: a single-socket probe cannot
+//	            observe reply-misrouting, which is how the 2026-09-01 defect
+//	            (8/8 by hand, 33% via sing-box) survived acceptance.
+//	-resolver   resolver for -check-udp (IPv4 literal, default 1.1.1.1:53)
 //	-hold       how long to stay up in interactive mode (default 10m)
 //	-log        facade log level: quiet|info|debug|trace
 //
@@ -95,6 +101,8 @@ func main() {
 	logLevel := flag.String("log", "info", "facade log level: quiet|info|debug|trace")
 	hold := flag.Duration("hold", 10*time.Minute, "how long to stay up in interactive mode")
 	check := flag.Bool("check", false, "run a reachability check through the tunnel and exit")
+	checkUDP := flag.Bool("check-udp", false, "resolve several names over one UDP ASSOCIATE from DISTINCT source ports, then exit")
+	resolver := flag.String("resolver", "1.1.1.1:53", "resolver used by -check-udp (IPv4 literal)")
 	flag.Parse()
 
 	cfg := mobile.NewConfig()
@@ -190,12 +198,25 @@ func main() {
 	fmt.Printf("[probe] curl -sS --socks5-hostname %s:%s@%s --http3 https://cloudflare.com   # exercises UDP\n\n",
 		user, pass, proxy)
 
-	if *check {
-		if err := runCheck(proxy, user, pass); err != nil {
-			fmt.Printf("[probe] FAIL: %v\n", err)
+	if *check || *checkUDP {
+		failed := false
+		if *check {
+			if err := runCheck(proxy, user, pass); err != nil {
+				fmt.Printf("[probe] FAIL: %v\n", err)
+				failed = true
+			} else {
+				fmt.Println("[probe] OK — tunnel carried a request end to end")
+			}
+		}
+		if *checkUDP {
+			if err := runUDPCheck(proxy, user, pass, *resolver); err != nil {
+				fmt.Printf("[probe] FAIL (udp): %v\n", err)
+				failed = true
+			}
+		}
+		if failed {
 			os.Exit(1)
 		}
-		fmt.Println("[probe] OK — tunnel carried a request end to end")
 		return
 	}
 

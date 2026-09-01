@@ -80,6 +80,15 @@ type ShadowLinkConfig struct {
 	CFIP       string                `yaml:"cfip,omitempty"`         // specific Cloudflare edge IP (bypass DNS for WS)
 	WSPool     bool                  `yaml:"ws_pool,omitempty"`      // enable WS pool (default true for CDN+WS)
 	WSPoolSize int                   `yaml:"ws_pool_size,omitempty"` // pool size (default 8; ready-pool в per-stream режиме — 6)
+	// FlowWindow — окно flow control на стрим, байты. 0 = env
+	// SHADOWLINK_FLOW_WINDOW, затем дефолт 1 МиБ. Потолок 6 МиБ.
+	//
+	// Ручка нужна встроенным клиентам: до 2026-09-01 окно задавалось ТОЛЬКО
+	// переменной окружения, а мобильный фасад живёт внутри чужого процесса
+	// (на iOS — в extension), где выставить env практически нечем. Величина не
+	// косметическая: она задаёт потолок ОДНОГО потока (окно / RTT), и серверный
+	// -flow-max-window его не поднимает — согласование берёт min(клиент, сервер).
+	FlowWindow uint64 `yaml:"flow_window,omitempty"`
 	// BackupServers are fallback "host:port" endpoints tried in order when
 	// the primary Server handshake fails (ТСПУ blocks the CF SNI, DNS
 	// poisoning, etc.). Must share the same X25519 pubkey.

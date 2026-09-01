@@ -270,6 +270,27 @@ type statsRegistry struct {
 	// a bug.
 	StaleFrameDroppedTotal atomic.Uint64
 
+	// UDPDatagramsDroppedTotal — SOCKS5 UDP datagrams discarded on the client
+	// relay path, summed across every discard reason (short datagram, bad
+	// header, foreign source IP, empty payload, unparseable downlink chunk,
+	// unroutable reply, reply before the client ever spoke).
+	//
+	// Added 2026-09-01 after the NixaVPN client team measured 33% DNS success
+	// over sing-box (242 ok / 485 fail) while a single-socket probe scored 8/8.
+	// Nothing on our side could name the failing branch: each discard was a bare
+	// `continue`, and the only UDP-adjacent metric we had —
+	// shadowlink_ws_frames_discarded_total — lives on the SERVER and counts AEAD
+	// and sequence-window failures, so it is silent by construction for a
+	// datagram dropped before it is ever sealed.
+	//
+	// Logging these is not an option (a peer flooding malformed datagrams would
+	// fill the disk), which is the same conclusion the server reached for
+	// undecryptable frames. The per-reason breakdown lives in proxy/socks5 and
+	// is reported alongside this total; this counter exists so the aggregate is
+	// visible in the client's own metrics without a package cycle
+	// (proxy/socks5 imports client, never the reverse).
+	UDPDatagramsDroppedTotal atomic.Uint64
+
 	// DownlinkReplayDroppedTotal — downlink chunks dropped because their
 	// transport-level chunk.SeqNum failed the session anti-replay window
 	// (already-seen or too-old). M1 (2026-06-11): AEAD proves authenticity but
@@ -592,6 +613,25 @@ type statsRegistry struct {
 	ActiveProfileChrome120 atomic.Uint64
 	ActiveProfileChrome131 atomic.Uint64
 	ActiveProfileChrome133 atomic.Uint64
+}
+
+// udpDropReporter yields a one-line per-reason breakdown of dropped SOCKS5 UDP
+// datagrams, or "" when there is nothing to report. It is a registered hook
+// rather than a field because the detail lives in proxy/socks5, and that
+// package imports client — the dependency cannot be reversed.
+//
+// Without the breakdown the aggregate counter would say only "datagrams were
+// lost", which is the position we were in when the field team reported 33% DNS
+// success on 2026-09-01 and nothing on our side could name the branch.
+var udpDropReporter atomic.Pointer[func() string]
+
+// SetUDPDropReporter registers the breakdown source. Called from proxy/socks5.
+func SetUDPDropReporter(fn func() string) {
+	if fn == nil {
+		udpDropReporter.Store(nil)
+		return
+	}
+	udpDropReporter.Store(&fn)
 }
 
 // Histogram is a fixed-bucket histogram for duration-style observations.
@@ -971,6 +1011,10 @@ func WritePromMetrics(w io.Writer) {
 	fmt.Fprintf(w, "shadowlink_stale_frame_dropped_total %d\n", Stats.StaleFrameDroppedTotal.Load())
 	fmt.Fprintf(w, "shadowlink_downlink_replay_dropped_total %d\n", Stats.DownlinkReplayDroppedTotal.Load())
 
+	fmt.Fprintf(w, "# HELP shadowlink_udp_datagrams_dropped_total SOCKS5 UDP datagrams discarded on the client relay path, all reasons summed; per-reason breakdown is reported in the client stats line\n")
+	fmt.Fprintf(w, "# TYPE shadowlink_udp_datagrams_dropped_total counter\n")
+	fmt.Fprintf(w, "shadowlink_udp_datagrams_dropped_total %d\n", Stats.UDPDatagramsDroppedTotal.Load())
+
 	fmt.Fprintf(w, "# HELP shadowlink_migration_frame_unparseable_total Decrypted FlagData frames on a migration slot that matched neither the control path nor ParseStreamDataSeq; stream torn down (H-C2). Should stay ~0\n")
 	fmt.Fprintf(w, "# TYPE shadowlink_migration_frame_unparseable_total counter\n")
 	fmt.Fprintf(w, "shadowlink_migration_frame_unparseable_total %d\n", Stats.MigrationFrameUnparseable.Load())
@@ -1206,6 +1250,7 @@ func StartStatsLogger(ctx context.Context, interval time.Duration) {
 			lastSocks, lastUp, lastDown                        int64
 			lastWriterExits, lastReaderExits                   int64
 			lastBypassMatch, lastBypassMiss                    int64
+			lastUDPDropped                                     uint64
 		)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -1231,29 +1276,45 @@ func StartStatsLogger(ctx context.Context, interval time.Duration) {
 			bypassMatch := Stats.BypassMatchTotal.Load()
 			bypassMiss := Stats.BypassMissTotal.Load()
 
-			slog.Info("shadowlink client stats (delta)",
+			udpDropped := Stats.UDPDatagramsDroppedTotal.Load()
+
+			attrs := []any{
 				"interval", interval,
-				"cover_posts", cover-lastCover,
-				"udp_polls", udp-lastUDP,
-				"ws_created", wsNew-lastWSNew,
-				"ws_died", wsDie-lastWSDie,
-				"encrypts", enc-lastEnc,
-				"decrypts", dec-lastDec,
-				"decrypt_fails", decFail-lastDecFail,
-				"socks_connects", socks-lastSocks,
-				"uplink_kb", (up-lastUp)/1024,
-				"downlink_kb", (down-lastDown)/1024,
-				"writer_exits", writerExits-lastWriterExits,
-				"reader_exits", readerExits-lastReaderExits,
-				"bypass_match", bypassMatch-lastBypassMatch,
-				"bypass_miss", bypassMiss-lastBypassMiss,
-			)
+				"cover_posts", cover - lastCover,
+				"udp_polls", udp - lastUDP,
+				"ws_created", wsNew - lastWSNew,
+				"ws_died", wsDie - lastWSDie,
+				"encrypts", enc - lastEnc,
+				"decrypts", dec - lastDec,
+				"decrypt_fails", decFail - lastDecFail,
+				"socks_connects", socks - lastSocks,
+				"uplink_kb", (up - lastUp) / 1024,
+				"downlink_kb", (down - lastDown) / 1024,
+				"writer_exits", writerExits - lastWriterExits,
+				"reader_exits", readerExits - lastReaderExits,
+				"bypass_match", bypassMatch - lastBypassMatch,
+				"bypass_miss", bypassMiss - lastBypassMiss,
+			}
+			// Only present when non-zero: a field that is "0" every five seconds
+			// costs log volume and reads as reassurance rather than information.
+			// The per-reason breakdown is supplied by proxy/socks5 through
+			// UDPDropReporter, which client cannot import directly.
+			if d := udpDropped - lastUDPDropped; d > 0 {
+				attrs = append(attrs, "udp_dropped", d)
+				if r := udpDropReporter.Load(); r != nil {
+					if summary := (*r)(); summary != "" {
+						attrs = append(attrs, "udp_drop_reasons", summary)
+					}
+				}
+			}
+			slog.Info("shadowlink client stats (delta)", attrs...)
 
 			lastCover, lastUDP, lastWSNew, lastWSDie = cover, udp, wsNew, wsDie
 			lastEnc, lastDec, lastDecFail = enc, dec, decFail
 			lastSocks, lastUp, lastDown = socks, up, down
 			lastWriterExits, lastReaderExits = writerExits, readerExits
 			lastBypassMatch, lastBypassMiss = bypassMatch, bypassMiss
+			lastUDPDropped = udpDropped
 
 			logSlotDeathSummary()
 		}

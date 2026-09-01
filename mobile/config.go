@@ -66,6 +66,28 @@ type Config struct {
 	// (hard rule 8) — только с замером.
 	WSPoolSize int32
 
+	// FlowWindowKB — окно flow control на стрим, в КИЛОБАЙТАХ. 0 = дефолт
+	// движка (1 МиБ). Потолок 6 МиБ (6144); большее значение будет прижато.
+	//
+	// В килобайтах, а не в байтах, потому что gobind не переносит uint64 через
+	// границу языка, а int32 в байтах упёрся бы в 2 ГиБ и провоцировал бы
+	// путаницу единиц на стороне платформы.
+	//
+	// Зачем ручка. Окно задаёт потолок скорости ОДНОГО потока: окно / RTT.
+	// Замер команды NixaVPN 2026-09-01 — один поток ~23 Мбит/с при RTT 241 мс,
+	// туннель целиком ~187 Мбит/с на 8 потоках; это и есть 1 МиБ / 241 мс с
+	// поправкой на возврат кредитов. До этой правки величина задавалась ТОЛЬКО
+	// переменной окружения SHADOWLINK_FLOW_WINDOW, которую в extension на iOS
+	// выставить нечем, то есть на мобильных ручки не было вовсе.
+	//
+	// ⚠ Серверный -flow-max-window потолок НЕ поднимает: согласование берёт
+	// min(клиент, сервер), поэтому меньшая сторона связывает всегда.
+	//
+	// ⚠ Поднимать не «на всякий случай»: больший буфер — больше памяти на
+	// стрим, а бюджет NEPacketTunnelProvider ограничен (50 MiB с iOS 15) и
+	// пики приходятся на переподключение. Менять с замером.
+	FlowWindowKB int32
+
 	// StateDir — каталог приложения для персистентного состояния (fp-state.bin).
 	// Пустая строка означает, что fingerprint-профиль будет переизбираться на
 	// каждом старте — на мобильных это работает против hard rule 2.
@@ -174,6 +196,9 @@ func buildEngineConfig(cfg *Config, user, pass string) (*engine.Config, error) {
 	if cfg.WSPoolSize < 0 {
 		return nil, fmt.Errorf("config: WSPoolSize отрицательный: %d", cfg.WSPoolSize)
 	}
+	if cfg.FlowWindowKB < 0 {
+		return nil, fmt.Errorf("config: FlowWindowKB отрицательный: %d", cfg.FlowWindowKB)
+	}
 
 	return &engine.Config{
 		SOCKS: socksBindAddr,
@@ -198,6 +223,7 @@ func buildEngineConfig(cfg *Config, user, pass string) (*engine.Config, error) {
 			CDN:        strings.TrimSpace(cfg.CDN),
 			SNI:        strings.TrimSpace(cfg.SNI),
 			WSPoolSize: int(cfg.WSPoolSize),
+			FlowWindow: uint64(cfg.FlowWindowKB) * 1024,
 			Routing:    cfg.routing,
 		},
 	}, nil

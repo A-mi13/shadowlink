@@ -642,6 +642,7 @@ func (e *ShadowLinkEngine) Connect(ctx context.Context) (retErr error) {
 					SNIHost:                    sniHost,
 					CFIP:                       slCfg.CFIP,
 					MaxStreamsPerSlot:          maxStreamsPerSlot,
+					FlowWindow:                 slCfg.FlowWindow,
 					MaxPendingPerSlot:          maxPendingPerSlot,
 					MaxBytesPerSlot:            maxBytesPerSlot,
 					MaxSlotAge:                 maxSlotAge,

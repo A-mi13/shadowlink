@@ -2061,6 +2061,22 @@ type WSPoolConfig struct {
 	// For CF CDN mode, set low (4-8) so each WS carries light traffic.
 	MaxStreamsPerSlot int
 
+	// FlowWindow overrides the advertised per-stream flow-control window in
+	// bytes. 0 = fall back to SHADOWLINK_FLOW_WINDOW, then to the 1 MiB default.
+	// Clamped to maxFlowWindow (6 MiB) like every other path.
+	//
+	// This exists because the window used to be reachable ONLY through an
+	// environment variable (client/stream_flow.go), which an embedded caller
+	// cannot realistically set: the mobile facade runs inside an app process,
+	// and on iOS the tunnel lives in a NEPacketTunnelProvider extension. The
+	// ceiling it sets is real — measured 2026-09-01 by the NixaVPN client team,
+	// one stream capped near 23 Mbit/s at 241 ms RTT while the tunnel as a whole
+	// carried ~187 Mbit/s across 8 streams, which is 1 MiB / RTT to within
+	// credit-return latency. Note the server's -flow-max-window cannot raise it:
+	// negotiation takes min(client, server) (server/stream_credit.go), so the
+	// client is the binding side whenever its window is smaller.
+	FlowWindow uint64
+
 	// MaxBytesPerSlot triggers preemptive rotation after N downstream bytes on
 	// a single slot's TCP. 0 = disabled. Critical for Russia TSPU DPI (2026)
 	// which silently freezes foreign-IP TCPs after ~15-20KB over TLS 1.3
@@ -2356,7 +2372,13 @@ func NewWSPoolTransport(cl *Client, cfg WSPoolConfig) *WSPoolTransport {
 		cancel:                     cancel,
 		log:                        slog.Default(),
 	}
-	p.flowDesiredWindow = flowWindowFromEnv(1 << 20)
+	// Explicit config wins over the environment; env stays the fallback so
+	// existing deployments and field probes keep working unchanged.
+	if cfg.FlowWindow > 0 {
+		p.flowDesiredWindow = clampFlowWindow(cfg.FlowWindow)
+	} else {
+		p.flowDesiredWindow = flowWindowFromEnv(1 << 20)
+	}
 	p.initRevivalSignal()
 	p.allocSlots()
 	return p

@@ -160,6 +160,7 @@ Fields are plain Kotlin properties (`cfg.serverAddr = …`).
 | `cdn` | `String` | no | Legacy URL-format compatibility. Production is direct-to-origin. |
 | `useTLS` | `boolean` | yes in production | Disable only in lab setups. |
 | `wsPoolSize` | `int` | no | Number of WS pool slots. `0` ⇒ engine default **8** (VERIFIED, `engine/engine.go`). Negative ⇒ validation error. Do not change without a measurement (see §11). |
+| `flowWindowKB` | `int` | no | Per-stream flow-control window, **in kilobytes**. `0` ⇒ engine default (1 MiB). Clamped to 6144 (6 MiB). Negative ⇒ validation error. See §4.5 before raising it. |
 | `stateDir` | `String` | strongly recommended | App-private directory for persistent fingerprint state (`fp-state.bin`). Empty ⇒ the TLS fingerprint profile is re-picked on every start, which is a detectable drift. |
 
 ### 4.1 Methods
@@ -201,6 +202,7 @@ text.
 | `clientIDHex` not hex | `config: ClientIDHex не hex: …` |
 | `clientIDHex` wrong length | `config: ClientIDHex должен быть 16 байт (32 hex), получено N` |
 | `wsPoolSize < 0` | `config: WSPoolSize отрицательный: N` |
+| `flowWindowKB < 0` | `config: FlowWindowKB отрицательный: N` |
 
 VERIFIED in `mobile/config.go`.
 
@@ -217,6 +219,41 @@ parameters, build a new `Config` and a new `Session`.
 override, and that is intentional: without the pooled WS transport the data path
 falls back to 20 ms polling tickers, which puts a 50 Hz timing signature on the
 wire plus one encrypted frame per tick.
+
+### 4.5 `flowWindowKB` — what it actually controls
+
+This window caps the throughput of a **single stream**, not of the tunnel. The
+ceiling is `window / RTT`, because a stream may not have more bytes in flight
+than its window before credits come back.
+
+Measured 2026-09-01 (NixaVPN client team, Bangkok → Poland, RTT 241 ms):
+
+| streams | aggregate |
+|---|---|
+| 1 | 20.9 · 23.0 · 33.4 Mbit/s |
+| 4 | 82.2 · 127.6 · 81.3 Mbit/s |
+| 8 | 191.3 · 186.6 · 169.2 Mbit/s |
+
+Aggregate scales close to linearly, so nothing shared is saturating; the per
+stream number is the 1 MiB default divided by the RTT (≈34.8 Mbit/s in theory,
+lower in practice by the credit-return latency). A browser opening many
+connections is unaffected. A single large download is.
+
+Two things worth knowing before you change it:
+
+- **The server cannot raise it for you.** Window negotiation takes
+  `min(client, server)` (`server/stream_credit.go`), so whichever side is
+  smaller binds. Raising `-flow-max-window` on the server does nothing while the
+  client asks for 1 MiB.
+- **Memory is the cost.** The window sizes per-stream buffers on both sides.
+  `NEPacketTunnelProvider` has a 50 MiB budget on iOS 15+, and peaks land on
+  reconnection rather than steady state. Raise it with a measurement, not
+  preemptively.
+
+Until v0.3.1 this was reachable only through the `SHADOWLINK_FLOW_WINDOW`
+environment variable, which an app process — and especially a
+`NEPacketTunnelProvider` extension — has no practical way to set. That is why
+the earlier attempts to test the window from the mobile side showed no effect.
 
 ---
 
@@ -446,6 +483,54 @@ the tunnel network settings.
 
 This is a missing feature at the SDK boundary, not a bug — but if you skip it,
 your product leaks DNS.
+
+#### 8.1.1 UDP through the facade's SOCKS5 — fixed in v0.3.1
+
+If you front the facade's SOCKS5 with another proxy (sing-box, tun2socks, any
+`UDP ASSOCIATE` client), note what changed and why, because the symptom was
+misleading.
+
+Before v0.3.1 the relay pinned the **full address** — IP *and* port — of the
+first datagram of an association and sent every response back to it, while
+accepting uplink from any port of that IP. A client that multiplexes several UDP
+flows over one association from different source ports (sing-box does this, one
+socket per query in flight) therefore received replies for the first flow only.
+
+The measured shape of this: **8/8 success driven by a single-socket probe, 33 %
+(242 ok / 485 fail) driven by sing-box, over the same tunnel at the same time**.
+A one-socket client cannot observe the defect at all, because for it the pin and
+the real sender coincide — which is why manual acceptance passed. If you are
+validating UDP, drive it with something that multiplexes.
+
+Fixed by routing each response to the sender that asked, keyed by destination
+(`proxy/socks5/udp.go`). The same-source-IP restriction is unchanged: a foreign
+local process still cannot inject into or steal from your association.
+
+Three related lifecycle fixes shipped with it:
+
+- **Traffic on the control TCP no longer tears down the association.** RFC 1928
+  ends it on *close*; the old code treated any byte as a teardown signal, so a
+  client sending keepalives on the control channel killed its own relay.
+- **`REP=0x00` is no longer sent before the relay is usable.** It used to be
+  written before the stream's session was resolved, so a client could be told
+  the association was up over a dead relay and then block until its own timeout
+  instead of failing over.
+- **Discarded datagrams are now counted** (see §8.1.2). Every discard used to be
+  a silent `continue`.
+
+#### 8.1.2 Diagnosing UDP loss
+
+`shadowlink_udp_datagrams_dropped_total` in the client's Prometheus output gives
+the aggregate; the client stats line carries a `udp_drop_reasons` field with the
+per-reason breakdown, present only when non-zero. Reasons: `short_datagram`,
+`bad_header` (FRAG ≠ 0 or unknown ATYP), `foreign_source_ip`, `empty_payload`,
+`bad_downlink_chunk`, `unroutable_reply`, `no_client_yet`.
+
+Note that the server-side `shadowlink_ws_frames_discarded_total` will **not**
+show UDP datagrams dropped on the client relay: it counts AEAD and
+sequence-window failures on inbound WS frames, so it is silent by construction
+for a datagram discarded before it is ever sealed. Reading a clean value there as
+"UDP is healthy" is the mistake that kept the 33 % invisible.
 
 ### 8.2 `networkChanged()` — mandatory
 
